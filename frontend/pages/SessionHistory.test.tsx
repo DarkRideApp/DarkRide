@@ -1,6 +1,6 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { SessionHistory } from './SessionHistory';
 import { WebSocketContext } from '@darkrideapp/plugin-sdk/react';
@@ -212,19 +212,21 @@ describe('SessionHistory', () => {
       await waitFor(() => {
         expect(screen.getByTestId('sessions-table')).toBeInTheDocument();
       });
+      // The page fires two concurrent fetches on mount (sessions + device list).
+      // waitFor resolves as soon as sessions-table appears, but the device-list
+      // fetch may still have a re-render queued. Flush it before clicking —
+      // otherwise the first click can land mid-commit and miss its onClick.
+      await act(async () => {});
 
-      // Select two rows
       fireEvent.click(screen.getByTestId('row-select-1'));
+      await screen.findByText('1 selected');
       fireEvent.click(screen.getByTestId('row-select-2'));
+      await screen.findByText('2 selected');
 
-      const bulkDeleteBtn = await screen.findByTestId('bulk-delete-btn');
-      fireEvent.click(bulkDeleteBtn);
+      fireEvent.click(screen.getByTestId('bulk-delete-btn'));
 
-      // Confirmation dialog should appear
-      await waitFor(() => {
-        expect(screen.getByText('Delete Sessions')).toBeInTheDocument();
-        expect(screen.getByText(/Are you sure you want to delete 2 sessions/)).toBeInTheDocument();
-      });
+      await screen.findByText('Delete Sessions');
+      expect(screen.getByText(/Are you sure you want to delete 2 sessions/)).toBeInTheDocument();
     });
 
     it('deletes sessions on confirmation', async () => {
