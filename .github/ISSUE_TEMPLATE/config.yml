@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/DarkRideApp/DarkRide/blob/main/SECURITY.md
+    about: Please report security issues privately — do NOT open a public issue.
+  - name: Question / help
+    url: https://github.com/DarkRideApp/DarkRide/discussions
+    about: For "how do I..." questions, please use GitHub Discussions.

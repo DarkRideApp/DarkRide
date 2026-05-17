@@ -1,0 +1,10 @@
+{
+  "name": "@darkrideapp/plugin-test",
+  "version": "0.0.1",
+  "main": "darkride-plugin.js",
+  "keywords": ["darkride-plugin"],
+  "description": "Tiny test plugin used by e2e lifecycle test — registers GET /v1/test-plugin/ping",
+  "peerDependencies": {
+    "drizzle-orm": "*"
+  }
+}

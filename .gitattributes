@@ -1,0 +1,6 @@
+* text=auto
+*.sh text eol=lf
+# Migration SQL files MUST stay LF — the migrator hashes their contents and
+# CRLF would invalidate hashes computed on other platforms.
+migrations/*.sql text eol=lf
+scripts/*.sql text eol=lf

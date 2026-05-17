@@ -1,0 +1,79 @@
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+
+// Allow overriding the backend port via env var (e.g. for E2E tests on a non-default port)
+const backendPort = process.env.PORT || '3000';
+const backendOrigin = `http://localhost:${backendPort}`;
+
+export default defineConfig({
+  plugins: [react()],
+  base: '/ui/',
+  root: './frontend',
+  build: {
+    outDir: '../dist/frontend',
+    emptyOutDir: true,
+    commonjsOptions: {
+      // Workspace package outputs CJS; tell Rollup to transform it so named
+      // exports are statically visible (e.g. pluginRegistry from /react).
+      include: [/packages\/plugin-sdk\/dist\//, /node_modules/],
+    },
+  },
+  resolve: {
+    alias: {
+      '@shared': path.resolve(__dirname, './shared'),
+      '@frontend': path.resolve(__dirname, './frontend'),
+    },
+  },
+  // Pre-bundle heavy dependencies so the first dev load doesn't spend minutes
+  // walking plugin frontend files for discovery. Without this, Vite's dep
+  // scanner crawls every `../../../../frontend/...` relative import in plugins/,
+  // which can take 4+ minutes on cold start.
+  optimizeDeps: {
+    include: [
+      'react',
+      'react-dom',
+      'react-dom/client',
+      'react-router-dom',
+      'recharts',
+      'react-markdown',
+      'remark-gfm',
+      'rehype-highlight',
+      'highlight.js',
+      'lucide-react',
+      '@xterm/xterm',
+      '@xterm/addon-fit',
+      'monaco-editor',
+      // Plugin transitive deps: pre-bundle CJS-only packages used by plugin
+      // frontends so esbuild synthesizes named exports. Without this,
+      // `await import('leaflet')` from a managed-install plugin gives a
+      // namespace without `.map(...)`. Workspace plugins didn't need this
+      // because Vite's scanner found the import in-tree; managed plugins
+      // live outside Vite's root and aren't auto-discovered.
+      'leaflet',
+      // Workspace SDK ships CJS but is consumed as ESM in the browser.
+      // Pre-bundling via esbuild does the interop so named imports
+      // (e.g. `pluginRegistry`) work in dev. The production Rollup build
+      // handles this via build.commonjsOptions.include above.
+      '@darkrideapp/plugin-sdk',
+      '@darkrideapp/plugin-sdk/react',
+      '@darkrideapp/plugin-sdk/utils',
+    ],
+  },
+  server: {
+    proxy: {
+      '/v1': backendOrigin,
+      '/data': backendOrigin,
+      '/mcp': backendOrigin,
+      '/oauth': backendOrigin,
+      '/.well-known': backendOrigin,
+      '/SKILL.md': backendOrigin,
+      '/openapi.json': backendOrigin,
+      '/health': backendOrigin,
+      '/ws': {
+        target: `ws://localhost:${backendPort}`,
+        ws: true,
+      },
+    },
+  },
+});

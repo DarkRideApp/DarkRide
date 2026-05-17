@@ -1,0 +1,1 @@
+ALTER TABLE automation_sessions ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0;

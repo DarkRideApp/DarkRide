@@ -1,0 +1,18 @@
+# CODEOWNERS for DarkRide core
+#
+# Every PR touching files listed here requires review from the owner.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything
+*                                 @cubehouse
+
+# The legal, security, and commercial files get extra attention
+/LICENSE                          @cubehouse
+/NOTICE                           @cubehouse
+/COMMERCIAL.md                    @cubehouse
+/CLA.md                           @cubehouse
+/SECURITY.md                      @cubehouse
+
+# CI / deploy / build
+/.github/                         @cubehouse
+/Dockerfile                       @cubehouse

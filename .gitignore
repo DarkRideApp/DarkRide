@@ -1,0 +1,53 @@
+node_modules/
+dist/
+data/
+!data/apks/
+data/apks/*
+!data/apks/wg-binaries/
+!data/apks/wireguard.apk
+.env
+*.db
+*.db-journal
+*.db-wal
+coverage/
+vendor/
+.venv/
+python/__pycache__/
+scripts/__pycache__/
+*.mbtiles
+*.apk
+*.zip
+screenshots/
+!docs/screenshots/
+.playwright-mcp/
+flutter/*
+.worktrees/
+changelog.json
+.superpowers/
+ansible/.ansible-fact-cache/
+.claude/
+
+# Test plugin bundle — built at test-time
+tests/fixtures/test-plugin.git/
+tests/fixtures/test-plugin-work/
+
+# Private notes and design docs not for the public repo. Move things in here
+# rather than committing them; the working tree keeps the content for personal
+# reference, git stops tracking. See `docs/internal/README.md` for the rationale.
+docs/internal/
+TODO.md
+
+# Ops + internal notes kept in a separate private companion repo.
+# These globs are belt-and-braces so they can't accidentally be re-added.
+ansible/
+docs/superpowers/
+docs/*-rollout.md
+docs/*-todo.md
+docs/todo.md
+
+# Only kitchen-sink ships as an in-tree plugin (a worked example). Anything
+# else dropped into plugins/ during dev — symlinks, separate clones, scratch
+# work — should NOT be committed. The lockfile-hygiene CI job also catches
+# this if a non-kitchen-sink workspace makes it into package-lock.json.
+plugins/*
+!plugins/kitchen-sink/

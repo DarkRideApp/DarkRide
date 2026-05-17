@@ -1,0 +1,388 @@
+import { eq, and, isNotNull } from 'drizzle-orm';
+import { automations, devices } from '../db/schema';
+import type { AppDatabase } from '../db/index';
+import { AutomationRunner } from './automation-runner';
+import type { DeviceManager } from './device-manager';
+import { createLoggers } from '../logs';
+import type { ScheduleConfig, DeviceFilter, TriggerType } from '../../shared/types/api';
+import { matchesDeviceFilter, migrateDeviceFilter } from '../../shared/lib/device-filter';
+import { matchesCrontab } from '@darkrideapp/plugin-sdk/utils';
+
+const { log, error } = createLoggers('automation-scheduler');
+
+interface QueueEntry {
+  automationId: number;
+  triggerType: TriggerType;
+  queuedAt: Date;
+}
+
+export class AutomationScheduler {
+  private schedules = new Map<number, ScheduleConfig>();
+  private lastIntervalFired = new Map<number, Date>();
+  private queue: QueueEntry[] = [];
+  private checkInterval: ReturnType<typeof setInterval> | null = null;
+  private queueAlertTimer: ReturnType<typeof setTimeout> | null = null;
+  private processingQueue = false;
+
+  constructor(
+    private db: AppDatabase,
+    private runner: AutomationRunner,
+    private deviceManager?: DeviceManager,
+  ) {}
+
+  start(): void {
+    this.loadSchedules();
+    // Check every minute
+    this.checkInterval = setInterval(() => {
+      this.checkSchedules();
+      this.processQueue();
+    }, 60_000);
+    log('Scheduler started');
+  }
+
+  stop(): void {
+    if (this.checkInterval) {
+      clearInterval(this.checkInterval);
+      this.checkInterval = null;
+    }
+    if (this.queueAlertTimer) {
+      clearTimeout(this.queueAlertTimer);
+      this.queueAlertTimer = null;
+    }
+    log('Scheduler stopped');
+  }
+
+  loadSchedules(): void {
+    const rows = this.db
+      .select()
+      .from(automations)
+      .where(and(isNotNull(automations.schedule), eq(automations.enabled, true)))
+      .all();
+
+    this.schedules.clear();
+    this.lastIntervalFired.clear();
+
+    const now = new Date();
+    for (const row of rows) {
+      if (!row.schedule) continue;
+      try {
+        const config = JSON.parse(row.schedule) as ScheduleConfig;
+        this.schedules.set(row.id, config);
+        if (config.type === 'interval' || config.type === 'windowed_interval') {
+          // Init to now to prevent burst-on-restart
+          this.lastIntervalFired.set(row.id, now);
+        }
+      } catch {
+        error(`Invalid schedule JSON for automation ${row.id}`);
+      }
+    }
+
+    log(`Loaded ${this.schedules.size} schedules from DB`);
+  }
+
+  setSchedule(automationId: number, config: ScheduleConfig): void {
+    // Persist to DB
+    this.db
+      .update(automations)
+      .set({ schedule: JSON.stringify(config) })
+      .where(eq(automations.id, automationId))
+      .run();
+
+    // Update in-memory
+    this.schedules.set(automationId, config);
+    if (config.type === 'interval' || config.type === 'windowed_interval') {
+      this.lastIntervalFired.set(automationId, new Date());
+    } else {
+      this.lastIntervalFired.delete(automationId);
+    }
+
+    log(`Schedule set for automation ${automationId}: ${JSON.stringify(config)}`);
+  }
+
+  removeSchedule(automationId: number): void {
+    // Clear in DB
+    this.db
+      .update(automations)
+      .set({ schedule: null })
+      .where(eq(automations.id, automationId))
+      .run();
+
+    // Clear in-memory
+    this.schedules.delete(automationId);
+    this.lastIntervalFired.delete(automationId);
+
+    log(`Schedule removed for automation ${automationId}`);
+  }
+
+  getSchedule(automationId: number): ScheduleConfig | null {
+    return this.schedules.get(automationId) ?? null;
+  }
+
+  getSchedules(): Map<number, ScheduleConfig> {
+    return this.schedules;
+  }
+
+  enqueue(automationId: number, triggerType: TriggerType = 'schedule'): boolean {
+    // Skip duplicate queued entries
+    if (this.queue.some((q) => q.automationId === automationId)) {
+      log(`Automation ${automationId} already in queue, skipping`);
+      return false;
+    }
+
+    this.queue.push({ automationId, triggerType, queuedAt: new Date() });
+    log(`Automation ${automationId} added to queue (trigger: ${triggerType})`);
+
+    // Start queue health alert timer if not already running
+    if (!this.queueAlertTimer && this.queue.length > 0) {
+      this.queueAlertTimer = setTimeout(() => {
+        if (this.queue.length > 0) {
+          error(`Queue health alert: ${this.queue.length} items pending for 5+ minutes`);
+        }
+        this.queueAlertTimer = null;
+      }, 5 * 60_000);
+    }
+
+    // Process immediately instead of waiting for next interval tick
+    this.processQueue();
+
+    return true;
+  }
+
+  getQueue(): QueueEntry[] {
+    return [...this.queue];
+  }
+
+  getQueueStatus(): {
+    queue: Array<{
+      automationId: number;
+      automationName: string | null;
+      triggerType: TriggerType;
+      queuedAt: Date;
+      waitingSeconds: number;
+      reason: string | null;
+    }>;
+    processingQueue: boolean;
+    devices: Array<{
+      id: string;
+      online: boolean;
+      busy: boolean;
+    }>;
+  } {
+    const now = Date.now();
+    const allDevices = this.db.select().from(devices).all();
+
+    const deviceStatuses = allDevices.map((d) => ({
+      id: d.id,
+      online: this.deviceManager?.isOnline(d.id) ?? true,
+      busy: this.deviceManager?.isBusy(d.id) ?? false,
+    }));
+
+    const queueDetails = this.queue.map((entry) => {
+      const auto = this.db.select().from(automations).where(eq(automations.id, entry.automationId)).all()[0];
+
+      // Determine why the entry can't run
+      let reason: string | null = null;
+      if (this.processingQueue) {
+        reason = 'waiting for current automation to finish';
+      } else {
+        const available = this.findAvailableDevice(entry.automationId);
+        if (!available) {
+          const onlineCount = deviceStatuses.filter((d) => d.online).length;
+          const busyCount = deviceStatuses.filter((d) => d.online && d.busy).length;
+          if (allDevices.length === 0) {
+            reason = 'no devices configured';
+          } else if (onlineCount === 0) {
+            reason = 'all devices offline';
+          } else if (busyCount === onlineCount) {
+            reason = 'all online devices busy';
+          } else {
+            reason = 'no device matches filter';
+          }
+        }
+      }
+
+      return {
+        automationId: entry.automationId,
+        automationName: auto?.name ?? null,
+        triggerType: entry.triggerType,
+        queuedAt: entry.queuedAt,
+        waitingSeconds: Math.round((now - entry.queuedAt.getTime()) / 1000),
+        reason,
+      };
+    });
+
+    return {
+      queue: queueDetails,
+      processingQueue: this.processingQueue,
+      devices: deviceStatuses,
+    };
+  }
+
+  clearQueue(): number {
+    const count = this.queue.length;
+    this.queue.length = 0;
+    if (this.queueAlertTimer) {
+      clearTimeout(this.queueAlertTimer);
+      this.queueAlertTimer = null;
+    }
+    if (count > 0) {
+      log(`Queue cleared (${count} item(s) removed)`);
+    }
+    return count;
+  }
+
+  private checkSchedules(now = new Date()): void {
+
+    for (const [automationId, config] of this.schedules) {
+      // Re-check enabled status in case it was toggled since loadSchedules()
+      const row = this.db.select({ enabled: automations.enabled }).from(automations).where(eq(automations.id, automationId)).all()[0];
+      if (!row || !row.enabled) {
+        this.schedules.delete(automationId);
+        this.lastIntervalFired.delete(automationId);
+        continue;
+      }
+      if (config.type === 'cron') {
+        for (const expression of config.expressions) {
+          if (this.matchesCrontab(expression, now)) {
+            log(`Cron schedule triggered for automation ${automationId}`);
+            this.enqueue(automationId, 'schedule');
+            break; // Only enqueue once even if multiple expressions match
+          }
+        }
+      } else if (config.type === 'interval') {
+        const lastFired = this.lastIntervalFired.get(automationId);
+        const elapsed = lastFired ? now.getTime() - lastFired.getTime() : Infinity;
+        if (elapsed >= config.intervalMs) {
+          log(`Interval schedule triggered for automation ${automationId}`);
+          this.lastIntervalFired.set(automationId, now);
+          this.enqueue(automationId, 'schedule');
+        }
+      } else if (config.type === 'windowed_interval') {
+        if (!this.isInWindow(config.windowStart, config.windowEnd, now)) continue;
+        const lastFired = this.lastIntervalFired.get(automationId);
+        const elapsed = lastFired ? now.getTime() - lastFired.getTime() : Infinity;
+        if (elapsed >= config.intervalMinutes * 60_000) {
+          log(`Windowed interval triggered for automation ${automationId}`);
+          this.lastIntervalFired.set(automationId, now);
+          this.enqueue(automationId, 'schedule');
+        }
+      }
+    }
+  }
+
+  /**
+   * Returns true if the current time falls within the [windowStart, windowEnd] window.
+   * If windowEnd is earlier than windowStart (in minutes-since-midnight), the window
+   * is treated as crossing midnight: active from windowStart until end-of-day AND from
+   * start-of-day until windowEnd.
+   */
+  isInWindow(windowStart: string, windowEnd: string, now: Date): boolean {
+    const nowMins = now.getHours() * 60 + now.getMinutes();
+    const [startH, startM] = windowStart.split(':').map(Number);
+    const [endH, endM] = windowEnd.split(':').map(Number);
+    const startMins = startH * 60 + startM;
+    const endMins = endH * 60 + endM;
+    if (endMins < startMins) {
+      // Wraps midnight: active if nowMins is on the "start" side or the "end" side
+      return nowMins >= startMins || nowMins <= endMins;
+    }
+    return nowMins >= startMins && nowMins <= endMins;
+  }
+
+  private async processQueue(): Promise<void> {
+    if (this.queue.length === 0) return;
+    // Guard against concurrent processQueue() calls (async gap between
+    // findAvailableDevice check and runAutomation's tryAcquireBusy)
+    if (this.processingQueue) return;
+    this.processingQueue = true;
+
+    try {
+      const entry = this.queue[0];
+
+      // Look up the automation to find out whether it actually wants a
+      // device. Deviceless automations should run without one — pre-fix
+      // the scheduler grabbed any online idle device, which then showed
+      // up in session history as if the automation was bound to it.
+      const automation = this.db
+        .select({ requiresDevice: automations.requiresDevice })
+        .from(automations)
+        .where(eq(automations.id, entry.automationId))
+        .all()[0];
+
+      let deviceForRun: string | undefined;
+      if (automation?.requiresDevice !== false) {
+        const availableDevice = this.findAvailableDevice(entry.automationId);
+        if (!availableDevice) return;
+        deviceForRun = availableDevice;
+      }
+
+      this.queue.shift();
+
+      // Clear alert timer if queue is empty
+      if (this.queue.length === 0 && this.queueAlertTimer) {
+        clearTimeout(this.queueAlertTimer);
+        this.queueAlertTimer = null;
+      }
+
+      try {
+        await this.runner.runAutomation(
+          entry.automationId,
+          deviceForRun,
+          entry.triggerType,
+        );
+      } catch (err: any) {
+        error(`Failed to run queued automation ${entry.automationId}: ${err.message}`);
+      }
+    } finally {
+      this.processingQueue = false;
+      // Immediately process next item if queue is not empty
+      if (this.queue.length > 0) {
+        setTimeout(() => this.processQueue(), 0);
+      }
+    }
+  }
+
+  private findAvailableDevice(automationId: number): string | null {
+    // Parse device filter from the automation row
+    let deviceFilter: DeviceFilter | undefined;
+    const row = this.db.select().from(automations).where(eq(automations.id, automationId)).all()[0];
+    if (row?.deviceFilter) {
+      try {
+        const raw = JSON.parse(row.deviceFilter);
+        deviceFilter = migrateDeviceFilter(raw);
+      } catch {
+        // Invalid JSON, ignore filter
+      }
+    }
+
+    const allDevices = this.db.select().from(devices).all();
+    if (allDevices.length === 0) return null;
+
+    // Prefer an online, non-busy device matching filter
+    if (this.deviceManager) {
+      for (const device of allDevices) {
+        if (!this.deviceManager.isOnline(device.id)) continue;
+        if (this.deviceManager.isBusy(device.id)) continue;
+        if (deviceFilter && !matchesDeviceFilter(device, deviceFilter)) continue;
+        return device.id;
+      }
+      // No available device found
+      return null;
+    }
+
+    // Fallback if no DeviceManager (tests) — still apply filter
+    if (deviceFilter) {
+      const match = allDevices.find(d => matchesDeviceFilter(d, deviceFilter!));
+      return match?.id ?? null;
+    }
+    return allDevices[0].id;
+  }
+
+  /**
+   * Parse and match a crontab expression against a date.
+   * Delegates to shared cron utility.
+   */
+  matchesCrontab(expression: string, date: Date): boolean {
+    return matchesCrontab(expression, date);
+  }
+}

@@ -1,0 +1,1 @@
+ALTER TABLE tracked_apps ADD COLUMN last_play_store_version TEXT;

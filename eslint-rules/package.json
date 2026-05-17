@@ -1,0 +1,6 @@
+{
+  "name": "eslint-plugin-local",
+  "version": "0.0.0",
+  "main": "index.js",
+  "description": "Local ESLint rules for this project"
+}

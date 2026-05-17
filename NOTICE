@@ -1,0 +1,274 @@
+DarkRide
+Copyright 2026 Jamie Holding
+
+This product includes software developed by third parties.
+Licensed under various open-source licenses as detailed below.
+
+================================================================================
+Apache License 2.0 / MIT dual-license
+================================================================================
+
+@node-rs/argon2
+  Copyright LongYinan and contributors
+  https://github.com/napi-rs/node-rs
+  License: MIT OR Apache-2.0
+
+================================================================================
+Apache License 2.0
+================================================================================
+
+AWS SDK for JavaScript v3
+  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  https://github.com/aws/aws-sdk-js-v3
+  Packages: @aws-sdk/client-s3, @aws-sdk/lib-storage, @aws-sdk/s3-request-presigner
+
+@devicefarmer/minicap-prebuilt
+  Copyright DeviceFarmer / The OpenSTF Project
+  https://github.com/DeviceFarmer
+
+@devicefarmer/minitouch-prebuilt
+  Copyright The OpenSTF Project
+  https://github.com/DeviceFarmer
+
+@u4/minicap-prebuilt
+  Copyright UrielCh
+  https://github.com/UrielCh/minicap-prebuilt
+
+Drizzle ORM
+  Copyright Drizzle Team
+  https://orm.drizzle.team
+
+Sharp
+  Copyright Lovell Fuller and contributors
+  https://sharp.pixelplumbing.com
+  Note: Sharp bundles libvips on Linux/macOS via @img/sharp-libvips-* packages.
+  See the LGPL section below.
+
+================================================================================
+MIT License
+================================================================================
+
+@modelcontextprotocol/sdk
+  Copyright Anthropic, PBC
+  https://modelcontextprotocol.io
+
+@octokit/rest
+  Copyright Gregor Martynus and contributors
+  https://github.com/octokit/rest.js
+
+xterm.js (@xterm/xterm, @xterm/addon-fit)
+  Copyright The xterm.js authors
+  https://xtermjs.org
+
+adm-zip
+  Copyright Nasca Iacob
+  https://github.com/cthackers/adm-zip
+
+Archiver
+  Copyright Chris Talkington
+  https://github.com/archiverjs/node-archiver
+
+better-sqlite3
+  Copyright Joshua Wise
+  https://github.com/WiseLibs/better-sqlite3
+
+cookie-parser
+  Copyright TJ Holowaychuk and contributors
+  https://github.com/expressjs/cookie-parser
+
+Express
+  Copyright TJ Holowaychuk and contributors
+  https://expressjs.com
+
+google-play-scraper
+  Copyright Facundo Olano
+  https://github.com/facundoolano/google-play-scraper
+
+http-proxy-agent / https-proxy-agent
+  Copyright Nathan Rajlich
+  https://github.com/TooTallNate/proxy-agents
+
+jose
+  Copyright Filip Skokan
+  https://github.com/panva/jose
+
+monaco-editor
+  Copyright Microsoft Corporation
+  https://github.com/microsoft/monaco-editor
+
+node-pty
+  Copyright Microsoft Corporation
+  https://github.com/microsoft/node-pty
+
+QRCode
+  Copyright Ryan Day
+  https://github.com/soldair/node-qrcode
+
+React, React DOM
+  Copyright Meta Platforms, Inc. and affiliates
+  https://react.dev
+
+React Router
+  Copyright Remix Software, Inc. and contributors
+  https://github.com/remix-run/react-router
+
+react-markdown
+  Copyright Espen Hovlandsdal
+  https://github.com/remarkjs/react-markdown
+
+Recharts
+  Copyright recharts group
+  https://github.com/recharts/recharts
+
+rehype-highlight
+  Copyright Titus Wormer
+  https://github.com/rehypejs/rehype-highlight
+
+remark-gfm
+  Copyright Titus Wormer
+  https://github.com/remarkjs/remark-gfm
+
+socks
+  Copyright Josh Glazebrook
+  https://github.com/JoshGlazebrook/socks
+
+socks-proxy-agent
+  Copyright Nathan Rajlich
+  https://github.com/TooTallNate/proxy-agents
+
+ws
+  Copyright Einar Otto Stangvik
+  https://github.com/websockets/ws
+
+================================================================================
+BSD-3-Clause License
+================================================================================
+
+highlight.js
+  Copyright Ivan Sagalaev
+  https://highlightjs.org
+
+pbf
+  Copyright Konstantin Kaefer / Mapbox
+  https://github.com/mapbox/pbf
+
+================================================================================
+ISC License
+================================================================================
+
+isolated-vm
+  Copyright Marcel Laverdet
+  https://github.com/laverdet/isolated-vm
+
+Lucide React
+  Copyright Lucide Contributors
+  https://lucide.dev
+
+semver
+  Copyright Isaac Z. Schlueter and contributors
+  https://github.com/npm/node-semver
+
+================================================================================
+MIT-0 License
+================================================================================
+
+Nodemailer
+  Copyright Andris Reinman
+  https://nodemailer.com
+
+================================================================================
+LGPL-3.0-or-later
+================================================================================
+
+libvips (bundled with Sharp on Linux/macOS via @img/sharp-libvips-*)
+  Copyright John Cupitt and contributors
+  https://www.libvips.org
+  Image-processing library that Sharp wraps. Distributed as a prebuilt
+  shared library; the bundled binary is dynamically linked from Sharp's
+  native add-on at runtime.
+
+================================================================================
+Python Dependencies
+================================================================================
+
+mitmproxy
+  Copyright The mitmproxy project
+  https://mitmproxy.org
+  License: MIT
+
+Flask
+  Copyright Pallets
+  https://flask.palletsprojects.com
+  License: BSD-3-Clause
+
+uiautomator2
+  Copyright openatx
+  https://github.com/openatx/uiautomator2
+  License: MIT
+
+websocket-client
+  Copyright liris
+  https://github.com/websocket-client/websocket-client
+  License: Apache-2.0
+
+Frida, frida-tools
+  Copyright Ole André Vadla Ravnås
+  https://frida.re
+  License: wxWindows Library Licence 3.1
+
+Androguard
+  Copyright Anthony Desnos and contributors
+  https://github.com/androguard/androguard
+  License: Apache-2.0
+
+zstandard (python)
+  Copyright Gregory Szorc
+  https://github.com/indygreg/python-zstandard
+  License: BSD-3-Clause
+
+jsbeautifier
+  Copyright Einar Lielmanis and contributors
+  https://beautifier.io
+  License: MIT
+
+hermes-dec
+  https://github.com/P1sec/hermes-dec
+  License: MIT
+
+pymobiledevice3
+  Copyright DoronZ
+  https://github.com/doronz88/pymobiledevice3
+  License: GNU GPL v3 or later
+
+jsonpath-ng
+  https://github.com/h2non/jsonpath-ng
+  License: Apache-2.0
+
+================================================================================
+External Tools (not bundled — built / installed by the user)
+================================================================================
+
+WireGuard / wireguard-go
+  Copyright Jason A. Donenfeld
+  https://www.wireguard.com
+  License: MIT
+  The host installs the WireGuard userspace toolchain. wireguard-go shared
+  libraries for Android devices are built from source by the user via
+  `scripts/build-wireguard-go.sh` when kernel WireGuard is unavailable on
+  the target device. Not bundled with the source distribution.
+
+scrcpy
+  Copyright 2018 Genymobile
+  Copyright 2018-2025 Romain Vimont
+  https://github.com/Genymobile/scrcpy
+  License: Apache-2.0 (verified for tags v1.20 through v3.3.1 + v4.0)
+  scrcpy-server jars are bundled inside the @u4/minicap-prebuilt npm
+  package, covering versions v1.20, v1.24, v1.25, v2.0, v2.1, v2.1.1,
+  v2.2, v2.3, v2.3.1, v2.4, v2.5, v2.6, v2.6.1, v2.7, v3.0, v3.0.1,
+  v3.0.2, v3.1, v3.2, v3.3, v3.3.1. Used for H.264 device screen
+  streaming and remote control.
+
+jadx, apktool, mobsfscan, blutter
+  Downloaded on demand from upstream releases (jadx: Apache-2.0,
+  apktool: Apache-2.0, mobsfscan: GPL-3.0-or-later, blutter: MIT).
+  Not bundled — the host fetches them via the Tool Manager on first use.

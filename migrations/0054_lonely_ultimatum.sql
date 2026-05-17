@@ -1,0 +1,1 @@
+ALTER TABLE `automations` ADD `requires_device` integer DEFAULT true NOT NULL;

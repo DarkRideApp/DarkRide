@@ -1,0 +1,1 @@
+ALTER TABLE automations ADD COLUMN device_filter TEXT;

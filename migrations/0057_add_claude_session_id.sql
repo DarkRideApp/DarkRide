@@ -1,0 +1,1 @@
+ALTER TABLE `ai_conversations` ADD `claude_session_id` text;

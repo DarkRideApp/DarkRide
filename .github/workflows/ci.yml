@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Opt JavaScript-based actions (checkout/setup-node/setup-python) onto the
+  # Node 24 runtime ahead of GitHub's forced switch on 2026-06-02.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  lockfile-hygiene:
+    name: Lockfile hygiene (workspaces match repo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      # The plugins/* workspace glob in package.json pulls any plugin
+      # checked into plugins/ into package-lock.json. The only public
+      # in-tree plugin is kitchen-sink — anything else (symlinked plugin
+      # under active development, scratch clones) leaks names and version
+      # numbers into the committed lockfile. Fail the build if any
+      # plugins/* workspace other than kitchen-sink appears.
+      - name: Check package-lock.json for unexpected plugin workspaces
+        run: |
+          # Match actual workspace package nodes (`"plugins/<name>": {`),
+          # not the workspaces glob (`"plugins/*"`) or other quoted refs.
+          suspicious=$(grep -E '^\s*"plugins/[^"*]+": \{' package-lock.json | grep -v '"plugins/kitchen-sink"' || true)
+          if [ -n "$suspicious" ]; then
+            echo "::error::package-lock.json contains plugin workspaces other than kitchen-sink. Don't commit the lockfile while non-public plugins are linked in plugins/. See docs/development.md."
+            echo "$suspicious"
+            exit 1
+          fi
+          echo "Lockfile workspace set: kitchen-sink only ✓"
+
+  backend:
+    name: Backend (typecheck + tests + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      # The root tsconfig's `paths` mapping for @darkrideapp/plugin-sdk
+      # resolves to packages/plugin-sdk/dist/*. Build the SDK so those
+      # type files exist before `tsc --noEmit` and the test suite run.
+      - name: Build plugin SDK
+        run: npm run build -w @darkrideapp/plugin-sdk
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      # Skip the typecheck embedded in `npm run test` — the dedicated Type
+      # check step above already ran it, and rerunning costs ~30s per build.
+      - name: Backend unit tests
+        run: npx vitest run
+
+      - name: Build
+        run: npm run build
+
+  frontend:
+    name: Frontend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      # Vite needs to resolve @darkrideapp/plugin-sdk/react via the SDK's
+      # built dist/ — the package.json `exports` map points there. Build
+      # the SDK first so the frontend tests can import it.
+      - name: Build plugin SDK
+        run: npm run build -w @darkrideapp/plugin-sdk
+
+      - name: Frontend tests
+        run: npm run test:frontend
+
+  python:
+    name: Python bridge tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+          cache-dependency-path: python/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r python/requirements.txt
+          .venv/bin/pip install pytest
+
+      - name: Python tests
+        run: .venv/bin/python -m pytest python/ -v

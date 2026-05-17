@@ -1,0 +1,23 @@
+{
+  "name": "@darkrideapp/plugin-kitchen-sink",
+  "version": "0.1.0",
+  "private": true,
+  "keywords": [
+    "darkride-plugin"
+  ],
+  "description": "Test plugin exercising every DarkRide extension point",
+  "dependencies": {
+    "drizzle-orm": "^0.45.2",
+    "express": "^4.21.0",
+    "lucide-react": "^0.564.0",
+    "react": "^19.0.0"
+  },
+  "peerDependencies": {
+    "@darkrideapp/plugin-sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "supertest": "^7.0.0",
+    "vitest": "^3.2.0"
+  }
+}

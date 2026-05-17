@@ -1,0 +1,589 @@
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import {
+  ArrowLeft, Home, Square, Power, Move, Camera, MoreHorizontal,
+  ArrowUp, ArrowDown, ArrowRight, Unlock as UnlockIcon,
+} from 'lucide-react';
+import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
+import { ButtonList } from '@darkrideapp/plugin-sdk/react';
+import type { ButtonListItem } from '@darkrideapp/plugin-sdk/react';
+import { pluginRegistry } from '@darkrideapp/plugin-sdk/react';
+import { decodeFrame, FrameMsgType, WireVersionMismatchError } from '../../lib/video/wire-format';
+import { H264Decoder } from '../../lib/video/h264-decoder';
+import { GapDetector } from '../../lib/video/gap-detector';
+import { KeyframeTrigger } from '../../lib/video/keyframe-trigger';
+import { VideoHealthIndicator, HealthState } from './VideoHealthIndicator';
+import { VideoQualitySelector } from './VideoQualitySelector';
+import './DeviceViewer.css';
+
+pluginRegistry.registerUiSlots('core', [
+  {
+    id: 'device-viewer:overflow-actions',
+    kind: 'button-list',
+    description: 'Buttons shown inside the DeviceViewer ⋯ overflow popover. Plugins can inject device-scoped actions here.',
+  },
+]);
+
+/**
+ * Popover anchored to a trigger element, rendered via portal so it escapes any
+ * parent stacking context. Closes on outside click (mousedown on anything that
+ * isn't the anchor or the popover itself).
+ */
+interface PopoverProps {
+  anchorRef: React.RefObject<HTMLElement>;
+  open: boolean;
+  align?: 'start' | 'end';
+  onClose: () => void;
+  children: React.ReactNode;
+}
+
+function Popover({ anchorRef, open, align = 'start', onClose, children }: PopoverProps): JSX.Element | null {
+  const [style, setStyle] = useState<React.CSSProperties | null>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+
+  // Recompute position on open AND on scroll/resize so the popover follows
+  // its anchor when the user scrolls. Prefers below; flips above if there's
+  // no room below or more room above.
+  const reposition = useCallback(() => {
+    if (!anchorRef.current) { setStyle(null); return; }
+    const rect = anchorRef.current.getBoundingClientRect();
+    const popH = popoverRef.current?.getBoundingClientRect().height ?? 0;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const spaceAbove = rect.top;
+    const flipAbove = (popH > 0 && popH + 8 > spaceBelow && spaceAbove > spaceBelow) || spaceBelow < 80;
+    const base: React.CSSProperties = { position: 'fixed', zIndex: 9999 };
+    if (flipAbove) base.bottom = Math.round(window.innerHeight - rect.top + 4);
+    else base.top = Math.round(rect.bottom + 4);
+    if (align === 'end') base.right = Math.round(window.innerWidth - rect.right);
+    else base.left = Math.round(rect.left);
+    setStyle(base);
+  }, [anchorRef, align]);
+
+  useLayoutEffect(() => {
+    if (!open) { setStyle(null); return; }
+    reposition();
+  }, [open, reposition]);
+
+  // Re-run after the popover first renders so we can measure its real height
+  // and decide whether to flip above.
+  useLayoutEffect(() => {
+    if (!open) return;
+    if (popoverRef.current) reposition();
+  }, [open, reposition, children]);
+
+  useEffect(() => {
+    if (!open) return;
+    // Re-measure on scroll (capture=true catches any scrollable ancestor) and resize
+    const onScroll = () => reposition();
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', onScroll);
+    return () => {
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', onScroll);
+    };
+  }, [open, reposition]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (anchorRef.current?.contains(t) || popoverRef.current?.contains(t)) return;
+      onClose();
+    };
+    const keyHandler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    // setTimeout 0 so the mousedown that opened this doesn't immediately close it
+    const t = setTimeout(() => document.addEventListener('mousedown', handler), 0);
+    document.addEventListener('keydown', keyHandler);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('mousedown', handler);
+      document.removeEventListener('keydown', keyHandler);
+    };
+  }, [open, anchorRef, onClose]);
+
+  if (!open || !style) return null;
+  return createPortal(
+    <div
+      ref={popoverRef}
+      style={{
+        ...style,
+        background: 'var(--bg-primary, #222)',
+        border: '1px solid var(--border-color, #444)',
+        borderRadius: 4,
+        padding: 6,
+        boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+      }}
+    >{children}</div>,
+    document.body,
+  );
+}
+
+export interface DeviceAction {
+  key: string;
+  label: string;
+  icon: React.ReactNode;
+  onClick: () => void | Promise<void>;
+  disabled?: boolean;
+  placement?: 'primary' | 'overflow';
+}
+
+export interface DeviceViewerProps {
+  deviceId: string;
+  onStreamReady?: (info: {
+    screenWidth: number;
+    screenHeight: number;
+    backend: 'scrcpy' | 'minicap' | 'polling' | 'wda-polling';
+  }) => void;
+  onError?: (error: string) => void;
+  className?: string;
+  extraActions?: DeviceAction[];
+  captureSessionId?: number;
+}
+
+export function DeviceViewer({ deviceId, onStreamReady, onError, className, extraActions, captureSessionId }: DeviceViewerProps): JSX.Element {
+  const ws = useWebSocket();
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const viewerId = useMemo(
+    () => crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    [deviceId],
+  );
+  const screenDimsRef = useRef<{ width: number; height: number } | null>(null);
+  const draggingRef = useRef<boolean>(false);
+  const lastTouchRef = useRef<{ x: number; y: number } | null>(null);
+  // Cached resolution reserves canvas space immediately on mount so the
+  // buttons don't reflow when the first frame arrives. Populated from
+  // localStorage or replaced when a stream-ready event reports new dims.
+  const cachedResKey = `darkride:device-viewer:last-res:${deviceId}`;
+  const [reservedDims, setReservedDims] = React.useState<{ width: number; height: number } | null>(() => {
+    try {
+      const raw = localStorage.getItem(cachedResKey);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.width === 'number' && typeof parsed?.height === 'number' && parsed.width > 0 && parsed.height > 0) {
+        return { width: parsed.width, height: parsed.height };
+      }
+    } catch { /* ignore */ }
+    return null;
+  });
+
+  const toDeviceCoords = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const normX = (e.clientX - rect.left) / rect.width;
+    const normY = (e.clientY - rect.top) / rect.height;
+    const screen = screenDimsRef.current;
+    const targetW = screen?.width ?? canvas.width;
+    const targetH = screen?.height ?? canvas.height;
+    return {
+      x: Math.round(normX * targetW),
+      y: Math.round(normY * targetH),
+    };
+  }, []);
+
+  const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const coords = toDeviceCoords(e);
+    if (!coords) return;
+    draggingRef.current = true;
+    lastTouchRef.current = coords;
+    ws.sendMessage('device-touch', { deviceId, eventType: 'down', x: coords.x, y: coords.y });
+  }, [ws, deviceId, toDeviceCoords]);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!draggingRef.current) return;
+    const coords = toDeviceCoords(e);
+    if (!coords) return;
+    lastTouchRef.current = coords;
+    ws.sendMessage('device-touch', { deviceId, eventType: 'move', x: coords.x, y: coords.y });
+  }, [ws, deviceId, toDeviceCoords]);
+
+  const handleMouseUp = useCallback(() => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    const { x, y } = lastTouchRef.current ?? { x: 0, y: 0 };
+    ws.sendMessage('device-touch', { deviceId, eventType: 'up', x, y });
+  }, [ws, deviceId]);
+
+  const handleNav = useCallback((button: 'back' | 'home' | 'recents' | 'power') => {
+    ws.sendMessage('device-nav', { deviceId, button });
+  }, [ws, deviceId]);
+
+  const handleScreenshot = useCallback(async () => {
+    if (captureSessionId != null) {
+      await ws.sendRestApi('POST', `/v1/device/screenshot/${encodeURIComponent(deviceId)}`, { sessionId: captureSessionId });
+    } else {
+      await ws.sendRestApi('GET', `/v1/device/screenshot/${encodeURIComponent(deviceId)}`);
+    }
+  }, [ws, deviceId, captureSessionId]);
+
+  const [supported, setSupported] = useState<boolean | null>(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [videoTier, setVideoTier] = useState(1);
+  const [videoBitrate, setVideoBitrate] = useState(4_000_000);
+  const [resetSticky, setResetSticky] = useState(false);
+  const [swipeOpen, setSwipeOpen] = React.useState(false);
+  const [overflowOpen, setOverflowOpen] = React.useState(false);
+  const swipeTriggerRef = useRef<HTMLButtonElement>(null);
+  const overflowTriggerRef = useRef<HTMLButtonElement>(null);
+  const [platform, setPlatform] = React.useState<'android' | 'ios' | null>(null);
+
+  const runCommand = useCallback(async (command: string) => {
+    await ws.sendRestApi('POST', `/v1/device/command/${encodeURIComponent(deviceId)}`, { command });
+    setOverflowOpen(false);
+  }, [ws, deviceId]);
+
+  const handleRetryStream = useCallback(() => {
+    ws.sendMessage('device-stream-restart', { deviceId, viewerId });
+    setOverflowOpen(false);
+  }, [ws, deviceId, viewerId]);
+
+  const handleQualityChange = useCallback((tier: number | null) => {
+    ws.sendMessage('device-stream-set-tier', { deviceId, tier });
+  }, [ws, deviceId]);
+
+  const handleSwipe = useCallback((direction: 'up' | 'down' | 'left' | 'right') => {
+    const screen = screenDimsRef.current;
+    const w = screen?.width ?? 1080;
+    const h = screen?.height ?? 1920;
+    const cx = Math.round(w / 2);
+    const cy = Math.round(h / 2);
+    const dist = Math.round(Math.min(w, h) * 0.35);
+    const swipes = {
+      up:    { startX: cx, startY: cy + dist, endX: cx, endY: cy - dist },
+      down:  { startX: cx, startY: cy - dist, endX: cx, endY: cy + dist },
+      left:  { startX: cx + dist, startY: cy, endX: cx - dist, endY: cy },
+      right: { startX: cx - dist, startY: cy, endX: cx + dist, endY: cy },
+    } as const;
+    ws.sendMessage('device-swipe', { deviceId, ...swipes[direction], durationMs: 400 });
+    setSwipeOpen(false);
+  }, [ws, deviceId]);
+
+  // Capability detection: check whether the browser supports WebCodecs VideoDecoder.
+  useEffect(() => {
+    if (typeof (globalThis as any).VideoDecoder === 'undefined') {
+      setSupported(false);
+      return;
+    }
+    let cancelled = false;
+    (globalThis as any).VideoDecoder.isConfigSupported({ codec: 'avc1.42E01E' })
+      .then((r: any) => { if (!cancelled) setSupported(!!r.supported); })
+      .catch(() => { if (!cancelled) setSupported(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!deviceId || !ws.connected) return;
+    ws.sendMessage('device-stream-start', { deviceId, viewerId });
+    return () => {
+      ws.sendMessage('device-stream-stop', { deviceId, viewerId });
+    };
+  }, [ws, deviceId, viewerId]);
+
+  // Polling/minicap fallback: JSON device-frame messages carry base64 JPEG.
+  // Kept alongside the binary WebCodecs path — both backends can coexist.
+  useEffect(() => {
+    return ws.subscribe('device-frame', (msg: any) => {
+      if (msg.deviceId !== deviceId) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      const img = new Image();
+      img.onload = () => {
+        const currentCanvas = canvasRef.current;
+        if (!currentCanvas) return;
+        const currentCtx = currentCanvas.getContext('2d');
+        if (!currentCtx) return;
+        currentCanvas.width = img.width;
+        currentCanvas.height = img.height;
+        currentCtx.drawImage(img, 0, 0);
+        img.onload = null;
+      };
+      img.src = `data:image/jpeg;base64,${msg.frame}`;
+    });
+  }, [ws, deviceId]);
+
+  // scrcpy H.264 path via WebCodecs — only active when browser supports VideoDecoder.
+  // Tracks observed frameId gaps for the lifetime of this effect; the detector
+  // is reset when the user (or backend) intentionally resets the stream.
+  const gapDetectorRef = useRef<GapDetector | null>(null);
+  const triggerRef = useRef<KeyframeTrigger | null>(null);
+  const lastKeyframeAtRef = useRef<number>(Date.now());
+  const gapStatsRef = useRef({ totalGaps: 0, totalMissed: 0, regressions: 0, wraps: 0, keyframeRequests: 0, watchdogFires: 0 });
+  useEffect(() => {
+    if (!supported) return;
+    // Effect re-runs on deviceId change carry the ref's stale value from
+    // the previous device. Reset so the new device gets a fresh 8s window
+    // before the watchdog can fire.
+    lastKeyframeAtRef.current = Date.now();
+
+    const trigger = new KeyframeTrigger((reason) => {
+      gapStatsRef.current.keyframeRequests += 1;
+      ws.sendMessage('device-stream-request-keyframe', { deviceId, viewerId, reason });
+    });
+    triggerRef.current = trigger;
+
+    const decoder = new H264Decoder({
+      onFrame: (frame) => {
+        const canvas = canvasRef.current;
+        if (!canvas) { frame.close(); return; }
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { frame.close(); return; }
+        if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+        if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
+        ctx.drawImage(frame, 0, 0);
+        frame.close();
+      },
+      onError: (e) => { console.error('[DeviceViewer] decode error', { deviceId, error: e?.message ?? String(e) }); },
+      onResetRequested: () => { trigger.maybeFire('decode-error'); },
+    });
+
+    const gapDetector = new GapDetector();
+    gapDetectorRef.current = gapDetector;
+
+    const unsub = ws.subscribeBinary((data: ArrayBuffer) => {
+      let frame;
+      try {
+        frame = decodeFrame(data);
+      } catch (e) {
+        if (e instanceof WireVersionMismatchError) {
+          console.error('[DeviceViewer] wire version mismatch — backend/frontend out of sync', {
+            deviceId, received: e.received, expected: e.expected,
+          });
+        } else {
+          console.error('[DeviceViewer] frame decode failed', { deviceId, error: (e as Error)?.message });
+        }
+        return;
+      }
+
+      const result = gapDetector.feed(frame.frameId);
+      if (!result.firstFrame) {
+        if (result.gap > 0) {
+          gapStatsRef.current.totalGaps += 1;
+          gapStatsRef.current.totalMissed += result.gap;
+          if (result.wrapped) gapStatsRef.current.wraps += 1;
+          // Step 2: ask the device for a keyframe when the gap is large
+          // enough to plausibly corrupt the reference chain. Trigger
+          // enforces gap >= 2 + 250ms debounce.
+          trigger.maybeFire('gap', result.gap);
+          console.warn('[DeviceViewer] frame gap', {
+            deviceId,
+            gap: result.gap,
+            frameId: frame.frameId,
+            msgType: FrameMsgType[frame.msgType],
+            wrapped: result.wrapped,
+            totalGaps: gapStatsRef.current.totalGaps,
+            totalMissed: gapStatsRef.current.totalMissed,
+          });
+        } else if (result.gap < 0) {
+          // Counter went backwards without a wrap — usually means the backend
+          // restarted the stream's per-viewer counter without our 'video-reset'
+          // signal, or genuine reordering. Either way, treat the next frame as
+          // a fresh reference point.
+          gapStatsRef.current.regressions += 1;
+          console.warn('[DeviceViewer] frame counter regression', {
+            deviceId,
+            previous: gapDetector.last,
+            received: frame.frameId,
+            regressions: gapStatsRef.current.regressions,
+          });
+        }
+      }
+
+      if (frame.msgType === FrameMsgType.CONFIG) setReconnecting(false);
+      if (frame.msgType === FrameMsgType.KEYFRAME) lastKeyframeAtRef.current = Date.now();
+      decoder.push(frame);
+    });
+
+    const watchdogTimer = setInterval(() => {
+      if (Date.now() - lastKeyframeAtRef.current > 8000 && triggerRef.current) {
+        gapStatsRef.current.watchdogFires += 1;
+        triggerRef.current.maybeFire('watchdog');
+      }
+    }, 1000);
+
+    return () => {
+      clearInterval(watchdogTimer);
+      unsub();
+      decoder.close();
+      gapDetectorRef.current = null;
+      triggerRef.current = null;
+    };
+  }, [ws, supported, deviceId]);
+
+  useEffect(() => {
+    return ws.subscribe('device-stream-started', (msg: any) => {
+      if (msg.deviceId !== deviceId) return;
+      if (msg.screenWidth && msg.screenHeight) {
+        const dims = { width: msg.screenWidth, height: msg.screenHeight };
+        screenDimsRef.current = dims;
+        setReservedDims(dims);
+        try { localStorage.setItem(cachedResKey, JSON.stringify(dims)); } catch { /* private mode */ }
+      }
+      onStreamReady?.({
+        screenWidth: msg.screenWidth,
+        screenHeight: msg.screenHeight,
+        backend: msg.backend,
+      });
+    });
+  }, [ws, deviceId, onStreamReady]);
+
+  useEffect(() => {
+    if (!onError) return;
+    return ws.subscribe('device-stream-error', (msg: any) => {
+      if (msg.deviceId !== deviceId) return;
+      onError(msg.error ?? 'Stream error');
+    });
+  }, [ws, deviceId, onError]);
+
+  useEffect(() => {
+    return ws.subscribe('video-reset', (msg: any) => {
+      if (msg.deviceId !== deviceId) return;
+      setReconnecting(true);
+      // The backend is intentionally restarting the stream — its per-viewer
+      // counter is about to start over. Reset our detector so the next frame
+      // is a fresh reference and we don't fire a regression warning. Also
+      // clear the trigger debounce so a real post-reset gap fires promptly,
+      // and bump the watchdog clock so the post-reset window starts fresh.
+      gapDetectorRef.current?.reset();
+      triggerRef.current?.reset();
+      lastKeyframeAtRef.current = Date.now();
+    });
+  }, [ws, deviceId]);
+
+  useEffect(() => {
+    return ws.subscribe('video-config-change', (msg: any) => {
+      if (msg.deviceId !== deviceId) return;
+      if (typeof msg.tier === 'number') setVideoTier(msg.tier);
+      if (typeof msg.bitrate === 'number') setVideoBitrate(msg.bitrate);
+    });
+  }, [ws, deviceId]);
+
+  useEffect(() => {
+    if (!reconnecting) {
+      setResetSticky(false);
+      return;
+    }
+    setResetSticky(true);
+    const t = setTimeout(() => setResetSticky(false), 5000);
+    return () => clearTimeout(t);
+  }, [reconnecting]);
+
+  useEffect(() => {
+    if (!deviceId) return;
+    let cancelled = false;
+    ws.sendRestApi('GET', `/v1/device/view/${encodeURIComponent(deviceId)}`).then(res => {
+      if (cancelled) return;
+      const p = res.body?.data?.platform;
+      if (p === 'android' || p === 'ios') setPlatform(p);
+    }).catch(() => {/* fall through — safer to show Android-superset */});
+    return () => { cancelled = true; };
+  }, [ws, deviceId]);
+
+  const isAndroid = platform !== 'ios'; // default = Android-superset until we know otherwise
+
+  const healthState: HealthState =
+    reconnecting || resetSticky ? 'resetting' :
+    videoTier >= 2 ? 'degraded' : 'healthy';
+
+  const iconSize = 16;
+  const primaryExtras = (extraActions ?? []).filter(a => a.placement === 'primary');
+
+  const overflowButtons: ButtonListItem[] = [
+    ...(isAndroid ? [{
+      id: 'core:stop-all',
+      label: 'Stop all apps',
+      icon: 'x-circle',
+      onClick: () => runCommand('stopall'),
+    }] : []),
+    ...(isAndroid ? [{
+      id: 'core:retry-stream',
+      label: 'Retry stream',
+      icon: 'refresh-cw',
+      onClick: handleRetryStream,
+    }] : []),
+    ...(extraActions ?? [])
+      .filter(a => a.placement !== 'primary')
+      .map(a => ({
+        id: a.key,
+        label: a.label,
+        icon: '',
+        onClick: a.onClick,
+        disabled: a.disabled,
+      })),
+  ];
+  return (
+    <div className={className}>
+      {/* Canvas container — max-height clamps the rendered size so the video can't exceed
+          ~viewport height on a wide layout (DeviceView page). maxWidth+maxHeight on the
+          canvas itself preserves aspect ratio as a replaced element. reservedDims
+          gives the container an aspect ratio from the last-known device resolution,
+          so buttons below don't reflow when the first frame arrives. */}
+      <div className="device-viewer-canvas-wrap" style={{
+        display: 'flex', justifyContent: 'center', alignItems: 'center',
+        background: '#000', maxHeight: 'calc(100vh - 200px)', overflow: 'hidden',
+        ...(reservedDims ? { aspectRatio: `${reservedDims.width} / ${reservedDims.height}` } : {}),
+        flexDirection: 'column',
+      }}>
+        {supported === false && (
+          <div className="device-viewer-unsupported">
+            Live video requires a modern browser (Chrome 94+, Firefox 130+, Safari 16.4+, Edge 94+).
+            Touch and screenshot still work.
+          </div>
+        )}
+        <canvas
+          ref={canvasRef}
+          style={{
+            maxWidth: '100%', maxHeight: 'calc(100vh - 200px)', cursor: 'pointer', display: 'block',
+            ...(supported === false ? { visibility: 'hidden', position: 'absolute', pointerEvents: 'none' } : {}),
+          }}
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}
+        />
+        {reconnecting && <div className="device-viewer-reconnecting">Reconnecting…</div>}
+      </div>
+      <div style={{ display: 'flex', gap: 6, padding: '6px', justifyContent: 'center', flexWrap: 'wrap', alignItems: 'center' }}>
+        <button className="btn btn-sm" data-testid="dv-nav-back" title="Back" onClick={() => handleNav('back')}><ArrowLeft size={iconSize} /></button>
+        <button className="btn btn-sm" data-testid="dv-nav-home" title="Home" onClick={() => handleNav('home')}><Home size={iconSize} /></button>
+        <button className="btn btn-sm" data-testid="dv-nav-recents" title="Recents" onClick={() => handleNav('recents')}><Square size={iconSize} /></button>
+        {isAndroid && <button className="btn btn-sm" data-testid="dv-nav-power" title="Power" onClick={() => handleNav('power')}><Power size={iconSize} /></button>}
+        {isAndroid && <button className="btn btn-sm" data-testid="dv-cmd-unlock" title="Unlock" onClick={() => runCommand('unlock')}><UnlockIcon size={iconSize} /></button>}
+        <button ref={swipeTriggerRef} className="btn btn-sm" data-testid="dv-swipe" title="Swipe" onClick={() => setSwipeOpen(o => !o)}><Move size={iconSize} /></button>
+        <button className="btn btn-sm" data-testid="dv-screenshot" title="Screenshot" onClick={handleScreenshot}><Camera size={iconSize} /></button>
+        {primaryExtras.map(a => (
+          <button
+            key={a.key}
+            className="btn btn-sm"
+            data-testid={`dv-extra-${a.key}`}
+            title={a.label}
+            disabled={a.disabled}
+            onClick={a.onClick}
+          >{a.icon}</button>
+        ))}
+        <VideoQualitySelector onChange={handleQualityChange} autoTier={videoTier} />
+        <VideoHealthIndicator state={healthState} tier={videoTier} bitrate={videoBitrate} />
+        <button ref={overflowTriggerRef} className="btn btn-sm" data-testid="dv-overflow" title="More" onClick={() => setOverflowOpen(o => !o)}><MoreHorizontal size={iconSize} /></button>
+      </div>
+
+      <Popover anchorRef={swipeTriggerRef} open={swipeOpen} onClose={() => setSwipeOpen(false)}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, auto)', gap: 4 }}>
+          <span /><button className="btn btn-sm" data-testid="dv-swipe-up" onClick={() => handleSwipe('up')}><ArrowUp size={iconSize} /></button><span />
+          <button className="btn btn-sm" data-testid="dv-swipe-left" onClick={() => handleSwipe('left')}><ArrowLeft size={iconSize} /></button>
+          <span />
+          <button className="btn btn-sm" data-testid="dv-swipe-right" onClick={() => handleSwipe('right')}><ArrowRight size={iconSize} /></button>
+          <span /><button className="btn btn-sm" data-testid="dv-swipe-down" onClick={() => handleSwipe('down')}><ArrowDown size={iconSize} /></button><span />
+        </div>
+      </Popover>
+
+      <Popover anchorRef={overflowTriggerRef} open={overflowOpen} align="end" onClose={() => setOverflowOpen(false)}>
+        <ButtonList
+          id="device-viewer:overflow-actions"
+          className="button-list-vertical"
+          buttons={overflowButtons}
+        />
+      </Popover>
+    </div>
+  );
+}

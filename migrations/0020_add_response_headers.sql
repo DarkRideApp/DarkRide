@@ -1,0 +1,1 @@
+ALTER TABLE captured_traffic ADD COLUMN response_headers text;
