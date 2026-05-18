@@ -10,6 +10,7 @@ import type { PythonBridgeManager } from './python-bridge';
 import type { FridaReleaseManager } from './frida-release-manager';
 import { createLoggers } from '../logs';
 import { apkFilePath, resolveApkLocal } from '../utils/apk-paths';
+import { safeJoinInside } from '../utils/safe-path';
 
 const execFileAsync = promisify(execFile);
 const { log, error } = createLoggers('gadget-injector');
@@ -107,7 +108,7 @@ export class GadgetInjector {
     const sourceApkPath = localResolution ? localResolution.baseApkPath : apkFilePath(packageName, apkVersion.filename);
     const vName = apkVersion.versionName ?? String(apkVersion.versionCode);
     const outputFilename = `${packageName}/${apkVersion.versionCode}_${vName}_frida-${resolvedVersion}.apk`;
-    const outputPath = resolve(INJECTED_APK_DIR, outputFilename);
+    const outputPath = safeJoinInside(INJECTED_APK_DIR, outputFilename);
 
     const bridge = await this.bridgeManager.getBridge('__system__');
     const response = await fetch(`http://localhost:${bridge.port}/rpc`, {

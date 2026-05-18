@@ -15,6 +15,7 @@ import type { DeviceManager } from '../services/device-manager';
 import type { CaptureSessionManager } from '../services/capture-session-manager';
 import type { FileStorageService } from '../services/file-storage';
 import { adbShell } from '../services/device-manager';
+import { safeJoinInside } from '../utils/safe-path';
 import { createLoggers } from '../logs';
 import { broadcastToAll } from '../websocket/index';
 import {
@@ -1068,7 +1069,7 @@ export function registerAnalysisEndpoints(
           res.status(404).json({ success: false, error: 'No APK files in split directory' });
           return;
         }
-        zipPath = path.join(apkInfo.apkPath, targetApk);
+        zipPath = safeJoinInside(apkInfo.apkPath, targetApk);
       } else {
         zipPath = apkInfo.apkPath;
       }

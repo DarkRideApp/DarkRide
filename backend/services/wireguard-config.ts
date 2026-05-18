@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { createLoggers } from '../logs';
+import { safeJoinInside } from '../utils/safe-path';
 
 const { log } = createLoggers('wireguard-config');
 
@@ -161,7 +162,7 @@ export function ensureConfigs(
   serverPort: number = 51820,
 ): EnsureConfigsResult {
   const configDir = path.resolve('./data/wireguard');
-  const configPath = path.join(configDir, `${deviceId}.json`);
+  const configPath = safeJoinInside(configDir, `${deviceId}.json`);
 
   // Client address: deterministic based on device position but simple default
   const clientAddress = '10.0.0.2/32';
