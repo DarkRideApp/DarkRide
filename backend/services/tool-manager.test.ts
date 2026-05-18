@@ -91,19 +91,19 @@ describe('ToolManager', () => {
 
   describe('hasJava()', () => {
     it('returns true when java is available', () => {
-      execSyncMock.mockReturnValueOnce('openjdk version "17.0.10"');
+      execFileSyncMock.mockReturnValueOnce(Buffer.from('openjdk version "17.0.10"'));
       expect(manager.hasJava()).toBe(true);
     });
 
     it('returns false when java is not available', () => {
-      execSyncMock.mockImplementation(() => {
+      execFileSyncMock.mockImplementation(() => {
         throw new Error('Command not found: java');
       });
       expect(manager.hasJava()).toBe(false);
     });
 
     it('caches java availability after first check', () => {
-      execSyncMock.mockReturnValueOnce('openjdk version "17.0.10"');
+      execFileSyncMock.mockReturnValueOnce(Buffer.from('openjdk version "17.0.10"'));
       manager.hasJava(); // first call discovers java
       execSyncMock.mockClear();
 
@@ -154,7 +154,7 @@ describe('ToolManager', () => {
   describe('getStatus()', () => {
     it('returns not-installed for missing tools', async () => {
       fsMock.existsSync.mockReturnValue(false);
-      execSyncMock.mockImplementation(() => { throw new Error('no java'); });
+      execFileSyncMock.mockImplementation(() => { throw new Error('no java'); });
 
       const status = await manager.getStatus();
       expect(status.java).toBe(false);
@@ -166,7 +166,7 @@ describe('ToolManager', () => {
 
     it('returns installed with version for present tools', async () => {
       fsMock.existsSync.mockReturnValue(true);
-      execSyncMock.mockReturnValue('openjdk version "17.0.10"');
+      execFileSyncMock.mockReturnValue(Buffer.from('openjdk version "17.0.10"'));
 
       const status = await manager.getStatus();
       expect(status.java).toBe(true);
@@ -178,14 +178,14 @@ describe('ToolManager', () => {
 
     it('detects java availability', async () => {
       fsMock.existsSync.mockReturnValue(false);
-      execSyncMock.mockReturnValue('openjdk version "17.0.10"');
+      execFileSyncMock.mockReturnValue(Buffer.from('openjdk version "17.0.10"'));
       const status = await manager.getStatus();
       expect(status.java).toBe(true);
     });
 
     it('reports correct tool names', async () => {
       fsMock.existsSync.mockReturnValue(false);
-      execSyncMock.mockImplementation(() => { throw new Error('no java'); });
+      execFileSyncMock.mockImplementation(() => { throw new Error('no java'); });
 
       const status = await manager.getStatus();
       const names = status.tools.map(t => t.name);
@@ -196,7 +196,7 @@ describe('ToolManager', () => {
   describe('getToolPaths()', () => {
     it('returns absolute paths to all installed tool binaries', () => {
       fsMock.existsSync.mockReturnValue(true);
-      execSyncMock.mockReturnValue('openjdk version "17.0.10"');
+      execFileSyncMock.mockReturnValue(Buffer.from('openjdk version "17.0.10"'));
 
       const paths = manager.getToolPaths();
       expect(paths.jadx).not.toBeNull();
@@ -214,7 +214,7 @@ describe('ToolManager', () => {
 
     it('returns null for missing tools', () => {
       fsMock.existsSync.mockReturnValue(false);
-      execSyncMock.mockImplementation(() => { throw new Error('no java'); });
+      execFileSyncMock.mockImplementation(() => { throw new Error('no java'); });
 
       const paths = manager.getToolPaths();
       expect(paths.jadx).toBeNull();
@@ -337,7 +337,7 @@ describe('ToolManager', () => {
   describe('ensureTools()', () => {
     it('downloads all missing tools', async () => {
       fsMock.existsSync.mockReturnValue(false);
-      execSyncMock.mockImplementation(() => { throw new Error('no java'); });
+      execFileSyncMock.mockImplementation(() => { throw new Error('no java'); });
 
       // Mock fetch for jadx, apktool GitHub releases + downloads (4 calls)
       const mockBuffer = Buffer.from('fake-data');
@@ -383,19 +383,25 @@ describe('ToolManager', () => {
 
     it('skips already-installed tools', async () => {
       fsMock.existsSync.mockReturnValue(true);
-      execSyncMock.mockReturnValue('openjdk version "17.0.10"');
+      execFileSyncMock.mockReturnValue(Buffer.from('openjdk version "17.0.10"'));
 
       const fetchSpy = vi.spyOn(global, 'fetch');
       const paths = await manager.ensureTools();
 
       // Nothing should be downloaded
       expect(fetchSpy).not.toHaveBeenCalled();
-      expect(execFileSyncMock).not.toHaveBeenCalled();
+      // execFileSync IS called once (the java -version probe in hasJava). It
+      // must NOT be called with pip-install args — that's the installation
+      // path we're asserting did not run.
+      const pipInstallCalls = execFileSyncMock.mock.calls.filter(
+        (call: any[]) => Array.isArray(call[1]) && call[1].includes('install'),
+      );
+      expect(pipInstallCalls).toHaveLength(0);
     });
 
     it('returns status summary with paths', async () => {
       fsMock.existsSync.mockReturnValue(true);
-      execSyncMock.mockReturnValue('openjdk version "17.0.10"');
+      execFileSyncMock.mockReturnValue(Buffer.from('openjdk version "17.0.10"'));
 
       const paths = await manager.ensureTools();
 
@@ -407,7 +413,7 @@ describe('ToolManager', () => {
 
     it('continues if one tool fails to download', async () => {
       fsMock.existsSync.mockReturnValue(false);
-      execSyncMock.mockImplementation(() => { throw new Error('no java'); });
+      execFileSyncMock.mockImplementation(() => { throw new Error('no java'); });
 
       const fetchSpy = vi.spyOn(global, 'fetch');
 

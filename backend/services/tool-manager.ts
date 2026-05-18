@@ -1,4 +1,4 @@
-import { execSync, execFileSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import AdmZip from 'adm-zip';
@@ -50,7 +50,8 @@ export class ToolManager {
   hasJava(): boolean {
     if (this.javaPath !== null) return true;
     try {
-      execSync('java -version 2>&1', { encoding: 'utf8', timeout: 5000 });
+      // java -version writes to stderr; we only care about the exit code.
+      execFileSync('java', ['-version'], { timeout: 5000, stdio: 'ignore' });
       this.javaPath = 'java';
       return true;
     } catch {
@@ -244,8 +245,9 @@ export class ToolManager {
 
     log('Cloning blutter from GitHub...');
     try {
-      execSync(
-        `git clone --depth 1 https://github.com/worawit/blutter.git ${destDir}`,
+      execFileSync(
+        'git',
+        ['clone', '--depth', '1', 'https://github.com/worawit/blutter.git', destDir],
         { timeout: 120000, stdio: ['pipe', 'pipe', 'pipe'] },
       );
       // Install Python dependencies into venv

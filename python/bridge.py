@@ -505,9 +505,11 @@ def _extract_webview_dom(serial, wv_bounds):
         print(f"[CDP] Found {len(socket_names)} devtools socket(s): {socket_names}", flush=True)
 
         for sock_name in socket_names:
-            # Find a free local port
+            # Find a free local port. Bind to loopback only — the socket
+            # exists for the kernel to assign a port and is closed immediately;
+            # binding to all interfaces ('') would briefly expose it.
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind(('', 0))
+            s.bind(('127.0.0.1', 0))
             local_port = s.getsockname()[1]
             s.close()
 
@@ -1014,9 +1016,11 @@ def handle_get_web_view_info(params):
         socket_names = list(dict.fromkeys(socket_names))
 
         for sock_name in socket_names:
-            # Find a free local port
+            # Find a free local port. Bind to loopback only — the socket
+            # exists for the kernel to assign a port and is closed immediately;
+            # binding to all interfaces ('') would briefly expose it.
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind(('', 0))
+            s.bind(('127.0.0.1', 0))
             local_port = s.getsockname()[1]
             s.close()
 
@@ -1704,13 +1708,17 @@ def rpc():
             },
             "id": req_id,
         })
-    except Exception as e:
+    except Exception:
+        # Log the full traceback to stderr for the operator to inspect, but
+        # don't include str(e) in the response — generic Python exception
+        # messages can leak filesystem paths, internal types, or other
+        # implementation details to the caller.
         traceback.print_exc()
         return jsonify({
             "jsonrpc": "2.0",
             "error": {
                 "code": ErrorCode.DEVICE_DISCONNECTED,
-                "message": f"Internal error: {str(e)}",
+                "message": "Internal error — see server logs",
             },
             "id": req_id,
         })
