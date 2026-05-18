@@ -100,7 +100,7 @@ export function setupWebSocket(
         callback(true);
         return;
       }
-      log(`ws upgrade rejected: disallowed origin "${info.origin}" (allowlist: ${allowedOrigins.join(',') || '(empty=disabled)'})`);
+      log(`ws upgrade rejected: disallowed origin "${info.origin}" — add it to WEBSOCKET_ALLOWED_ORIGINS env var to allow (current allowlist: ${allowedOrigins.join(',') || '(empty=disabled)'})`);
       callback(false, 403, 'Origin not allowed');
     },
   });

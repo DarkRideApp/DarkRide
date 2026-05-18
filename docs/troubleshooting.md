@@ -10,6 +10,21 @@
 4. If device shows as "unauthorized": `adb kill-server && adb start-server`, then re-authorize
 5. Check DarkRide server logs for errors related to device detection
 
+## WebSocket Upgrade Rejected (Origin Not Allowed)
+
+**Symptoms:** Frontend can't connect; server log shows `[websocket] ws upgrade rejected: disallowed origin "https://your-host" …`.
+
+DarkRide's `/ws` endpoint enforces an Origin allowlist to defend against CSWSH (cross-site WebSocket hijacking). The default allowlist covers loopback (`127.0.0.1`, `localhost`) on the bound port and the Vite dev port (`5173`). Any other origin — typically a reverse-proxied public hostname — must be added explicitly.
+
+1. Set `WEBSOCKET_ALLOWED_ORIGINS` to a comma-separated list of extra origins (scheme + host + non-default port). The current allowlist is printed in the rejection log line.
+   ```
+   WEBSOCKET_ALLOWED_ORIGINS=https://darkride.example.com,https://staging.darkride.example.com
+   ```
+2. Restart DarkRide.
+3. Verify with a fresh page load — the rejection log line should no longer appear.
+
+See [SECURITY.md](../SECURITY.md#websocket-origin-allowlist) for the threat model and [environment.md](environment.md) for the full env var reference.
+
 ## HTTPS Capture Not Working
 
 **Symptoms:** Capture starts but no traffic appears.
