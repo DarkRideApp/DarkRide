@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DarkRide standalone logo mark — ferris-wheel pictogram on the dark
+     background. Full-color palette: cream (#F2ECDE) outer wheel, amber
+     (#E89342) inner ring, rust (#8C3A1E) cabin. Matches the website's
+     favicon.svg. Use this for square-format applications: avatars, OG
+     images, app icons. For inline-with-text uses, the two wordmark
+     variants in this directory are usually a better fit. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <rect width="240" height="240" fill="#0E1216"/>
+  <path d="M32 193 L32 130 A88 88 0 0 1 208 130 L208 193" fill="none" stroke="#F2ECDE" stroke-width="16"/>
+  <path d="M72 193 L72 152 A48 48 0 0 1 168 152 L168 193" fill="none" stroke="#E89342" stroke-width="12"/>
+  <path d="M100 193 L100 176 A20 20 0 0 1 140 176 L140 193 Z" fill="#8C3A1E"/>
+  <path d="M31 200 L31 131 A89 89 0 0 1 209 131 L209 200 Z" fill="none" stroke="#F2ECDE" stroke-width="14" stroke-linejoin="miter"/>
+</svg>

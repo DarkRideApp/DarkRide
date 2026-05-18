@@ -1,8 +1,32 @@
-# DarkRide
+<div align="center">
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/wordmark-dark.svg">
+    <img alt="DarkRide" src="brand/wordmark-light.svg" width="420">
+  </picture>
+
+  <p><strong>An AI-native workbench for mobile reverse engineering.</strong></p>
+  <p>For mobile pentesters, bug bounty hunters &amp; app reverse engineers.</p>
+
+  <p>
+    <a href="https://darkride.app">Website</a> ·
+    <a href="#installation">Installation</a> ·
+    <a href="ROADMAP.md">Roadmap</a> ·
+    <a href="https://github.com/DarkRideApp/DarkRide/discussions">Discussions</a> ·
+    <a href="https://darkride.app/pricing">Pro</a>
+  </p>
+
+  <p>
+    <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0-1f6feb.svg"></a>
+    <a href="https://github.com/DarkRideApp/DarkRide/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DarkRideApp/DarkRide/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+    <a href="COMMERCIAL.md"><img alt="Commercial license available" src="https://img.shields.io/badge/commercial%20license-available-E89342.svg"></a>
+  </p>
+
+  <img alt="DarkRide dashboard" src="docs/screenshots/dashboard-dark.png" width="900">
+
+</div>
 
 Self-hosted toolkit for Android device control, network traffic capture, APK analysis, and Frida instrumentation — all driven from a single web UI, with a TypeScript automation engine and a plugin system for extending it. iOS support is limited to USB device discovery and traffic capture today; screen control, automation, and Frida are Android-only ([see roadmap](ROADMAP.md)).
-
-![Dashboard](docs/screenshots/dashboard-dark.png)
 
 ## Features
 
@@ -16,7 +40,7 @@ Self-hosted toolkit for Android device control, network traffic capture, APK ana
 - **Plugin system** — Plugins register nav items, pages, API routes, AI tools, DB tables, jobs, settings, notification events, commands, protocol decoders, and plugin-to-plugin hooks. `darkride plugin create` scaffolds a new one. See [Plugin Authoring Guide](docs/plugins/README.md); `plugins/kitchen-sink/` exercises every extension point.
 - **Session history & debugging** — Filter, pin, and replay automation runs; Selector Debugger for testing DOM queries against captured snapshots.
 
-## Quick Start
+## Installation
 
 ### Prerequisites
 

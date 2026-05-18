@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DarkRide wordmark for light backgrounds (GitHub light theme).
+     Strokes + fill in near-black (#0E1216) — matches the website's
+     dark text on light backgrounds. Single-color for crispness. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 160" width="540" height="120">
+  <g transform="translate(40 20) scale(0.5)" fill="none" stroke="#0E1216">
+    <path d="M56 193 L56 144 A64 64 0 0 1 184 144 L184 193" stroke-width="10"/>
+    <path d="M78 193 L78 158 A42 42 0 0 1 162 158 L162 193" stroke-width="7" opacity="0.7"/>
+    <path d="M98 193 L98 174 A22 22 0 0 1 142 174 L142 193 Z" fill="#0E1216"/>
+    <path d="M31 200 L31 131 A89 89 0 0 1 209 131 L209 200 Z" stroke-width="14" stroke-linejoin="miter"/>
+  </g>
+  <text x="180" y="106"
+        font-family="'Space Grotesk', 'Helvetica Neue', system-ui, sans-serif"
+        font-size="80" font-weight="600" letter-spacing="-2"
+        fill="#0E1216">darkride</text>
+</svg>
