@@ -15,6 +15,12 @@ env:
   # Node 24 runtime ahead of GitHub's forced switch on 2026-06-02.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
+# All jobs only read source code; none push, comment, or modify GitHub state.
+# Setting top-level permissions to read-only follows least-privilege for the
+# GITHUB_TOKEN (CodeQL js/actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
 jobs:
   lockfile-hygiene:
     name: Lockfile hygiene (workspaces match repo)

@@ -1,9 +1,9 @@
 import AdmZip from 'adm-zip';
 import { writeFile, mkdir } from 'fs/promises';
-import { join } from 'path';
 import { automationSessions, capturedTraffic, websocketMessages, screenshots, devices } from '../db/schema';
 import { eq } from 'drizzle-orm';
 import type { AppDatabase } from '../db/index';
+import { safeJoinInside } from '../utils/safe-path';
 
 interface ImportResult {
   sessionId: number;
@@ -226,8 +226,11 @@ export async function importSessionZip(
     const filename = entry.entryName.replace('screenshots/', '');
     if (!filename) continue;
 
-    // Write screenshot file to disk
-    const filePath = join(screenshotPath, filename);
+    // Zipslip defense: session-export emits flat filenames under screenshots/.
+    // Reject anything that contains a path separator or resolves outside
+    // screenshotPath — a malicious zip could otherwise use '..' to write
+    // arbitrary files anywhere the server process has write access.
+    const filePath = safeJoinInside(screenshotPath, filename);
     await writeFile(filePath, entry.getData());
 
     // Insert screenshot record
