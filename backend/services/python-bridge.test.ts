@@ -38,6 +38,10 @@ vi.mock('child_process', () => ({
     const callback = cb || opts;
     if (typeof callback === 'function') callback(null, '', '');
   },
+  execFile: (_file: string, _args: string[], opts: any, cb?: Function) => {
+    const callback = cb || opts;
+    if (typeof callback === 'function') callback(null, '', '');
+  },
 }));
 
 describe('PythonBridgeManager', () => {

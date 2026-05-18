@@ -30,6 +30,9 @@ function createMockChild(): ChildProcess {
 
 vi.mock('child_process', () => ({
   spawn: vi.fn(() => createMockChild()),
+  exec: vi.fn(),
+  execFile: vi.fn(),
+  execSync: vi.fn(),
 }));
 
 vi.mock('../logs', () => ({

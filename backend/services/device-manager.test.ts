@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi, afterEach } from 'vitest';
 import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
@@ -10,13 +10,23 @@ import {
   CURRENT_SETUP_VERSION,
   STANDBY_TIMEOUT,
   MIN_BATTERY_LEVEL,
+  adbShell,
+  adbCommand,
 } from './device-manager';
 
 const { devices } = schema;
 
-// Mock child_process.exec
+// Mock child_process exec + execFile + spawn + execSync.
+// Note on `execFile`: production code now invokes adb via `execFile('adb', [args...])`
+// for shell-injection safety. To keep the rest of this file's dispatch logic
+// (which uses `cmd.includes('which wg')` etc. on the joined command string)
+// usable as-is, we install a bridge below that joins the execFile arguments
+// back into a single command string and re-dispatches through the `exec` mock.
+// Individual tests therefore continue to set `execMock.mockImplementation(...)`
+// the way they always did.
 vi.mock('child_process', () => ({
   exec: vi.fn(),
+  execFile: vi.fn(),
   spawn: vi.fn(),
   execSync: vi.fn(),
 }));
@@ -26,7 +36,7 @@ vi.mock('util', async (importOriginal) => {
   return {
     ...actual,
     promisify: (fn: any) => {
-      // Return a wrapper that calls exec with a callback pattern
+      // Return a wrapper that calls exec/execFile with a callback pattern.
       return (...args: any[]) => {
         return new Promise((resolve, reject) => {
           fn(...args, (err: any, stdout: any, stderr: any) => {
@@ -37,6 +47,20 @@ vi.mock('util', async (importOriginal) => {
       };
     },
   };
+});
+
+beforeAll(async () => {
+  // Bridge execFile → exec so tests that dispatch on `cmd.includes(...)` keep
+  // working without rewriting every mockImplementation. The bridge stays in
+  // place across the whole suite; individual `execMock.mockImplementation(...)`
+  // calls steer the underlying exec mock as before.
+  const cp = await import('child_process');
+  const execMock = cp.exec as unknown as ReturnType<typeof vi.fn>;
+  const execFileMock = cp.execFile as unknown as ReturnType<typeof vi.fn>;
+  execFileMock.mockImplementation((file: string, args: string[], opts: any, cb: any) => {
+    const joined = `${file} ${args.join(' ')}`;
+    return execMock(joined, opts, cb);
+  });
 });
 
 describe('parseAdbDevices', () => {
@@ -731,5 +755,42 @@ describe('DeviceManager', () => {
 
       await expect(manager.pollAdbDevices()).resolves.not.toThrow();
     });
+  });
+});
+
+describe('adb helpers — command-injection prevention', () => {
+  let execFileMock: ReturnType<typeof vi.fn>;
+  let execMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    const cp = await import('child_process');
+    execFileMock = cp.execFile as unknown as ReturnType<typeof vi.fn>;
+    execMock = cp.exec as unknown as ReturnType<typeof vi.fn>;
+    // The suite-level beforeAll bridge stays in place — exec runs the response.
+    execMock.mockImplementation((_cmd: any, _opts: any, cb: any) => cb(null, '', ''));
+  });
+
+  it('adbShell passes a hostile deviceId as one argv slot (no host shell sees it)', async () => {
+    // A malicious deviceId containing shell metacharacters MUST arrive at adb as a
+    // single arg — if it ever reached /bin/sh -c "...", the `;` would terminate the
+    // adb invocation and the trailing chunk would run as a separate command.
+    const hostileDeviceId = 'DEV; rm -rf /tmp/should-not-exist';
+    await adbShell(hostileDeviceId, 'ls', 1000);
+
+    expect(execFileMock).toHaveBeenCalled();
+    const lastCall = execFileMock.mock.calls[execFileMock.mock.calls.length - 1];
+    expect(lastCall[0]).toBe('adb');                  // direct binary, not /bin/sh
+    expect(Array.isArray(lastCall[1])).toBe(true);    // argv array, not joined string
+    expect(lastCall[1]).toContain(hostileDeviceId);   // hostile id stays one slot
+  });
+
+  it('adbCommand passes argv array verbatim (no shell interpretation)', async () => {
+    // Same contract for the lower-level adbCommand helper.
+    const hostilePath = '/tmp/path with spaces; touch /tmp/pwned';
+    await adbCommand(['-s', 'DEV001', 'push', hostilePath, '/data/local/tmp/x'], 1000);
+
+    const lastCall = execFileMock.mock.calls[execFileMock.mock.calls.length - 1];
+    expect(lastCall[0]).toBe('adb');
+    expect(lastCall[1]).toEqual(['-s', 'DEV001', 'push', hostilePath, '/data/local/tmp/x']);
   });
 });

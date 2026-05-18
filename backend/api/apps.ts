@@ -220,7 +220,7 @@ async function getInstalledAppsFast(deviceId: string): Promise<Array<{
   const tmpScript = path.join(tmpDir, 'list_apps.sh');
   try {
     fs.writeFileSync(tmpScript, scriptContent, 'utf-8');
-    await adbCommand(`-s ${deviceId} push "${tmpScript}" /data/local/tmp/darkride_list_apps.sh`);
+    await adbCommand(['-s', deviceId, 'push', tmpScript, '/data/local/tmp/darkride_list_apps.sh']);
   } finally {
     try { fs.unlinkSync(tmpScript); } catch {}
     try { fs.rmdirSync(tmpDir); } catch {}

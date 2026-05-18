@@ -3,6 +3,8 @@ import path from 'path';
 
 // Mock child_process
 vi.mock('child_process', () => ({
+  exec: vi.fn(),
+  execFile: vi.fn(),
   execSync: vi.fn(),
   execFileSync: vi.fn(),
 }));

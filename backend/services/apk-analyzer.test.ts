@@ -18,6 +18,7 @@ const mockChildProcess = {
 vi.mock('child_process', () => ({
   spawn: vi.fn(() => mockChildProcess),
   exec: vi.fn(),
+  execFile: vi.fn(),
   execSync: vi.fn(),
 }));
 

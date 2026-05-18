@@ -1,4 +1,4 @@
-import { exec, spawn } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import crypto from 'crypto';
 import path from 'path';
@@ -17,7 +17,7 @@ import { matchesDeviceFilter, migrateDeviceFilter } from '../../shared/lib/devic
 import { getMitmproxyConfdir } from './mitmproxy-manager';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 const { log, error } = createLoggers('device-manager');
 const ADB_POLL_INTERVAL = 5000;
@@ -55,13 +55,19 @@ export interface DeviceStatus {
 
 /**
  * Execute an ADB shell command on a specific device.
+ *
+ * `command` is the device-shell command to run — adb itself receives it as a
+ * single argv slot, so the host shell is never invoked. The device shell DOES
+ * interpret `command` (intentionally — callers rely on this for pipes,
+ * redirection, etc.); the security boundary is that arbitrary `deviceId` or
+ * other host-side data can never escape into a host-shell command line.
  */
 export async function adbShell(deviceId: string, command: string, timeout: number = 10000): Promise<string> {
   try {
-    const { stdout } = await execAsync(`adb -s ${deviceId} shell ${command}`, { timeout });
+    const { stdout } = await execFileAsync('adb', ['-s', deviceId, 'shell', command], { timeout });
     return stdout.trim();
   } catch (err: any) {
-    // execAsync errors include stdout/stderr — surface them in the error message
+    // execFileAsync errors include stdout/stderr — surface them in the error message
     const output = [err.stdout, err.stderr].filter(Boolean).map((s: string) => s.trim()).join('\n').trim();
     if (output) {
       throw new Error(`${err.message}\n${output}`);
@@ -71,11 +77,15 @@ export async function adbShell(deviceId: string, command: string, timeout: numbe
 }
 
 /**
- * Execute a raw ADB command (non-shell).
+ * Execute a raw ADB command (non-shell). Arguments are passed as an argv
+ * array so no host shell sees them.
+ *
+ * @example adbCommand(['-s', deviceId, 'push', localPath, remotePath])
+ * @example adbCommand(['devices'])
  */
-export async function adbCommand(command: string, timeout: number = 10000): Promise<string> {
+export async function adbCommand(args: string[], timeout: number = 10000): Promise<string> {
   try {
-    const { stdout } = await execAsync(`adb ${command}`, { timeout });
+    const { stdout } = await execFileAsync('adb', args, { timeout });
     return stdout.trim();
   } catch (err: any) {
     const output = [err.stdout, err.stderr].filter(Boolean).map((s: string) => s.trim()).join('\n').trim();
@@ -93,7 +103,7 @@ export async function adbCommand(command: string, timeout: number = 10000): Prom
  */
 export async function adbPull(deviceId: string, remotePath: string, localPath: string, timeout: number = 5 * 60 * 1000): Promise<void> {
   try {
-    await adbCommand(`-s ${deviceId} pull "${remotePath}" "${localPath}"`, timeout);
+    await adbCommand(['-s', deviceId, 'pull', remotePath, localPath], timeout);
     return;
   } catch (pullErr: any) {
     log(`adb pull failed for ${remotePath}, trying exec-out cat fallback: ${pullErr.message?.split('\n')[0]}`);
@@ -357,7 +367,7 @@ export class DeviceManager {
    */
   async pollAdbDevices(): Promise<void> {
     try {
-      const output = await adbCommand('devices');
+      const output = await adbCommand(['devices']);
       const parsed = parseAdbDevices(output);
 
       const currentIds = new Set<string>();
@@ -632,7 +642,7 @@ export class DeviceManager {
             if (!this.fridaReleaseManager.isDownloaded(version)) {
               binPath = await this.fridaReleaseManager.downloadVersion(version);
             }
-            await adbCommand(`-s ${deviceId} push "${binPath}" /data/local/tmp/frida-server`);
+            await adbCommand(['-s', deviceId, 'push', binPath, '/data/local/tmp/frida-server']);
             await adbShell(deviceId, '"su -c \'chmod 755 /data/local/tmp/frida-server\'"');
             this.db.update(devices)
               .set({ fridaVersion: version })
@@ -659,7 +669,7 @@ export class DeviceManager {
         // Push minitouch
         try {
           const minitouchBin = await ensureMinitouch(arch);
-          await adbCommand(`-s ${deviceId} push "${minitouchBin}" /data/local/tmp/minitouch`);
+          await adbCommand(['-s', deviceId, 'push', minitouchBin, '/data/local/tmp/minitouch']);
           await adbShell(deviceId, 'chmod 755 /data/local/tmp/minitouch');
           log(`Device ${deviceId}: minitouch binary pushed`);
         } catch (err: any) {
@@ -671,8 +681,8 @@ export class DeviceManager {
           try {
             const minicapPaths = await ensureMinicap(arch, apiLevel);
             await Promise.all([
-              adbCommand(`-s ${deviceId} push "${minicapPaths.binary}" /data/local/tmp/minicap`),
-              adbCommand(`-s ${deviceId} push "${minicapPaths.sharedLib}" /data/local/tmp/minicap.so`),
+              adbCommand(['-s', deviceId, 'push', minicapPaths.binary, '/data/local/tmp/minicap']),
+              adbCommand(['-s', deviceId, 'push', minicapPaths.sharedLib, '/data/local/tmp/minicap.so']),
             ]);
             await adbShell(deviceId, 'chmod 755 /data/local/tmp/minicap');
             log(`Device ${deviceId}: minicap binary + so pushed`);
@@ -684,7 +694,7 @@ export class DeviceManager {
         // Push scrcpy-server jar
         try {
           const scrcpyJar = getScrcpyServerJar();
-          await adbCommand(`-s ${deviceId} push "${scrcpyJar}" /data/local/tmp/scrcpy-server.jar`);
+          await adbCommand(['-s', deviceId, 'push', scrcpyJar, '/data/local/tmp/scrcpy-server.jar']);
           log(`Device ${deviceId}: scrcpy-server jar pushed`);
         } catch (err: any) {
           log(`Device ${deviceId}: scrcpy push skipped: ${err.message}`);
@@ -944,8 +954,9 @@ export class DeviceManager {
   async takeScreenshot(deviceId: string): Promise<Buffer> {
     const remotePath = '/sdcard/darkride_screenshot.png';
     await adbShell(deviceId, `screencap -p ${remotePath}`);
-    const { stdout } = await execAsync(
-      `adb -s ${deviceId} exec-out cat ${remotePath}`,
+    const { stdout } = await execFileAsync(
+      'adb',
+      ['-s', deviceId, 'exec-out', 'cat', remotePath],
       { encoding: 'buffer' as any, maxBuffer: 50 * 1024 * 1024, timeout: 15000 },
     );
     // Clean up remote file
@@ -1127,7 +1138,7 @@ export class DeviceManager {
     }
 
     // Push to device and make executable
-    await adbCommand(`-s ${deviceId} push "${binaryPath}" ${DeviceManager.WG_DEVICE_PATH}`);
+    await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_DEVICE_PATH]);
     await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_DEVICE_PATH}'"`);
     log(`Pushed wg binary to ${deviceId} (${arch})`);
   }
@@ -1203,7 +1214,7 @@ export class DeviceManager {
       );
     }
 
-    await adbCommand(`-s ${deviceId} push "${binaryPath}" ${DeviceManager.WG_GO_DEVICE_PATH}`);
+    await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_GO_DEVICE_PATH]);
     await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_GO_DEVICE_PATH}'"`);
     log(`Pushed wireguard-go binary to ${deviceId} (${abi})`);
   }
@@ -1257,7 +1268,7 @@ export class DeviceManager {
       );
     }
 
-    await adbCommand(`-s ${deviceId} push "${binaryPath}" ${DeviceManager.WG_UAPI_DEVICE_PATH}`);
+    await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_UAPI_DEVICE_PATH]);
     await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_UAPI_DEVICE_PATH}'"`);
     log(`Pushed wg-uapi binary to ${deviceId} (${abi})`);
   }
@@ -1320,7 +1331,7 @@ export class DeviceManager {
     const tmpConf = path.join(tmpDir, 'wg_peer.conf');
     try {
       fs.writeFileSync(tmpConf, peerConf, 'utf-8');
-      await adbCommand(`-s ${deviceId} push "${tmpConf}" /data/local/tmp/wg_peer.conf`);
+      await adbCommand(['-s', deviceId, 'push', tmpConf, '/data/local/tmp/wg_peer.conf']);
     } finally {
       try { fs.unlinkSync(tmpConf); } catch {}
       try { fs.rmdirSync(tmpDir); } catch {}
@@ -1485,7 +1496,7 @@ export class DeviceManager {
         throw new Error(`Failed to copy cert to temp path: ${tmpCert}`);
       }
       log(`Pushing cert ${certHash}.0 (${fs.statSync(tmpCert).size} bytes) to device ${deviceId}`);
-      await adbCommand(`-s ${deviceId} push "${tmpCert}" /data/local/tmp/${certHash}.0`);
+      await adbCommand(['-s', deviceId, 'push', tmpCert, `/data/local/tmp/${certHash}.0`]);
     } finally {
       try { fs.unlinkSync(tmpCert); } catch {}
       try { fs.rmdirSync(tmpDir2); } catch {}
@@ -1572,7 +1583,7 @@ export class DeviceManager {
     const tmpScript = path.join(tmpDir3, 'inject_cert.sh');
     try {
       fs.writeFileSync(tmpScript, injectScript, 'utf-8');
-      await adbCommand(`-s ${deviceId} push "${tmpScript}" /data/local/tmp/inject_cert.sh`);
+      await adbCommand(['-s', deviceId, 'push', tmpScript, '/data/local/tmp/inject_cert.sh']);
     } finally {
       try { fs.unlinkSync(tmpScript); } catch {}
       try { fs.rmdirSync(tmpDir3); } catch {}
