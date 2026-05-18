@@ -13,6 +13,7 @@ import type { PluginInstallsRepo } from '../services/plugin-installs-repo';
 import type Database from 'better-sqlite3';
 import type { SystemStateService } from '../services/system-state-service';
 import { getDataRoot } from '../config/paths';
+import { safeJoinInside } from '../utils/safe-path';
 import { dropPluginTables, listPluginTables } from '../db/plugin-migrator';
 import { isNewer } from '../services/version-compare';
 
@@ -269,7 +270,7 @@ export function registerPluginEndpoints(
             { npmShasum: result.npmShasum ?? undefined, gitRef: result.resolvedRef ?? undefined },
           );
           if (!contentCheck.ok) {
-            const rollbackDir = join(getDataRoot(), 'installed-plugins', 'node_modules', result.pkgName);
+            const rollbackDir = safeJoinInside(getDataRoot(), 'installed-plugins', 'node_modules', result.pkgName);
             try { rmSync(rollbackDir, { recursive: true, force: true }); } catch (e) { log(`rollback rm -rf ${rollbackDir} failed: ${e}`); }
             emitProgress('done', `Verification failed: ${contentCheck.reason}`);
             res.status(400).json({
@@ -287,14 +288,14 @@ export function registerPluginEndpoints(
       // reconcile(), applyPluginMigrations, dropPluginTables, enable/disable.
       // Honour package.json#main first (published plugins compile to dist/);
       // fall back to legacy root convention.
-      const pkgDir = join(getDataRoot(), 'installed-plugins', 'node_modules', result.pkgName);
+      const pkgDir = safeJoinInside(getDataRoot(), 'installed-plugins', 'node_modules', result.pkgName);
       let entryCandidate: string | undefined;
-      const pkgJsonPath = join(pkgDir, 'package.json');
+      const pkgJsonPath = safeJoinInside(pkgDir, 'package.json');
       if (existsSync(pkgJsonPath)) {
         try {
           const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
           if (typeof pkg?.main === 'string') {
-            const mainPath = join(pkgDir, pkg.main);
+            const mainPath = safeJoinInside(pkgDir, pkg.main);
             if (existsSync(mainPath)) entryCandidate = mainPath;
           }
         } catch {
@@ -410,12 +411,12 @@ export function registerPluginEndpoints(
             return;
           }
           const pkgName = state.npmPackage ?? name;
-          const pkgDir = join(getDataRoot(), 'installed-plugins', 'node_modules', pkgName);
+          const pkgDir = safeJoinInside(getDataRoot(), 'installed-plugins', 'node_modules', pkgName);
           try { rmSync(pkgDir, { recursive: true, force: true }); } catch (e) { log(`rm -rf ${pkgDir} failed: ${e}`); }
           pluginInstallsRepo.remove(name);
           if (wipeData) {
             try { dropPluginTables(rawSqlite, name); } catch (e) { log(`dropPluginTables failed: ${e}`); }
-            try { rmSync(join(getDataRoot(), 'plugins', name), { recursive: true, force: true }); } catch (e) { log(`rm -rf data/plugins/${name} failed: ${e}`); }
+            try { rmSync(safeJoinInside(getDataRoot(), 'plugins', name), { recursive: true, force: true }); } catch (e) { log(`rm -rf data/plugins/${name} failed: ${e}`); }
           }
           stateManager.remove(name);
           systemStateService?.setRestartRequired(`plugin ${name} uninstalled`);
@@ -429,7 +430,7 @@ export function registerPluginEndpoints(
           }
           if (wipeData) {
             try { dropPluginTables(rawSqlite, name); } catch (e) { log(`dropPluginTables failed: ${e}`); }
-            try { rmSync(join(getDataRoot(), 'plugins', name), { recursive: true, force: true }); } catch (e) { log(`rm -rf data/plugins/${name} failed: ${e}`); }
+            try { rmSync(safeJoinInside(getDataRoot(), 'plugins', name), { recursive: true, force: true }); } catch (e) { log(`rm -rf data/plugins/${name} failed: ${e}`); }
           }
           pluginInstallsRepo.remove(name);
           stateManager.remove(name);
@@ -448,7 +449,7 @@ export function registerPluginEndpoints(
             if (rawSqlite) {
               try { dropPluginTables(rawSqlite, name); } catch (e) { log(`dropPluginTables failed: ${e}`); }
             }
-            try { rmSync(join(getDataRoot(), 'plugins', name), { recursive: true, force: true }); } catch (e) { log(`rm -rf data/plugins/${name} failed: ${e}`); }
+            try { rmSync(safeJoinInside(getDataRoot(), 'plugins', name), { recursive: true, force: true }); } catch (e) { log(`rm -rf data/plugins/${name} failed: ${e}`); }
           }
           stateManager.remove(name);
           systemStateService?.setRestartRequired(`plugin ${name} uninstalled`);
@@ -489,7 +490,7 @@ export function registerPluginEndpoints(
       }
 
       const tables = rawSqlite ? listPluginTables(rawSqlite, name) : [];
-      const dataDir = join(getDataRoot(), 'plugins', name);
+      const dataDir = safeJoinInside(getDataRoot(), 'plugins', name);
       const fileStorageBytes = dirSize(dataDir);
 
       res.json({
@@ -542,7 +543,7 @@ export function registerPluginEndpoints(
       // the old version (set by reconcile on a previous boot), so the
       // updateAvailable flag stays true and the UI shows "Update to..."
       // even though the update succeeded.
-      const pkgJsonPath = join(getDataRoot(), 'installed-plugins', 'node_modules', state.npmPackage, 'package.json');
+      const pkgJsonPath = safeJoinInside(getDataRoot(), 'installed-plugins', 'node_modules', state.npmPackage, 'package.json');
       let newVersion: string | undefined;
       if (existsSync(pkgJsonPath)) {
         try {

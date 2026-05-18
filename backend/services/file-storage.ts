@@ -9,6 +9,7 @@ import type { FileStorageService as IFileStorageService } from '@darkrideapp/plu
 import { NamespacedStorageImpl } from './namespaced-storage';
 import { cleanupEvictedApkAnalysisDir } from '../utils/apk-paths';
 import { absoluteLocalPath, toRelativeLocalPath } from '../config/paths';
+import { safeJoinInside } from '../utils/safe-path';
 
 const logger = createLoggers('file-sync');
 
@@ -619,7 +620,7 @@ export class FileStorageService implements IFileStorageService {
 
         if (existing.length > 0) { result.alreadyTracked++; continue; }
 
-        const localPath = path.join(this.screenshotPath!, ss.filename);
+        const localPath = safeJoinInside(this.screenshotPath!, ss.filename);
         try {
           const stat = fs.statSync(localPath);
           this.trackFile(localPath, cloudKey, 'session-screenshot', stat.size);

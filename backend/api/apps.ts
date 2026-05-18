@@ -16,7 +16,8 @@ import type { ApkAnalyzerService } from '../services/apk-analyzer';
 import type { FileStorageService } from '../services/file-storage';
 import type { AppDatabase } from '../db/index';
 import { createLoggers } from '../logs';
-import { APK_DIR } from '../utils/apk-paths';
+import { APK_DIR, packageDir, apkFilePath } from '../utils/apk-paths';
+import { safeJoinInside } from '../utils/safe-path';
 import { enumerateApkPaths } from '../utils/apk-utils';
 import { isValidPackageName } from '../utils/validators';
 import { computeVersionAvailability } from '../services/apk-availability';
@@ -45,9 +46,9 @@ export function clearAppListCache(deviceId: string): void {
 
 /** Resolve which icon file exists for a package (icon.png or icon.webp). */
 function resolveIconPath(packageName: string): { path: string; contentType: string } | null {
-  const pngPath = path.join(APK_DIR, packageName, 'icon.png');
+  const pngPath = apkFilePath(packageName, 'icon.png');
   if (fs.existsSync(pngPath)) return { path: pngPath, contentType: 'image/png' };
-  const webpPath = path.join(APK_DIR, packageName, 'icon.webp');
+  const webpPath = apkFilePath(packageName, 'icon.webp');
   if (fs.existsSync(webpPath)) return { path: webpPath, contentType: 'image/webp' };
   return null;
 }
@@ -70,8 +71,8 @@ async function saveAppIconFromDevice(deviceId: string, packageName: string): Pro
         encoding: 'buffer',
       });
       if (stdout.length > 100) {
-        fs.mkdirSync(path.join(APK_DIR, packageName), { recursive: true });
-        fs.writeFileSync(path.join(APK_DIR, packageName, 'icon.png'), stdout);
+        fs.mkdirSync(packageDir(packageName), { recursive: true });
+        fs.writeFileSync(apkFilePath(packageName, 'icon.png'), stdout);
         return;
       }
     }
@@ -389,9 +390,9 @@ export function registerAppEndpoints(
           const base64 = buf.toString('base64');
           iconCache.set(cacheKey, { base64, expiry: Date.now() + ICON_CACHE_TTL });
           // Persist to disk for APK browser
-          const iconDiskPath = path.join(APK_DIR, packageName, 'icon.png');
+          const iconDiskPath = apkFilePath(packageName, 'icon.png');
           try {
-            fs.mkdirSync(path.join(APK_DIR, packageName), { recursive: true });
+            fs.mkdirSync(packageDir(packageName), { recursive: true });
             fs.writeFileSync(iconDiskPath, buf);
           } catch {}
           res.json({ success: true, data: { icon: base64 } });
@@ -519,7 +520,7 @@ export function registerAppEndpoints(
       const vn = versionName ?? 'unknown';
 
       // Prepare local directory
-      const pkgDir = path.join(APK_DIR, packageName);
+      const pkgDir = packageDir(packageName);
       fs.mkdirSync(pkgDir, { recursive: true });
 
       const isSplit = apkPaths.length > 1;
@@ -529,7 +530,7 @@ export function registerAppEndpoints(
       if (isSplit) {
         // Split APK: store in subdirectory
         filename = `${vc}_${vn}`;
-        const splitDir = path.join(pkgDir, filename);
+        const splitDir = safeJoinInside(pkgDir, filename);
         fs.mkdirSync(splitDir, { recursive: true });
         for (const apkPath of apkPaths) {
           const apkName = path.basename(apkPath);
@@ -541,7 +542,7 @@ export function registerAppEndpoints(
       } else {
         // Single APK
         filename = `${vc}_${vn}.apk`;
-        const localPath = path.join(pkgDir, filename);
+        const localPath = safeJoinInside(pkgDir, filename);
         await adbPull(deviceId, apkPaths[0], localPath);
         totalSize = fs.statSync(localPath).size;
       }
@@ -730,7 +731,7 @@ export function registerAppEndpoints(
 
     // Delete file(s) from disk
     if (tracked) {
-      const filePath = path.join(APK_DIR, tracked.packageName, version.filename);
+      const filePath = apkFilePath(tracked.packageName, version.filename);
       try {
         if (fs.existsSync(filePath)) {
           if (fs.statSync(filePath).isDirectory()) {
@@ -924,7 +925,7 @@ export function registerAppEndpoints(
       return;
     }
 
-    const filePath = path.join(APK_DIR, app.packageName, version.filename);
+    const filePath = apkFilePath(app.packageName, version.filename);
 
     if (!fs.existsSync(filePath)) {
       // Try cloud storage
@@ -1021,7 +1022,7 @@ export function registerAppEndpoints(
       return;
     }
     try {
-      const apkPath = path.join(APK_DIR, tracked.packageName, version.filename);
+      const apkPath = apkFilePath(tracked.packageName, version.filename);
 
       // If file not on disk, try to fetch from cloud storage
       if (!fs.existsSync(apkPath) && fileSync) {

@@ -9,6 +9,7 @@ import { screenshots, devices } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { createLoggers } from '../logs';
 import { generateWireGuardQrCode } from '../utils/qr-code';
+import { safeJoinInside } from '../utils/safe-path';
 
 const { log, error } = createLoggers('devices-api');
 
@@ -339,7 +340,7 @@ export function registerDeviceEndpoints(deviceManager: DeviceManager, db?: AppDa
       const timestamp = Date.now();
       const filename = `${sessionId}_${timestamp}_capture.png`;
       mkdirSync(SCREENSHOT_PATH, { recursive: true });
-      writeFileSync(join(SCREENSHOT_PATH, filename), imageBuffer);
+      writeFileSync(safeJoinInside(SCREENSHOT_PATH, filename), imageBuffer);
 
       db.insert(screenshots)
         .values({

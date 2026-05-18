@@ -5,6 +5,7 @@ import { execSync, execFileSync } from 'child_process';
 import { fridaReleases, settings } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { createLoggers } from '../logs';
+import { safeJoinInside } from '../utils/safe-path';
 
 const isWindows = process.platform === 'win32';
 const venvPython = isWindows
@@ -182,12 +183,21 @@ export class FridaReleaseManager {
     return this.getBinaryPath(version);
   }
 
+  /**
+   * Resolve and validate the per-version directory under this.dataDir.
+   * Throws if `version` would escape the data directory (defence-in-depth
+   * against a future regression in upstream version validation).
+   */
+  private versionDir(version: string): string {
+    return safeJoinInside(this.dataDir, version);
+  }
+
   async downloadVersion(version: string): Promise<string> {
     const release = this.getRelease(version);
     if (!release) throw new Error(`Unknown Frida version: ${version}`);
     if (release.isDownloaded) return this.getBinaryPath(version);
 
-    const versionDir = path.join(this.dataDir, version);
+    const versionDir = this.versionDir(version);
     fs.mkdirSync(versionDir, { recursive: true });
 
     const xzPath = path.join(versionDir, 'frida-server-arm64.xz');
@@ -214,7 +224,7 @@ export class FridaReleaseManager {
   }
 
   getBinaryPath(version: string): string {
-    return path.join(this.dataDir, version, 'frida-server-arm64');
+    return path.join(this.versionDir(version), 'frida-server-arm64');
   }
 
   isDownloaded(version: string): boolean {
@@ -223,7 +233,7 @@ export class FridaReleaseManager {
   }
 
   getGadgetPath(version: string): string {
-    return path.join(this.dataDir, version, 'frida-gadget-arm64.so');
+    return path.join(this.versionDir(version), 'frida-gadget-arm64.so');
   }
 
   isGadgetDownloaded(version: string): boolean {
@@ -269,7 +279,7 @@ export class FridaReleaseManager {
   }
 
   deleteVersion(version: string): void {
-    const versionDir = path.join(this.dataDir, version);
+    const versionDir = this.versionDir(version);
     if (fs.existsSync(versionDir)) {
       fs.rmSync(versionDir, { recursive: true });
     }

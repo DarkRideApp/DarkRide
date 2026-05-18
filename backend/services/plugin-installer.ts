@@ -4,6 +4,7 @@ import { resolve, join } from 'path';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync } from 'fs';
 import { createLoggers } from '../logs';
 import { getDataRoot } from '../config/paths';
+import { safeJoinInside } from '../utils/safe-path';
 
 const execFile = promisify(execFileCb);
 
@@ -246,7 +247,7 @@ export class PluginInstaller {
     // typically omits it (the git SHA is the pin instead).
     const npmShasum = typeof lockEntry.integrity === 'string' ? lockEntry.integrity : null;
 
-    const pkgDir = join(this.managedRoot, 'node_modules', pkgName);
+    const pkgDir = safeJoinInside(this.managedRoot, 'node_modules', pkgName);
     let entryFile: string | null;
     try {
       entryFile = await ensurePluginEntryJs(pkgDir);
@@ -334,12 +335,12 @@ async function ensurePluginEntryJs(pkgDir: string): Promise<string | null> {
   // Published plugins compile to dist/darkride-plugin.js and declare the
   // entry via package.json#main. Honour main first; fall back to legacy
   // root convention.
-  const pkgJsonPath = join(pkgDir, 'package.json');
+  const pkgJsonPath = safeJoinInside(pkgDir, 'package.json');
   if (existsSync(pkgJsonPath)) {
     try {
       const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
       if (typeof pkg?.main === 'string') {
-        const mainPath = join(pkgDir, pkg.main);
+        const mainPath = safeJoinInside(pkgDir, pkg.main);
         if (existsSync(mainPath)) return mainPath;
       }
     } catch {
@@ -347,11 +348,11 @@ async function ensurePluginEntryJs(pkgDir: string): Promise<string | null> {
     }
   }
 
-  const jsPath = join(pkgDir, 'darkride-plugin.js');
+  const jsPath = safeJoinInside(pkgDir, 'darkride-plugin.js');
   if (existsSync(jsPath)) return jsPath;
 
   const tsCandidate = ['darkride-plugin.ts', 'darkride-plugin.tsx']
-    .map(f => join(pkgDir, f))
+    .map(f => safeJoinInside(pkgDir, f))
     .find(existsSync);
   if (!tsCandidate) return null;
 

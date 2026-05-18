@@ -9,9 +9,24 @@ export function getDataRoot(): string {
   return path.resolve(process.env.DATA_ROOT || './data');
 }
 
-/** Resolve a cloud_files.local_path row value to an absolute filesystem path. */
+/**
+ * Resolve a cloud_files.local_path row value to an absolute filesystem path.
+ *
+ * Defence-in-depth: relative inputs are containment-checked against DATA_ROOT
+ * to prevent any path that resolves outside the managed data directory. The
+ * DB column is server-controlled but we treat its contents as untrusted
+ * (defence against future bugs that write user input there). Absolute paths
+ * are accepted as-is — these are produced by callers that already validated.
+ */
 export function absoluteLocalPath(stored: string): string {
-  return path.isAbsolute(stored) ? stored : path.join(getDataRoot(), stored);
+  if (path.isAbsolute(stored)) return stored;
+  const root = getDataRoot();
+  const resolved = path.resolve(root, stored);
+  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
+  if (resolved !== root && !resolved.startsWith(rootWithSep)) {
+    throw new Error(`absoluteLocalPath: stored path escapes DATA_ROOT: ${stored}`);
+  }
+  return resolved;
 }
 
 /**

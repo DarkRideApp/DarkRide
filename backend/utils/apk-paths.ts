@@ -5,6 +5,7 @@ import { apkVersions, trackedApps } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import type { FileStorageService } from '../services/file-storage';
 import { getDataRoot } from '../config/paths';
+import { safeJoinInside } from './safe-path';
 
 // ── Tier 1: Constants + Pure Path Construction (no I/O) ──────────────
 
@@ -24,14 +25,30 @@ export function getApkDir(): string {
   return path.join(getDataRoot(), 'apks');
 }
 
-/** Full local path to an APK file (or split-APK directory). */
+/**
+ * Per-package directory under APK_DIR (`data/apks/<packageName>/`).
+ * Throws if `packageName` would escape APK_DIR.
+ */
+export function packageDir(packageName: string): string {
+  return safeJoinInside(getApkDir(), packageName);
+}
+
+/**
+ * Full local path to an APK file (or split-APK directory).
+ *
+ * Defence-in-depth: throws if `packageName` or `filename` would escape
+ * APK_DIR (`..`, absolute paths). packageName is regex-validated upstream
+ * at API boundaries, but the containment check protects against a future
+ * validator regression and any path the function gets through plugin or
+ * automation code that bypassed the API layer.
+ */
 export function apkFilePath(packageName: string, filename: string): string {
-  return path.join(getApkDir(), packageName, filename);
+  return safeJoinInside(getApkDir(), packageName, filename);
 }
 
 /** Directory containing analysis output for a specific version. */
 export function analysisDir(packageName: string, versionCode: number): string {
-  return path.join(getApkDir(), packageName, 'analysis', String(versionCode));
+  return safeJoinInside(getApkDir(), packageName, 'analysis', String(versionCode));
 }
 
 /** Path to the per-version analysis SQLite DB. */

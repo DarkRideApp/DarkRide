@@ -14,7 +14,8 @@ import type { NotificationService } from './notification-service';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
-import { APK_DIR } from '../utils/apk-paths';
+import { APK_DIR, packageDir } from '../utils/apk-paths';
+import { safeJoinInside } from '../utils/safe-path';
 import { enumerateApkPaths } from '../utils/apk-utils';
 import { applyRetentionForApp, applyRetentionForAllApps } from './apk-retention';
 import { backfillApkCloudFiles, cleanupStaleAnalysisDirs } from './apk-backfill';
@@ -37,7 +38,7 @@ const ICON_SKIP_SUFFIXES = ['_round', '_foreground', '_background', '_monochrome
  * Returns true if an icon was saved.
  */
 export function extractIconFromLocalApk(packageName: string): boolean {
-  const pkgDir = path.join(APK_DIR, packageName);
+  const pkgDir = packageDir(packageName);
   if (!fs.existsSync(pkgDir)) return false;
 
   // Look for an APK file directly in the package dir
@@ -46,10 +47,10 @@ export function extractIconFromLocalApk(packageName: string): boolean {
   // If no direct .apk files, look inside split APK directories for base.apk
   if (!apkFile) {
     for (const entry of fs.readdirSync(pkgDir)) {
-      const entryPath = path.join(pkgDir, entry);
+      const entryPath = safeJoinInside(pkgDir,entry);
       try {
         if (fs.statSync(entryPath).isDirectory()) {
-          const baseApk = path.join(entryPath, 'base.apk');
+          const baseApk = safeJoinInside(entryPath, 'base.apk');
           if (fs.existsSync(baseApk)) {
             apkFile = path.join(entry, 'base.apk');
             break;
@@ -61,7 +62,7 @@ export function extractIconFromLocalApk(packageName: string): boolean {
   if (!apkFile) return false;
 
   try {
-    const zip = new AdmZip(path.join(pkgDir, apkFile));
+    const zip = new AdmZip(safeJoinInside(pkgDir,apkFile));
     const allEntries = zip.getEntries();
 
     for (const density of DENSITY_ORDER) {
@@ -88,7 +89,7 @@ export function extractIconFromLocalApk(packageName: string): boolean {
       if (buf.length > 100) {
         const ext = best.entryName.endsWith('.webp') ? 'webp' : 'png';
         const iconFile = ext === 'png' ? 'icon.png' : 'icon.webp';
-        fs.writeFileSync(path.join(pkgDir, iconFile), buf);
+        fs.writeFileSync(safeJoinInside(pkgDir,iconFile), buf);
         log(`Extracted icon for ${packageName} (${best.entryName})`);
         return true;
       }
@@ -103,7 +104,7 @@ export function extractIconFromLocalApk(packageName: string): boolean {
  * Returns true if an icon was saved.
  */
 export async function fetchIconFromGooglePlay(packageName: string): Promise<boolean> {
-  const pkgDir = path.join(APK_DIR, packageName);
+  const pkgDir = packageDir(packageName);
   try {
     const pageRes = await fetch(
       `https://play.google.com/store/apps/details?id=${encodeURIComponent(packageName)}&hl=en`,
@@ -120,7 +121,7 @@ export async function fetchIconFromGooglePlay(packageName: string): Promise<bool
     if (buf.length < 100) return false;
 
     fs.mkdirSync(pkgDir, { recursive: true });
-    fs.writeFileSync(path.join(pkgDir, 'icon.png'), buf);
+    fs.writeFileSync(safeJoinInside(pkgDir,'icon.png'), buf);
     log(`Fetched icon for ${packageName} from Google Play`);
     return true;
   } catch { return false; }
@@ -460,7 +461,7 @@ export class ApkTracker {
     apkPaths = await enumerateApkPaths(deviceId, apkPaths);
 
     // Prepare local directory
-    const pkgDir = path.join(APK_DIR, packageName);
+    const pkgDir = packageDir(packageName);
     fs.mkdirSync(pkgDir, { recursive: true });
 
     const isSplit = apkPaths.length > 1;
@@ -470,7 +471,7 @@ export class ApkTracker {
     if (isSplit) {
       // Split APK: store all files in a subdirectory
       filename = `${currentVersionCode}_${versionName}`;
-      const splitDir = path.join(pkgDir, filename);
+      const splitDir = safeJoinInside(pkgDir,filename);
       fs.mkdirSync(splitDir, { recursive: true });
       for (const apkPath of apkPaths) {
         const apkName = path.basename(apkPath);
@@ -481,7 +482,7 @@ export class ApkTracker {
       log(`Pulled split APK (${apkPaths.length} files) for ${packageName} v${versionName} from ${deviceId}`);
     } else {
       filename = `${currentVersionCode}_${versionName}.apk`;
-      const localPath = path.join(pkgDir, filename);
+      const localPath = safeJoinInside(pkgDir,filename);
       await adbPull(deviceId, apkPaths[0], localPath);
       totalSize = fs.statSync(localPath).size;
     }
@@ -508,7 +509,7 @@ export class ApkTracker {
     if (this.fileSync) {
       if (isSplit) {
         // Split APKs: track each individual .apk file inside the directory
-        const splitDir = path.join(pkgDir, filename);
+        const splitDir = safeJoinInside(pkgDir,filename);
         for (const apkPath of apkPaths) {
           const apkName = path.basename(apkPath);
           const localFilePath = path.join(splitDir, apkName);
@@ -517,7 +518,7 @@ export class ApkTracker {
           this.fileSync.trackFile(localFilePath, cloudKey, 'apk', fileSize);
         }
       } else {
-        const apkLocalPath = path.join(pkgDir, filename);
+        const apkLocalPath = safeJoinInside(pkgDir,filename);
         const cloudKey = `apks/${packageName}/${filename}`;
         this.fileSync.trackFile(apkLocalPath, cloudKey, 'apk', totalSize);
       }
@@ -570,8 +571,8 @@ export class ApkTracker {
   }
 
   private async saveAppIconIfMissing(deviceId: string, packageName: string): Promise<void> {
-    const pkgDir = path.join(APK_DIR, packageName);
-    if (fs.existsSync(path.join(pkgDir, 'icon.png')) || fs.existsSync(path.join(pkgDir, 'icon.webp'))) return;
+    const pkgDir = packageDir(packageName);
+    if (fs.existsSync(safeJoinInside(pkgDir,'icon.png')) || fs.existsSync(safeJoinInside(pkgDir,'icon.webp'))) return;
 
     // Method 1: Try cmd package dump-icon from device (Android 13+)
     try {
@@ -584,7 +585,7 @@ export class ApkTracker {
         });
         if (stdout.length > 100) {
           fs.mkdirSync(pkgDir, { recursive: true });
-          fs.writeFileSync(path.join(pkgDir, 'icon.png'), stdout);
+          fs.writeFileSync(safeJoinInside(pkgDir,'icon.png'), stdout);
           log(`Backfilled icon for ${packageName} (from device)`);
           return;
         }
