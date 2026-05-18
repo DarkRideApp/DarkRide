@@ -2,7 +2,7 @@ import { eq, desc, sql } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import AdmZip from 'adm-zip';
 import { registerEndpoint } from './api-service';
@@ -21,7 +21,7 @@ import { enumerateApkPaths } from '../utils/apk-utils';
 import { isValidPackageName } from '../utils/validators';
 import { computeVersionAvailability } from '../services/apk-availability';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const { log, error } = createLoggers('apps-api');
 
 // In-memory icon cache: key = "deviceId:packageName", value = { base64, expiry }
@@ -64,7 +64,7 @@ async function saveAppIconFromDevice(deviceId: string, packageName: string): Pro
   try {
     const check = await adbShell(deviceId, `cmd package dump-icon ${packageName}`, 5000);
     if (check && !check.includes('Error') && !check.includes('Unknown')) {
-      const { stdout } = await execAsync(`adb -s ${deviceId} exec-out cmd package dump-icon ${packageName}`, {
+      const { stdout } = await execFileAsync('adb', ['-s', deviceId, 'exec-out', 'cmd', 'package', 'dump-icon', packageName], {
         maxBuffer: 1024 * 1024,
         timeout: 5000,
         encoding: 'buffer',
@@ -379,7 +379,7 @@ export function registerAppEndpoints(
       const iconData = await adbShell(deviceId, `cmd package dump-icon ${packageName}`, 5000);
       if (iconData && !iconData.includes('Error') && !iconData.includes('Unknown')) {
         // The output is raw PNG data — convert to base64
-        const { stdout } = await execAsync(`adb -s ${deviceId} exec-out cmd package dump-icon ${packageName}`, {
+        const { stdout } = await execFileAsync('adb', ['-s', deviceId, 'exec-out', 'cmd', 'package', 'dump-icon', packageName], {
           maxBuffer: 1024 * 1024,
           timeout: 5000,
           encoding: 'buffer',
@@ -1038,7 +1038,7 @@ export function registerAppEndpoints(
 
       // Determine if this is a split APK (directory) or single APK (file)
       const isDirectory = fs.statSync(apkPath).isDirectory();
-      let cmd: string;
+      let adbArgs: string[];
       if (isDirectory) {
         // Split APK: use install-multiple with all .apk files in the directory
         const apkFiles = fs.readdirSync(apkPath).filter(f => f.endsWith('.apk'));
@@ -1046,15 +1046,14 @@ export function registerAppEndpoints(
           res.status(404).json({ success: false, error: 'No APK files found in split directory' });
           return;
         }
-        const filePaths = apkFiles.map(f => `"${path.join(apkPath, f)}"`).join(' ');
-        cmd = `adb -s ${deviceId} install-multiple -r ${filePaths}`;
+        adbArgs = ['-s', deviceId, 'install-multiple', '-r', ...apkFiles.map(f => path.join(apkPath, f))];
         log(`Installing split APK (${apkFiles.length} files) ${tracked.packageName} v${version.versionCode} on ${deviceId}`);
       } else {
-        cmd = `adb -s ${deviceId} install -r "${apkPath}"`;
+        adbArgs = ['-s', deviceId, 'install', '-r', apkPath];
         log(`Installing ${tracked.packageName} v${version.versionCode} on ${deviceId}`);
       }
 
-      const { stdout, stderr } = await execAsync(cmd, { timeout: 120000 });
+      const { stdout, stderr } = await execFileAsync('adb', adbArgs, { timeout: 120000 });
       const output = (stdout || '') + (stderr || '');
       if (output.includes('Failure') || output.includes('INSTALL_FAILED')) {
         const failMatch = output.match(/Failure \[([^\]]+)\]/);

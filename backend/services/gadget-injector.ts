@@ -2,7 +2,7 @@ import { eq, and, lt } from 'drizzle-orm';
 import { join, resolve } from 'path';
 import { getDataRoot } from '../config/paths';
 import { existsSync, mkdirSync, unlinkSync, statSync } from 'fs';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { injectedApks, apkVersions, trackedApps } from '../db/schema';
 import type { AppDatabase } from '../db/index';
@@ -11,7 +11,7 @@ import type { FridaReleaseManager } from './frida-release-manager';
 import { createLoggers } from '../logs';
 import { apkFilePath, resolveApkLocal } from '../utils/apk-paths';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const { log, error } = createLoggers('gadget-injector');
 
 const INJECTED_APK_DIR = join(getDataRoot(), 'apks-injected');
@@ -160,22 +160,39 @@ export class GadgetInjector {
     // Ensure debug keystore exists
     if (!existsSync(KEYSTORE_PATH)) {
       log('Generating debug keystore...');
-      await execAsync(
-        `keytool -genkey -v -keystore "${KEYSTORE_PATH}" -alias ${KEYSTORE_ALIAS} -keyalg RSA -keysize 2048 -validity 10000 -storepass ${KEYSTORE_PASS} -dname "CN=DarkRide"`,
-      );
+      await execFileAsync('keytool', [
+        '-genkey', '-v',
+        '-keystore', KEYSTORE_PATH,
+        '-alias', KEYSTORE_ALIAS,
+        '-keyalg', 'RSA',
+        '-keysize', '2048',
+        '-validity', '10000',
+        '-storepass', KEYSTORE_PASS,
+        '-dname', 'CN=DarkRide',
+      ]);
     }
 
     // Try apksigner first (Android SDK), fall back to jarsigner
     try {
-      await execAsync(
-        `apksigner sign --ks "${KEYSTORE_PATH}" --ks-key-alias ${KEYSTORE_ALIAS} --ks-pass pass:${KEYSTORE_PASS} "${apkPath}"`,
-      );
+      await execFileAsync('apksigner', [
+        'sign',
+        '--ks', KEYSTORE_PATH,
+        '--ks-key-alias', KEYSTORE_ALIAS,
+        '--ks-pass', `pass:${KEYSTORE_PASS}`,
+        apkPath,
+      ]);
       log('APK signed with apksigner');
     } catch {
       log('apksigner not found, falling back to jarsigner');
-      await execAsync(
-        `jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 -keystore "${KEYSTORE_PATH}" -storepass ${KEYSTORE_PASS} "${apkPath}" ${KEYSTORE_ALIAS}`,
-      );
+      await execFileAsync('jarsigner', [
+        '-verbose',
+        '-sigalg', 'SHA256withRSA',
+        '-digestalg', 'SHA-256',
+        '-keystore', KEYSTORE_PATH,
+        '-storepass', KEYSTORE_PASS,
+        apkPath,
+        KEYSTORE_ALIAS,
+      ]);
       log('APK signed with jarsigner');
     }
   }

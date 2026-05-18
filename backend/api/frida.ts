@@ -1,5 +1,5 @@
 import { eq, desc, and, sql } from 'drizzle-orm';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { join, resolve } from 'path';
 import { getDataRoot } from '../config/paths';
@@ -14,7 +14,7 @@ import { createLoggers } from '../logs';
 import { CATEGORY_LABELS, seedFridaScriptLibrary } from '../services/frida-script-library';
 import { callFridaBridge as callFridaBridgeShared } from '../services/frida-bridge';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const { log, error: logError } = createLoggers('frida');
 
 export function registerFridaEndpoints(db: AppDatabase, releaseManager: FridaReleaseManager, bridgeManager: PythonBridgeManager, deviceManager?: DeviceManager): void {
@@ -195,8 +195,8 @@ export function registerFridaEndpoints(db: AppDatabase, releaseManager: FridaRel
       // Push frida-server binary to device
       const localPath = releaseManager.getBinaryPath(resolved);
       log(`Pushing frida-server ${resolved} to ${deviceId}...`);
-      await execAsync(`adb -s ${deviceId} push "${localPath}" /data/local/tmp/frida-server`, { timeout: 30000 });
-      await execAsync(`adb -s ${deviceId} shell chmod 755 /data/local/tmp/frida-server`, { timeout: 5000 });
+      await execFileAsync('adb', ['-s', deviceId, 'push', localPath, '/data/local/tmp/frida-server'], { timeout: 30000 });
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'chmod 755 /data/local/tmp/frida-server'], { timeout: 5000 });
 
       const result = await callFridaBridge(deviceId, 'frida_start_server', {});
       res.json({ success: true, data: { ...result, version: resolved } });
@@ -332,9 +332,9 @@ export function registerFridaGadgetEndpoints(injector: GadgetInjector): void {
       }
       const apkPath = resolve(join(getDataRoot(), 'apks-injected'), row.filename);
       // Uninstall original (ignore failure)
-      try { await execAsync(`adb -s ${deviceId} uninstall ${row.packageName}`, { timeout: 15000 }); } catch {}
+      try { await execFileAsync('adb', ['-s', deviceId, 'uninstall', row.packageName], { timeout: 15000 }); } catch {}
       // Install injected APK
-      await execAsync(`adb -s ${deviceId} install "${apkPath}"`, { timeout: 60000 });
+      await execFileAsync('adb', ['-s', deviceId, 'install', apkPath], { timeout: 60000 });
       res.json({ success: true, data: { packageName: row.packageName, fridaVersion: row.fridaVersion } });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });

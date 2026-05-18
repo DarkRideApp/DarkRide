@@ -24,6 +24,7 @@ vi.mock('fs', async (importOriginal) => {
 
 vi.mock('child_process', () => ({
   exec: vi.fn(),
+  execFile: vi.fn(),
   execSync: vi.fn(),
 }));
 

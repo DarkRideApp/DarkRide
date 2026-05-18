@@ -1,11 +1,11 @@
-import { exec as execCb } from 'child_process';
+import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import { resolve, join } from 'path';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync } from 'fs';
 import { createLoggers } from '../logs';
 import { getDataRoot } from '../config/paths';
 
-const exec = promisify(execCb);
+const execFile = promisify(execFileCb);
 
 const { log, error } = createLoggers('plugin-installer');
 
@@ -66,10 +66,9 @@ export class PluginInstaller {
       );
     }
 
-    const cmd = `npm install ${installTarget}`;
     log(`Installing ${packageName}...`); // log the un-tokenised URL only — never the token
     try {
-      const { stdout } = await exec(cmd, { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
+      const { stdout } = await execFile('npm', ['install', installTarget], { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
       log(`Installed ${packageName}`);
       return { success: true, stdout };
     } catch (err: any) {
@@ -89,10 +88,9 @@ export class PluginInstaller {
       return { success: false, error: validationError };
     }
 
-    const cmd = `npm uninstall ${packageName}`;
     log(`Uninstalling ${packageName}...`);
     try {
-      const { stdout } = await exec(cmd, { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
+      const { stdout } = await execFile('npm', ['uninstall', packageName], { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
       log(`Uninstalled ${packageName}`);
       return { success: true, stdout };
     } catch (err: any) {
@@ -117,10 +115,9 @@ export class PluginInstaller {
     // to managed plugins (they're installed flat with no governing range);
     // (2) we always want the absolute latest, including major-version bumps.
     mkdirSync(this.managedRoot, { recursive: true });
-    const cmd = `npm install --prefix=${this.managedRoot} --legacy-peer-deps ${packageName}@latest`;
     log(`Updating ${packageName} (managed)...`);
     try {
-      const { stdout } = await exec(cmd, { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
+      const { stdout } = await execFile('npm', ['install', `--prefix=${this.managedRoot}`, '--legacy-peer-deps', `${packageName}@latest`], { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
       log(`Updated ${packageName}`);
       return { success: true, stdout };
     } catch (err: any) {
@@ -140,9 +137,8 @@ export class PluginInstaller {
       return null;
     }
 
-    const cmd = `npm view ${packageName} version`;
     try {
-      const { stdout } = await exec(cmd, { cwd: PROJECT_ROOT, timeout: TIMEOUT_VERSION });
+      const { stdout } = await execFile('npm', ['view', packageName, 'version'], { cwd: PROJECT_ROOT, timeout: TIMEOUT_VERSION });
       return stdout.trim() || null;
     } catch (err: any) {
       error(`Failed to get latest version for ${packageName}: ${err.message}`);
@@ -208,11 +204,13 @@ export class PluginInstaller {
     // Note: no --no-save here — with --prefix, npm writes to <managedRoot>/package.json
     // and <managedRoot>/package-lock.json, leaving the project root's files untouched.
     // --no-save would also suppress the lock file, breaking the resolvedRef lookup below.
-    const cmd = `npm install --prefix=${this.managedRoot} --legacy-peer-deps ${installTarget}`;
     log(`Installing ${packageName} (managed)...`);
 
     try {
-      await exec(cmd, { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
+      // npm accepts a single positional install target including any auth-token-rewritten
+      // git+https URL; passing as a separate argv slot avoids shell interpretation of
+      // any meta-characters that might appear in the token or version specifier.
+      await execFile('npm', ['install', `--prefix=${this.managedRoot}`, '--legacy-peer-deps', installTarget], { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
     } catch (err: any) {
       const sanitisedMsg = (err.message ?? String(err)).replace(/token:[^@]+@/g, 'token:***@');
       error(`Failed to install ${packageName}: ${sanitisedMsg}`);

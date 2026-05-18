@@ -2,19 +2,19 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PluginInstaller } from './plugin-installer';
 
 vi.mock('child_process', () => ({
-  exec: vi.fn(),
+  execFile: vi.fn(),
 }));
 
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 
 function mockExecSuccess(stdout = '') {
-  (exec as any).mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+  (execFile as any).mockImplementation((_cmd: string, _args: string[], _opts: any, cb: Function) => {
     cb(null, { stdout, stderr: '' });
   });
 }
 
 function mockExecFailure(message = 'command failed') {
-  (exec as any).mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+  (execFile as any).mockImplementation((_cmd: string, _args: string[], _opts: any, cb: Function) => {
     cb(new Error(message));
   });
 }
@@ -32,8 +32,9 @@ describe('PluginInstaller', () => {
       mockExecSuccess('added 1 package');
       const result = await installer.install('@darkride/plugin-foo');
       expect(result.success).toBe(true);
-      expect(exec).toHaveBeenCalledWith(
-        expect.stringContaining('npm install @darkride/plugin-foo'),
+      expect(execFile).toHaveBeenCalledWith(
+        'npm',
+        ['install', '@darkride/plugin-foo'],
         expect.any(Object),
         expect.any(Function),
       );
@@ -43,13 +44,13 @@ describe('PluginInstaller', () => {
       const result = await installer.install('../../../etc/passwd');
       expect(result.success).toBe(false);
       expect(result.error).toContain('Invalid package name');
-      expect(exec).not.toHaveBeenCalled();
+      expect(execFile).not.toHaveBeenCalled();
     });
 
     it('rejects package names with shell metacharacters', async () => {
       const result = await installer.install('foo; rm -rf /');
       expect(result.success).toBe(false);
-      expect(exec).not.toHaveBeenCalled();
+      expect(execFile).not.toHaveBeenCalled();
     });
 
     it('accepts scoped package names with dots in the scope', async () => {
@@ -57,8 +58,9 @@ describe('PluginInstaller', () => {
       mockExecSuccess('added 1 package');
       const result = await installer.install('@example.dots/plugin-foo');
       expect(result.success).toBe(true);
-      expect(exec).toHaveBeenCalledWith(
-        expect.stringContaining('npm install @example.dots/plugin-foo'),
+      expect(execFile).toHaveBeenCalledWith(
+        'npm',
+        ['install', '@example.dots/plugin-foo'],
         expect.any(Object),
         expect.any(Function),
       );
@@ -68,8 +70,9 @@ describe('PluginInstaller', () => {
       mockExecSuccess('added 1 package');
       const result = await installer.install('git+https://gitea.local/org/plugin-foo.git');
       expect(result.success).toBe(true);
-      expect(exec).toHaveBeenCalledWith(
-        expect.stringContaining('npm install git+https://gitea.local/org/plugin-foo.git'),
+      expect(execFile).toHaveBeenCalledWith(
+        'npm',
+        ['install', 'git+https://gitea.local/org/plugin-foo.git'],
         expect.any(Object),
         expect.any(Function),
       );
@@ -86,6 +89,20 @@ describe('PluginInstaller', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('404');
     });
+
+    it('passes installTarget as a single argv slot (no shell interpretation)', async () => {
+      // Regression test for the command-injection fix: a package name containing
+      // shell metacharacters that bypassed validation (it won't, but defence-
+      // in-depth) must NOT be interpreted by the host shell. Verifying that
+      // execFile receives the value as one argv slot guarantees this.
+      mockExecSuccess('added 1 package');
+      await installer.install('@darkride/plugin-foo');
+      const call = (execFile as any).mock.calls[0];
+      expect(call[0]).toBe('npm');
+      expect(Array.isArray(call[1])).toBe(true);
+      // Whole installTarget appears as ONE element of args, not split or interpolated.
+      expect(call[1]).toContain('@darkride/plugin-foo');
+    });
   });
 
   describe('uninstall', () => {
@@ -93,6 +110,12 @@ describe('PluginInstaller', () => {
       mockExecSuccess('removed 1 package');
       const result = await installer.uninstall('@darkride/plugin-foo');
       expect(result.success).toBe(true);
+      expect(execFile).toHaveBeenCalledWith(
+        'npm',
+        ['uninstall', '@darkride/plugin-foo'],
+        expect.any(Object),
+        expect.any(Function),
+      );
     });
   });
 

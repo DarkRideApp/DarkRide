@@ -291,7 +291,7 @@ export class FridaReleaseManager {
     const attempts: Array<{ name: string; fn: () => void }> = [
       {
         name: 'xz',
-        fn: () => execSync(`xz -d -f "${xzPath}"`, { timeout: 60000 }),
+        fn: () => execFileSync('xz', ['-d', '-f', xzPath], { timeout: 60000 }),
       },
       {
         name: 'venv python lzma',
@@ -303,7 +303,8 @@ export class FridaReleaseManager {
       {
         name: '7z',
         fn: () => {
-          execSync(`7z e -y -o"${path.dirname(xzPath)}" "${xzPath}"`, { timeout: 60000 });
+          // 7z's `-o` flag has no space before the directory; pass as one argv.
+          execFileSync('7z', ['e', '-y', `-o${path.dirname(xzPath)}`, xzPath], { timeout: 60000 });
           fs.unlinkSync(xzPath);
         },
       },

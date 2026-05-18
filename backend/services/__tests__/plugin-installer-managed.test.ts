@@ -5,9 +5,9 @@ import { tmpdir } from 'os';
 import { PluginInstaller } from '../plugin-installer';
 
 vi.mock('child_process', () => ({
-  exec: vi.fn(),
+  execFile: vi.fn(),
 }));
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 
 function setupManagedTreeWithPlugin(
   prefix: string,
@@ -51,13 +51,13 @@ describe('PluginInstaller.installManaged', () => {
 
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), 'installer-managed-'));
-    vi.mocked(exec).mockReset();
+    vi.mocked(execFile).mockReset();
   });
   afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
 
   it('creates the prefix package.json stub on first install', async () => {
     const installer = new PluginInstaller({ managedRoot: tmp });
-    vi.mocked(exec).mockImplementation((cmd: any, _opts: any, cb: any) => {
+    vi.mocked(execFile).mockImplementation((_file: any, _args: any, _opts: any, cb: any) => {
       setupManagedTreeWithPlugin(tmp, '@darkrideapp', 'plugin-test', { lockfileResolved: 'git+https://e.com/x.git#abc123' });
       cb(null, { stdout: '', stderr: '' });
       return {} as any;
@@ -70,7 +70,7 @@ describe('PluginInstaller.installManaged', () => {
 
   it('runs npm install with --prefix, --no-save, --legacy-peer-deps', async () => {
     const installer = new PluginInstaller({ managedRoot: tmp });
-    vi.mocked(exec).mockImplementation((cmd: any, _opts: any, cb: any) => {
+    vi.mocked(execFile).mockImplementation((_file: any, _args: any, _opts: any, cb: any) => {
       expect(cmd).toContain(`--prefix=${tmp}`);
       expect(cmd).toContain('--no-save');
       expect(cmd).toContain('--legacy-peer-deps');
@@ -79,12 +79,12 @@ describe('PluginInstaller.installManaged', () => {
       return {} as any;
     });
     await installer.installManaged('git+https://e.com/x.git', null);
-    expect(vi.mocked(exec)).toHaveBeenCalled();
+    expect(vi.mocked(execFile)).toHaveBeenCalled();
   });
 
   it('embeds the auth token for git+https URLs', async () => {
     const installer = new PluginInstaller({ managedRoot: tmp });
-    vi.mocked(exec).mockImplementation((cmd: any, _opts: any, cb: any) => {
+    vi.mocked(execFile).mockImplementation((_file: any, _args: any, _opts: any, cb: any) => {
       expect(cmd).toContain('token:secret123@');
       setupManagedTreeWithPlugin(tmp, '@darkrideapp', 'plugin-test');
       cb(null, { stdout: '', stderr: '' });
@@ -95,7 +95,7 @@ describe('PluginInstaller.installManaged', () => {
 
   it('returns success with pkgName + resolvedRef parsed from package-lock', async () => {
     const installer = new PluginInstaller({ managedRoot: tmp });
-    vi.mocked(exec).mockImplementation((_cmd: any, _opts: any, cb: any) => {
+    vi.mocked(execFile).mockImplementation((_file: any, _args: any, _opts: any, cb: any) => {
       setupManagedTreeWithPlugin(tmp, '@darkrideapp', 'plugin-test', { lockfileResolved: 'git+https://e.com/x.git#deadbeef' });
       cb(null, { stdout: '', stderr: '' });
       return {} as any;
@@ -106,7 +106,7 @@ describe('PluginInstaller.installManaged', () => {
 
   it('rolls back when entry file is missing', async () => {
     const installer = new PluginInstaller({ managedRoot: tmp });
-    vi.mocked(exec).mockImplementation((_cmd: any, _opts: any, cb: any) => {
+    vi.mocked(execFile).mockImplementation((_file: any, _args: any, _opts: any, cb: any) => {
       setupManagedTreeWithPlugin(tmp, '@darkrideapp', 'plugin-test', { withEntry: false });
       cb(null, { stdout: '', stderr: '' });
       return {} as any;
@@ -122,12 +122,12 @@ describe('PluginInstaller.installManaged', () => {
     const result = await installer.installManaged('not://a-valid-target', null);
     expect(result.success).toBe(false);
     if (!result.success) expect(result.error).toMatch(/Invalid/);
-    expect(vi.mocked(exec)).not.toHaveBeenCalled();
+    expect(vi.mocked(execFile)).not.toHaveBeenCalled();
   });
 
   it('redacts auth token from error messages on install failure', async () => {
     const installer = new PluginInstaller({ managedRoot: tmp });
-    vi.mocked(exec).mockImplementation((_cmd: any, _opts: any, cb: any) => {
+    vi.mocked(execFile).mockImplementation((_file: any, _args: any, _opts: any, cb: any) => {
       cb(Object.assign(new Error('npm fail token:abc123@e.com fail'), { code: 1 }), { stdout: '', stderr: '' });
       return {} as any;
     });
@@ -138,7 +138,7 @@ describe('PluginInstaller.installManaged', () => {
 
   it('compiles darkride-plugin.ts to .js when only TS is shipped', async () => {
     const installer = new PluginInstaller({ managedRoot: tmp });
-    vi.mocked(exec).mockImplementation((_cmd: any, _opts: any, cb: any) => {
+    vi.mocked(execFile).mockImplementation((_file: any, _args: any, _opts: any, cb: any) => {
       setupManagedTreeWithPlugin(tmp, '@darkrideapp', 'plugin-test', {
         tsContent: `const greeting: string = 'hi';\nmodule.exports = { name: 'test', greeting };\n`,
         lockfileResolved: 'git+https://e.com/x.git#abc123',
@@ -160,7 +160,7 @@ describe('PluginInstaller.installManaged', () => {
 
   it('prefers existing .js over .ts (no recompile)', async () => {
     const installer = new PluginInstaller({ managedRoot: tmp });
-    vi.mocked(exec).mockImplementation((_cmd: any, _opts: any, cb: any) => {
+    vi.mocked(execFile).mockImplementation((_file: any, _args: any, _opts: any, cb: any) => {
       setupManagedTreeWithPlugin(tmp, '@darkrideapp', 'plugin-test', {
         jsContent: `module.exports = { name: 'js-wins' };\n`,
         tsContent: `module.exports = { name: 'ts-loses' };\n`,
@@ -179,7 +179,7 @@ describe('PluginInstaller.installManaged', () => {
 
   it('rolls back when .ts has a syntax error and surfaces the compile error', async () => {
     const installer = new PluginInstaller({ managedRoot: tmp });
-    vi.mocked(exec).mockImplementation((_cmd: any, _opts: any, cb: any) => {
+    vi.mocked(execFile).mockImplementation((_file: any, _args: any, _opts: any, cb: any) => {
       setupManagedTreeWithPlugin(tmp, '@darkrideapp', 'plugin-test', {
         tsContent: `const x: string = ;\nthis is not valid typescript\n`,
       });
