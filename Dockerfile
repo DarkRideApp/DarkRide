@@ -54,6 +54,14 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/migrations ./migrations
 COPY python ./python
 COPY package.json ./
+# Workspace packages are symlinked into node_modules (npm workspaces). The
+# symlinks in node_modules point at packages/* — we have to copy the actual
+# target directory in too, with its built dist/, or the symlinks resolve to
+# nothing. Hit while smoke-testing 2026-05-18: the server crashed on boot
+# with "Cannot find module '@darkrideapp/plugin-sdk/utils'" — node was
+# following node_modules/@darkrideapp/plugin-sdk → ../../packages/plugin-sdk,
+# which didn't exist in the runtime layer.
+COPY --from=build /app/packages ./packages
 
 # Create the Python venv at /app/.venv (what `backend/services/python-bridge.ts`
 # looks for via `resolve(process.cwd(), '.venv')`). Installing deps at build
