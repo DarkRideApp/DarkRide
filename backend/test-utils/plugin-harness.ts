@@ -59,6 +59,7 @@ export interface CreateHarnessOptions {
     websocket: unknown;
     apks: unknown;
     paths: unknown;
+    dispatcher: unknown;
   }>;
 }
 
@@ -174,6 +175,11 @@ const stubApks = {
 const stubPaths = {
   fileStorage: (rel: string) => `/stub/${rel}`,
 } as any;
+
+/** Stub DispatcherApi — callable that throws a helpful error. */
+const stubDispatcher = (() => {
+  throw new Error('dispatcher() not available in default stub — pass via coreServices.dispatcher');
+}) as any;
 
 // ---------------------------------------------------------------------------
 
@@ -296,6 +302,7 @@ export async function createPluginTestHarness(
       websocket: (opts.coreServices?.websocket ?? stubWebsocket) as any,
       apks: (opts.coreServices?.apks ?? stubApks) as any,
       paths: (opts.coreServices?.paths ?? stubPaths) as any,
+      dispatcher: (opts.coreServices?.dispatcher ?? stubDispatcher) as any,
     });
     await pluginManager.startAll();
   }

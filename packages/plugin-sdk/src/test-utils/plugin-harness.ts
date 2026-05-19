@@ -84,6 +84,7 @@ function createDefaultMockCtx(pluginName: string): PluginContext {
     websocket: createNoopWebsocket(),
     apks: createNoopApks(),
     paths: createNoopPaths(),
+    dispatcher: () => { throw new Error('dispatcher() not available in default mock — pass via mocks'); },
   } as PluginContext;
 }
 

@@ -164,4 +164,18 @@ describe('PluginContextImpl', () => {
       expect(registerEndpoint).toHaveBeenCalledWith('PATCH', '/test/:id', handler, undefined);
     });
   });
+
+  describe('ctx.dispatcher', () => {
+    it('throws a clear error when accessed before wiring', () => {
+      const { ctx } = createTestContext();
+      expect(() => ctx.dispatcher).toThrow('ctx.dispatcher not available until plugin is fully loaded');
+    });
+
+    it('returns the wired api after setDispatcherApi()', () => {
+      const { ctx } = createTestContext();
+      const fakeDispatcher = { register: vi.fn(), unregister: vi.fn(), dispatch: vi.fn() } as any;
+      ctx.setDispatcherApi(fakeDispatcher);
+      expect(ctx.dispatcher).toBe(fakeDispatcher);
+    });
+  });
 });

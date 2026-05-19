@@ -1,6 +1,6 @@
 {
   "name": "@darkrideapp/plugin-sdk",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Plugin authoring SDK for DarkRide. Re-exports definePlugin and all plugin types.",
   "license": "AGPL-3.0",
   "main": "./dist/index.js",
