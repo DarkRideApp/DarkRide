@@ -15,6 +15,7 @@ import type {
   WebsocketApi,
   ApkApi,
   PathsApi,
+  DispatcherApi,
 } from './ctx-extensions';
 
 export type { PluginNavItem, PluginPageDef, PluginSetting, PluginCommand, UiSlotDefinition, UiContribution };
@@ -174,6 +175,15 @@ export interface PluginContext {
 
   /** Host's path helpers — resolve relative paths under DATA_ROOT. */
   paths: PathsApi;
+
+  /**
+   * Host's pooled outbound-HTTP dispatcher factory. Use when you need
+   * to route outbound traffic through a SOCKS5 proxy (e.g. for
+   * geo-locked APIs) and want the host to dedupe Agents + cap
+   * concurrent connections per endpoint. Plugins that just need
+   * direct egress don't need this — undici's defaults are correct.
+   */
+  dispatcher: DispatcherApi;
 }
 
 // --- Plugin Definition ---

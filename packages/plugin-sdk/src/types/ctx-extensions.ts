@@ -1,4 +1,5 @@
 import type { CloudFileRow, AutomationRow, ApkHandle, ApkVersionMeta } from './host-tables';
+import type { Dispatcher } from 'undici';
 
 export interface SettingsApi {
   get(key: string): Promise<string | null>;
@@ -59,4 +60,49 @@ export interface PathsApi {
    *  For plugin-scoped storage prefer ctx.files() — this is for interop with
    *  external processes that need an absolute path. */
   fileStorage(relativePath: string): string;
+}
+
+// --- DispatcherApi ---
+
+/**
+ * Egress configuration for an outbound HTTP request. Today only SOCKS5
+ * is supported; HTTP / HTTPS / PAC proxy variants can be added when a
+ * real consumer needs them.
+ *
+ * The host pools dispatchers by structural equality — two calls to
+ * `ctx.dispatcher(spec)` with equal specs return the same instance,
+ * which deduplicates Agents across plugins and bounds the TCP
+ * connection rate against any one upstream endpoint.
+ */
+export type DispatcherSpec = {
+  type: 'socks5';
+  host: string;
+  port: number;
+  auth?: { username: string; password: string };
+  /**
+   * Max concurrent TCP connections this Agent will open. Default 8 —
+   * chosen conservatively to avoid handshake-rate throttling on
+   * commercial SOCKS endpoints (NordVPN's observed throttle threshold
+   * is well below undici's default of 100).
+   */
+  connections?: number;
+};
+
+/**
+ * Get or create a pooled undici Dispatcher for the given egress spec.
+ * Structurally-equal specs return the same instance; the host owns
+ * the Agent lifecycle and destroys it at shutdown.
+ *
+ * @example
+ *   import { fetch } from 'undici';
+ *   const dispatcher = ctx.dispatcher({
+ *     type: 'socks5',
+ *     host: 'us.socks.nordhold.net',
+ *     port: 1080,
+ *     auth: { username: '…', password: '…' },
+ *   });
+ *   const res = await fetch('https://example.com', { dispatcher });
+ */
+export interface DispatcherApi {
+  (spec: DispatcherSpec): Dispatcher;
 }
