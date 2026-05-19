@@ -1,0 +1,86 @@
+name: Publish plugin-sdk to npm
+
+# Triggered only by pushed tags shaped `sdk-v<semver>`. Decoupled from the
+# regular CI workflow because (1) the trigger condition is different (tags,
+# not branch pushes), (2) it has elevated permissions (id-token: write for
+# npm OIDC), and (3) it should not run on every push or PR.
+#
+# Release flow:
+#   1. Bump packages/plugin-sdk/package.json to the new version (e.g. 1.5.0)
+#   2. Commit + push to main
+#   3. git tag sdk-v1.5.0 && git push --tags
+#   4. This workflow fires, verifies the tag matches package.json, builds,
+#      runs SDK tests, and publishes via npm trusted publishing.
+
+on:
+  push:
+    tags:
+      - 'sdk-v*'
+
+env:
+  # Opt JS-based actions onto Node 24 ahead of GitHub's forced switch on
+  # 2026-06-02. Matches ci.yml.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+# Top-level: contents read only. The publish job overrides with id-token
+# write for OIDC.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish @darkrideapp/plugin-sdk
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail fast if someone tags a commit where package.json's version
+      # doesn't match the tag. Prevents accidental "tag says 1.5.0 but we
+      # publish 1.4.0" mishaps.
+      - name: Verify tag matches package.json version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#sdk-v}"
+          PKG_VERSION=$(node -p "require('./packages/plugin-sdk/package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag '${GITHUB_REF_NAME}' implies version ${TAG_VERSION} but packages/plugin-sdk/package.json declares ${PKG_VERSION}"
+            exit 1
+          fi
+          echo "Publishing @darkrideapp/plugin-sdk@${PKG_VERSION}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        # --legacy-peer-deps mirrors the install flag the plugin repos use,
+        # required because the SDK's peer-deps (React 19, drizzle, etc.)
+        # don't all satisfy each other's ranges in the workspace.
+        run: npm install --legacy-peer-deps
+
+      - name: Build SDK
+        run: npm run build -w @darkrideapp/plugin-sdk
+
+      - name: Run SDK tests
+        # SDK-only tests (not the full host suite). The SDK is self-contained
+        # in packages/plugin-sdk/; backend changes can't break its build, so
+        # gating publish on the full suite would add latency without value.
+        run: npx vitest run packages/plugin-sdk/
+
+      - name: Publish
+        # OIDC trusted publishing: no NODE_AUTH_TOKEN, no secret. The job's
+        # id-token: write + setup-node's registry-url is enough for npm CLI
+        # to mint and submit a workflow-bound ID token. --provenance attaches
+        # the signed provenance attestation that shows up on the npm page.
+        #
+        # ONE-TIME setup required in the npm UI before this can succeed:
+        # configure a Trusted Publisher for @darkrideapp/plugin-sdk pointing
+        # at this repo + workflow. Until that's done, npm rejects with
+        # "OIDC not configured for this package". See:
+        #   https://docs.npmjs.com/trusted-publishers
+        run: npm publish --access public --provenance
+        working-directory: packages/plugin-sdk
