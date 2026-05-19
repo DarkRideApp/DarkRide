@@ -58,7 +58,27 @@ Optional, per feature:
 
 > DarkRide creates its Python venv (`.venv/`) and installs `python/requirements.txt` automatically on first start — you don't need to set those up manually. `frida-server`, `jadx`, and `apktool` binaries are downloaded on demand into `data/`.
 
-### Install and Run
+### Docker (fastest — try without installing anything)
+
+A prebuilt image is published to GitHub Container Registry on every push to `main`:
+
+```bash
+docker run -d --name darkride \
+  -p 3000:3000 \
+  -e HOST=0.0.0.0 \
+  -e DARKRIDE_BOOTSTRAP_ADMIN_USERNAME=admin \
+  -e DARKRIDE_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -hex 16)" \
+  -v darkride-data:/app/data \
+  ghcr.io/darkrideapp/darkride:latest
+
+docker logs darkride 2>&1 | grep -E "bootstrap|claim"   # find the admin password printed in logs
+```
+
+Open `http://localhost:3000/ui`. The container ships with Node 24 + Python 3.13 + `adb` + the mitmproxy/frida/pymobiledevice3 Python bridges, ready to talk to a USB-attached Android device once you mount it with `--device` (Linux hosts) or set up `adb connect` over the network.
+
+Tags available: `:latest` follows main; `:sha-<7chars>` pins to a specific build for rollback.
+
+### Install and Run (development)
 
 ```bash
 # Clone and install Node dependencies
