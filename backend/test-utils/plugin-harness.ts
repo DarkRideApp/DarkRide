@@ -176,12 +176,10 @@ const stubPaths = {
   fileStorage: (rel: string) => `/stub/${rel}`,
 } as any;
 
-/** Stub DispatcherApi — no-op. */
-const stubDispatcher = {
-  register: () => {},
-  unregister: () => {},
-  dispatch: async () => {},
-} as any;
+/** Stub DispatcherApi — callable that throws a helpful error. */
+const stubDispatcher = (() => {
+  throw new Error('dispatcher() not available in default stub — pass via coreServices.dispatcher');
+}) as any;
 
 // ---------------------------------------------------------------------------
 
