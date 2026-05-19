@@ -233,6 +233,50 @@ describe('createDispatcherApi — SOCKS5 connect callback', () => {
       );
     });
   });
+
+  it('propagates TLS handshake errors via the connect callback', async () => {
+    // SOCKS tunnel succeeds; TLS upgrade then fails. The connect
+    // callback must surface the TLS error, not silently complete.
+    const fakeRawSocket = { fake: 'raw' } as any;
+    vi.mocked(SocksClient.createConnection).mockResolvedValue({
+      socket: fakeRawSocket,
+    } as any);
+
+    const tlsErr = new Error('tls: handshake failed');
+    const fakeTlsSocket: any = {
+      once: vi.fn(),
+    };
+    fakeTlsSocket.once.mockImplementation((event: string, cb: any) => {
+      // Fire 'error' instead of 'secureConnect'
+      if (event === 'error') queueMicrotask(() => cb(tlsErr));
+      return fakeTlsSocket;
+    });
+    vi.mocked(tls.connect).mockReturnValue(fakeTlsSocket);
+
+    const api = createDispatcherApi();
+    const spec = {
+      type: 'socks5' as const,
+      host: 'us.socks.nordhold.net',
+      port: 1080,
+    };
+    api(spec);
+
+    const connectFn = (api as any).__testConnectFor(spec);
+    await new Promise<void>((resolve, reject) => {
+      connectFn(
+        { hostname: 'example.com', port: 443, protocol: 'https:' },
+        (err: any, socket: any) => {
+          try {
+            expect(err).toBe(tlsErr);
+            expect(socket).toBeNull();
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
+        },
+      );
+    });
+  });
 });
 
 describe('createDispatcherApi — lifecycle', () => {
