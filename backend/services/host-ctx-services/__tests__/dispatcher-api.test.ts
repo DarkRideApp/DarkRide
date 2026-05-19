@@ -234,3 +234,35 @@ describe('createDispatcherApi — SOCKS5 connect callback', () => {
     });
   });
 });
+
+describe('createDispatcherApi — lifecycle', () => {
+  it('closeAll() closes every pooled dispatcher and clears the pool', async () => {
+    const api = createDispatcherApi();
+    const a = api({ type: 'socks5', host: 'us.socks.nordhold.net', port: 1080 });
+    const b = api({ type: 'socks5', host: 'uk.socks.nordhold.net', port: 1080 });
+    // Mock close so the spy doesn't recurse into undici internals:
+    // DispatcherBase.close() with no callback wraps itself in a Promise
+    // by calling this.close(cb), which would double-count the spy.
+    const closeSpyA = vi.spyOn(a, 'close').mockResolvedValue();
+    const closeSpyB = vi.spyOn(b, 'close').mockResolvedValue();
+
+    await api.closeAll();
+
+    expect(closeSpyA).toHaveBeenCalledTimes(1);
+    expect(closeSpyB).toHaveBeenCalledTimes(1);
+
+    // After closeAll the pool is empty — next call constructs fresh
+    const aAgain = api({ type: 'socks5', host: 'us.socks.nordhold.net', port: 1080 });
+    expect(aAgain).not.toBe(a);
+  });
+
+  it('closeAll() does not throw when an individual close rejects', async () => {
+    const api = createDispatcherApi();
+    const a = api({ type: 'socks5', host: 'us.socks.nordhold.net', port: 1080 });
+    vi.spyOn(a, 'close').mockRejectedValue(new Error('drain timeout'));
+
+    // Should NOT propagate — closeAll uses Promise.allSettled, so a
+    // single bad agent doesn't block shutdown of the rest.
+    await expect(api.closeAll()).resolves.toBeUndefined();
+  });
+});
