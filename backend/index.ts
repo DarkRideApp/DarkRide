@@ -275,6 +275,8 @@ runner.setIosDeviceManager(iosDeviceManager);
 // pluginManager is initialized in the async startup IIFE but referenced in
 // shutdown() which lives at module scope — hoist the declaration here.
 let pluginManager: PluginManager | null = null;
+// dispatcherApi likewise: constructed during startup, closed during shutdown.
+let dispatcherApi: ReturnType<typeof createDispatcherApi> | null = null;
 
 // Initialize saved traffic store and wire to hook registry
 const savedTrafficStore = new SavedTrafficStore(db);
@@ -980,6 +982,7 @@ httpServer.listen(PORT, HOST, () => {
   // plugin context. Plugins access these via ctx.cloudStorage, ctx.notify(...),
   // ctx.runner, ctx.fileSync from start() onwards. Replaces the per-plugin
   // wiring.ts singleton pattern.
+  dispatcherApi = createDispatcherApi();
   pluginManager.wireCoreServices({
     cloudStorage,
     notify: (event) => notificationService.emit(event),
@@ -1026,7 +1029,7 @@ httpServer.listen(PORT, HOST, () => {
       },
     }),
     paths: createPathsApi({ absoluteLocalPath }),
-    dispatcher: createDispatcherApi(),
+    dispatcher: dispatcherApi,
   });
 
   // Give the apk analyzer access to the plugin hook bus so it can emit
@@ -1282,6 +1285,17 @@ async function shutdown() {
       await pluginManager.stopAll();
     } catch (err: any) {
       error(`pluginManager.stopAll error: ${err?.message ?? String(err)}`);
+    }
+  }
+
+  // Drain any pooled outbound HTTP dispatchers after plugin teardown.
+  // Plugin stop() handlers may still be flushing requests; closing
+  // before stopAll() would prematurely abort them.
+  if (dispatcherApi) {
+    try {
+      await dispatcherApi.closeAll();
+    } catch (err: any) {
+      error(`dispatcherApi.closeAll error: ${err?.message ?? String(err)}`);
     }
   }
 
