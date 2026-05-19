@@ -30,6 +30,7 @@ import type {
   WebsocketApi,
   ApkApi,
   PathsApi,
+  DispatcherApi,
 } from '@darkrideapp/plugin-sdk';
 import { registerEndpoint } from '../api/api-service';
 import { registerPluginScopes, type ScopeMetadata } from '../auth/scopes-registry';
@@ -104,6 +105,7 @@ export class PluginContextImpl implements PluginContext {
   private _websocket: WebsocketApi | null = null;
   private _apks: ApkApi | null = null;
   private _paths: PathsApi | null = null;
+  private _dispatcher: DispatcherApi | null = null;
   private loggerCache = new Map<string, PluginLogger>();
 
   constructor(
@@ -349,6 +351,20 @@ export class PluginContextImpl implements PluginContext {
       );
     }
     return this._paths;
+  }
+
+  setDispatcherApi(api: DispatcherApi): void {
+    this._dispatcher = api;
+  }
+
+  get dispatcher(): DispatcherApi {
+    if (this._dispatcher === null) {
+      throw new Error(
+        `Plugin "${this.pluginName}": ctx.dispatcher not available until plugin is fully loaded. ` +
+        `Access from start() or later, not register().`,
+      );
+    }
+    return this._dispatcher;
   }
 
   setAiFactory(factory: AiAgentFactory): void {

@@ -88,6 +88,7 @@ import { createAutomationsApi } from './services/host-ctx-services/automations-a
 import { createWebsocketApi } from './services/host-ctx-services/websocket-api';
 import { createApkApi } from './services/host-ctx-services/apk-api';
 import { createPathsApi } from './services/host-ctx-services/paths-api';
+import { createDispatcherApi } from './services/host-ctx-services/dispatcher-api';
 import { registerFilteredChannel } from './websocket/channel-registry';
 import { registerIosSyslogHandlers } from './websocket/ios-syslog-handlers';
 import { IosDeviceManager } from './services/ios-device-manager';
@@ -1025,6 +1026,7 @@ httpServer.listen(PORT, HOST, () => {
       },
     }),
     paths: createPathsApi({ absoluteLocalPath }),
+    dispatcher: createDispatcherApi(),
   });
 
   // Give the apk analyzer access to the plugin hook bus so it can emit

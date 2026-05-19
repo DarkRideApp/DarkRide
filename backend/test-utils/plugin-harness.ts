@@ -59,6 +59,7 @@ export interface CreateHarnessOptions {
     websocket: unknown;
     apks: unknown;
     paths: unknown;
+    dispatcher: unknown;
   }>;
 }
 
@@ -173,6 +174,13 @@ const stubApks = {
 /** Stub PathsApi — pass-through. */
 const stubPaths = {
   fileStorage: (rel: string) => `/stub/${rel}`,
+} as any;
+
+/** Stub DispatcherApi — no-op. */
+const stubDispatcher = {
+  register: () => {},
+  unregister: () => {},
+  dispatch: async () => {},
 } as any;
 
 // ---------------------------------------------------------------------------
@@ -296,6 +304,7 @@ export async function createPluginTestHarness(
       websocket: (opts.coreServices?.websocket ?? stubWebsocket) as any,
       apks: (opts.coreServices?.apks ?? stubApks) as any,
       paths: (opts.coreServices?.paths ?? stubPaths) as any,
+      dispatcher: (opts.coreServices?.dispatcher ?? stubDispatcher) as any,
     });
     await pluginManager.startAll();
   }

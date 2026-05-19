@@ -366,6 +366,7 @@ export class PluginManager {
     websocket: import('@darkrideapp/plugin-sdk').WebsocketApi;
     apks: import('@darkrideapp/plugin-sdk').ApkApi;
     paths: import('@darkrideapp/plugin-sdk').PathsApi;
+    dispatcher: import('@darkrideapp/plugin-sdk').DispatcherApi;
   }): void {
     for (const [, plugin] of this.plugins) {
       plugin.context.setCloudStorage(services.cloudStorage);
@@ -378,6 +379,7 @@ export class PluginManager {
       plugin.context.setWebsocketApi(services.websocket);
       plugin.context.setApksApi(services.apks);
       plugin.context.setPathsApi(services.paths);
+      plugin.context.setDispatcherApi(services.dispatcher);
     }
   }
 
