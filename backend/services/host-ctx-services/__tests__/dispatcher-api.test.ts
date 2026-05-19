@@ -266,3 +266,39 @@ describe('createDispatcherApi — lifecycle', () => {
     await expect(api.closeAll()).resolves.toBeUndefined();
   });
 });
+
+describe('createDispatcherApi — concurrent construction', () => {
+  it('50 concurrent calls with equal specs construct exactly one Agent', async () => {
+    const api = createDispatcherApi();
+    const spec = {
+      type: 'socks5' as const,
+      host: 'us.socks.nordhold.net',
+      port: 1080,
+      auth: { username: 'u', password: 'p' },
+    };
+
+    const results = await Promise.all(
+      Array.from({ length: 50 }, () => Promise.resolve(api(spec))),
+    );
+
+    const unique = new Set(results);
+    expect(unique.size).toBe(1);
+  });
+
+  it('mixed concurrent calls across distinct specs each construct exactly one Agent', async () => {
+    const api = createDispatcherApi();
+    const usSpec = { type: 'socks5' as const, host: 'us.socks.nordhold.net', port: 1080 };
+    const ukSpec = { type: 'socks5' as const, host: 'uk.socks.nordhold.net', port: 1080 };
+
+    const results = await Promise.all([
+      ...Array.from({ length: 25 }, () => Promise.resolve(api(usSpec))),
+      ...Array.from({ length: 25 }, () => Promise.resolve(api(ukSpec))),
+    ]);
+
+    const uniqueUs = new Set(results.slice(0, 25));
+    const uniqueUk = new Set(results.slice(25));
+    expect(uniqueUs.size).toBe(1);
+    expect(uniqueUk.size).toBe(1);
+    expect([...uniqueUs][0]).not.toBe([...uniqueUk][0]);
+  });
+});
