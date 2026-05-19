@@ -190,10 +190,15 @@ describe('SessionHistory', () => {
       await waitFor(() => {
         expect(screen.getByTestId('sessions-table')).toBeInTheDocument();
       });
+      // Flush the concurrent device-list fetch's pending commit — see the
+      // de-flake notes on 'opens confirmation dialog on bulk delete click'.
+      await act(async () => {});
 
       // Select first row
       fireEvent.click(screen.getByTestId('row-select-1'));
-      expect(screen.getByText('1 selected')).toBeInTheDocument();
+      // findByText (async) over getByText (sync) — React 18 may not have
+      // flushed the selection-state commit by the next assertion.
+      await screen.findByText('1 selected');
       expect(screen.getByTestId('bulk-delete-btn')).toBeInTheDocument();
     });
 
@@ -202,9 +207,12 @@ describe('SessionHistory', () => {
       await waitFor(() => {
         expect(screen.getByTestId('sessions-table')).toBeInTheDocument();
       });
+      // Flush the concurrent device-list fetch's pending commit — see the
+      // de-flake notes on 'opens confirmation dialog on bulk delete click'.
+      await act(async () => {});
 
       fireEvent.click(screen.getByTestId('select-all-checkbox'));
-      expect(screen.getByText('3 selected')).toBeInTheDocument();
+      await screen.findByText('3 selected');
     });
 
     it('opens confirmation dialog on bulk delete click', async () => {
@@ -235,10 +243,17 @@ describe('SessionHistory', () => {
       await waitFor(() => {
         expect(screen.getByTestId('sessions-table')).toBeInTheDocument();
       });
+      // Flush the concurrent device-list fetch's pending commit — see the
+      // de-flake notes on 'opens confirmation dialog on bulk delete click'.
+      await act(async () => {});
 
       fireEvent.click(screen.getByTestId('row-select-1'));
-      const bulkDeleteBtn = await screen.findByTestId('bulk-delete-btn');
-      fireEvent.click(bulkDeleteBtn);
+      // Anchor on selection-state propagation, not on the button rendering.
+      // The bulk-delete button only mounts once the selection set is non-empty,
+      // so finding '1 selected' first guarantees the button is already in
+      // the DOM and avoids a race against findByTestId's polling.
+      await screen.findByText('1 selected');
+      fireEvent.click(screen.getByTestId('bulk-delete-btn'));
 
       await waitFor(() => {
         expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
@@ -260,10 +275,14 @@ describe('SessionHistory', () => {
       await waitFor(() => {
         expect(screen.getByTestId('sessions-table')).toBeInTheDocument();
       });
+      // Flush the concurrent device-list fetch's pending commit — see the
+      // de-flake notes on 'opens confirmation dialog on bulk delete click'.
+      await act(async () => {});
 
       fireEvent.click(screen.getByTestId('row-select-1'));
-      const bulkDeleteBtn = await screen.findByTestId('bulk-delete-btn');
-      fireEvent.click(bulkDeleteBtn);
+      // Anchor on selection-state propagation, not on the button rendering.
+      await screen.findByText('1 selected');
+      fireEvent.click(screen.getByTestId('bulk-delete-btn'));
 
       await waitFor(() => {
         expect(screen.getByText('Cancel')).toBeInTheDocument();
