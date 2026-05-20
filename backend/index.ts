@@ -135,6 +135,8 @@ import { backfillFailedDiffs } from './services/apk-diff-backfill';
 import { createProviderRegistry } from './services/providers';
 import { createAdbDeviceProvider } from './services/providers/adb-device';
 import { createIosDeviceProvider } from './services/providers/ios-device';
+import { createDockerAndroidProvider } from './services/providers/docker-android';
+import { createDockerClient } from './services/providers/docker-helpers';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
@@ -865,6 +867,22 @@ httpServer.listen(PORT, HOST, () => {
   // Rehydrate any stored Pro license from the DB. Cheap (one row + one
   // JWS verify) so it can run before the slower phases below.
   await licenseService.init();
+
+  // docker-android — only register if the Docker daemon is reachable. The
+  // provider's isAvailable() check is async, so we do it here at boot time
+  // once rather than on every wizard load. Result is cached implicitly by
+  // the registration outcome — if Docker isn't running when DarkRide boots,
+  // the provider isn't available; user restarts DarkRide after starting
+  // Docker.
+  const dockerClient = createDockerClient();
+  const dockerAndroidProvider = createDockerAndroidProvider(dockerClient);
+  const dockerAvailability = await dockerAndroidProvider.isAvailable();
+  if (dockerAvailability.available) {
+    providerRegistry.register(dockerAndroidProvider);
+    log(`docker-android provider registered (Docker daemon detected)`);
+  } else {
+    log(`docker-android provider NOT registered: ${dockerAvailability.reason ?? 'daemon unreachable'}`);
+  }
 
   // Reconcile DB device_instances against what each provider currently reports.
   // Runs before plugins load so DB state is accurate before any plugin queries it.
