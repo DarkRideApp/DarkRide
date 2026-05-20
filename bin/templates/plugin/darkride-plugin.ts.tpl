@@ -1,10 +1,13 @@
 import { definePlugin } from '@darkrideapp/plugin-sdk';
+import { register{{pascalName}}Endpoints } from './backend/routes';
 
 export default definePlugin({
   name: '{{slug}}',
   // version is read from package.json#version at boot — do not duplicate it here.
 
   register(ctx) {
+    register{{pascalName}}Endpoints(ctx);
+
     ctx.nav([
       { group: 'Tools', label: '{{label}}', path: '/{{slug}}', icon: 'box' },
     ]);

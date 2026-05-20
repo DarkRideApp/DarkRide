@@ -7,7 +7,9 @@ describe('Kitchen Sink Plugin', () => {
     const definition = module.default;
 
     expect(definition.name).toBe('kitchen-sink');
-    expect(definition.version).toBe('0.1.0');
+    // definition.version is deprecated — the host reads package.json#version
+    // at boot. Asserting on the in-source field here would re-introduce the
+    // duplication this plugin is meant to demonstrate avoiding.
 
     const manager = new PluginManager();
     manager.loadPlugin(definition);

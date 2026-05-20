@@ -85,7 +85,7 @@ describe('Plugin System Integration', () => {
     const definition = module.default;
 
     expect(definition.name).toBe('kitchen-sink');
-    expect(definition.version).toBe('0.1.0');
+    // definition.version is deprecated — package.json#version is authoritative.
 
     const manager = new PluginManager();
     manager.loadPlugin(definition);

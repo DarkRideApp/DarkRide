@@ -4,7 +4,7 @@ import * as schema from './backend/schema';
 
 export default definePlugin({
   name: 'kitchen-sink',
-  version: '0.1.0',
+  // version is read from package.json#version at boot — see PluginDefinition.
 
   register(ctx) {
     // --- Extension Point: Routes ---

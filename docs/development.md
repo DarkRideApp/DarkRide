@@ -171,7 +171,7 @@ Push to your own plugin repo. Each private plugin's main branch is the source of
 
 ### Coordinating versions
 
-There's no formal versioning between core and plugins today. Both move together. If a plugin starts requiring a specific core API version, declare it via `darkride: '^X.Y.Z'` in the plugin's `package.json` (the field is read by the plugin loader; see `shared/plugins/types.ts`).
+There's no formal versioning between core and plugins today. Both move together. If a plugin starts requiring a specific core API version, declare it via `darkride: '^X.Y.Z'` in the `definePlugin({...})` call in `darkride-plugin.ts` (the field is read by the plugin loader at startup; see the `darkride` field on `PluginDefinition` in `@darkrideapp/plugin-sdk`).
 
 ## Troubleshooting
 

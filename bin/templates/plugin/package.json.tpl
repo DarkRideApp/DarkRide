@@ -5,6 +5,6 @@
   "keywords": ["darkride-plugin"],
   "description": "{{description}}",
   "peerDependencies": {
-    "@darkrideapp/plugin-sdk": "^1.0.0"
+    "@darkrideapp/plugin-sdk": "^1.4.0"
   }
 }
