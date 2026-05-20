@@ -132,6 +132,9 @@ import { AiAgentFactory } from './services/ai-agent-factory';
 import { AiCallLogger } from './services/ai-call-logger';
 import { ServiceUserManager } from './auth/service-user-manager';
 import { backfillFailedDiffs } from './services/apk-diff-backfill';
+import { createProviderRegistry } from './services/providers';
+import { createAdbDeviceProvider } from './services/providers/adb-device';
+import { createCaptureModeRegistry } from './services/capture-mode-registry';
 
 const { log, error } = createLoggers('server');
 
@@ -251,6 +254,24 @@ registerLicenseEndpoints(licenseService);
 
 // Initialize services
 const deviceManager = DeviceManager.getInstance(db);
+
+// Emulator support — provider abstraction (spec docs/specs/2026-05-20-emulator-support-design.md §4).
+// Phase 1 wires the registry + adb-device provider but does not yet drive it
+// from DeviceManager.start() — the legacy pollAdbDevices interval keeps
+// running. Phase 2 swaps the interval to call pollDevicesFromProviders.
+const providerRegistry = createProviderRegistry();
+providerRegistry.register(createAdbDeviceProvider());
+deviceManager.setProviderRegistry(providerRegistry);
+
+const captureModeRegistry = createCaptureModeRegistry();
+// The wireguard capture handler is a Phase 1 no-op shim. Phase 2 replaces
+// it with the real per-device capture setup that today lives inline in
+// DeviceManager's setup path.
+captureModeRegistry.register('wireguard', async (_instance, _cfg) => {
+  // Phase 1: no-op. See spec §5.
+});
+deviceManager.setCaptureModeRegistry(captureModeRegistry);
+
 const proxyRotator = new ProxyRotator(db);
 const bridgeManager = new PythonBridgeManager(db);
 const compiler = new AutomationCompiler();
