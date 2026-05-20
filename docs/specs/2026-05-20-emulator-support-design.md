@@ -30,7 +30,7 @@ Existing physical-Android support is preserved exactly via the `adb-device` prov
 - **Auto-install of the Android SDK** — license-acceptance flow + multi-arch + ongoing maintenance is more than v1 budget. The AVD provider detects + points at install instructions.
 - **Cross-provider migration** — moving an AVD's userdata into a Docker container, or vice versa. Each instance lives in its provider.
 - **Multi-host orchestration** — DarkRide manages emulators on the same host it runs on. Distributed setups (DarkRide on a laptop, emulators on a build farm) are not in scope.
-- **GPU passthrough toggle in the Docker provider** — defaults are sufficient. Power users can `docker run` themselves; their container appears via `adb-device`.
+- **Per-vendor GPU passthrough UI toggle in the Docker provider** — silent auto-detection of common cases ships in v1 (see §6.3); the explicit UI control for per-vendor mode selection is v2.
 - **Real-device USB-over-IP** — outside scope.
 - **Snapshot / restore** of AVDs and Docker containers. v2.
 
@@ -197,6 +197,13 @@ Extracted from the existing `device-manager.ts` polling loop. Most of the curren
 **Image strategy:** `ghcr.io/darkrideapp/docker-android:<android-version>` is published by a workflow in this repo. The Dockerfile is `FROM budtmo/docker-android:emulator_<version>` + `COPY wg-go /usr/local/bin/`, `COPY frida-server /usr/local/bin/`, plus a thin entrypoint wrapper. We track budtmo as upstream + ship our small diff. Pre-baked wg-go and Frida binaries in the image mean the runtime push step skips for Docker spawns (saves ~10–30s per launch).
 
 The **mitmproxy CA cert is NOT baked into the image** — it's regenerated per DarkRide install. The runtime CA install path (push via `adb push` + remount `/system` rw + drop into `/system/etc/security/cacerts/`) is the same as today's physical-device flow. The Docker image just needs to be a `userdebug` build with `/system` writable after `adb root` + remount, which budtmo already provides.
+
+**GPU passthrough (auto-detect, no UI knob):** at `startInstance` time the provider inspects the host:
+- On Linux, if `/dev/dri` exists, pass `--device /dev/dri:/dev/dri` to `docker run` (Intel/AMD GPU access for the emulator).
+- If the NVIDIA Container Toolkit is installed (detected by probing `docker info` for the `nvidia` runtime), pass `--gpus all` (NVIDIA GPU access).
+- On macOS / Windows, GPU-to-container passthrough is not practical; the provider falls back to software rendering and surfaces a one-line "GPU passthrough not available on this host — using software rendering" note in the wizard.
+
+Per-vendor explicit toggles (force-software, force-host-GPU, vendor-specific overrides) are deferred to v2. The auto-detect default covers the common Linux dev-machine and CI-runner cases for free.
 
 ### 6.4 `ios-device`
 
@@ -370,6 +377,8 @@ Steps:
 
 Target wall time: under 8 minutes on a `ubuntu-latest` runner with KVM nested virt. Acceptable to be slow — runs nightly.
 
+**Known flake rate.** Community reports ~5–10% spurious failure rate for Android emulator runs on hosted GitHub runners (boot timeout, adbd race, kernel quirks). v1 mitigates by **retry-once on boot failure** inside the workflow; only the second consecutive failure marks the run red. The nightly cadence makes this acceptable. If the rate degrades materially, the escape hatch is documented in §14 (deferred) — swap the runner label to a self-hosted runner; same workflow file.
+
 ### 11.4 Plugin SDK tests
 
 `packages/plugin-sdk/__tests__/device-providers.test.ts` — registration shape, type exports, capture-handler dispatch contract.
@@ -386,6 +395,7 @@ Devices page renders per-provider type badges + provider-aware action menus. Cre
 - **Docker container nesting with WG inside** — three network layers stacked. Likely works; debug pain if it doesn't. Same week-1 prototype validates both this and the previous risk.
 - **First-pull UX for the docker-android image** — 3GB is a real download. **Mitigation:** pre-pull check + UI progress + cancel button. Ship a smaller "lite" Android version (AOSP 11) as default for the "5-min onboarding" path.
 - **Reconcile-on-boot startup time** — user with 20 stopped instances + Docker daemon paused could slow boot if calls are sequential. **Mitigation:** parallelise per-provider, time-bound each call, surface partial results.
+- **Hosted-runner emulator flake on GitHub Actions** — community-reported ~5–10% spurious failure rate for Android emulators on `ubuntu-latest`. **Mitigation:** retry-once inside the workflow + nightly schedule absorbs occasional reruns. **Escape hatch:** self-hosted GitHub runner with the same workflow file (see §14).
 - **License acceptance for AVD SDK install hint** — Google's SDK license is interactive in some tooling. Our install hint just points at Android Studio / cmdline-tools; the user accepts via their installer of choice. No license-text in DarkRide.
 
 ---
@@ -411,7 +421,8 @@ The existing `device-manager.ts` (1200 lines) refactors into the orchestrator (~
 | iOS Simulator provider | ~3 days | Plugin lane, requires Mac contributor. `xcrun simctl`-driven. |
 | Cloud-farm providers (Corellium, BrowserStack, AWS Device Farm) | ~5 days each | Plugin lane. Open architecture — we don't gate on these. |
 | Snapshot / restore for AVDs + Docker containers | ~1 week | High value for test reproducibility. |
-| GPU passthrough config in Docker provider | ~2 days | Once a concrete request comes in. |
+| Per-vendor GPU passthrough UI toggle | ~2 days | Linux auto-detect ships in v1 (§6.3); v2 adds an explicit knob for force-software / force-host-GPU / vendor overrides. |
+| Self-hosted GitHub runner for E2E | ~0.5 day | If hosted-runner flake (§12) becomes intolerable. Same workflow file, just swap the `runs-on` label. |
 | Provider-defined capture modes beyond `wireguard` + `ios-bridge` | already supported | Architecture allows it (plugin `captureHandler`); we just don't ship one in v1. |
 
 ---
