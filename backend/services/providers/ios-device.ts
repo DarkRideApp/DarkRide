@@ -8,6 +8,13 @@ import type { DeviceProvider, DeviceProviderInstance, NetworkConfig, ProviderAva
  */
 export interface IosDeviceManagerLike {
   isAvailable(): boolean;
+  /**
+   * Snapshot of currently-known iOS devices. The `isOnline` field is
+   * optional with intentional defaulting: `undefined` is treated as
+   * "online" (state='running'); only an explicit `false` maps to
+   * state='stopped'. Mock authors should set `isOnline: false` to
+   * exercise the stopped path.
+   */
   getDevices(): Promise<Array<{ udid: string; name?: string | null; isOnline?: boolean }>>;
 }
 

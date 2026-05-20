@@ -1,3 +1,5 @@
+import { resolve } from 'path';
+import { existsSync } from 'fs';
 import { eq } from 'drizzle-orm';
 import { devices } from '../db/schema';
 import type { AppDatabase } from '../db/index';
@@ -115,8 +117,6 @@ export class IosDeviceManager {
     }
 
     const { spawn } = await import('child_process');
-    const { resolve } = await import('path');
-    const { existsSync } = await import('fs');
     const { ensureVenv } = await import('./python-bridge');
 
     const port = 9200;
@@ -513,11 +513,18 @@ export class IosDeviceManager {
   }
 
   /**
-   * Whether the Python iOS bridge is currently reachable. Used by the
-   * `ios-device` provider's `isAvailable()` check.
+   * Whether the iOS bridge prerequisites are installed on this host —
+   * specifically whether the Python `ios_bridge.py` script is present in
+   * the project. Returns `true` even if the bridge process is not
+   * currently running (the poller starts it lazily). The `bridgeReady`
+   * runtime state is a separate concern (see `start()` polling backoff)
+   * and is not exposed publicly.
+   *
+   * Used by the `ios-device` provider's `isAvailable()` check.
    */
   isAvailable(): boolean {
-    return this.bridgeReady;
+    const scriptPath = resolve(process.cwd(), 'python/ios_bridge.py');
+    return existsSync(scriptPath);
   }
 
   /**
