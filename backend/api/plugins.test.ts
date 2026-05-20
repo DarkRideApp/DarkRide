@@ -433,6 +433,66 @@ describe('Plugin API Endpoints', () => {
       expect(stateManager.setVersion).toHaveBeenCalledWith('demo-plugin-b', '1.5.0');
     });
 
+    it('rejects install when name collides with an existing workspace plugin', async () => {
+      // The installed plugin's definition.name is 'demo-plugin-b'. Stage
+      // a workspace plugin already registered under the same name. The
+      // install endpoint must refuse with 409 and roll back the npm
+      // install rather than letting the managed copy run migrations on
+      // a name the workspace copy will continue serving.
+      setupInstalledPlugin(tmpDataRoot, '@darkride/plugin-demo-b', 'demo-plugin-b', '1.0.1');
+      (installer.installManaged as ReturnType<typeof vi.fn>).mockResolvedValue({
+        success: true, pkgName: '@darkride/plugin-demo-b', resolvedRef: null, npmShasum: null,
+      });
+      stateManager = createMockStateManager({
+        get: vi.fn().mockImplementation((n: string) =>
+          n === 'demo-plugin-b'
+            ? { name: 'demo-plugin-b', installedVia: 'workspace', enabled: true }
+            : undefined,
+        ),
+      });
+      app = createApp(pluginManager, stateManager, installer, sourceManager, undefined, pluginInstallsRepo);
+
+      const res = await request(app)
+        .post('/v1/plugins/install')
+        .send({ npmPackage: '@darkride/plugin-demo-b' });
+
+      expect(res.status).toBe(409);
+      expect(res.body.success).toBe(false);
+      expect(res.body.nameCollision).toEqual({ existingSource: 'workspace' });
+      expect(pluginInstallsRepo.record).not.toHaveBeenCalled();
+      expect(stateManager.upsertManagedPending).not.toHaveBeenCalled();
+      // Rollback removed the tarball.
+      const rolledBack = rmSyncSpy.mock.calls.find(c => String(c[0]).endsWith('@darkride/plugin-demo-b'));
+      expect(rolledBack).toBeDefined();
+    });
+
+    it('allows install when name collides with a previous "missing" managed install (re-install path)', async () => {
+      // A user who uninstalled a managed plugin (or whose plugin row is
+      // marked 'missing' after a failed boot) should be able to
+      // reinstall the same name. The 'missing' state is the recovery
+      // path, not a collision.
+      setupInstalledPlugin(tmpDataRoot, '@darkride/plugin-demo-b', 'demo-plugin-b', '1.0.1');
+      (installer.installManaged as ReturnType<typeof vi.fn>).mockResolvedValue({
+        success: true, pkgName: '@darkride/plugin-demo-b', resolvedRef: null, npmShasum: null,
+      });
+      stateManager = createMockStateManager({
+        get: vi.fn().mockImplementation((n: string) =>
+          n === 'demo-plugin-b'
+            ? { name: 'demo-plugin-b', installedVia: 'missing', enabled: false }
+            : undefined,
+        ),
+      });
+      app = createApp(pluginManager, stateManager, installer, sourceManager, undefined, pluginInstallsRepo);
+
+      const res = await request(app)
+        .post('/v1/plugins/install')
+        .send({ npmPackage: '@darkride/plugin-demo-b' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(pluginInstallsRepo.record).toHaveBeenCalled();
+    });
+
     it('rejects missing npmPackage body field', async () => {
       const res = await request(app)
         .post('/v1/plugins/install')

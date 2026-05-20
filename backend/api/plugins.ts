@@ -347,6 +347,24 @@ export function registerPluginEndpoints(
         return;
       }
 
+      // Identity-collision gate: refuse the install if `definition.name`
+      // collides with a plugin already known to the host via a DIFFERENT
+      // source (workspace or npm). Without this, the managed plugin's
+      // migrations would run (creating tables under the collided name)
+      // while the workspace/npm plugin's code wins the load loop — the
+      // running code then sees a foreign schema.
+      const existing = stateManager.get(runtimeName);
+      if (existing && existing.installedVia !== 'managed' && existing.installedVia !== 'missing') {
+        delete require.cache[resolvedEntry];
+        try { rmSync(pkgDir, { recursive: true, force: true }); } catch (e) { log(`rollback rm -rf ${pkgDir} failed: ${e}`); }
+        res.status(409).json({
+          success: false,
+          error: `Plugin name "${runtimeName}" collides with an existing ${existing.installedVia} plugin. Uninstall or rename the existing plugin first.`,
+          nameCollision: { existingSource: existing.installedVia },
+        });
+        return;
+      }
+
       // Plugin peer dependency gate: refuse if any required peer is absent or
       // 'missing'. Roll back the npm install so the next attempt is clean.
       // Optional dependencies are deliberately not checked — they're "use if

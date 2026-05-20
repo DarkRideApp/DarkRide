@@ -936,9 +936,50 @@ httpServer.listen(PORT, HOST, () => {
     allDiscoveredCombined.map(p => ({ name: p.definition.name, definition: p.definition })),
   );
 
-  const byNameForMigrations = new Map(allDiscoveredCombined.map(p => [p.definition.name, p]));
+  // First-wins dedup: matches the load loop below so the plugin whose
+  // migrations are applied is the same plugin whose code will run. The
+  // Map constructor's last-wins semantics would otherwise pick the
+  // managed-installed copy of a name-collision while the load loop
+  // picks the workspace copy, leaving the running code with a foreign
+  // schema. See plugins.ts identity-collision gate for the install-side
+  // prevention.
+  const byNameForMigrations = new Map<string, typeof allDiscoveredCombined[number]>();
+  const collisions: Array<{ name: string; chosen: string; rejected: string }> = [];
+  for (const p of allDiscoveredCombined) {
+    const existing = byNameForMigrations.get(p.definition.name);
+    if (existing) {
+      collisions.push({
+        name: p.definition.name,
+        chosen: existing.source ?? 'npm',
+        rejected: p.source ?? 'npm',
+      });
+      continue;
+    }
+    byNameForMigrations.set(p.definition.name, p);
+  }
+  for (const c of collisions) {
+    // Disable the losing managed install (if any) + record a structured
+    // error so the user can find it in the plugin manager UI. Workspace
+    // and npm wins are not auto-disabled — they're the dev source of
+    // truth and you'd be fighting `rm -rf` for npm.
+    if (c.rejected === 'managed') {
+      log(`WARNING: managed plugin "${c.name}" collides with ${c.chosen} install — disabling managed copy`);
+      try {
+        pluginStateManager.setEnabled(c.name, false);
+        pluginStateManager.setLastError(
+          c.name,
+          `Name collides with an existing ${c.chosen} plugin. Uninstall the ${c.chosen} copy or rename this plugin to load both.`,
+        );
+      } catch (e: any) {
+        error(`Failed to record collision state for "${c.name}": ${e?.message ?? e}`);
+      }
+    } else {
+      log(`WARNING: plugin "${c.name}" present from both ${c.chosen} and ${c.rejected} — using ${c.chosen}`);
+    }
+  }
   const pluginsForMigration = loadOrderForMigrations
-    .map(name => byNameForMigrations.get(name)!)
+    .map(name => byNameForMigrations.get(name))
+    .filter((p): p is NonNullable<typeof p> => p !== undefined)
     .map(p => ({ name: p.definition.name, path: p.path }));
 
   // Track plugins whose migrations failed so we skip loading them below
