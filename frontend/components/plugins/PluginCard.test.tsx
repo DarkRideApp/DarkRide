@@ -57,6 +57,31 @@ describe('PluginCard managed-disabled badge', () => {
   });
 });
 
+describe('PluginCard lastError banner', () => {
+  // A plugin auto-disabled by the host (e.g. failed migration) needs to
+  // surface WHY — otherwise it looks identical to "user disabled this".
+  const fixture = "kitchen-sink:0001_broken.sql: near 'BANANA': syntax error";
+
+  it('renders the auto-disabled banner with the host error message', () => {
+    render(<PluginCard {...baseProps} enabled={false} lastError={fixture} />);
+    expect(screen.getByText(/Auto-disabled by host/i)).toBeInTheDocument();
+    expect(screen.getByText(/syntax error/i)).toBeInTheDocument();
+  });
+
+  it('does NOT render the banner when lastError is null/undefined', () => {
+    render(<PluginCard {...baseProps} enabled={false} />);
+    expect(screen.queryByText(/Auto-disabled by host/i)).not.toBeInTheDocument();
+  });
+
+  it('renders the banner even on an enabled plugin (lastError sticks until next successful boot)', () => {
+    // A plugin can be re-enabled by the user but still have a stale
+    // lastError until the next clean boot clears it. Surface it so the
+    // user knows why it was disabled and that a restart is needed.
+    render(<PluginCard {...baseProps} enabled={true} lastError={fixture} />);
+    expect(screen.getByText(/Auto-disabled by host/i)).toBeInTheDocument();
+  });
+});
+
 const updateBaseProps = {
   name: 'maps',
   version: '1.0.0',

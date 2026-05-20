@@ -1,5 +1,5 @@
 import React from 'react';
-import { Package, ToggleLeft, ToggleRight, Trash2, RefreshCw, ShieldCheck, ShieldAlert, ShieldX } from 'lucide-react';
+import { Package, ToggleLeft, ToggleRight, Trash2, RefreshCw, ShieldCheck, ShieldAlert, ShieldX, AlertTriangle } from 'lucide-react';
 
 interface PluginCardProps {
   name: string;
@@ -18,6 +18,13 @@ interface PluginCardProps {
   updateAvailable?: boolean;
   /** True while an update is in flight; disables the Update button + shows spinner. */
   updating?: boolean;
+  /**
+   * Structured error from the host (e.g. migration failure that triggered
+   * an auto-disable). When set, surface it on the card so the user knows
+   * why the plugin was disabled — without this, an auto-disabled plugin
+   * looks identical to a user-disabled one.
+   */
+  lastError?: string | null;
   onEnable: () => void;
   onDisable: () => void;
   onUninstall: () => void;
@@ -40,6 +47,7 @@ export function PluginCard({
   latestVersion,
   updateAvailable,
   updating,
+  lastError,
   onEnable,
   onDisable,
   onUninstall,
@@ -113,6 +121,16 @@ export function PluginCard({
           </button>
         </div>
       </div>
+
+      {lastError && (
+        <div className="plugin-card-error-banner" role="alert">
+          <AlertTriangle size={14} aria-hidden style={{ flexShrink: 0 }} />
+          <div>
+            <strong>Auto-disabled by host.</strong>
+            <pre className="plugin-card-error-message">{lastError}</pre>
+          </div>
+        </div>
+      )}
 
       {description && <p className="plugin-card-description">{description}</p>}
       {author && <div className="plugin-card-author">by {author}</div>}

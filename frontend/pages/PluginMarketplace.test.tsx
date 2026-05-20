@@ -219,6 +219,61 @@ describe('PluginMarketplace', () => {
     });
   });
 
+  it('shows a name-collision message when install returns 409 with nameCollision', async () => {
+    // The install endpoint refuses with 409 when the would-be runtime name
+    // collides with a workspace/npm plugin. The toast must tell the user
+    // what's wrong AND what to do, not just show the raw 409 body.
+    const ws = createMockWs({
+      sendRestApi: vi.fn().mockImplementation((method: string, path: string) => {
+        if (method === 'GET' && path === '/v1/plugins/marketplace') {
+          return Promise.resolve({
+            type: 'restapi',
+            id: '1',
+            status: 200,
+            body: {
+              success: true,
+              data: { sources: [], plugins: [mockMarketplacePlugins[1]] }, // demo-plugin
+            },
+          });
+        }
+        if (method === 'GET' && path === '/v1/plugins/installed') {
+          return Promise.resolve({
+            type: 'restapi',
+            id: '2',
+            status: 200,
+            body: { success: true, data: { plugins: [], darkrideVersion: '1.5.0' } },
+          });
+        }
+        if (method === 'POST' && path === '/v1/plugins/install') {
+          return Promise.resolve({
+            type: 'restapi',
+            id: '3',
+            status: 409,
+            body: {
+              success: false,
+              error: 'Plugin name "demo-plugin" collides with an existing workspace plugin. Uninstall or rename the existing plugin first.',
+              nameCollision: { existingSource: 'workspace' },
+            },
+          });
+        }
+        return Promise.resolve({ type: 'restapi', id: '4', status: 200, body: { success: true } });
+      }),
+    });
+    renderMarketplace(ws);
+
+    await waitFor(() => {
+      expect(screen.getByText('Demo Plugin')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Install'));
+
+    await waitFor(() => {
+      // The toast wrapper renders to a portal — query for the structured
+      // workspace-collision message.
+      expect(screen.getByText(/Name conflicts with an existing workspace plugin/i)).toBeInTheDocument();
+    });
+  });
+
   it('install button uses installUrl for git sources', async () => {
     // Only show the git plugin so we know which button to click
     const ws = createMockWs({

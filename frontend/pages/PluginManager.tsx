@@ -22,6 +22,8 @@ interface InstalledPlugin {
   extensionPoints?: { tools: number; pages: number; settings: number };
   updateAvailable?: boolean;
   latestVersion?: string;
+  /** Set by the host when a fatal error (e.g. migration failure) auto-disabled the plugin. */
+  lastError?: string | null;
 }
 
 /** Shape returned by GET /v1/plugins/:name/scope-status */
@@ -390,6 +392,7 @@ export function PluginManager() {
                   latestVersion={plugin.latestVersion}
                   updateAvailable={plugin.updateAvailable}
                   updating={updatingNames.has(plugin.name)}
+                  lastError={plugin.lastError}
                   onUpdate={plugin.updateAvailable ? () => handleUpdate(plugin.name) : undefined}
                   actions={hasSettings(plugin.name) ? (
                     <Link

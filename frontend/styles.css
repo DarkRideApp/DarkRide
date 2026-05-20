@@ -6715,6 +6715,9 @@ body.live-log-open .ai-chat-fab {
 .plugin-card-author { font-size: 12px; color: var(--text-tertiary); }
 .plugin-card-extensions { display: flex; gap: 12px; margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
 .plugin-card-warning { display: block; margin-top: 8px; font-size: 12px; color: var(--warning-text, #d4a72c); }
+.plugin-card-error-banner { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; padding: 10px 12px; background: rgba(239, 68, 68, 0.08); border: 1px solid var(--danger, #ef4444); border-radius: 6px; font-size: 13px; color: var(--danger-text, #ef4444); }
+.plugin-card-error-banner strong { display: block; margin-bottom: 4px; font-weight: 600; }
+.plugin-card-error-message { margin: 0; font-family: var(--font-mono, monospace); font-size: 12px; white-space: pre-wrap; word-break: break-word; color: var(--text-primary); }
 
 /* Scope Consent Modal */
 .scope-consent-body { padding: 4px 0; }

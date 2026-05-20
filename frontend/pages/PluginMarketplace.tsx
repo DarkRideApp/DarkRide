@@ -187,6 +187,14 @@ export function PluginMarketplace() {
       // RestartBanner picks up the backend's setRestartRequired(...) state
       // via useRestartRequired() and renders the banner + button itself.
       fetchPlugins();
+    } else if (res.body?.nameCollision) {
+      // 409 from the identity-collision gate. Re-frame the raw error
+      // into something actionable — the host's error string is already
+      // good, but prefix with a clear "what's wrong" headline.
+      const src = res.body.nameCollision.existingSource;
+      toast.error(`Name conflicts with an existing ${src} plugin. Uninstall the ${src} copy or rename this plugin to install both.`);
+    } else if (res.body?.contentMismatch) {
+      toast.error(`Refused: signed-manifest content pin mismatch. ${res.body.error ?? ''}`);
     } else {
       toast.error(res.body?.error || `Failed to install ${plugin.displayName}`);
     }
@@ -208,6 +216,11 @@ export function PluginMarketplace() {
     if (res.body?.success) {
       toast.success(`${plugin.displayName} installed. Restart to activate.`);
       fetchPlugins();
+    } else if (res.body?.nameCollision) {
+      const src = res.body.nameCollision.existingSource;
+      toast.error(`Name conflicts with an existing ${src} plugin. Uninstall the ${src} copy or rename this plugin to install both.`);
+    } else if (res.body?.contentMismatch) {
+      toast.error(`Refused: signed-manifest content pin mismatch. ${res.body.error ?? ''}`);
     } else {
       toast.error(res.body?.error || 'Install failed');
     }
