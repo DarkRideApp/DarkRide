@@ -874,7 +874,11 @@ httpServer.listen(PORT, HOST, () => {
       }
       const result = await pluginInstaller.installManaged(target, authToken);
       if (!result.success) {
-        const hint = !authToken && (target.startsWith('git+') || target.includes('github.com'))
+        // Hint only on git URLs (where auth is the most likely culprit).
+        // Bare package names like "@scope/foo" never need auth tokens, so
+        // dropping that case avoids a misleading "is this a private repo?"
+        // hint when the failure is something else (network, npm 404, etc.).
+        const hint = !authToken && target.startsWith('git+')
           ? ' (no auth token available — if this is a private repo, reinstall via the marketplace UI to refresh credentials)'
           : '';
         error(`Plugin install replay failed: ${row.name} — ${result.error}${hint}`);
