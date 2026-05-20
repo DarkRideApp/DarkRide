@@ -16,6 +16,8 @@ import type { DeviceFilter } from '../../shared/types/api';
 import { matchesDeviceFilter, migrateDeviceFilter } from '../../shared/lib/device-filter';
 import { getMitmproxyConfdir } from './mitmproxy-manager';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
+import type { ProviderRegistry } from './providers';
+import type { CaptureModeRegistry } from './capture-mode-registry';
 
 const execFileAsync = promisify(execFile);
 
@@ -265,11 +267,32 @@ export class DeviceManager {
   private stayAwakeDevices = new Set<string>(); // devices with stay_on_while_plugged_in enabled
   private offlineListeners: Array<(deviceId: string) => void> = [];
   private hookBus: HookBus | null = null;
+  private providerRegistry: ProviderRegistry | null = null;
+  private captureModeRegistry: CaptureModeRegistry | null = null;
 
   constructor(private db: AppDatabase) {}
 
   setHookBus(bus: HookBus): void {
     this.hookBus = bus;
+  }
+
+  /**
+   * Wire the provider registry. Once wired, `pollDevicesFromProviders()`
+   * routes device discovery through registered DeviceProviders instead of
+   * the legacy inline `adb devices` parsing. Existing `pollAdbDevices()`
+   * remains as the no-registry fallback during the refactor.
+   */
+  setProviderRegistry(reg: ProviderRegistry): void {
+    this.providerRegistry = reg;
+  }
+
+  /**
+   * Wire the capture-mode registry for per-mode capture dispatch.
+   * Phase 1 wires a no-op stub for `wireguard` mode; Phase 2 replaces it
+   * with the real handler.
+   */
+  setCaptureModeRegistry(reg: CaptureModeRegistry): void {
+    this.captureModeRegistry = reg;
   }
 
   /** Register a callback to check if a device has active stream viewers. */
@@ -450,6 +473,47 @@ export class DeviceManager {
       }
     } catch (err: any) {
       error(`ADB poll failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * New provider-driven polling path. Asks the registry for all instances
+   * across all registered providers and upserts them into the devices
+   * table. Falls through (returns early) if no registry is wired —
+   * backwards-compat for the refactor period.
+   *
+   * Phase 1 only: inserts new serials / updates lastSeen for existing ones.
+   * Root checks and property collection are ADB-specific and remain in
+   * `pollAdbDevices`; they will be wired in Phase 2 once the provider
+   * contract surfaces those capabilities.
+   */
+  async pollDevicesFromProviders(): Promise<void> {
+    if (!this.providerRegistry) {
+      return;
+    }
+    const all = await this.providerRegistry.listInstancesAll();
+    for (const row of all) {
+      if (!row.instance.serial) continue;
+      const id = row.instance.serial;
+
+      const existing = this.db
+        .select()
+        .from(devices)
+        .where(eq(devices.id, id))
+        .all();
+
+      if (existing.length === 0) {
+        log(`New device discovered via provider ${row.providerId}: ${id}`);
+        this.db.insert(devices).values({
+          id,
+          lastSeen: new Date(),
+        }).run();
+      } else {
+        this.db.update(devices)
+          .set({ lastSeen: new Date() })
+          .where(eq(devices.id, id))
+          .run();
+      }
     }
   }
 
