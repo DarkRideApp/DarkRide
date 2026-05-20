@@ -1034,6 +1034,73 @@ describe('Plugin API Endpoints', () => {
       expect(res.body.error).toContain('name');
     });
 
+    it('refuses update when the new tarball renames definition.name', async () => {
+      // The update endpoint must NOT silently absorb a definition.name
+      // change — that would orphan the prior plugin_state row's data
+      // (settings, tables, peer references) when the next boot's
+      // reconcile inserts a fresh row under the new name. The author
+      // should bump the npm package name to switch identities; we
+      // refuse rather than corrupt the user's state.
+      setupInstalledPlugin(tmpDataRoot, '@darkride/plugin-renamed', 'new-runtime-name', '2.0.0');
+      stateManager = createMockStateManager({
+        get: vi.fn().mockReturnValue({
+          name: 'old-runtime-name',
+          npmPackage: '@darkride/plugin-renamed',
+          installedVia: 'managed',
+        }),
+      });
+      installer = createMockInstaller({
+        update: vi.fn().mockResolvedValue({
+          success: true,
+          pkgName: '@darkride/plugin-renamed',
+          resolvedRef: null,
+          npmShasum: null,
+        }),
+      });
+      app = createApp(pluginManager, stateManager, installer, sourceManager, undefined, pluginInstallsRepo);
+
+      const res = await request(app)
+        .post('/v1/plugins/update')
+        .send({ name: 'old-runtime-name' });
+
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.identityChanged).toEqual({
+        previous: 'old-runtime-name',
+        attempted: 'new-runtime-name',
+      });
+      // setVersion must NOT have been called — the rename gate fires
+      // before version persistence, leaving the state row clean.
+      expect(stateManager.setVersion).not.toHaveBeenCalled();
+    });
+
+    it('allows update when definition.name is unchanged', async () => {
+      setupInstalledPlugin(tmpDataRoot, '@darkride/plugin-stable', 'stable-name', '2.0.0');
+      stateManager = createMockStateManager({
+        get: vi.fn().mockReturnValue({
+          name: 'stable-name',
+          npmPackage: '@darkride/plugin-stable',
+          installedVia: 'managed',
+        }),
+      });
+      installer = createMockInstaller({
+        update: vi.fn().mockResolvedValue({
+          success: true,
+          pkgName: '@darkride/plugin-stable',
+          resolvedRef: null,
+          npmShasum: null,
+        }),
+      });
+      app = createApp(pluginManager, stateManager, installer, sourceManager, undefined, pluginInstallsRepo);
+
+      const res = await request(app)
+        .post('/v1/plugins/update')
+        .send({ name: 'stable-name' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+
     it('content pin: rolls back and 400s when post-update artefact does not match signed manifest', async () => {
       // Simulates registry tampering between install and update: the
       // marketplace's signed manifest pins npmShasum=A but the freshly

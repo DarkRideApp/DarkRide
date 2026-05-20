@@ -59,13 +59,17 @@ describe('Kitchen Sink Plugin', () => {
     expect(criticalEvent!.type).toBe('kitchen-sink:critical-test');
   });
 
-  it('registers routes via ctx.routes()', async () => {
+  it('declares no routes from register() (routes are deferred to start())', async () => {
+    // Routes that depend on services like ctx.files() must wait for the
+    // service registry to be wired. kitchen-sink moved its route setup
+    // into start() so handler closures can capture services directly,
+    // instead of using a lazy getter that hides the dependency. The
+    // integration test (which runs the full register→start lifecycle)
+    // is the canonical place that asserts routes are present.
     const module = await import('../darkride-plugin');
     const manager = new PluginManager();
     manager.loadPlugin(module.default);
-
-    const routeSetups = manager.getAllRouteSetups();
-    expect(routeSetups.length).toBeGreaterThanOrEqual(1);
+    expect(manager.getAllRouteSetups()).toHaveLength(0);
   });
 
   it('registers DB tables via ctx.dbTables()', async () => {
@@ -124,14 +128,9 @@ describe('Kitchen Sink Plugin', () => {
     expect(() => hookBus.emit('device:connected', { id: 'test-device' })).not.toThrow();
   });
 
-  it('uses ctx.files() for route file serving', async () => {
-    const module = await import('../darkride-plugin');
-    const manager = new PluginManager();
-    manager.loadPlugin(module.default);
-
-    // ctx.files() is wired after register(), so it's used lazily inside routes.
-    // Verify that route setups were registered (they use ctx.files() internally).
-    const routeSetups = manager.getAllRouteSetups();
-    expect(routeSetups.length).toBeGreaterThanOrEqual(1);
-  });
+  // Note: the "ctx.files() route file serving" coverage moved to the
+  // integration test (Kitchen Sink Integration > "start()-registered
+  // route is reachable"). Loading the plugin without running start()
+  // intentionally produces zero routes — see "declares no routes from
+  // register()" above.
 });

@@ -852,39 +852,17 @@ httpServer.listen(PORT, HOST, () => {
   // Replay any managed installs whose disk state has been wiped.
   // (`npm ci` on a fresh deploy doesn't touch data/, but a redeployed box
   //  with empty data/ would.)
+  const { replayMissingInstalls } = await import('./services/replay-missing-installs');
   const managedRoot = pathJoin(getDataRoot(), 'installed-plugins');
   const managedNodeModules = pathJoin(managedRoot, 'node_modules');
-  const missingInstalls = pluginInstallsRepo.getMissingDirs(managedNodeModules);
-  if (missingInstalls.length > 0) {
-    log(`Replaying ${missingInstalls.length} managed plugin install(s)...`);
-    for (const row of missingInstalls) {
-      const target = row.resolvedRef
-        ? `${row.sourceUrl}#${row.resolvedRef}`
-        : row.sourceUrl;
-      // Auth token resolution order:
-      // 1. The token persisted on the install row at install time.
-      // 2. As a fallback for pre-0090 rows (authToken=null), look up the
-      //    originating source — but only if it still exists.
-      // 3. Give up. The install will fail for private repos; we log
-      //    once per missing-cred replay so the user can investigate.
-      let authToken: string | null = row.authToken;
-      if (!authToken && row.sourceId != null && pluginSourceManager) {
-        const src = pluginSourceManager.getAll().find((s: any) => s.id === row.sourceId);
-        if (src?.authToken) authToken = src.authToken;
-      }
-      const result = await pluginInstaller.installManaged(target, authToken);
-      if (!result.success) {
-        // Hint only on git URLs (where auth is the most likely culprit).
-        // Bare package names like "@scope/foo" never need auth tokens, so
-        // dropping that case avoids a misleading "is this a private repo?"
-        // hint when the failure is something else (network, npm 404, etc.).
-        const hint = !authToken && target.startsWith('git+')
-          ? ' (no auth token available — if this is a private repo, reinstall via the marketplace UI to refresh credentials)'
-          : '';
-        error(`Plugin install replay failed: ${row.name} — ${result.error}${hint}`);
-      }
-    }
-  }
+  await replayMissingInstalls({
+    installsRepo: pluginInstallsRepo,
+    installer: pluginInstaller,
+    sourceManager: pluginSourceManager ?? null,
+    managedNodeModules,
+    log,
+    logError: error,
+  });
 
   const npmDiscovered = await discoverNpmPlugins();
   const managedDiscovered = await discoverNpmPlugins(managedNodeModules, 'managed');

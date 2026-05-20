@@ -40,11 +40,15 @@ describe('createPluginTestHarness', () => {
     expect(metadata[0].name).toBe('kitchen-sink');
   });
 
-  it('registers plugin routes on Express app', async () => {
-    harness = await createPluginTestHarness('plugins/kitchen-sink');
-    // Kitchen-sink registers /v1/kitchen-sink/items
+  it('registers plugin routes on Express app (start: true picks up start()-phase routes)', async () => {
+    // Kitchen-sink now registers /v1/kitchen-sink/items in start(), not
+    // register(). The harness must run the full lifecycle to surface
+    // start()-phase routes — verify that by asking with start: true.
+    harness = await createPluginTestHarness({
+      pluginDir: 'plugins/kitchen-sink',
+      start: true,
+    });
     const res = await request(harness.app).get('/v1/kitchen-sink/items');
-    // Should respond with 200, not 404
     expect(res.status).not.toBe(404);
   });
 

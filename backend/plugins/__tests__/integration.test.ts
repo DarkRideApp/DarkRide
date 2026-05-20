@@ -105,7 +105,11 @@ describe('Plugin System Integration', () => {
     expect(manager.getAllAiTools()).toHaveLength(0);
     expect(manager.getAllJobs()).toHaveLength(1);
     expect(manager.getAllJobs()[0].id).toBe('kitchen-sink-heartbeat');
-    expect(manager.getAllRouteSetups()).toHaveLength(1);
+    // Routes are registered in start() now, not register(). Loading the
+    // plugin without running startAll() intentionally yields zero routes —
+    // see plugins/kitchen-sink/__tests__/plugin-load.test.ts and the
+    // integration test in plugin-harness.test.ts (which uses start: true).
+    expect(manager.getAllRouteSetups()).toHaveLength(0);
 
     expect(manager.getAllTools()).toHaveLength(1);
     expect(manager.getAllTools()[0].name).toBe('kitchen_sink_greet');

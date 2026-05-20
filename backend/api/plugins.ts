@@ -624,6 +624,51 @@ export function registerPluginEndpoints(
         }
       }
 
+      // Identity check: refuse the update if the new tarball ships a
+      // different `definition.name`. Plugin renames across versions
+      // would otherwise orphan the old state row (settings, data,
+      // peer-consumer references) when the next boot's reconcile
+      // inserts a fresh row under the new name. The author should
+      // bump the npm package name (or do uninstall+reinstall manually)
+      // to switch identities — silent rename here would be a worse
+      // surprise.
+      const updatedPkgDir = safeJoinInside(getDataRoot(), 'installed-plugins', 'node_modules', state.npmPackage);
+      const updatedEntryCandidates = ['darkride-plugin.js', 'darkride-plugin.ts'].map(f => join(updatedPkgDir, f));
+      let updatedEntry: string | undefined = updatedEntryCandidates.find(existsSync);
+      const updatedPkgJsonPath = safeJoinInside(updatedPkgDir, 'package.json');
+      if (!updatedEntry && existsSync(updatedPkgJsonPath)) {
+        try {
+          const pkg = JSON.parse(readFileSync(updatedPkgJsonPath, 'utf-8'));
+          if (typeof pkg?.main === 'string') {
+            const main = safeJoinInside(updatedPkgDir, pkg.main);
+            if (existsSync(main)) updatedEntry = main;
+          }
+        } catch {
+          // Malformed package.json — fall through; the identity check
+          // will be skipped and a subsequent boot will surface the issue.
+        }
+      }
+      if (updatedEntry) {
+        try {
+          const resolved = require.resolve(updatedEntry);
+          delete require.cache[resolved];
+          const imported = require(resolved);
+          const definition = imported?.default?.default ?? imported?.default ?? imported;
+          const newRuntimeName = typeof definition?.name === 'string' ? definition.name : null;
+          if (newRuntimeName && newRuntimeName !== state.name) {
+            res.status(400).json({
+              success: false,
+              error: `Refusing update — plugin "${state.name}" renamed itself to "${newRuntimeName}" in this version. The author should bump the npm package name to publish a renamed plugin; uninstall and reinstall manually to switch identities.`,
+              identityChanged: { previous: state.name, attempted: newRuntimeName },
+            });
+            return;
+          }
+          delete require.cache[resolved];
+        } catch {
+          // Loading the new entry failed — let the next boot decide.
+        }
+      }
+
       // Read the freshly-installed package.json for the new version and
       // persist it. Without this, /v1/plugins/installed keeps reporting
       // the old version (set by reconcile on a previous boot), so the

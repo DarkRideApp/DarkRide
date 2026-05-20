@@ -7,15 +7,9 @@ export default definePlugin({
   // version is read from package.json#version at boot — see PluginDefinition.
 
   register(ctx) {
-    // --- Extension Point: Routes ---
-    // Routes need ctx.files(), which is wired after register().
-    // We pass a getter that resolves lazily at request time.
-    ctx.routes((router) => {
-      const getFiles = () => { try { return ctx.files(); } catch { return undefined; } };
-      setupRoutes(router, getFiles);
-    });
-
     // --- Extension Point: DB Tables ---
+    // register() is the right place for declarative contributions like
+    // schema, nav, pages — no services available yet, but none needed.
     ctx.dbTables(schema);
 
     // --- Extension Point: Nav ---
@@ -127,6 +121,17 @@ export default definePlugin({
 
   async start(ctx) {
     const logger = ctx.logger();
+
+    // --- Extension Point: Routes ---
+    // Register routes here (not in register()) so handlers can close over
+    // services constructed at start time. Capturing `ctx.files()` once
+    // and passing it via a closure beats the older "lazy getter inside
+    // the handler" pattern — it makes the lifecycle dependency obvious
+    // and removes the runtime try/catch dance.
+    const files = ctx.files();
+    ctx.routes((router) => {
+      setupRoutes(router, () => files);
+    });
 
     // ─── Extension Point: ctx.settings (read/write KV at runtime) ───────
     // Plugins access the host's settings table via ctx.settings — works
