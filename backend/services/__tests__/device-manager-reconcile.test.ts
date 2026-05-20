@@ -43,7 +43,7 @@ describe('reconcileWithProviders', () => {
     ]);
     const reg = makeMockRegistry({ 'docker-android': [] });
     await reconcileWithProviders(reg, repo);
-    expect(repo.updateState).toHaveBeenCalledWith(1, 'stopped', expect.any(String));
+    expect(repo.updateState).toHaveBeenCalledWith(1, 'stopped');
   });
 
   it('Case B: in provider, not in DB → insert (BYOE auto-discovery)', async () => {

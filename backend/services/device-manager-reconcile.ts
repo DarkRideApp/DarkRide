@@ -33,7 +33,10 @@ export async function reconcileWithProviders(
   for (const r of dbRows) {
     const key = `${r.providerId}::${r.runtimeId}`;
     if (!providerByKey.has(key) && r.state !== 'stopped' && r.state !== 'error') {
-      repo.updateState(r.id, 'stopped', 'provider no longer reports this instance');
+      // We don't store a "why" string here — DeviceInstancesRepo only persists
+      // lastError when state === 'error'. If you want a stored diagnostic for
+      // disappeared devices, transition state to 'error' instead.
+      repo.updateState(r.id, 'stopped');
     }
   }
 
