@@ -138,6 +138,7 @@ import { createIosDeviceProvider } from './services/providers/ios-device';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
+import { registerDevicesProvidersEndpoints } from './api/devices-providers';
 
 const { log, error } = createLoggers('server');
 
@@ -867,7 +868,9 @@ httpServer.listen(PORT, HOST, () => {
 
   // Reconcile DB device_instances against what each provider currently reports.
   // Runs before plugins load so DB state is accurate before any plugin queries it.
-  await reconcileWithProviders(providerRegistry, new DeviceInstancesRepo(db));
+  const deviceInstancesRepo = new DeviceInstancesRepo(db);
+  await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
+  registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo);
 
   // Phase 1: Python environment
   setStartupPhase('preparing_python', 'Preparing Python environment...');
