@@ -512,6 +512,35 @@ export class IosDeviceManager {
     return this.busyDevices.has(deviceId);
   }
 
+  /**
+   * Whether the Python iOS bridge is currently reachable. Used by the
+   * `ios-device` provider's `isAvailable()` check.
+   */
+  isAvailable(): boolean {
+    return this.bridgeReady;
+  }
+
+  /**
+   * Snapshot of currently-known iOS devices. Reads the UDIDs from the
+   * online set and joins with the device-name cache; cheaper than another
+   * round-trip to the Python bridge.
+   *
+   * Used by the `ios-device` provider's `listInstances()`. The shape is
+   * deliberately minimal — providers map further into DeviceProviderInstance.
+   */
+  async getDevices(): Promise<Array<{ udid: string; name?: string | null; isOnline: boolean }>> {
+    // Read the iOS devices the poller has seen, joined with their name from
+    // the devices table. We don't call back into the bridge here — the
+    // poller maintains onlineDevices and the devices table already has the
+    // metadata. For UDIDs not in onlineDevices, treat as offline.
+    const rows = this.db.select().from(devices).where(eq(devices.platform, 'ios')).all() as Array<{ id: string; name: string | null }>;
+    return rows.map((r) => ({
+      udid: r.id,
+      name: r.name,
+      isOnline: this.onlineDevices.has(r.id),
+    }));
+  }
+
   async getDeviceStatus(deviceId: string): Promise<DeviceStatus | null> {
     const device = this.db.select().from(devices).where(eq(devices.id, deviceId)).all()[0];
     if (!device || device.platform !== 'ios') return null;

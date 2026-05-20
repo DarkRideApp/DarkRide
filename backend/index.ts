@@ -134,6 +134,7 @@ import { ServiceUserManager } from './auth/service-user-manager';
 import { backfillFailedDiffs } from './services/apk-diff-backfill';
 import { createProviderRegistry } from './services/providers';
 import { createAdbDeviceProvider } from './services/providers/adb-device';
+import { createIosDeviceProvider } from './services/providers/ios-device';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
@@ -293,6 +294,13 @@ const captureManager = new CaptureSessionManager(db, mitmproxyManager, deviceMan
 captureManager.setIosDeviceManager(iosDeviceManager);
 runner.setNotificationService(notificationService);
 runner.setIosDeviceManager(iosDeviceManager);
+
+// Register iOS devices as a first-class provider. iosDeviceManager must be
+// constructed first (above) because the provider holds a reference to it.
+providerRegistry.register(createIosDeviceProvider(iosDeviceManager));
+captureModeRegistry.register('ios-bridge', async (_instance, _cfg) => {
+  // Phase 2: no-op shim. The existing iOS capture pipeline (capture-session-manager + IosDeviceManager.markBusy/markIdle) handles the actual wiring. This dispatch seam exists so future plugin providers can register alternative iOS-bridge modes too.
+});
 
 
 // pluginManager is initialized in the async startup IIFE but referenced in
