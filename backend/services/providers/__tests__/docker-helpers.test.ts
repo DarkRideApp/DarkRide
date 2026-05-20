@@ -47,6 +47,7 @@ describe('listDarkrideContainers', () => {
     const d = makeDockerMock({ listContainers: list });
     const r = await listDarkrideContainers(d);
     expect(list).toHaveBeenCalledWith(expect.objectContaining({
+      all: true,
       filters: expect.objectContaining({ label: expect.arrayContaining(['darkride.emulator=true']) }),
     }));
     expect(r).toEqual([{ id: 'abc123', name: 'darkride-emu-1', state: 'running', adbPort: 6001 }]);

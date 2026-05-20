@@ -6,7 +6,7 @@ import Docker from 'dockerode';
  */
 export interface DockerLike {
   ping(): Promise<unknown>;
-  info(): Promise<any>;
+  info(): Promise<Record<string, unknown>>;
   listContainers(opts: any): Promise<any[]>;
   getContainer(id: string): any;
   createContainer(opts: any): Promise<any>;
@@ -30,7 +30,7 @@ export async function detectDockerDaemon(d: DockerLike): Promise<DockerDetectRes
   try {
     await d.ping();
     const info = await d.info();
-    const nvidia = Boolean(info?.Runtimes?.nvidia);
+    const nvidia = Boolean(((info.Runtimes ?? {}) as Record<string, unknown>).nvidia);
     return { available: true, nvidiaContainerToolkit: nvidia };
   } catch (err: any) {
     return {
@@ -69,5 +69,5 @@ export async function listDarkrideContainers(d: DockerLike): Promise<DarkrideCon
 
 /** Construct a Docker client using the conventional defaults (socket auto-detect). */
 export function createDockerClient(): DockerLike {
-  return new Docker() as unknown as DockerLike;
+  return new Docker();
 }
