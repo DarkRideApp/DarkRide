@@ -1,4 +1,5 @@
 import type { Router } from 'express';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import type { PluginApi } from './api';
 import type { PluginAiApi, PluginAiTool, PluginAiContext } from './ai';
 import type { PluginTool, PluginToolContext } from './tools';
@@ -111,9 +112,14 @@ export interface PluginContext {
    * actually exists.
    */
   hasPeer(pluginName: string): boolean;
-  // BetterSQLite3Database is widened to `any` so the SDK package compiles
-  // without drizzle-orm peer deps. Task 6 will retype service-shape fields.
-  db<T extends Record<string, unknown>>(schema: T): any;
+  /**
+   * Get a Drizzle DB instance typed against your plugin's schema. Pass the
+   * schema object you registered via `ctx.dbTables(schema)` (or a merged
+   * shape if you also query core tables). Returns a `BetterSQLite3Database<T>`
+   * with full type inference on queries; the underlying SQLite handle is
+   * the host's, so your queries participate in the same transaction surface.
+   */
+  db<T extends Record<string, unknown>>(schema: T): BetterSQLite3Database<T>;
   files(): NamespacedStorage;
 
   /**

@@ -177,17 +177,22 @@ Plugins access the core's services directly through `ctx`. There is no per-plugi
 
 | Need | Use |
 |---|---|
-| Database (your schema) | `ctx.db(schema)` — Drizzle DB scoped to your tables |
+| Database (your schema) | `ctx.db(schema)` — typed Drizzle DB scoped to your tables |
 | Notifications | `ctx.notify({ type, title, body, ... })` |
 | Settings (KV) | `ctx.settings.get/set/getJson/setJson/delete/list` (async) |
 | Cloud blob storage | `ctx.cloudStorage` — typed as `CloudStorageService` |
 | Raw file storage | `ctx.fileSync` — typed as `FileStorageService` (rare; prefer `ctx.files()`) |
 | Plugin-scoped storage | `ctx.files()` — namespaced; created on demand |
+| Cloud-file sync state | `ctx.cloudFiles.listByNamespace/setSyncState/setRetain/delete` |
 | Automation runner | `ctx.runner` — typed as `AutomationRunner` (only if the plugin scripts triggers) |
+| Automation list (read-only) | `ctx.automations.list()` |
 | AI agents | `ctx.ai.agent({ tier })` |
 | Hooks | `ctx.hooks.on(name, handler)` / `ctx.hooks.emit(name, payload)` |
 | Plugin logging | `ctx.logger()` or `ctx.logger('subsystem')` |
 | WebSocket | `ctx.websocket.registerChannel(name)` / `ctx.websocket.broadcast(msg)` |
+| APK lookup / materialise | `ctx.apks.lookupVersion/ensureLocal/analysisDbPath` |
+| Path under DATA_ROOT | `ctx.paths.fileStorage(rel)` (absolute path for external-process interop) |
+| Outbound HTTP via proxy | `ctx.dispatcher({ type: 'socks5', host, port, auth? })` — pooled undici Dispatcher |
 
 The host service shapes (`CloudStorageService`, `FileStorageService`, `AutomationRunner`) are exported as types from `@darkrideapp/plugin-sdk` — `import type { CloudStorageService } from '@darkrideapp/plugin-sdk'` if you need to refer to them in your own type signatures.
 

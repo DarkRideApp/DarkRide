@@ -171,6 +171,37 @@ await ctx.settings.delete('my_plugin_api_key');
 
 Every read/write returns a Promise — propagate `async`/`await` through your service code. Don't reach into the host's `settings` Drizzle table directly; the `SettingsApi` is the supported access path and is the same surface plugins use whether they're in-tree or installed via the marketplace.
 
+## Outbound HTTP via Proxy (`ctx.dispatcher`)
+
+`ctx.dispatcher(spec)` returns a pooled [undici `Dispatcher`](https://undici.nodejs.org/) you can pass to `fetch()`. The host owns the Agent lifecycle: two calls with structurally-equal specs return the **same instance**, so dispatchers are shared across plugins that route to the same upstream — which keeps the TCP connection rate under commercial proxy throttle thresholds.
+
+Most plugins do **not** need this. Use it only when you need to route outbound traffic through a SOCKS5 proxy (e.g., for geo-locked APIs where the consistent egress IP matters). For direct outbound HTTP, just call `fetch` with no dispatcher.
+
+```typescript
+import { fetch } from 'undici';
+
+async start(ctx) {
+  const dispatcher = ctx.dispatcher({
+    type: 'socks5',
+    host: 'us.socks.nordhold.net',
+    port: 1080,
+    auth: { username: await ctx.settings.get('proxy_user') ?? '', password: await ctx.settings.get('proxy_pass') ?? '' },
+    // connections defaults to 8 — tune lower if your upstream throttles aggressively.
+  });
+
+  ctx.api(api => {
+    api.get('/v1/my-plugin/lookup', async (req, res) => {
+      const upstream = await fetch('https://geo-locked.example.com/data', { dispatcher });
+      res.json({ data: await upstream.json() });
+    });
+  });
+}
+```
+
+The dispatcher is destroyed automatically at server shutdown after `stop()` runs. You don't need to call `dispatcher.destroy()` yourself.
+
+**Only SOCKS5 is supported today.** HTTP / HTTPS / PAC proxy variants are not implemented; if you need one, file an issue.
+
 ## Commands
 
 Register command palette commands:
@@ -212,7 +243,7 @@ ctx.hooks.define('my-plugin:item-created', { id: 'number', title: 'string' });
 
 **Available core hooks:** `app:startup`, `app:shutdown`, `device:connected`, `device:disconnected`, `session:created`, `automation:started`, `automation:completed`, `apk:detected-app`, `apk:analyzed`
 
-For low-level network traffic events, plugins use `TrafficHookRegistry` (see `backend/services/traffic-hook-registry.ts`) — a per-packet hook surface with batched delivery, separate from this lifecycle hook bus.
+Low-level network traffic events (per-packet, per-request) are not on the lifecycle hook bus — they're routed through a separate, host-internal `TrafficHookRegistry` that today is only reachable from plugins that ship in-tree with the host repo. If your standalone plugin needs to inspect captured traffic, [open an issue](https://github.com/DarkRideApp/DarkRide/issues) describing the use case so the right surface can be added to `ctx`.
 
 ## File Storage
 
