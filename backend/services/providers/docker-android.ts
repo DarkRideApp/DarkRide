@@ -113,11 +113,15 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       const info = await container.inspect();
       const adbPortStr = info?.NetworkSettings?.Ports?.['5555/tcp']?.[0]?.HostPort;
       if (!adbPortStr) {
+        // Don't leak a running container behind a failed port lookup.
+        await container.stop({ t: 5 }).catch(() => { /* best effort */ });
         throw new Error(`Container ${id} started but no host port was bound to 5555/tcp`);
       }
       const adbPort = Number(adbPortStr);
       const ok = await adbConnect(adbPort);
       if (!ok) {
+        // Same — adb connect failure must not leak a running container.
+        await container.stop({ t: 5 }).catch(() => { /* best effort */ });
         throw new Error(`adb failed to connect to localhost:${adbPort} (container ${id})`);
       }
       return { id, serial: `localhost:${adbPort}` };

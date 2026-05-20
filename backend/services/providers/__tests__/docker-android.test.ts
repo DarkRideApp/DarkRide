@@ -107,4 +107,21 @@ describe('docker-android provider', () => {
     const p = createDockerAndroidProvider(makeDockerMock());
     expect(p.getNetworkConfig('any')).toEqual({ mode: 'wireguard' });
   });
+
+  it('startInstance stops the container and throws if adbConnect fails (no orphan)', async () => {
+    const d = makeDockerMock();
+    const stop = vi.fn().mockResolvedValue(undefined);
+    (d.getContainer as any).mockReturnValue({
+      start: vi.fn().mockResolvedValue(undefined),
+      stop,
+      inspect: vi.fn().mockResolvedValue({
+        State: { Running: true },
+        NetworkSettings: { Ports: { '5555/tcp': [{ HostPort: '6001' }] } },
+      }),
+    });
+    const adbConnect = vi.fn().mockResolvedValue(false);
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false, adbConnect });
+    await expect(p.startInstance('container-test-emu')).rejects.toThrow(/adb failed/i);
+    expect(stop).toHaveBeenCalled();
+  });
 });
