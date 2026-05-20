@@ -8,11 +8,11 @@ function makeMockProvider(id: string, overrides: Partial<DeviceProvider> = {}): 
     displayName: `Mock ${id}`,
     isAvailable: vi.fn().mockResolvedValue({ available: true }),
     listInstances: vi.fn().mockResolvedValue([]),
-    startInstance: vi.fn(),
-    stopInstance: vi.fn(),
+    startInstance: vi.fn() as DeviceProvider['startInstance'],
+    stopInstance: vi.fn() as DeviceProvider['stopInstance'],
     getNetworkConfig: () => ({ mode: 'wireguard' }),
     ...overrides,
-  } as any;
+  };
 }
 
 describe('createProviderRegistry', () => {
@@ -62,6 +62,26 @@ describe('createProviderRegistry', () => {
   it('listInstancesAll continues past a single provider failure (one bad provider does not break the others)', async () => {
     const reg = createProviderRegistry();
     const a = makeMockProvider('a', { listInstances: vi.fn().mockRejectedValue(new Error('boom')) });
+    const b = makeMockProvider('b', {
+      listInstances: vi.fn().mockResolvedValue([{ id: 'b1', displayName: 'B1', state: 'running', spawnedByDarkride: false }]),
+    });
+    reg.register(a); reg.register(b);
+    const all = await reg.listInstancesAll();
+    expect(all).toEqual([
+      { providerId: 'b', instance: { id: 'b1', displayName: 'B1', state: 'running', spawnedByDarkride: false } },
+    ]);
+  });
+
+  it('listInstancesAll isolates a provider that throws synchronously (not just rejects)', async () => {
+    // Defends against future refactors that drop the `async` wrapper in
+    // the map callback — a sync throw would then leak past Promise.allSettled
+    // and break the failure-isolation guarantee. A realistic failure mode:
+    // a provider whose listInstances checks a prerequisite eagerly
+    // (e.g. `if (!this.adbPath) throw ...`) before returning a promise.
+    const reg = createProviderRegistry();
+    const a = makeMockProvider('a', {
+      listInstances: vi.fn().mockImplementation(() => { throw new Error('sync-boom'); }),
+    });
     const b = makeMockProvider('b', {
       listInstances: vi.fn().mockResolvedValue([{ id: 'b1', displayName: 'B1', state: 'running', spawnedByDarkride: false }]),
     });
