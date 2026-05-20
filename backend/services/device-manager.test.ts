@@ -784,7 +784,7 @@ describe('DeviceManager — provider-driven polling', () => {
       ],
     };
     manager.setProviderRegistry(mockRegistry as any);
-    await (manager as any).pollDevicesFromProviders();
+    await manager.pollDevicesFromProviders();
 
     const rows = db.select().from(devices).all();
     expect(rows.map((d) => d.id).sort()).toEqual(['S1', 'S2']);
@@ -792,7 +792,7 @@ describe('DeviceManager — provider-driven polling', () => {
 
   it('pollDevicesFromProviders returns early when no registry is wired', async () => {
     // No setProviderRegistry call — should not throw and should not insert anything
-    await expect((manager as any).pollDevicesFromProviders()).resolves.toBeUndefined();
+    await expect(manager.pollDevicesFromProviders()).resolves.toBeUndefined();
     const rows = db.select().from(devices).all();
     expect(rows).toHaveLength(0);
   });
@@ -808,7 +808,7 @@ describe('DeviceManager — provider-driven polling', () => {
       ],
     };
     manager.setProviderRegistry(mockRegistry as any);
-    await (manager as any).pollDevicesFromProviders();
+    await manager.pollDevicesFromProviders();
 
     const rows = db.select().from(devices).all();
     expect(rows.map((d) => d.id)).toEqual(['S3']);

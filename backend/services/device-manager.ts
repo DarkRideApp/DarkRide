@@ -268,6 +268,9 @@ export class DeviceManager {
   private offlineListeners: Array<(deviceId: string) => void> = [];
   private hookBus: HookBus | null = null;
   private providerRegistry: ProviderRegistry | null = null;
+  // TODO(phase-2): read in capture-startup path. Setter is present so the
+  // boot wiring (Task 1.6) can install it now; the read site lands when
+  // Phase 2 implements the capture-mode dispatch.
   private captureModeRegistry: CaptureModeRegistry | null = null;
 
   constructor(private db: AppDatabase) {}
