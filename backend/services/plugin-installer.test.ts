@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import { PluginInstaller } from './plugin-installer';
 
 vi.mock('child_process', () => ({
@@ -120,10 +123,55 @@ describe('PluginInstaller', () => {
   });
 
   describe('update', () => {
-    it('runs npm update', async () => {
+    let tmpManagedRoot: string;
+
+    beforeEach(() => {
+      // The update path reads the post-update package-lock.json to surface
+      // the new pkgName/resolvedRef/npmShasum for content-pin verification
+      // (see plugin-architecture-review 2026-05-20 I6). Provide an isolated
+      // managedRoot with a synthesized lockfile rather than relying on
+      // whatever leftover state the host's real DATA_ROOT happens to have.
+      tmpManagedRoot = mkdtempSync(join(tmpdir(), 'plugin-installer-update-'));
+      mkdirSync(tmpManagedRoot, { recursive: true });
+      writeFileSync(join(tmpManagedRoot, 'package-lock.json'), JSON.stringify({
+        packages: {
+          'node_modules/@darkride/plugin-foo': {
+            integrity: 'sha512-FAKE-INTEGRITY',
+            resolved: 'https://registry.npmjs.org/@darkride/plugin-foo/-/plugin-foo-1.2.3.tgz',
+          },
+        },
+      }));
+      installer = new PluginInstaller({ managedRoot: tmpManagedRoot });
+    });
+
+    afterEach(() => {
+      if (tmpManagedRoot) rmSync(tmpManagedRoot, { recursive: true, force: true });
+    });
+
+    it('runs npm install --prefix with @latest and surfaces lockfile-derived fingerprints', async () => {
       mockExecSuccess('updated 1 package');
       const result = await installer.update('@darkride/plugin-foo');
       expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.pkgName).toBe('@darkride/plugin-foo');
+        expect(result.npmShasum).toBe('sha512-FAKE-INTEGRITY');
+        expect(result.resolvedRef).toBe(null); // not a git URL
+      }
+      const args = (execFile as any).mock.calls[0][1] as string[];
+      expect(args).toContain(`--prefix=${tmpManagedRoot}`);
+      expect(args).toContain('@darkride/plugin-foo@latest');
+    });
+
+    it('returns error when the post-update lockfile is missing', async () => {
+      // Simulate npm install completing but no lockfile being written
+      // (corrupted prefix dir, --no-package-lock somewhere, etc.).
+      rmSync(join(tmpManagedRoot, 'package-lock.json'));
+      mockExecSuccess('updated 1 package');
+      const result = await installer.update('@darkride/plugin-foo');
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toMatch(/package-lock\.json/);
+      }
     });
   });
 
