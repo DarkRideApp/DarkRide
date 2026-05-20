@@ -9,11 +9,17 @@ describe('Kitchen Sink Integration', () => {
   let harness: PluginTestHarness;
 
   beforeAll(async () => {
-    harness = await createPluginTestHarness('plugins/kitchen-sink');
+    // start: true so kitchen-sink's start() runs and the exercised
+    // ctx-extension demos (settings/websocket/dispatcher/etc.) are
+    // covered by this integration test.
+    harness = await createPluginTestHarness({
+      pluginDir: 'plugins/kitchen-sink',
+      start: true,
+    });
   });
 
-  afterAll(() => {
-    harness?.cleanup();
+  afterAll(async () => {
+    if (harness) await harness.cleanup();
   });
 
   // -- Metadata --
@@ -59,6 +65,16 @@ describe('Kitchen Sink Integration', () => {
   it('unknown routes return 404', async () => {
     const res = await request(harness.app).get('/v1/kitchen-sink/nonexistent');
     expect(res.status).toBe(404);
+  });
+
+  it('start()-registered route is reachable (confirms full lifecycle ran)', async () => {
+    // /v1/kitchen-sink/started is registered inside start(), not register().
+    // If this route 404s, the harness didn't actually run startAll() — that
+    // would mean the ctx-extension demos in start() weren't exercised either.
+    const res = await request(harness.app).get('/v1/kitchen-sink/started');
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.status).toBe('started');
   });
 
   // -- Tools --

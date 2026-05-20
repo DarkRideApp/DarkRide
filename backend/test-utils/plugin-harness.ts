@@ -176,10 +176,23 @@ const stubPaths = {
   fileStorage: (rel: string) => `/stub/${rel}`,
 } as any;
 
-/** Stub DispatcherApi — callable that throws a helpful error. */
-const stubDispatcher = (() => {
-  throw new Error('dispatcher() not available in default stub — pass via coreServices.dispatcher');
-}) as any;
+/**
+ * Stub DispatcherApi — returns a no-op Dispatcher object so plugins that
+ * construct dispatchers in start() (e.g. to capture a closure) don't crash
+ * under the harness. The returned object is structurally a Dispatcher but
+ * does not actually perform any I/O; calling .dispatch on it would error.
+ * Tests that need a real dispatcher must pass coreServices.dispatcher.
+ */
+const stubDispatcher = ((_spec: any): any => ({
+  dispatch: () => false,
+  close: () => Promise.resolve(),
+  destroy: () => Promise.resolve(),
+  on: () => stubDispatcher,
+  once: () => stubDispatcher,
+  off: () => stubDispatcher,
+  emit: () => false,
+  removeListener: () => stubDispatcher,
+})) as any;
 
 // ---------------------------------------------------------------------------
 

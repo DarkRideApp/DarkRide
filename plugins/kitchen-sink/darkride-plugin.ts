@@ -126,6 +126,67 @@ export default definePlugin({
   },
 
   async start(ctx) {
+    const logger = ctx.logger();
+
+    // ─── Extension Point: ctx.settings (read/write KV at runtime) ───────
+    // Plugins access the host's settings table via ctx.settings — works
+    // identically whether the plugin is in-tree or installed via the
+    // marketplace. Reads return null when unset; writes are async.
+    const greeting = await ctx.settings.get('kitchen_sink_greeting');
+    logger.log(`[KitchenSink] greeting setting on boot: ${greeting ?? '(unset)'}`);
+
+    // ─── Extension Point: ctx.websocket (channels + broadcast) ─────────
+    // Register a filtered channel so subsequent broadcasts on this type
+    // only deliver to clients that subscribed to "kitchen-sink:demo".
+    ctx.websocket.registerChannel('kitchen-sink:demo');
+    ctx.websocket.broadcast({
+      type: 'kitchen-sink:demo',
+      hello: 'Kitchen Sink came online',
+      at: Date.now(),
+    });
+
+    // ─── Extension Point: ctx.paths (DATA_ROOT-relative path resolution) ─
+    // Use when an external process (sidecar binary, child Python script,
+    // etc.) needs an absolute path. For plugin-scoped storage prefer
+    // ctx.files() — ctx.paths is the escape hatch.
+    const exportPath = ctx.paths.fileStorage('exports/kitchen-sink/');
+    logger.log(`[KitchenSink] exports path: ${exportPath}`);
+
+    // ─── Extension Point: ctx.cloudFiles (sync-state management) ───────
+    // Read-only demo: list any cloud files registered under this plugin's
+    // namespace. New plugins typically don't need to touch cloudFiles
+    // directly — the file-sync runner manages state for them.
+    const cloudFiles = await ctx.cloudFiles.listByNamespace('kitchen-sink');
+    logger.log(`[KitchenSink] cloudFiles count: ${cloudFiles.length}`);
+
+    // ─── Extension Point: ctx.automations (read-only listing) ──────────
+    // Demonstrates the read-only listing surface; most plugins never need
+    // to enumerate automations directly. Surface it here so the kitchen-
+    // sink stays a complete reference.
+    const automations = await ctx.automations.list();
+    logger.log(`[KitchenSink] automations count: ${automations.length}`);
+
+    // ─── Extension Point: ctx.dispatcher (pooled outbound HTTP) ────────
+    // Construct a dispatcher with placeholder credentials and immediately
+    // discard the reference — the host's pool de-duplicates by spec, so
+    // this is a no-op against any other plugin that asks for the same
+    // upstream. NEVER actually fetch through this in the demo; we only
+    // want to exercise the wiring + the singleton-per-spec guarantee.
+    const demoDispatcher = ctx.dispatcher({
+      type: 'socks5',
+      host: 'demo.example.invalid',
+      port: 1080,
+      connections: 1,
+    });
+    logger.log(`[KitchenSink] dispatcher constructed: ${demoDispatcher.constructor.name}`);
+
+    // ─── Extension Point: ctx.apks (read-only) ─────────────────────────
+    // Look up a sentinel version that does not exist; the API answers
+    // null cleanly rather than throwing. Plugins that work with APKs use
+    // lookupVersion to find a handle, then ensureLocal to materialize.
+    const apkLookup = await ctx.apks.lookupVersion(-1);
+    logger.log(`[KitchenSink] apks.lookupVersion(-1) → ${apkLookup === null ? 'null (expected)' : 'unexpected hit'}`);
+
     // Register a route that is only available after start() — used to verify
     // that the harness picks up start()-phase contributions.
     ctx.routes((router) => {
