@@ -135,6 +135,8 @@ import { backfillFailedDiffs } from './services/apk-diff-backfill';
 import { createProviderRegistry } from './services/providers';
 import { createAdbDeviceProvider } from './services/providers/adb-device';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
+import { reconcileWithProviders } from './services/device-manager-reconcile';
+import { DeviceInstancesRepo } from './services/device-instances-repo';
 
 const { log, error } = createLoggers('server');
 
@@ -854,6 +856,10 @@ httpServer.listen(PORT, HOST, () => {
   // Rehydrate any stored Pro license from the DB. Cheap (one row + one
   // JWS verify) so it can run before the slower phases below.
   await licenseService.init();
+
+  // Reconcile DB device_instances against what each provider currently reports.
+  // Runs before plugins load so DB state is accurate before any plugin queries it.
+  await reconcileWithProviders(providerRegistry, new DeviceInstancesRepo(db));
 
   // Phase 1: Python environment
   setStartupPhase('preparing_python', 'Preparing Python environment...');
