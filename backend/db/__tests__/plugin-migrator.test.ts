@@ -52,6 +52,7 @@ describe('applyPluginMigrations', () => {
     const result = applyPluginMigrations(db, [{ name: 'foo', path }]);
     expect(result.applied).toBe(2);
     expect(result.total).toBe(2);
+    expect(result.failures).toEqual([]);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as { name: string }[];
     const names = tables.map(t => t.name);
@@ -78,13 +79,21 @@ describe('applyPluginMigrations', () => {
     expect(tables).toHaveLength(0); // SQL not re-run
   });
 
-  it('rolls back the transaction on SQL error and rethrows with context', () => {
+  it('rolls back the transaction on SQL error and reports failure (does not throw)', () => {
+    // Migration failure must NOT propagate as a thrown exception — the
+    // boot sequence depends on continuing past a bad plugin and disabling
+    // it, not on the host process crashing.
     const db = makeDb();
     const path = makePlugin(tmp, 'foo', {
       '0000_bad.sql': 'CREATE TABLE foo_a (id INTEGER); BANANA;', // syntax error
     });
 
-    expect(() => applyPluginMigrations(db, [{ name: 'foo', path }])).toThrow(/foo:0000_bad\.sql/);
+    const result = applyPluginMigrations(db, [{ name: 'foo', path }]);
+    expect(result.applied).toBe(0);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0].plugin).toBe('foo');
+    expect(result.failures[0].filename).toBe('0000_bad.sql');
+    expect(result.failures[0].error).toMatch(/foo:0000_bad\.sql/);
 
     // Table NOT created (rolled back)
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='foo_a'").all();
@@ -92,6 +101,48 @@ describe('applyPluginMigrations', () => {
     // Tracking row NOT inserted
     const tracked = db.prepare('SELECT * FROM plugin_migrations').all();
     expect(tracked).toHaveLength(0);
+  });
+
+  it('isolates failures: one bad plugin does not stop the next plugin', () => {
+    // The original bug: bad migration in one managed plugin crashed the
+    // whole boot. The migrator must keep going so the rest of the system
+    // boots cleanly with the offender auto-disabled.
+    const db = makeDb();
+    const badPath = makePlugin(tmp, 'bad', { '0000_broken.sql': 'BANANA;' });
+    const goodPath = makePlugin(tmp, 'good', { '0000_ok.sql': 'CREATE TABLE good_t (id INTEGER);' });
+
+    const result = applyPluginMigrations(db, [
+      { name: 'bad', path: badPath },
+      { name: 'good', path: goodPath },
+    ]);
+
+    expect(result.applied).toBe(1); // good's migration succeeded
+    expect(result.failures.map(f => f.plugin)).toEqual(['bad']);
+
+    // good's table was created
+    const goodTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='good_t'").all();
+    expect(goodTables).toHaveLength(1);
+  });
+
+  it('stops a failed plugin queue after the first failure (avoids dependent-migration cascades)', () => {
+    // If migration 0001 fails, 0002 probably depends on it (e.g. ALTERs
+    // the table 0001 was supposed to create). Don't pile failure logs.
+    const db = makeDb();
+    const path = makePlugin(tmp, 'foo', {
+      '0000_first.sql': 'CREATE TABLE foo_a (id INTEGER);',  // succeeds
+      '0001_broken.sql': 'BANANA;',                           // fails
+      '0002_later.sql': 'CREATE TABLE foo_b (id INTEGER);',   // skipped
+    });
+
+    const result = applyPluginMigrations(db, [{ name: 'foo', path }]);
+
+    expect(result.applied).toBe(1);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0].filename).toBe('0001_broken.sql');
+
+    // 0002 was never tried — table absent, no tracking row
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='foo_b'").all();
+    expect(tables).toHaveLength(0);
   });
 
   it('handles multiple plugins independently', () => {
@@ -127,14 +178,14 @@ describe('applyPluginMigrations', () => {
     const path = makePlugin(tmp, 'foo', { '0000_a.sql': 'CREATE TABLE t1 (i INTEGER);' });
     db.prepare('INSERT INTO plugin_migrations VALUES (?,?,?)').run('foo', '0000_a.sql', 1);
     const result = applyPluginMigrations(db, [{ name: 'foo', path }]);
-    expect(result).toEqual({ applied: 0, total: 1 });
+    expect(result).toEqual({ applied: 0, total: 1, failures: [] });
   });
 
   it('no-op when plugin has no migrations directory', () => {
     const db = makeDb();
     const path = mkdtempSync(join(tmp, 'no-migrations-'));
     const result = applyPluginMigrations(db, [{ name: 'foo', path }]);
-    expect(result).toEqual({ applied: 0, total: 0 });
+    expect(result).toEqual({ applied: 0, total: 0, failures: [] });
   });
 });
 

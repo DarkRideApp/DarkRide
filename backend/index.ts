@@ -941,12 +941,30 @@ httpServer.listen(PORT, HOST, () => {
     .map(name => byNameForMigrations.get(name)!)
     .map(p => ({ name: p.definition.name, path: p.path }));
 
+  // Track plugins whose migrations failed so we skip loading them below
+  // (a half-migrated schema is a foot-gun). The set is empty unless
+  // applyPluginMigrations reports failures.
+  const migrationFailedPlugins = new Set<string>();
   if (pluginsForMigration.length > 0) {
     const sqlite = (db as any).$client;
     const { applyPluginMigrations, backfillPluginMigrationsFromJournal } = await import('./db/plugin-migrator');
     backfillPluginMigrationsFromJournal(sqlite, pluginsForMigration);
     const result = applyPluginMigrations(sqlite, pluginsForMigration);
     log(`Plugin migrations: ${result.applied} applied (${result.total} total tracked) across ${pluginsForMigration.length} plugin(s)`);
+
+    // Failure isolation: disable any plugin whose migration failed and
+    // record the error so the UI can surface it. Without this a bad
+    // migration would crash the whole boot — no UI recovery path.
+    for (const failure of result.failures) {
+      error(`Auto-disabling plugin "${failure.plugin}" — migration failure (${failure.filename}): ${failure.error}`);
+      try {
+        pluginStateManager.setEnabled(failure.plugin, false);
+        pluginStateManager.setLastError(failure.plugin, failure.error);
+      } catch (e: any) {
+        error(`Failed to record migration failure for "${failure.plugin}": ${e?.message ?? e}`);
+      }
+      migrationFailedPlugins.add(failure.plugin);
+    }
   }
 
   // Surface 'plugin disabled but has migrations on disk' — a class of silent-skip bug.
@@ -962,6 +980,11 @@ httpServer.listen(PORT, HOST, () => {
   for (const { definition, source, packageVersion, path: pluginDir } of [...discovered, ...npmDiscovered, ...managedDiscovered]) {
     if (seen.has(definition.name)) {
       log(`Skipping duplicate plugin "${definition.name}" from ${source ?? 'npm'} (already loaded from earlier source)`);
+      continue;
+    }
+    if (migrationFailedPlugins.has(definition.name)) {
+      // Already logged + disabled above. Skip loading to avoid running
+      // against a half-applied schema.
       continue;
     }
     if (!pluginStateManager.isEnabled(definition.name)) {

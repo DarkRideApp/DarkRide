@@ -10,9 +10,24 @@ export interface PluginRef {
   path: string;
 }
 
+export interface PluginMigrationFailure {
+  plugin: string;
+  filename: string;
+  error: string;
+}
+
 export interface ApplyResult {
   applied: number;
   total: number;
+  /**
+   * Per-plugin migration failures. When a plugin's migration file errors,
+   * the migrator stops applying further migrations for THAT plugin (the
+   * remainder probably depend on the failed one) but continues with the
+   * NEXT plugin. The boot sequence is expected to disable each failed
+   * plugin via pluginStateManager so it isn't loaded with a half-migrated
+   * schema.
+   */
+  failures: PluginMigrationFailure[];
 }
 
 interface JournalEntry {
@@ -36,13 +51,21 @@ interface Journal {
  * filenames already in plugin_migrations(plugin_name=?). For each unseen
  * file, run inside a transaction; on success insert the tracking row.
  *
- * Errors propagate out with `<plugin>:<filename>:` context. Boot fails loud,
- * not silent. The transaction guarantees the tracking row is only written
- * if the SQL itself succeeded.
+ * Failure isolation: a failing migration aborts the rest of THAT plugin's
+ * queue (later migrations probably depend on the failed one), but the next
+ * plugin's migrations still run. Failures are collected and returned for
+ * the boot sequence to disable the offending plugins. This avoids the old
+ * behaviour where one bad SQL file took down the whole server with no UI
+ * recovery path.
+ *
+ * The transaction guarantees that the tracking row is only written if the
+ * SQL itself succeeded, so a fix-and-retry on next boot sees the broken
+ * migration as unapplied.
  */
 export function applyPluginMigrations(db: Database.Database, plugins: PluginRef[]): ApplyResult {
   let applied = 0;
   let total = 0;
+  const failures: PluginMigrationFailure[] = [];
 
   const isAppliedStmt = db.prepare(
     'SELECT 1 FROM plugin_migrations WHERE plugin_name = ? AND filename = ?',
@@ -59,7 +82,13 @@ export function applyPluginMigrations(db: Database.Database, plugins: PluginRef[
       .filter(f => f.endsWith('.sql'))
       .sort();
 
+    let pluginFailed = false;
     for (const filename of files) {
+      if (pluginFailed) {
+        // Stop the queue for this plugin after the first failure. Don't
+        // count later files in `total` either — we never tried them.
+        break;
+      }
       total += 1;
       const seen = isAppliedStmt.get(plugin.name, filename);
       if (seen) continue;
@@ -76,18 +105,18 @@ export function applyPluginMigrations(db: Database.Database, plugins: PluginRef[
 
       try {
         runOne();
+        applied += 1;
       } catch (err: any) {
         const msg = err?.message ?? String(err);
-        const wrapped = new Error(`${plugin.name}:${filename}: ${msg}`);
-        logError(wrapped.message);
-        throw wrapped;
+        const wrapped = `${plugin.name}:${filename}: ${msg}`;
+        logError(wrapped);
+        failures.push({ plugin: plugin.name, filename, error: wrapped });
+        pluginFailed = true;
       }
-
-      applied += 1;
     }
   }
 
-  return { applied, total };
+  return { applied, total, failures };
 }
 
 /**

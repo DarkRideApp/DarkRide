@@ -459,6 +459,13 @@ export const pluginState = sqliteTable('plugin_state', {
   signature: text('signature'),
   signedBy: text('signed_by'),
   approvedAiScopes: text('approved_ai_scopes', { mode: 'json' }).$type<string[] | null>(),
+  /**
+   * Last fatal error (e.g. migration failure) that caused the host to
+   * auto-disable this plugin. Null when the plugin booted cleanly.
+   * Surfaced via /v1/plugins/installed so the UI can show the user what
+   * went wrong without making them dig through logs.
+   */
+  lastError: text('last_error'),
 });
 
 export const pluginSources = sqliteTable('plugin_sources', {

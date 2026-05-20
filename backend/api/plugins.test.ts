@@ -71,6 +71,7 @@ function createMockStateManager(overrides: Partial<Record<keyof PluginStateManag
     isEnabled: vi.fn().mockReturnValue(false),
     setEnabled: vi.fn(),
     setVersion: vi.fn(),
+    setLastError: vi.fn(),
     upsert: vi.fn(),
     upsertManagedPending: vi.fn(),
     remove: vi.fn(),

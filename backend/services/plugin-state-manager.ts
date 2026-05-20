@@ -111,6 +111,20 @@ export class PluginStateManager {
   }
 
   /**
+   * Record (or clear) a fatal error for a plugin. Boot calls this when a
+   * plugin's migrations fail; the plugin is also auto-disabled so it
+   * doesn't load against a half-applied schema. The error string is
+   * surfaced via /v1/plugins/installed so the UI can show the user.
+   */
+  setLastError(name: string, error: string | null): void {
+    this.db
+      .update(pluginState)
+      .set({ lastError: error, updatedAt: new Date() })
+      .where(eq(pluginState.name, name))
+      .run();
+  }
+
+  /**
    * Update the version field for a plugin. Called after a managed update
    * so the installed-plugins API reports the new version immediately,
    * without waiting for the next boot's reconcile.
