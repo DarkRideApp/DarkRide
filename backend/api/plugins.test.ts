@@ -320,6 +320,17 @@ describe('Plugin API Endpoints', () => {
   // ─── POST /v1/plugins/:name/enable ────────────────────────────────────────
 
   describe('POST /v1/plugins/:name/enable', () => {
+    beforeEach(() => {
+      stateManager = createMockStateManager({
+        get: vi.fn().mockImplementation((n: string) =>
+          n === 'plugin-a' || n === '@darkride/plugin-x'
+            ? { name: n, enabled: false, installedVia: 'managed' }
+            : undefined,
+        ),
+      });
+      app = createApp(pluginManager, stateManager, installer, sourceManager, undefined, pluginInstallsRepo);
+    });
+
     it('enables a plugin and returns restartRequired', async () => {
       const res = await request(app).post('/v1/plugins/plugin-a/enable');
 
@@ -336,6 +347,14 @@ describe('Plugin API Endpoints', () => {
       expect(stateManager.setEnabled).toHaveBeenCalledWith('@darkride/plugin-x', true);
     });
 
+    it('returns 404 when the plugin does not exist (no ghost restart state)', async () => {
+      const res = await request(app).post('/v1/plugins/does-not-exist/enable');
+
+      expect(res.status).toBe(404);
+      expect(res.body.success).toBe(false);
+      expect(stateManager.setEnabled).not.toHaveBeenCalled();
+    });
+
     it('returns 501 without stateManager', async () => {
       app = createApp(pluginManager, undefined, installer);
 
@@ -349,6 +368,17 @@ describe('Plugin API Endpoints', () => {
   // ─── POST /v1/plugins/:name/disable ───────────────────────────────────────
 
   describe('POST /v1/plugins/:name/disable', () => {
+    beforeEach(() => {
+      stateManager = createMockStateManager({
+        get: vi.fn().mockImplementation((n: string) =>
+          n === 'plugin-a'
+            ? { name: n, enabled: true, installedVia: 'managed' }
+            : undefined,
+        ),
+      });
+      app = createApp(pluginManager, stateManager, installer, sourceManager, undefined, pluginInstallsRepo);
+    });
+
     it('disables a plugin and returns restartRequired', async () => {
       const res = await request(app).post('/v1/plugins/plugin-a/disable');
 
@@ -356,6 +386,14 @@ describe('Plugin API Endpoints', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.restartRequired).toBe(true);
       expect(stateManager.setEnabled).toHaveBeenCalledWith('plugin-a', false);
+    });
+
+    it('returns 404 when the plugin does not exist (no ghost restart state)', async () => {
+      const res = await request(app).post('/v1/plugins/does-not-exist/disable');
+
+      expect(res.status).toBe(404);
+      expect(res.body.success).toBe(false);
+      expect(stateManager.setEnabled).not.toHaveBeenCalled();
     });
 
     it('returns 501 without stateManager', async () => {
@@ -933,6 +971,104 @@ describe('Plugin API Endpoints', () => {
 
       expect(res.status).toBe(400);
       expect(res.body.error).toContain('name');
+    });
+
+    it('content pin: rolls back and 400s when post-update artefact does not match signed manifest', async () => {
+      // Simulates registry tampering between install and update: the
+      // marketplace's signed manifest pins npmShasum=A but the freshly
+      // installed package has npmShasum=B. The endpoint must roll back
+      // the new tarball off disk and return 400.
+      stateManager = createMockStateManager({
+        get: vi.fn().mockReturnValue({
+          name: 'plugin-a',
+          npmPackage: '@darkride/plugin-a',
+          installedVia: 'managed',
+        }),
+      });
+      installer = createMockInstaller({
+        update: vi.fn().mockResolvedValue({
+          success: true,
+          pkgName: '@darkride/plugin-a',
+          resolvedRef: null,
+          npmShasum: 'sha512-TAMPERED',
+        }),
+      });
+      sourceManager = createMockSourceManager({
+        fetchAll: vi.fn().mockResolvedValue([{
+          sourceName: 'official',
+          sourceType: 'registry',
+          plugins: [{
+            name: 'plugin-a',
+            npmPackage: '@darkride/plugin-a',
+            signature: 'a-signature',
+            signedBy: 'darkride-official',
+            npmShasum: 'sha512-LEGITIMATE',
+          }],
+        }]),
+      });
+      const verifyContentsSpy = vi.fn().mockReturnValue({
+        ok: false,
+        reason: 'npm shasum mismatch (signed sha512-LEGITIMATE, installed sha512-TAMPERED)',
+      });
+      const verifier = createMockVerifier({ verifyContents: verifyContentsSpy });
+      rmSyncSpy.mockReset();
+      app = createApp(pluginManager, stateManager, installer, sourceManager, verifier, pluginInstallsRepo);
+
+      const res = await request(app)
+        .post('/v1/plugins/update')
+        .send({ name: 'plugin-a' });
+
+      // Debug-friendly order: assert call shape first so a wrong-branch failure
+      // tells you which gate the request slipped through.
+      expect(verifyContentsSpy).toHaveBeenCalledWith(
+        { npmShasum: 'sha512-LEGITIMATE', gitRef: undefined },
+        { npmShasum: 'sha512-TAMPERED', gitRef: undefined },
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.contentMismatch).toBe(true);
+      // Rollback called rmSync on the post-update tarball dir (fs.rmSync is
+      // a spy in this suite; this confirms the rollback path was reached
+      // with the expected target).
+      const rollbackCall = rmSyncSpy.mock.calls.find(c => String(c[0]).endsWith('@darkride/plugin-a'));
+      expect(rollbackCall).toBeDefined();
+      expect((rollbackCall as any)[1]).toEqual(expect.objectContaining({ recursive: true, force: true }));
+    });
+
+    it('content pin: skipped when marketplace has no signed entry for this plugin', async () => {
+      stateManager = createMockStateManager({
+        get: vi.fn().mockReturnValue({
+          name: 'plugin-a',
+          npmPackage: '@darkride/plugin-a',
+          installedVia: 'managed',
+        }),
+      });
+      installer = createMockInstaller({
+        update: vi.fn().mockResolvedValue({
+          success: true,
+          pkgName: '@darkride/plugin-a',
+          resolvedRef: null,
+          npmShasum: 'sha512-anything',
+        }),
+      });
+      sourceManager = createMockSourceManager({
+        fetchAll: vi.fn().mockResolvedValue([{
+          sourceName: 'official',
+          sourceType: 'registry',
+          plugins: [], // not present in marketplace
+        }]),
+      });
+      const verifyContentsSpy = vi.fn();
+      const verifier = createMockVerifier({ verifyContents: verifyContentsSpy });
+      app = createApp(pluginManager, stateManager, installer, sourceManager, verifier, pluginInstallsRepo);
+
+      const res = await request(app)
+        .post('/v1/plugins/update')
+        .send({ name: 'plugin-a' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(verifyContentsSpy).not.toHaveBeenCalled();
     });
 
     it('returns 500 when npm update fails', async () => {

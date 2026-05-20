@@ -102,13 +102,17 @@ export class PluginInstaller {
   }
 
   /**
-   * Update an npm package in the project root.
+   * Update a managed plugin to its latest published version. Returns the same
+   * shape as installManaged so the caller can re-verify content pins against
+   * the marketplace's signed manifest (a registry compromise between install
+   * and update would otherwise slip through).
    */
-  async update(packageName: string): Promise<InstallResult> {
+  async update(packageName: string): Promise<
+    | { success: true; pkgName: string; resolvedRef: string | null; npmShasum: string | null; stdout?: string }
+    | { success: false; error: string }
+  > {
     const validationError = validatePackageName(packageName);
-    if (validationError) {
-      return { success: false, error: validationError };
-    }
+    if (validationError) return { success: false, error: validationError };
 
     // Use `npm install <pkg>@latest --prefix=<managedRoot>` rather than
     // `npm update`. Two reasons: (1) `npm update` looks at the current dir's
@@ -117,15 +121,41 @@ export class PluginInstaller {
     // (2) we always want the absolute latest, including major-version bumps.
     mkdirSync(this.managedRoot, { recursive: true });
     log(`Updating ${packageName} (managed)...`);
+    let stdout: string;
     try {
-      const { stdout } = await execFile('npm', ['install', `--prefix=${this.managedRoot}`, '--legacy-peer-deps', `${packageName}@latest`], { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
-      log(`Updated ${packageName}`);
-      return { success: true, stdout };
+      const result = await execFile('npm', ['install', `--prefix=${this.managedRoot}`, '--legacy-peer-deps', `${packageName}@latest`], { cwd: PROJECT_ROOT, timeout: TIMEOUT_INSTALL });
+      stdout = result.stdout;
     } catch (err: any) {
       const msg = err.message ?? String(err);
       error(`Failed to update ${packageName}: ${msg}`);
       return { success: false, error: msg };
     }
+
+    // Read the updated lockfile to extract the new pin (same logic as
+    // installManaged). Without these fields the marketplace's signed manifest
+    // cannot be cross-checked.
+    const lockPath = join(this.managedRoot, 'package-lock.json');
+    if (!existsSync(lockPath)) {
+      return { success: false, error: 'npm update completed but no package-lock.json was written' };
+    }
+    let lock: any;
+    try {
+      lock = JSON.parse(readFileSync(lockPath, 'utf-8'));
+    } catch (err: any) {
+      return { success: false, error: `Failed to parse package-lock.json: ${err?.message ?? err}` };
+    }
+    const pkgName = PACKAGE_NAME_RE.test(packageName)
+      ? packageName
+      : findInstalledPkgName(this.managedRoot);
+    if (!pkgName) {
+      return { success: false, error: 'Could not determine installed package name after update' };
+    }
+    const lockEntry = lock.packages?.[`node_modules/${pkgName}`] ?? {};
+    const resolvedRef = parseGitRef(lockEntry.resolved);
+    const npmShasum = typeof lockEntry.integrity === 'string' ? lockEntry.integrity : null;
+
+    log(`Updated ${pkgName}`);
+    return { success: true, pkgName, resolvedRef, npmShasum, stdout };
   }
 
   /**

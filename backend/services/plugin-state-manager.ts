@@ -162,11 +162,18 @@ export class PluginStateManager {
   /**
    * Insert (or refresh) a plugin_state row for a managed install. Called by
    * the install endpoint immediately after a successful installManaged() so
-   * the UI shows "installed but disabled" before the next boot's reconcile.
+   * the UI shows the installed plugin before the next boot's reconcile.
    *
-   * - First-time: creates the row with enabled=false, installedVia='managed'.
+   * - First-time: creates the row with `enabled=true`, installedVia='managed'.
+   *   Auto-enable is intentional — the user explicitly clicked "Install",
+   *   so requiring an additional "Enable" click adds friction without
+   *   meaningful safety (the install itself was the consent gesture).
    * - Subsequent (re-install): preserves enabled state, just refreshes
    *   installedVia and updatedAt.
+   *
+   * Note: if you change this contract (e.g. default-disable for untrusted
+   * sources), update the rationale in the inline comment below and the
+   * memory file at plugin_architecture_overview.md.
    */
   upsertManagedPending(name: string, npmPackage: string, _sourceId?: number | null): void {
     const existing = this.get(name);

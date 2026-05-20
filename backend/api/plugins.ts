@@ -136,7 +136,14 @@ export function registerPluginEndpoints(
         return;
       }
 
-      const { name } = req.params;
+      const name = decodeURIComponent(req.params.name);
+      // Guard against ghost enables: a WHERE name=? update on an unknown name
+      // is a silent no-op that still flips restart-required. The UI ends up
+      // requiring a server bounce for a plugin that doesn't exist.
+      if (!stateManager.get(name)) {
+        res.status(404).json({ success: false, error: `Plugin "${name}" not found` });
+        return;
+      }
       stateManager.setEnabled(name, true);
       systemStateService?.setRestartRequired(`plugin ${name} enabled`);
       res.json({ success: true, restartRequired: true });
@@ -154,7 +161,11 @@ export function registerPluginEndpoints(
         return;
       }
 
-      const { name } = req.params;
+      const name = decodeURIComponent(req.params.name);
+      if (!stateManager.get(name)) {
+        res.status(404).json({ success: false, error: `Plugin "${name}" not found` });
+        return;
+      }
       stateManager.setEnabled(name, false);
       systemStateService?.setRestartRequired(`plugin ${name} disabled`);
       res.json({ success: true, restartRequired: true });
@@ -314,18 +325,24 @@ export function registerPluginEndpoints(
 
       let runtimeName: string;
       let pluginDependencies: string[] = [];
+      // Resolve once so rollback paths can also clear the cache key with a
+      // stable lookup (require.resolve on a wiped path still works because
+      // it returns the canonical absolute path).
+      const resolvedEntry = require.resolve(entryCandidate);
       try {
         // Clear require cache for any prior version of this plugin (re-install)
-        delete require.cache[require.resolve(entryCandidate)];
-        const imported = require(entryCandidate);
+        delete require.cache[resolvedEntry];
+        const imported = require(resolvedEntry);
         const definition = imported?.default?.default ?? imported?.default ?? imported;
         if (typeof definition?.name !== 'string' || !definition.name.trim()) {
+          delete require.cache[resolvedEntry];
           res.status(500).json({ success: false, error: 'Installed plugin entry file did not export a definition.name' });
           return;
         }
         runtimeName = definition.name;
         pluginDependencies = Array.isArray(definition.dependencies) ? definition.dependencies : [];
       } catch (err: any) {
+        delete require.cache[resolvedEntry];
         res.status(500).json({ success: false, error: `Failed to load installed plugin: ${err?.message ?? err}` });
         return;
       }
@@ -339,6 +356,9 @@ export function registerPluginEndpoints(
         return !depState || depState.installedVia === 'missing';
       });
       if (missingDeps.length > 0) {
+        // Stale cache entry would survive the rmSync below — clearing it
+        // ensures the retry path resolves a fresh module.
+        delete require.cache[resolvedEntry];
         try { rmSync(pkgDir, { recursive: true, force: true }); } catch (e) { log(`rollback rm -rf ${pkgDir} failed: ${e}`); }
         res.status(400).json({
           success: false,
@@ -536,6 +556,48 @@ export function registerPluginEndpoints(
       if (!result.success) {
         res.status(500).json({ success: false, error: result.error });
         return;
+      }
+
+      // Content-pin re-verification on update. Without this, an attacker
+      // who controls the npm registry (or MITMs the install) between the
+      // initial install and the user clicking "Update" can serve a
+      // malicious "latest" version. We re-fetch the marketplace manifest
+      // and check the post-update artefact fingerprints against what the
+      // publisher signed for this version. If the source has no signed
+      // manifest for this plugin (legacy / unsigned marketplaces), the
+      // check is skipped — the verify badge already covers the
+      // "publisher identity verified, contents not pinned" case.
+      if (verifier && sourceManager) {
+        try {
+          const marketplace = await sourceManager.fetchAll(true);
+          const flat = marketplace.flatMap((src: any) => src.plugins ?? []);
+          const signed = flat.find((p: any) => p?.npmPackage === state.npmPackage) as SignablePlugin | undefined;
+          if (signed?.signature && (signed.npmShasum || signed.gitRef)) {
+            const contentCheck = verifier.verifyContents(
+              { npmShasum: signed.npmShasum, gitRef: signed.gitRef },
+              { npmShasum: result.npmShasum ?? undefined, gitRef: result.resolvedRef ?? undefined },
+            );
+            if (!contentCheck.ok) {
+              // Roll back the new tarball so the malicious code is off disk.
+              // The previous version is not automatically restored — the
+              // user must re-install from a clean source. We mark the row
+              // as 'missing' so the UI surfaces the state clearly.
+              const rollbackDir = safeJoinInside(getDataRoot(), 'installed-plugins', 'node_modules', state.npmPackage);
+              try { rmSync(rollbackDir, { recursive: true, force: true }); } catch (e) { log(`update rollback rm -rf ${rollbackDir} failed: ${e}`); }
+              res.status(400).json({
+                success: false,
+                error: `Refusing update — ${contentCheck.reason}`,
+                contentMismatch: true,
+              });
+              return;
+            }
+          }
+        } catch (err: any) {
+          // Marketplace re-fetch failed — don't roll back, but log loudly.
+          // The user can still reach the update via a separate path; this
+          // is best-effort tamper detection.
+          log(`Content pin re-check skipped (marketplace fetch failed): ${err?.message ?? err}`);
+        }
       }
 
       // Read the freshly-installed package.json for the new version and
