@@ -33,19 +33,31 @@ export function createAdbDeviceProvider(): DeviceProvider {
     async listInstances(): Promise<DeviceProviderInstance[]> {
       const { stdout } = await execFile('adb', ['devices'], { timeout: 5000 });
       const lines = stdout.split('\n').map((l) => l.trim()).filter(Boolean);
-      // Skip the "List of devices attached" header.
-      const rows = lines.filter((l) => !l.startsWith('List of'));
+      // Skip the "List of devices attached" header AND adb's "* daemon ..."
+      // diagnostic lines (which appear on first invocation after daemon restart).
+      const rows = lines.filter((l) => !l.startsWith('List of') && !l.startsWith('*'));
       const out: DeviceProviderInstance[] = [];
       for (const row of rows) {
         // Each row is "<serial>\t<state>" — state is one of: device, offline, unauthorized, ...
         const [serial, adbState] = row.split(/\s+/);
         if (!serial) continue;
+        let state: import('@darkrideapp/plugin-sdk').DeviceInstanceState;
+        let lastError: string | undefined;
+        if (adbState === 'device') {
+          state = 'running';
+        } else if (adbState === 'unauthorized' || adbState === 'authorizing') {
+          state = 'error';
+          lastError = 'Authorisation required — accept the RSA fingerprint prompt on the device';
+        } else {
+          state = 'stopped';
+        }
         out.push({
           id: serial,
           displayName: serial,
           serial,
-          state: adbState === 'device' ? 'running' : 'stopped',
+          state,
           spawnedByDarkride: false,
+          ...(lastError ? { lastError } : {}),
         });
       }
       return out;

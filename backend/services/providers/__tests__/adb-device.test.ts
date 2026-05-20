@@ -68,4 +68,39 @@ describe('adb-device provider', () => {
     const p = createAdbDeviceProvider();
     expect(p.getNetworkConfig('any')).toEqual({ mode: 'wireguard' });
   });
+
+  it('filters out adb daemon diagnostic lines ("* daemon ...")', async () => {
+    // adb prints these on first invocation after daemon restart. Without
+    // filtering they become phantom instances with id="*".
+    mockAdbDevices(
+      `* daemon not running; starting now at tcp:5037\n` +
+      `* daemon started successfully\n` +
+      `List of devices attached\n` +
+      `R3CR70ABC123\tdevice\n`,
+    );
+    const p = createAdbDeviceProvider();
+    const instances = await p.listInstances();
+    expect(instances).toEqual([
+      { id: 'R3CR70ABC123', displayName: 'R3CR70ABC123', state: 'running', serial: 'R3CR70ABC123', spawnedByDarkride: false },
+    ]);
+  });
+
+  it('maps adb "unauthorized" state to error + actionable lastError', async () => {
+    mockAdbDevices(
+      `List of devices attached\n` +
+      `R3CR70ABC123\tunauthorized\n`,
+    );
+    const p = createAdbDeviceProvider();
+    const instances = await p.listInstances();
+    expect(instances).toEqual([
+      {
+        id: 'R3CR70ABC123',
+        displayName: 'R3CR70ABC123',
+        state: 'error',
+        serial: 'R3CR70ABC123',
+        spawnedByDarkride: false,
+        lastError: 'Authorisation required — accept the RSA fingerprint prompt on the device',
+      },
+    ]);
+  });
 });
