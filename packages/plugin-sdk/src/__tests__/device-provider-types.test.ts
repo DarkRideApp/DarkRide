@@ -3,6 +3,7 @@ import type {
   DeviceProvider,
   DeviceProviderInstance,
   NetworkConfig,
+  NetworkMode,
   CreateInstanceSpec,
   RunningInstance,
   CreateFormSchema,
@@ -27,6 +28,20 @@ describe('DeviceProvider type surface', () => {
     expectTypeOf(wg).toMatchTypeOf<NetworkConfig>();
     expectTypeOf(ios).toMatchTypeOf<NetworkConfig>();
     expectTypeOf(plugin).toMatchTypeOf<NetworkConfig>();
+
+    // A typo of a built-in mode must not silently typecheck against the
+    // narrowed arm. The `@ts-expect-error` line below MUST be an error
+    // (TS reports "unused @ts-expect-error" if it's not).
+    // @ts-expect-error 'wireguad' is a typo of 'wireguard' — must not satisfy the narrowed arm.
+    const typoBlocked: { mode: 'wireguard' } = { mode: 'wireguad' };
+    void typoBlocked;
+  });
+
+  it('NetworkMode is exported and usable as a standalone alias', () => {
+    const m: NetworkMode = 'wireguard';
+    const plug: NetworkMode = 'corellium-tunnel';
+    expectTypeOf<NetworkMode>().toMatchTypeOf<string>();
+    void m; void plug;
   });
 
   it('DeviceProviderInstance has state union restricted to the documented values', () => {

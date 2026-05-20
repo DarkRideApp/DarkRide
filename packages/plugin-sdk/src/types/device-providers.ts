@@ -16,11 +16,23 @@ export interface ProviderAvailability {
   installHint?: string;
 }
 
-/** The discriminated network mode a provider declares for an instance. */
+/**
+ * The discriminated mode string a provider declares for an instance.
+ * The two built-in modes (`wireguard`, `ios-bridge`) ship in core; the
+ * `(string & {})` arm preserves IntelliSense autocomplete for those
+ * while still permitting plugin-defined modes like `'corellium-tunnel'`.
+ *
+ * This is the well-known "widened literal" pattern: a typo like
+ * `'wireguad'` will not satisfy the built-in literal arms and TypeScript
+ * narrowing surfaces the mistake at the assignment site.
+ */
+export type NetworkMode = 'wireguard' | 'ios-bridge' | (string & {});
+
+/** Discriminated network configuration for an instance. */
 export type NetworkConfig =
   | { mode: 'wireguard' }
   | { mode: 'ios-bridge' }
-  | { mode: string; [key: string]: unknown };
+  | { mode: NetworkMode; [key: string]: unknown };
 
 /** What a provider reports about a single instance it manages. */
 export interface DeviceProviderInstance {
