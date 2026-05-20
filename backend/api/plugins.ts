@@ -375,6 +375,12 @@ export function registerPluginEndpoints(
         sourceUrl: installTarget,         // un-tokenised URL — never store the auth-tokenised version
         resolvedRef: result.resolvedRef,
         sourceId,
+        // Persist the token so replay-on-boot can re-authenticate against
+        // private repos. The originating source row may be deleted later,
+        // or the install may have come from a raw installUrl with no
+        // sourceId at all; without this column those installs become
+        // unrecoverable across server restarts.
+        authToken,
       });
       stateManager.upsertManagedPending(runtimeName, result.pkgName, sourceId);
 

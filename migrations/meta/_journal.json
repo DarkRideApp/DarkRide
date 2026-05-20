@@ -512,6 +512,13 @@
 			"when": 1777105478460,
 			"tag": "0089_system_state",
 			"breakpoints": true
+		},
+		{
+			"idx": 90,
+			"version": "7",
+			"when": 1777105478461,
+			"tag": "0090_plugin_installs_auth_token",
+			"breakpoints": true
 		}
 	]
 }

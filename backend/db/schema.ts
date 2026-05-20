@@ -488,6 +488,15 @@ export const pluginInstalls = sqliteTable('plugin_installs', {
   sourceUrl: text('source_url').notNull(),
   resolvedRef: text('resolved_ref'),
   sourceId: integer('source_id'),
+  /**
+   * Auth token used at install time. Persisted so replay-on-boot can
+   * re-authenticate against private repos when the originating source
+   * row has been deleted (or the install was via raw URL with no
+   * sourceId in the first place). Stored at the same security level
+   * as pluginSources.authToken — opaque in DB, never logged.
+   * Nullable for backwards-compatible rows from pre-0090 installs.
+   */
+  authToken: text('auth_token'),
   installedAt: integer('installed_at').notNull(),
 });
 

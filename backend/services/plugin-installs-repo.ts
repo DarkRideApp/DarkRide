@@ -10,6 +10,8 @@ export interface PluginInstallRecord {
   sourceUrl: string;
   resolvedRef: string | null;
   sourceId: number | null;
+  /** Token used at install time. May be null for older rows. */
+  authToken: string | null;
   installedAt: number;
 }
 
@@ -19,6 +21,13 @@ export interface PluginInstallInput {
   sourceUrl: string;
   resolvedRef: string | null;
   sourceId: number | null;
+  /**
+   * Token used at install time. Persisted so replay-on-boot can authenticate
+   * against private repos even when the originating source row has been
+   * deleted (or the install was via raw URL with no sourceId). Pass null when
+   * the install needed no authentication.
+   */
+  authToken: string | null;
 }
 
 export class PluginInstallsRepo {
@@ -36,6 +45,7 @@ export class PluginInstallsRepo {
           sourceUrl: input.sourceUrl,
           resolvedRef: input.resolvedRef,
           sourceId: input.sourceId,
+          authToken: input.authToken,
           installedAt,
         },
       })

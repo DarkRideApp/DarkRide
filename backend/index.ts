@@ -861,14 +861,23 @@ httpServer.listen(PORT, HOST, () => {
       const target = row.resolvedRef
         ? `${row.sourceUrl}#${row.resolvedRef}`
         : row.sourceUrl;
-      let authToken: string | null = null;
-      if (row.sourceId != null && pluginSourceManager) {
+      // Auth token resolution order:
+      // 1. The token persisted on the install row at install time.
+      // 2. As a fallback for pre-0090 rows (authToken=null), look up the
+      //    originating source — but only if it still exists.
+      // 3. Give up. The install will fail for private repos; we log
+      //    once per missing-cred replay so the user can investigate.
+      let authToken: string | null = row.authToken;
+      if (!authToken && row.sourceId != null && pluginSourceManager) {
         const src = pluginSourceManager.getAll().find((s: any) => s.id === row.sourceId);
         if (src?.authToken) authToken = src.authToken;
       }
       const result = await pluginInstaller.installManaged(target, authToken);
       if (!result.success) {
-        error(`Plugin install replay failed: ${row.name} — ${result.error}`);
+        const hint = !authToken && (target.startsWith('git+') || target.includes('github.com'))
+          ? ' (no auth token available — if this is a private repo, reinstall via the marketplace UI to refresh credentials)'
+          : '';
+        error(`Plugin install replay failed: ${row.name} — ${result.error}${hint}`);
       }
     }
   }
