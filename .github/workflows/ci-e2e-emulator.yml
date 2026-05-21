@@ -128,6 +128,27 @@ jobs:
       #    directly. `npm run dev` also boots the Vite dev server which
       #    pre-bundles deps that may not be present in CI (e.g. leaflet
       #    used by the Maps plugin); we skip that here.
+      # Pre-warm the Python venv so DarkRide's first-boot Python bridge
+      # setup is a no-op (the venv directory check skips creation when
+      # the python binary already exists). Boot time observations went
+      # 245s → 363s → 606s across runs without this prewarm — pip + mitmproxy
+      # + frida wheel builds are the dominant cost. Pre-warming flips them
+      # from the boot critical path to a cached workflow step (~90s, then
+      # ~5s on subsequent runs via actions/cache).
+      - name: Cache Python venv
+        uses: actions/cache@v4
+        id: venv-cache
+        with:
+          path: .venv
+          key: python-venv-${{ hashFiles('python/requirements.txt') }}
+
+      - name: Pre-warm Python venv
+        if: steps.venv-cache.outputs.cache-hit != 'true'
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r python/requirements.txt
+
       - name: Start DarkRide backend
         env:
           # DarkRide defaults to PORT=3000; the E2E test (and the curl
