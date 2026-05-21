@@ -142,8 +142,9 @@ jobs:
           #   - plugin discovery + migrations + reconcile
           #   - provider isAvailable checks (some shell out)
           #   - Python bridge venv creation + pip install (~30s + ~30s)
-          # Allow up to 4 minutes — the venv setup dominates.
-          for i in {1..120}; do
+          # Allow up to 6 minutes — the venv setup dominates (observed
+          # ~245s in CI; 360s gives ~50% margin).
+          for i in {1..180}; do
             if curl -fsS http://localhost:3001/v1/system/health >/dev/null 2>&1; then
               echo "DarkRide ready after ${i}*2s"
               break
@@ -151,7 +152,7 @@ jobs:
             sleep 2
           done
           curl -fsS http://localhost:3001/v1/system/health || {
-            echo "::error::DarkRide did not respond on :3001 within 240s"
+            echo "::error::DarkRide did not respond on :3001 within 360s"
             tail -300 /tmp/darkride.log
             exit 1
           }
