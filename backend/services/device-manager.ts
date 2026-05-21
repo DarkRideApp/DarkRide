@@ -1549,8 +1549,11 @@ export class DeviceManager {
    *  - Installs as a USER cert (no /system remount, no APEX namespace
    *    bind-mounts) — paired with the fixture's networkSecurityConfig,
    *    this is the minimum needed for the E2E to validate the chain.
+   *
+   * `proxyHost` is the IP the *emulator* should target — typically the
+   * host's docker-bridge gateway (172.17.0.1), not 127.0.0.1.
    */
-  async setupEmulatorHttpProxy(deviceId: string, proxyPort: number): Promise<void> {
+  async setupEmulatorHttpProxy(deviceId: string, proxyHost: string, proxyPort: number): Promise<void> {
     const certPath = path.join(getMitmproxyConfdir(), 'mitmproxy-ca-cert.pem');
     if (!fs.existsSync(certPath)) {
       throw new Error(`mitmproxy CA cert not found at ${certPath}. Start mitmproxy at least once to generate it.`);
@@ -1589,14 +1592,18 @@ export class DeviceManager {
       try { fs.rmdirSync(tmpDir); } catch {}
     }
 
-    // Forward emulator-localhost:<port> back to host:<port> so the emulator
-    // can reach the host's mitmproxy via its own loopback. adb reverse uses
-    // the existing adb transport — no docker networking changes needed.
-    log(`adb reverse tcp:${proxyPort} tcp:${proxyPort} for ${deviceId}`);
-    await adbCommand(['-s', deviceId, 'reverse', `tcp:${proxyPort}`, `tcp:${proxyPort}`], 5_000);
-
-    log(`Setting global http_proxy=127.0.0.1:${proxyPort} on ${deviceId}`);
-    await adbShell(deviceId, `settings put global http_proxy 127.0.0.1:${proxyPort}`, 5_000);
+    // `adb reverse` works for the adb transport itself but doesn't
+    // tunnel arbitrary TCP for emulators inside Docker — the in-container
+    // QEMU NAT prevents the emulator's localhost from reaching the
+    // container's adbd as a real transport. Instead, route the emulator's
+    // outbound traffic through the host's docker-bridge gateway
+    // (typically 172.17.0.1 on Linux). mitmproxy listens on 0.0.0.0:<port>
+    // and is reachable from the container via the bridge.
+    //   emulator -> 10.0.2.2 (QEMU NAT to container) -> bridge gateway -> host:<port>
+    // Keep `settings put global http_proxy` too — system-aware apps will
+    // pick it up even though HttpURLConnection ignores it.
+    log(`Setting global http_proxy=${proxyHost}:${proxyPort} on ${deviceId}`);
+    await adbShell(deviceId, `settings put global http_proxy ${proxyHost}:${proxyPort}`, 5_000);
   }
 
   /**

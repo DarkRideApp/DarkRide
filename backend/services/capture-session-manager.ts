@@ -161,12 +161,18 @@ export class CaptureSessionManager {
       if (isDockerAndroid && platform === 'android') {
         // Start mitmproxy in regular HTTP forward-proxy mode on a free port.
         const { port } = await this.mitmproxyManager.startHttpProxyCapture(deviceId, mitmOptions);
-        emuHttpProxy = { host: '127.0.0.1', port };
+        // 172.17.0.1: the default docker-bridge gateway on Linux — i.e. the
+        // host's IP from inside a container. Override via
+        // DARKRIDE_DOCKER_BRIDGE_GATEWAY for non-default bridge networks or
+        // Docker Desktop (where host.docker.internal works but requires DNS).
+        const gateway = process.env.DARKRIDE_DOCKER_BRIDGE_GATEWAY || '172.17.0.1';
+        emuHttpProxy = { host: gateway, port };
         subsystems.mitmproxy = 'ok';
         this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
 
-        // adb root, push user CA cert, adb reverse, set http_proxy.
-        await this.deviceManager.setupEmulatorHttpProxy(deviceId, port);
+        // adb root, push user CA cert, set http_proxy at the emulator's
+        // view of the host (via the bridge gateway).
+        await this.deviceManager.setupEmulatorHttpProxy(deviceId, gateway, port);
         subsystems.certInjection = 'ok';
         // WireGuard is conceptually skipped here, but the subsystems shape
         // is shared with physical-device flows — mark it as skipped rather

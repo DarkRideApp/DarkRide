@@ -310,7 +310,11 @@ export class MitmproxyManager {
     const webhookUrl = options?.webhookUrl || this.defaultWebhookUrl;
     const mitmdumpArgs: string[] = [
       '--set', `confdir=${confdir}`,
-      '--listen-host', '127.0.0.1',
+      // Listen on all interfaces so docker-android emulators can reach
+      // mitmproxy via the host's docker-bridge gateway (typically
+      // 172.17.0.1 on Linux). adb reverse + 127.0.0.1 doesn't work for
+      // arbitrary ports on emulators — only the adb transport itself.
+      '--listen-host', '0.0.0.0',
       '--listen-port', String(port),
       '-s', absoluteScriptPath,
       '--set', `node_webhook=${webhookUrl}`,
