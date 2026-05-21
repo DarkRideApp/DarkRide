@@ -65,6 +65,7 @@ function createDefaultMockCtx(pluginName: string): PluginContext {
     protocolDecoders: () => {},
     uiSlots: () => {},
     uiContributions: () => {},
+    deviceProviders: () => {},
     scopes: () => {},
     files: () => { throw new Error('files() not available in default mock — pass via mocks'); },
     notify: () => {},

@@ -758,6 +758,63 @@ describe('DeviceManager', () => {
   });
 });
 
+describe('DeviceManager — provider-driven polling', () => {
+  let db: BetterSQLite3Database<typeof schema>;
+  let manager: DeviceManager;
+
+  beforeEach(() => {
+    DeviceManager.resetInstance();
+    db = createTestDb();
+    manager = new DeviceManager(db);
+  });
+
+  afterEach(() => {
+    manager.stop();
+    DeviceManager.resetInstance();
+  });
+
+  it('pollDevicesFromProviders upserts each serial returned by the registry', async () => {
+    const mockRegistry = {
+      list: () => [],
+      get: () => undefined,
+      register: () => {},
+      listInstancesAll: async () => [
+        { providerId: 'adb-device', instance: { id: 'S1', displayName: 'S1', serial: 'S1', state: 'running' as const, spawnedByDarkride: false } },
+        { providerId: 'adb-device', instance: { id: 'S2', displayName: 'S2', serial: 'S2', state: 'stopped' as const, spawnedByDarkride: false } },
+      ],
+    };
+    manager.setProviderRegistry(mockRegistry as any);
+    await manager.pollDevicesFromProviders();
+
+    const rows = db.select().from(devices).all();
+    expect(rows.map((d) => d.id).sort()).toEqual(['S1', 'S2']);
+  });
+
+  it('pollDevicesFromProviders returns early when no registry is wired', async () => {
+    // No setProviderRegistry call — should not throw and should not insert anything
+    await expect(manager.pollDevicesFromProviders()).resolves.toBeUndefined();
+    const rows = db.select().from(devices).all();
+    expect(rows).toHaveLength(0);
+  });
+
+  it('pollDevicesFromProviders skips instances without a serial', async () => {
+    const mockRegistry = {
+      list: () => [],
+      get: () => undefined,
+      register: () => {},
+      listInstancesAll: async () => [
+        { providerId: 'avd', instance: { id: 'AVD1', displayName: 'AVD1', state: 'stopped' as const, spawnedByDarkride: true } },
+        { providerId: 'adb-device', instance: { id: 'S3', displayName: 'S3', serial: 'S3', state: 'running' as const, spawnedByDarkride: false } },
+      ],
+    };
+    manager.setProviderRegistry(mockRegistry as any);
+    await manager.pollDevicesFromProviders();
+
+    const rows = db.select().from(devices).all();
+    expect(rows.map((d) => d.id)).toEqual(['S3']);
+  });
+});
+
 describe('adb helpers — command-injection prevention', () => {
   let execFileMock: ReturnType<typeof vi.fn>;
   let execMock: ReturnType<typeof vi.fn>;

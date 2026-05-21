@@ -1,3 +1,5 @@
+import { resolve } from 'path';
+import { existsSync } from 'fs';
 import { eq } from 'drizzle-orm';
 import { devices } from '../db/schema';
 import type { AppDatabase } from '../db/index';
@@ -115,8 +117,6 @@ export class IosDeviceManager {
     }
 
     const { spawn } = await import('child_process');
-    const { resolve } = await import('path');
-    const { existsSync } = await import('fs');
     const { ensureVenv } = await import('./python-bridge');
 
     const port = 9200;
@@ -510,6 +510,42 @@ export class IosDeviceManager {
 
   isBusy(deviceId: string): boolean {
     return this.busyDevices.has(deviceId);
+  }
+
+  /**
+   * Whether the iOS bridge prerequisites are installed on this host —
+   * specifically whether the Python `ios_bridge.py` script is present in
+   * the project. Returns `true` even if the bridge process is not
+   * currently running (the poller starts it lazily). The `bridgeReady`
+   * runtime state is a separate concern (see `start()` polling backoff)
+   * and is not exposed publicly.
+   *
+   * Used by the `ios-device` provider's `isAvailable()` check.
+   */
+  isAvailable(): boolean {
+    const scriptPath = resolve(process.cwd(), 'python/ios_bridge.py');
+    return existsSync(scriptPath);
+  }
+
+  /**
+   * Snapshot of currently-known iOS devices. Reads the UDIDs from the
+   * online set and joins with the device-name cache; cheaper than another
+   * round-trip to the Python bridge.
+   *
+   * Used by the `ios-device` provider's `listInstances()`. The shape is
+   * deliberately minimal — providers map further into DeviceProviderInstance.
+   */
+  async getDevices(): Promise<Array<{ udid: string; name?: string | null; isOnline: boolean }>> {
+    // Read the iOS devices the poller has seen, joined with their name from
+    // the devices table. We don't call back into the bridge here — the
+    // poller maintains onlineDevices and the devices table already has the
+    // metadata. For UDIDs not in onlineDevices, treat as offline.
+    const rows = this.db.select().from(devices).where(eq(devices.platform, 'ios')).all() as Array<{ id: string; name: string | null }>;
+    return rows.map((r) => ({
+      udid: r.id,
+      name: r.name,
+      isOnline: this.onlineDevices.has(r.id),
+    }));
   }
 
   async getDeviceStatus(deviceId: string): Promise<DeviceStatus | null> {
