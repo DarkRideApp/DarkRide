@@ -198,7 +198,15 @@ describe('E2E — emulator capture', () => {
             },
           );
           return found;
-        }, TIMEOUT_CAPTURE_MS);
+        }, TIMEOUT_CAPTURE_MS).catch(async (err) => {
+          // Dump everything the traffic store knows about this device so
+          // we can tell whether the webhook fired at all and what shape
+          // got persisted. Helps debug capture-pipeline issues without
+          // another iteration.
+          const dumpAll = await rest('GET', `/v1/traffic/list?deviceId=${encodeURIComponent(serial)}`);
+          step(`traffic store dump (all for device): status=${dumpAll.status} total=${dumpAll.body?.data?.total ?? '?'} items=${JSON.stringify((dumpAll.body?.data?.items as any[] | undefined)?.slice(0, 5)?.map((t: any) => ({ url: t.requestUrl, host: t.hostname, status: t.responseStatus, dev: t.deviceId })))?.slice(0, 800)}`);
+          throw err;
+        });
         step(`captured: ${JSON.stringify(captured).slice(0, 300)}`);
 
         expect(captured).toBeDefined();
