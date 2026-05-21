@@ -137,19 +137,22 @@ jobs:
         run: |
           PORT=3001 npx tsx backend/index.ts > /tmp/darkride.log 2>&1 &
           echo $! > /tmp/darkride.pid
-          # Wait until the API responds. Cold boot does db migrations +
-          # plugin reconcile + provider isAvailable checks, so allow up to
-          # 120s.
-          for i in {1..60}; do
+          # Wait until the API responds. Cold boot in CI does:
+          #   - core db migrations
+          #   - plugin discovery + migrations + reconcile
+          #   - provider isAvailable checks (some shell out)
+          #   - Python bridge venv creation + pip install (~30s + ~30s)
+          # Allow up to 4 minutes — the venv setup dominates.
+          for i in {1..120}; do
             if curl -fsS http://localhost:3001/v1/system/health >/dev/null 2>&1; then
-              echo "DarkRide ready"
+              echo "DarkRide ready after ${i}*2s"
               break
             fi
             sleep 2
           done
           curl -fsS http://localhost:3001/v1/system/health || {
-            echo "::error::DarkRide did not respond on :3001 within 120s"
-            tail -200 /tmp/darkride.log
+            echo "::error::DarkRide did not respond on :3001 within 240s"
+            tail -300 /tmp/darkride.log
             exit 1
           }
 
