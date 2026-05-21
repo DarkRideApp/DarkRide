@@ -137,6 +137,7 @@ import { createAdbDeviceProvider } from './services/providers/adb-device';
 import { createIosDeviceProvider } from './services/providers/ios-device';
 import { createDockerAndroidProvider } from './services/providers/docker-android';
 import { createDockerClient } from './services/providers/docker-helpers';
+import { createAvdProvider } from './services/providers/avd';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
@@ -882,6 +883,16 @@ httpServer.listen(PORT, HOST, () => {
     log(`docker-android provider registered (Docker daemon detected)`);
   } else {
     log(`docker-android provider NOT registered: ${dockerAvailability.reason ?? 'daemon unreachable'}`);
+  }
+
+  // avd — only register if emulator + avdmanager are on PATH (Google Android SDK).
+  const avdProvider = createAvdProvider();
+  const avdAvailability = await avdProvider.isAvailable();
+  if (avdAvailability.available) {
+    providerRegistry.register(avdProvider);
+    log(`avd provider registered (emulator + avdmanager detected)`);
+  } else {
+    log(`avd provider NOT registered: ${avdAvailability.reason ?? 'cmdline-tools missing'}`);
   }
 
   // Reconcile DB device_instances against what each provider currently reports.
