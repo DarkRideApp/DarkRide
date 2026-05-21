@@ -47,6 +47,33 @@ describe('docker-android provider', () => {
     }));
   });
 
+  it('passes --device /dev/kvm when /dev/kvm exists (required for in-container emulator)', async () => {
+    const d = makeDockerMock();
+    const p = createDockerAndroidProvider(d, { hasDevKvm: () => true, hasDevDri: () => false, hasNvidia: async () => false });
+    await p.createInstance!({
+      displayName: 'kvm-test',
+      config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
+    });
+    expect(d.createContainer).toHaveBeenCalledWith(expect.objectContaining({
+      HostConfig: expect.objectContaining({
+        Devices: expect.arrayContaining([
+          expect.objectContaining({ PathOnHost: '/dev/kvm', PathInContainer: '/dev/kvm' }),
+        ]),
+      }),
+    }));
+  });
+
+  it('omits /dev/kvm when not present on the host (no Devices array entry)', async () => {
+    const d = makeDockerMock();
+    const p = createDockerAndroidProvider(d, { hasDevKvm: () => false, hasDevDri: () => false, hasNvidia: async () => false });
+    await p.createInstance!({
+      displayName: 'no-kvm',
+      config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
+    });
+    const call = (d.createContainer as any).mock.calls[0][0];
+    expect(call.HostConfig.Devices).toBeUndefined();
+  });
+
   it('GPU auto-detect: passes --device /dev/dri when /dev/dri exists', async () => {
     const d = makeDockerMock();
     const p = createDockerAndroidProvider(d, { hasDevDri: () => true, hasNvidia: async () => false });
@@ -78,10 +105,17 @@ describe('docker-android provider', () => {
   it('startInstance starts the container and returns serial=localhost:<port>', async () => {
     const d = makeDockerMock();
     const adbConnect = vi.fn().mockResolvedValue(true);
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false, adbConnect });
+    const bootCompleted = vi.fn().mockResolvedValue(true);
+    const p = createDockerAndroidProvider(d, {
+      hasDevDri: () => false, hasNvidia: async () => false,
+      adbConnect, bootCompleted,
+      // Collapse the retry window so unit tests don't sleep.
+      bootTimeoutMs: 100, bootRetryIntervalMs: 10,
+    });
     const running = await p.startInstance('container-test-emu');
     expect(running.serial).toMatch(/localhost:\d+/);
     expect(adbConnect).toHaveBeenCalledWith(6001);
+    expect(bootCompleted).toHaveBeenCalledWith('localhost:6001');
   });
 
   it('stopInstance calls container.stop', async () => {
@@ -120,8 +154,53 @@ describe('docker-android provider', () => {
       }),
     });
     const adbConnect = vi.fn().mockResolvedValue(false);
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false, adbConnect });
+    const p = createDockerAndroidProvider(d, {
+      hasDevDri: () => false, hasNvidia: async () => false,
+      adbConnect,
+      bootTimeoutMs: 100, bootRetryIntervalMs: 10,
+    });
     await expect(p.startInstance('container-test-emu')).rejects.toThrow(/adb failed/i);
+    expect(stop).toHaveBeenCalled();
+  });
+
+  it('startInstance retries adbConnect during the cold-boot window', async () => {
+    const d = makeDockerMock();
+    // Fail twice (emulator still booting), then succeed — typical 5-second
+    // window during a cold docker-android cold boot.
+    const adbConnect = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    const bootCompleted = vi.fn().mockResolvedValue(true);
+    const p = createDockerAndroidProvider(d, {
+      hasDevDri: () => false, hasNvidia: async () => false,
+      adbConnect, bootCompleted,
+      bootTimeoutMs: 500, bootRetryIntervalMs: 10,
+    });
+    const running = await p.startInstance('container-test-emu');
+    expect(running.serial).toBe('localhost:6001');
+    expect(adbConnect).toHaveBeenCalledTimes(3);
+  });
+
+  it('startInstance polls boot_completed after adb connect and stops the container if Android never boots', async () => {
+    const d = makeDockerMock();
+    const stop = vi.fn().mockResolvedValue(undefined);
+    (d.getContainer as any).mockReturnValue({
+      start: vi.fn().mockResolvedValue(undefined),
+      stop,
+      inspect: vi.fn().mockResolvedValue({
+        State: { Running: true },
+        NetworkSettings: { Ports: { '5555/tcp': [{ HostPort: '6001' }] } },
+      }),
+    });
+    const adbConnect = vi.fn().mockResolvedValue(true);
+    const bootCompleted = vi.fn().mockResolvedValue(false);
+    const p = createDockerAndroidProvider(d, {
+      hasDevDri: () => false, hasNvidia: async () => false,
+      adbConnect, bootCompleted,
+      bootTimeoutMs: 100, bootRetryIntervalMs: 10,
+    });
+    await expect(p.startInstance('container-test-emu')).rejects.toThrow(/boot did not complete/i);
     expect(stop).toHaveBeenCalled();
   });
 });
