@@ -71,18 +71,22 @@ describe('/v1/devices/providers endpoints', () => {
     }));
   });
 
-  it('POST .../start delegates to provider.startInstance + updates state', async () => {
+  it('POST .../start delegates to provider.startInstance + updates state + persists serial', async () => {
     const start = vi.fn().mockResolvedValue({ id: 'inst-1', serial: 'localhost:6001' });
     const reg = { get: () => ({ startInstance: start }) };
     const repo = {
       getById: vi.fn().mockReturnValue({ id: 99, providerId: 'docker-android', runtimeId: 'inst-1' }),
       updateState: vi.fn(),
+      updateSerial: vi.fn(),
     };
     const app = createApp(reg, repo);
     const res = await request(app).post('/v1/devices/providers/docker-android/instances/99/start');
     expect(res.status).toBe(200);
     expect(start).toHaveBeenCalledWith('inst-1');
     expect(repo.updateState).toHaveBeenCalledWith(99, 'running');
+    // CaptureSessionManager uses the serial column to find which provider
+    // spawned a device; persist it as soon as startInstance resolves.
+    expect(repo.updateSerial).toHaveBeenCalledWith(99, 'localhost:6001');
   });
 
   it('POST .../start records last_error when provider throws', async () => {

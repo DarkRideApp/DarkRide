@@ -63,6 +63,20 @@ export class DeviceInstancesRepo {
       .run();
   }
 
+  /**
+   * Persist the adb serial after `startInstance` resolves with the
+   * provider-assigned host port. CaptureSessionManager looks up the
+   * provider by serial so it can pick the right capture path
+   * (emulator HTTP proxy vs physical-device WireGuard) — without
+   * this the lookup misses and emulators get the physical-device flow.
+   */
+  updateSerial(id: number, serial: string | null): void {
+    this.db.update(deviceInstances)
+      .set({ serial, lastStateAt: new Date() })
+      .where(eq(deviceInstances.id, id))
+      .run();
+  }
+
   getById(id: number): DeviceInstanceRow | undefined {
     return this.db.select().from(deviceInstances).where(eq(deviceInstances.id, id)).all()[0] as DeviceInstanceRow | undefined;
   }

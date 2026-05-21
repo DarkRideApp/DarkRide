@@ -100,6 +100,9 @@ export function registerDevicesProvidersEndpoints(
       repo.updateState(row.id, 'starting');
       broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
       const r = await p.startInstance(row.runtimeId);
+      // Persist the resolved serial — required for CaptureSessionManager's
+      // provider lookup (it routes by deviceInstances.serial → providerId).
+      repo.updateSerial(row.id, r.serial ?? null);
       repo.updateState(row.id, 'running');
       broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
       res.json({ success: true, data: { running: r } });
