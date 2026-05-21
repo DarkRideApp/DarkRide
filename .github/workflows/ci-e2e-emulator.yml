@@ -165,14 +165,19 @@ jobs:
           #   - Python bridge venv creation + pip install (~60-90s)
           # Allow up to 10 minutes — the Python setup dominates.
           # Observed ~363s in CI; 600s gives ~65% margin for slow runners.
+          #
+          # Probe /health (auth-allowlisted in backend/auth/init.ts) rather than
+          # /v1/system/health — the latter is auth-gated and returns 401 to an
+          # anonymous probe, which would falsely keep the loop polling even
+          # after the server is up.
           for i in {1..300}; do
-            if curl -fsS http://localhost:3001/v1/system/health >/dev/null 2>&1; then
+            if curl -fsS http://localhost:3001/health >/dev/null 2>&1; then
               echo "DarkRide ready after ${i}*2s"
               break
             fi
             sleep 2
           done
-          curl -fsS http://localhost:3001/v1/system/health || {
+          curl -fsS http://localhost:3001/health || {
             echo "::error::DarkRide did not respond on :3001 within 600s"
             tail -300 /tmp/darkride.log
             exit 1
