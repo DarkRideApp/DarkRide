@@ -209,12 +209,16 @@ jobs:
           CSRF=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/setup-response.json','utf8')).csrfToken)")
           # Create a long-lived API key with the scopes the E2E needs.
           # Endpoint: POST /v1/profile/api-keys with { name, scopes[] }; 201 response.
-          # Scopes: core.devices:manage (provider endpoints), core.traffic:manage (capture endpoints).
+          # Scopes:
+          #   core.devices:manage  — POST /v1/devices/providers/.../instances{,/N/start,/N/stop}
+          #   core.traffic:manage  — POST /v1/capture/start
+          #   core.traffic:read    — GET  /v1/traffic/list  (verbs are not hierarchical;
+          #                          manage doesn't imply read — see backend/auth/scope-matcher.ts)
           curl -fsS -b /tmp/darkride-cookies.txt \
             -X POST http://localhost:3001/v1/profile/api-keys \
             -H 'Content-Type: application/json' \
             -H "X-CSRF-Token: $CSRF" \
-            -d '{"name":"e2e-test","scopes":["core.devices:manage","core.traffic:manage"]}' \
+            -d '{"name":"e2e-test","scopes":["core.devices:manage","core.traffic:manage","core.traffic:read"]}' \
             > /tmp/key-response.json
           API_KEY=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/key-response.json','utf8')).data.key)")
           if [ -z "$API_KEY" ]; then
