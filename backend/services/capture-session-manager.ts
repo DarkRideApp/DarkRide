@@ -66,7 +66,7 @@ export class CaptureSessionManager {
     return row?.providerId;
   }
 
-  async startCapture(deviceId: string, proxyOptions?: { mode: 'none' | 'normal' | 'nordvpn'; country?: string }, tlsProfile?: string): Promise<{ sessionId: number }> {
+  async startCapture(deviceId: string, proxyOptions?: { mode: 'none' | 'normal' | 'nordvpn'; country?: string }, tlsProfile?: string): Promise<{ sessionId: number; httpProxy?: { host: string; port: number } }> {
     // Guard: already capturing
     const existing = this.activeSessions.get(deviceId);
     if (existing) {
@@ -151,10 +151,17 @@ export class CaptureSessionManager {
       // path. iOS keeps its existing manual-tunnel flow.
       const providerId = this.getProviderIdForDevice(deviceId);
       const isDockerAndroid = providerId === 'docker-android';
+      // Set when we take the emu-http-proxy path so the API response can
+      // tell callers (E2E tests, custom launchers) where mitmproxy is
+      // listening — they need this to point apps at the proxy explicitly
+      // via Java's Proxy() rather than rely on `settings put global http_proxy`,
+      // which HttpURLConnection ignores in practice.
+      let emuHttpProxy: { host: string; port: number } | undefined;
 
       if (isDockerAndroid && platform === 'android') {
         // Start mitmproxy in regular HTTP forward-proxy mode on a free port.
         const { port } = await this.mitmproxyManager.startHttpProxyCapture(deviceId, mitmOptions);
+        emuHttpProxy = { host: '127.0.0.1', port };
         subsystems.mitmproxy = 'ok';
         this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
 
@@ -236,7 +243,7 @@ export class CaptureSessionManager {
         });
       }
 
-      return { sessionId };
+      return emuHttpProxy ? { sessionId, httpProxy: emuHttpProxy } : { sessionId };
     } catch (err: any) {
       // Cleanup on error
       error(`Failed to start capture for device ${deviceId}: ${err.message}`);

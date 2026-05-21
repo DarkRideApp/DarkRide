@@ -29,7 +29,10 @@ export function registerCaptureEndpoints(captureManager: CaptureSessionManager):
     try {
       const result = await captureManager.startCapture(deviceId, proxyOptions, tlsProfile);
       log(`Capture started for device ${deviceId}, session ${result.sessionId}`);
-      res.json({ success: true, data: { sessionId: result.sessionId } });
+      // httpProxy is only present for emu-http-proxy mode (docker-android
+      // emulators); physical-device captures omit it and the response is
+      // unchanged.
+      res.json({ success: true, data: { sessionId: result.sessionId, ...(result.httpProxy ? { httpProxy: result.httpProxy } : {}) } });
     } catch (err: any) {
       error(`Failed to start capture: ${err.message}`);
       res.status(500).json({ success: false, error: err.message });

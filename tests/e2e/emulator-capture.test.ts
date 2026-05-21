@@ -123,16 +123,25 @@ describe('E2E — emulator capture', () => {
         const captureRes = await rest('POST', `/v1/capture/start`, { deviceId: serial });
         step(`capture start response: status=${captureRes.status} body=${JSON.stringify(captureRes.body).slice(0, 300)}`);
         expect(captureRes.status).toBe(200);
+        // emu-http-proxy mode returns the mitmproxy host:port. The fixture
+        // wires this into a Java Proxy() for the request — relying on
+        // `settings put global http_proxy` alone doesn't work because
+        // HttpURLConnection ignores the system setting in practice.
+        const httpProxy = captureRes.body?.data?.httpProxy as { host: string; port: number } | undefined;
+        expect(httpProxy).toBeDefined();
+        const proxyUrl = `${httpProxy!.host}:${httpProxy!.port}`;
+        step(`proxy from capture response: ${proxyUrl}`);
 
         // 6. Launch the fixture activity — it fires https://e2e.example.test/ping
         //    from onCreate(), routed through DarkRide's mitmproxy bridge.
-        step(`adb -s ${serial} shell am start -n wiki.themeparks.darkride.e2efixture/.MainActivity`);
+        step(`adb -s ${serial} shell am start ... --es proxy_url ${proxyUrl}`);
         execFileSync(
           'adb',
           [
             '-s', serial,
             'shell', 'am', 'start',
             '-n', 'wiki.themeparks.darkride.e2efixture/.MainActivity',
+            '--es', 'proxy_url', proxyUrl,
           ],
           { stdio: 'inherit' },
         );
