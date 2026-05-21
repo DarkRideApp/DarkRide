@@ -5,7 +5,7 @@
  *   1. Spawn a docker-android container via DarkRide's API
  *   2. Install the fixture APK (built by CI from tests/e2e/fixtures/hello-world)
  *   3. Start capture session for the device
- *   4. Launch the app — it fires https://e2e.example.test/ping
+ *   4. Launch the app — it fires https://example.com/?darkride-e2e=ping
  *   5. Assert the request appears in DarkRide's captured traffic
  *   6. Tear down
  *
@@ -137,7 +137,7 @@ describe('E2E — emulator capture', () => {
         // (wget) are also missing or limited. We get the real signal from
         // the fixture's own logcat lines after the activity launches.
 
-        // 6. Launch the fixture activity — it fires https://e2e.example.test/ping
+        // 6. Launch the fixture activity — it fires https://example.com/?darkride-e2e=ping
         //    from onCreate(), routed through DarkRide's mitmproxy bridge.
         // Clear logcat first so the post-mortem only shows our app's lines.
         execFileSync('adb', ['-s', serial, 'logcat', '-c'], { stdio: 'inherit' });
@@ -175,18 +175,23 @@ describe('E2E — emulator capture', () => {
         }
 
         // 7. Poll the traffic store until the captured request appears.
-        //    Endpoint: GET /v1/traffic/list?deviceId=<serial>&hostname=e2e.example.test
+        //    Endpoint: GET /v1/traffic/list?deviceId=<serial>&hostname=example.com
         //    Response shape: { data: { items: [...], total, limit, offset } }
+        //    The fixture hits https://example.com/?darkride-e2e=ping — a
+        //    real domain so mitmproxy's CONNECT to it succeeds and the
+        //    request gets captured + decrypted. The query param marks the
+        //    request as ours so we don't false-positive on other example.com
+        //    traffic (there shouldn't be any in CI, but be defensive).
         const captured = await waitFor(async () => {
           const r = await rest(
             'GET',
-            `/v1/traffic/list?deviceId=${encodeURIComponent(serial)}&hostname=e2e.example.test`,
+            `/v1/traffic/list?deviceId=${encodeURIComponent(serial)}&hostname=example.com`,
           );
           const found = (r.body?.data?.items as any[] | undefined)?.find(
             (t: any) => {
               try {
                 const u = new URL(t.requestUrl);
-                return u.hostname === 'e2e.example.test' && u.pathname === '/ping';
+                return u.hostname === 'example.com' && u.searchParams.get('darkride-e2e') === 'ping';
               } catch {
                 return false;
               }
@@ -198,8 +203,8 @@ describe('E2E — emulator capture', () => {
 
         expect(captured).toBeDefined();
         const capturedUrl = new URL(captured.requestUrl);
-        expect(capturedUrl.hostname).toBe('e2e.example.test');
-        expect(capturedUrl.pathname).toBe('/ping');
+        expect(capturedUrl.hostname).toBe('example.com');
+        expect(capturedUrl.searchParams.get('darkride-e2e')).toBe('ping');
       } finally {
         // 8. Tear down — stop + delete the container even if assertions failed
         await rest(

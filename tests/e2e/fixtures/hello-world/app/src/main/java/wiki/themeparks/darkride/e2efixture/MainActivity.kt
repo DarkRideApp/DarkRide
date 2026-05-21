@@ -42,8 +42,16 @@ class MainActivity : Activity() {
         Log.i(TAG, "onCreate: proxy_url=${proxyUrl ?: "(none)"}")
         thread {
             try {
-                Log.i(TAG, "opening https://e2e.example.test/ping via proxy=${proxyUrl ?: "(direct)"}")
-                val url = URL("https://e2e.example.test/ping")
+                // Use a real domain so the CONNECT through mitmproxy
+                // actually resolves and completes. example.com is reserved
+                // for documentation/testing (RFC 2606) and stable — perfect
+                // for an E2E that just wants to validate the capture chain.
+                // mitmproxy intercepts TLS, presents its own cert (trusted
+                // via networkSecurityConfig + user CA push), and the
+                // request appears in DarkRide's traffic store keyed by
+                // hostname=example.com.
+                Log.i(TAG, "opening https://example.com/?darkride-e2e=ping via proxy=${proxyUrl ?: "(direct)"}")
+                val url = URL("https://example.com/?darkride-e2e=ping")
                 val conn = if (proxyUrl != null && proxyUrl.contains(':')) {
                     val (host, portStr) = proxyUrl.split(":", limit = 2)
                     val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(host, portStr.toInt()))
