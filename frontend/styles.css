@@ -6710,14 +6710,6 @@ body.live-log-open .ai-chat-fab {
 .plugin-card-title h3 { margin: 0; font-size: 15px; }
 .plugin-card-version { font-size: 12px; color: var(--text-secondary); }
 .plugin-card-badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: var(--bg-primary); color: var(--text-secondary); }
-.device-type-badge {
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 4px;
-  background: var(--bg-primary);
-  color: var(--text-secondary);
-  font-family: var(--font-mono, monospace);
-}
 .plugin-card-actions { display: flex; gap: 6px; align-items: center; }
 .plugin-card-description { margin: 8px 0 4px; font-size: 13px; color: var(--text-secondary); }
 .plugin-card-author { font-size: 12px; color: var(--text-tertiary); }

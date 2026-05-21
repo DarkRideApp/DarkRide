@@ -132,16 +132,6 @@ import { AiAgentFactory } from './services/ai-agent-factory';
 import { AiCallLogger } from './services/ai-call-logger';
 import { ServiceUserManager } from './auth/service-user-manager';
 import { backfillFailedDiffs } from './services/apk-diff-backfill';
-import { createProviderRegistry } from './services/providers';
-import { createAdbDeviceProvider } from './services/providers/adb-device';
-import { createIosDeviceProvider } from './services/providers/ios-device';
-import { createDockerAndroidProvider } from './services/providers/docker-android';
-import { createDockerClient } from './services/providers/docker-helpers';
-import { createAvdProvider } from './services/providers/avd';
-import { createCaptureModeRegistry } from './services/capture-mode-registry';
-import { reconcileWithProviders } from './services/device-manager-reconcile';
-import { DeviceInstancesRepo } from './services/device-instances-repo';
-import { registerDevicesProvidersEndpoints } from './api/devices-providers';
 
 const { log, error } = createLoggers('server');
 
@@ -261,24 +251,6 @@ registerLicenseEndpoints(licenseService);
 
 // Initialize services
 const deviceManager = DeviceManager.getInstance(db);
-
-// Emulator support — provider abstraction (spec docs/specs/2026-05-20-emulator-support-design.md §4).
-// Phase 1 wires the registry + adb-device provider but does not yet drive it
-// from DeviceManager.start() — the legacy pollAdbDevices interval keeps
-// running. Phase 2 swaps the interval to call pollDevicesFromProviders.
-const providerRegistry = createProviderRegistry();
-providerRegistry.register(createAdbDeviceProvider());
-deviceManager.setProviderRegistry(providerRegistry);
-
-const captureModeRegistry = createCaptureModeRegistry();
-// The wireguard capture handler is a Phase 1 no-op shim. Phase 2 replaces
-// it with the real per-device capture setup that today lives inline in
-// DeviceManager's setup path.
-captureModeRegistry.register('wireguard', async (_instance, _cfg) => {
-  // Phase 1: no-op. See spec §5.
-});
-deviceManager.setCaptureModeRegistry(captureModeRegistry);
-
 const proxyRotator = new ProxyRotator(db);
 const bridgeManager = new PythonBridgeManager(db);
 const compiler = new AutomationCompiler();
@@ -298,13 +270,6 @@ const captureManager = new CaptureSessionManager(db, mitmproxyManager, deviceMan
 captureManager.setIosDeviceManager(iosDeviceManager);
 runner.setNotificationService(notificationService);
 runner.setIosDeviceManager(iosDeviceManager);
-
-// Register iOS devices as a first-class provider. iosDeviceManager must be
-// constructed first (above) because the provider holds a reference to it.
-providerRegistry.register(createIosDeviceProvider(iosDeviceManager));
-captureModeRegistry.register('ios-bridge', async (_instance, _cfg) => {
-  // Phase 2: no-op shim. The existing iOS capture pipeline (capture-session-manager + IosDeviceManager.markBusy/markIdle) handles the actual wiring. This dispatch seam exists so future plugin providers can register alternative iOS-bridge modes too.
-});
 
 
 // pluginManager is initialized in the async startup IIFE but referenced in
@@ -869,38 +834,6 @@ httpServer.listen(PORT, HOST, () => {
   // JWS verify) so it can run before the slower phases below.
   await licenseService.init();
 
-  // docker-android — only register if the Docker daemon is reachable. The
-  // provider's isAvailable() check is async, so we do it here at boot time
-  // once rather than on every wizard load. Result is cached implicitly by
-  // the registration outcome — if Docker isn't running when DarkRide boots,
-  // the provider isn't available; user restarts DarkRide after starting
-  // Docker.
-  const dockerClient = createDockerClient();
-  const dockerAndroidProvider = createDockerAndroidProvider(dockerClient);
-  const dockerAvailability = await dockerAndroidProvider.isAvailable();
-  if (dockerAvailability.available) {
-    providerRegistry.register(dockerAndroidProvider);
-    log(`docker-android provider registered (Docker daemon detected)`);
-  } else {
-    log(`docker-android provider NOT registered: ${dockerAvailability.reason ?? 'daemon unreachable'}`);
-  }
-
-  // avd — only register if emulator + avdmanager are on PATH (Google Android SDK).
-  const avdProvider = createAvdProvider();
-  const avdAvailability = await avdProvider.isAvailable();
-  if (avdAvailability.available) {
-    providerRegistry.register(avdProvider);
-    log(`avd provider registered (emulator + avdmanager detected)`);
-  } else {
-    log(`avd provider NOT registered: ${avdAvailability.reason ?? 'cmdline-tools missing'}`);
-  }
-
-  // Reconcile DB device_instances against what each provider currently reports.
-  // Runs before plugins load so DB state is accurate before any plugin queries it.
-  const deviceInstancesRepo = new DeviceInstancesRepo(db);
-  await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
-  registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo);
-
   // Phase 1: Python environment
   setStartupPhase('preparing_python', 'Preparing Python environment...');
   try {
@@ -1178,20 +1111,6 @@ httpServer.listen(PORT, HOST, () => {
   const pluginEvents = pluginManager.getAllNotificationEvents();
   if (pluginEvents.length > 0) {
     registerPluginNotificationEvents(pluginEvents);
-  }
-
-  // Plugin-contributed device providers + capture handlers.
-  // Each plugin's register() may have called ctx.deviceProviders([...]) —
-  // collect those and wire them into the same registries used by the
-  // built-in providers.
-  for (const { pluginName, registration: reg } of pluginManager.getAllDeviceProviders()) {
-    try {
-      providerRegistry.register(reg.implementation);
-      captureModeRegistry.register(reg.networkMode, reg.captureHandler);
-      log(`Plugin "${pluginName}" registered device provider "${reg.id}" with capture mode "${reg.networkMode}"`);
-    } catch (err: any) {
-      error(`Plugin "${pluginName}" device provider registration failed: ${err.message}`);
-    }
   }
 
   // Register plugin API routes

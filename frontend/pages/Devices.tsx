@@ -10,7 +10,6 @@ import { Smartphone, Apple, RefreshCw } from 'lucide-react';
 import { CURRENT_SETUP_VERSION } from '../../shared/types/api';
 import type { Device } from '../../shared/types/api';
 import { SetupWizardModal } from '../components/devices/SetupWizardModal';
-import { CreateEmulatorModal } from '../components/devices/CreateEmulatorModal';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
 
@@ -34,7 +33,6 @@ export function Devices() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [loading, setLoading] = useState(true);
   const [setupDevice, setSetupDevice] = useState<Device | null>(null);
-  const [showCreateModal, setShowCreateModal] = useState(false);
 
   const fetchDevices = useCallback(async () => {
     try {
@@ -73,12 +71,6 @@ export function Devices() {
             <button className="btn btn-sm" onClick={() => fetchDevices()}>
               <RefreshCw size={14} style={{ marginRight: 6 }} />
               Sync All
-            </button>
-            <button
-              className="btn btn-sm btn-primary"
-              onClick={() => setShowCreateModal(true)}
-            >
-              + Add emulator
             </button>
           </div>
         }
@@ -184,15 +176,6 @@ export function Devices() {
           device={setupDevice}
           onClose={() => setSetupDevice(null)}
           onSetupComplete={handleSetupComplete}
-        />
-      )}
-      {showCreateModal && (
-        <CreateEmulatorModal
-          onCancel={() => setShowCreateModal(false)}
-          onCreated={() => {
-            setShowCreateModal(false);
-            fetchDevices();
-          }}
         />
       )}
     </div>
