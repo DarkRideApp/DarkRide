@@ -132,8 +132,15 @@ export async function spawnContainerHttpForwarder(
   ].join('\n');
 
   const container = d.getContainer(containerId);
+  // budtmo's docker-android image doesn't have an /etc/passwd entry for
+  // root — dockerode's default User="root" username lookup fails with
+  // "unable to find user root: no matching entries in passwd file". The
+  // image runs as androidusr (UID 1300); the forwarder doesn't need any
+  // privileged operation (binds an unprivileged port, opens TCP), so
+  // androidusr is fine.
   const exec = await container.exec({
     Cmd: ['python3', '-c', script],
+    User: 'androidusr',
     AttachStdout: false,
     AttachStderr: false,
     Detach: true,
