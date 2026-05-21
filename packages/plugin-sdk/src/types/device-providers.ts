@@ -72,6 +72,14 @@ export interface CreateFormSchema {
     default?: string | number | boolean;
     options?: Array<{ value: string; label: string }>; // for type='select'
     help?: string;
+    /** Inclusive min for type='number'. The UI renders a validation hint. */
+    min?: number;
+    /** Inclusive max for type='number'. The UI renders a validation hint. */
+    max?: number;
+    /** Numeric step for type='number' (defaults to 1). */
+    step?: number;
+    /** Placeholder for type='string'. */
+    placeholder?: string;
   }>;
 }
 

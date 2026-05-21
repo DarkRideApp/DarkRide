@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { Devices } from './Devices';
-import { WebSocketContext } from '@darkrideapp/plugin-sdk/react';
+import { WebSocketContext, ToastProvider } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
 
 // jsdom doesn't implement HTMLDialogElement methods
@@ -36,9 +36,11 @@ function createMockWs(): WebSocketContextValue {
 function renderDevices() {
   return render(
     <WebSocketContext.Provider value={createMockWs()}>
-      <MemoryRouter>
-        <Devices />
-      </MemoryRouter>
+      <ToastProvider>
+        <MemoryRouter>
+          <Devices />
+        </MemoryRouter>
+      </ToastProvider>
     </WebSocketContext.Provider>
   );
 }

@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useWebSocket, useToast } from '@darkrideapp/plugin-sdk/react';
+import { X, AlertCircle, RefreshCw, Info } from 'lucide-react';
 import { ProviderTab, type FormField } from './ProviderTab';
 
 interface Provider {
@@ -16,9 +17,21 @@ interface Props {
 }
 
 /**
- * Modal wizard for creating a new managed emulator instance. One tab per
- * provider that supports createInstance. Unavailable providers (e.g. no
- * Docker daemon) render an installHint instead of the form.
+ * Modal wizard for creating a new managed emulator instance.
+ *
+ * UX choices:
+ *   - When only one provider supports createInstance (the typical case for
+ *     most installs), tabs collapse — we just show the form.
+ *   - Create is non-blocking: the modal closes the moment the `created`
+ *     row exists. The actual emulator boot (~90s on KVM) is observable on
+ *     the Devices page via the new managed-instance card with a "Booting"
+ *     badge, driven by `provider-instance-updated` WebSocket broadcasts.
+ *   - Unavailable providers get a real empty state with a Re-check button,
+ *     not just a sentence of text.
+ *
+ * The form schema is fetched per provider from
+ * `GET /v1/devices/providers/:id/create-form` so plugin-contributed
+ * providers don't need any UI changes — they just declare their fields.
  */
 export function CreateEmulatorModal({ onCancel, onCreated }: Props) {
   const ws = useWebSocket();
@@ -29,16 +42,19 @@ export function CreateEmulatorModal({ onCancel, onCreated }: Props) {
   const [displayName, setDisplayName] = useState('');
   const [config, setConfig] = useState<Record<string, unknown>>({});
   const [submitting, setSubmitting] = useState(false);
+  const [rechecking, setRechecking] = useState(false);
+  const [providersLoaded, setProvidersLoaded] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      const r = await ws.sendRestApi('GET', '/v1/devices/providers');
-      const all = (r.body?.data?.providers ?? []) as Provider[];
-      const creatable = all.filter((p) => p.capabilities.canCreate);
-      setProviders(creatable);
-      if (creatable.length > 0) setActiveId(creatable[0].id);
-    })();
-  }, [ws]);
+  const fetchProviders = useCallback(async () => {
+    const r = await ws.sendRestApi('GET', '/v1/devices/providers');
+    const all = (r.body?.data?.providers ?? []) as Provider[];
+    const creatable = all.filter((p) => p.capabilities.canCreate);
+    setProviders(creatable);
+    if (creatable.length > 0 && !activeId) setActiveId(creatable[0].id);
+    setProvidersLoaded(true);
+  }, [ws, activeId]);
+
+  useEffect(() => { void fetchProviders(); }, [fetchProviders]);
 
   useEffect(() => {
     if (!activeId) return;
@@ -61,71 +77,168 @@ export function CreateEmulatorModal({ onCancel, onCreated }: Props) {
 
   const active = providers.find((p) => p.id === activeId);
 
+  async function reCheck() {
+    setRechecking(true);
+    try {
+      await fetchProviders();
+    } finally {
+      setRechecking(false);
+    }
+  }
+
   async function submit() {
     if (!activeId || !active?.available || !displayName.trim()) return;
     setSubmitting(true);
+    let createdOk = false;
     try {
       const r = await ws.sendRestApi('POST', `/v1/devices/providers/${activeId}/instances`, {
         displayName: displayName.trim(),
         config,
       });
       if (r.body?.success) {
-        toast.success(`Emulator "${displayName}" created — starting...`);
-        // Auto-start
-        await ws.sendRestApi('POST', `/v1/devices/providers/${activeId}/instances/${r.body.data.instance.id}/start`);
+        const instanceId = r.body.data.instance.id as number;
+        // Fire-and-forget the start request. The Devices page subscribes to
+        // provider-instance-updated and renders the boot progress; blocking
+        // here would freeze the modal for ~90s with no feedback.
+        void ws.sendRestApi(
+          'POST',
+          `/v1/devices/providers/${activeId}/instances/${instanceId}/start`,
+        );
+        toast.success(`"${displayName.trim()}" created — booting in the background`);
+        createdOk = true;
         onCreated();
       } else {
-        toast.error(r.body?.error ?? 'Create failed');
+        toast.error(r.body?.error ?? 'Failed to create emulator');
       }
+    } catch (err: any) {
+      toast.error(err?.message ?? 'Failed to create emulator');
     } finally {
-      setSubmitting(false);
+      if (!createdOk) setSubmitting(false);
     }
   }
 
+  const showTabs = providers.length > 1;
+  const submitDisabled = submitting || !active?.available || !displayName.trim();
+
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true">
-      <div className="modal create-emulator-modal">
+    <div className="modal-overlay" onClick={submitting ? undefined : onCancel}>
+      <div
+        className="modal modal-lg"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-emulator-title"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="modal-header">
-          <h2>Create emulator</h2>
-          <button onClick={onCancel} aria-label="Close">✕</button>
-        </div>
-        <div className="modal-tabs" role="tablist">
-          {providers.map((p) => (
-            <button
-              key={p.id}
-              role="tab"
-              aria-selected={p.id === activeId}
-              className={p.id === activeId ? 'tab active' : 'tab'}
-              onClick={() => setActiveId(p.id)}
-            >
-              {p.displayName}
-            </button>
-          ))}
-        </div>
-        <div className="modal-body">
-          {active && !active.available && (
-            <div className="provider-unavailable">
-              <p>{active.installHint ?? `${active.displayName} is not available on this host.`}</p>
-            </div>
-          )}
-          {active && active.available && (
-            <ProviderTab
-              schema={schema}
-              displayName={displayName}
-              setDisplayName={setDisplayName}
-              config={config}
-              setConfig={setConfig}
-            />
-          )}
-        </div>
-        <div className="modal-footer">
-          <button onClick={onCancel}>Cancel</button>
+          <h2 id="create-emulator-title">Create emulator</h2>
           <button
-            onClick={submit}
-            disabled={submitting || !active?.available || !displayName.trim()}
-            className="btn-primary"
+            className="modal-close"
+            onClick={onCancel}
+            aria-label="Close"
+            disabled={submitting}
           >
-            {submitting ? 'Creating...' : 'Create & start'}
+            <X size={18} />
+          </button>
+        </div>
+
+        {showTabs && (
+          <div className="emulator-modal-tabs" role="tablist">
+            {providers.map((p) => (
+              <button
+                key={p.id}
+                role="tab"
+                aria-selected={p.id === activeId}
+                className={`tab-btn${p.id === activeId ? ' active' : ''}`}
+                onClick={() => setActiveId(p.id)}
+                type="button"
+              >
+                {p.displayName}
+                {!p.available && (
+                  <span className="emulator-modal-tab-unavail" title="Not available">·</span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="modal-body">
+          {!providersLoaded ? (
+            <div className="emulator-modal-empty">Loading providers…</div>
+          ) : providers.length === 0 ? (
+            <div className="emulator-modal-empty">
+              <AlertCircle size={28} aria-hidden />
+              <div className="emulator-modal-empty-title">No emulator providers available</div>
+              <div className="emulator-modal-empty-detail">
+                Install Docker to enable docker-android, or the Android SDK
+                (with avdmanager + emulator on PATH) to enable AVD.
+              </div>
+            </div>
+          ) : active && !active.available ? (
+            <div className="emulator-modal-empty">
+              <AlertCircle size={28} aria-hidden />
+              <div className="emulator-modal-empty-title">
+                {active.displayName} isn't available on this host
+              </div>
+              <div className="emulator-modal-empty-detail">
+                {active.installHint ?? 'See the provider docs for setup instructions.'}
+              </div>
+              <button
+                className="btn btn-sm"
+                onClick={reCheck}
+                disabled={rechecking}
+                type="button"
+              >
+                <RefreshCw
+                  size={14}
+                  style={{ marginRight: 6 }}
+                  className={rechecking ? 'spin' : undefined}
+                />
+                {rechecking ? 'Re-checking…' : 'Re-check availability'}
+              </button>
+            </div>
+          ) : active ? (
+            <>
+              <ProviderTab
+                schema={schema}
+                displayName={displayName}
+                setDisplayName={setDisplayName}
+                config={config}
+                setConfig={setConfig}
+              />
+              <div className="emulator-modal-hint">
+                <Info size={14} aria-hidden />
+                <span>
+                  Cold boot takes ~90 seconds. The instance appears in your
+                  device list once it's ready.
+                </span>
+              </div>
+            </>
+          ) : null}
+        </div>
+
+        <div className="modal-footer">
+          <button
+            className="btn btn-ghost"
+            onClick={onCancel}
+            disabled={submitting}
+            type="button"
+          >
+            Cancel
+          </button>
+          <button
+            className="btn btn-primary"
+            onClick={submit}
+            disabled={submitDisabled}
+            type="button"
+            title={
+              !active?.available
+                ? 'Provider not available on this host'
+                : !displayName.trim()
+                  ? 'Enter a name to continue'
+                  : undefined
+            }
+          >
+            {submitting ? 'Creating…' : 'Create & start'}
           </button>
         </div>
       </div>

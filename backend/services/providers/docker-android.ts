@@ -259,7 +259,9 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             { value: 'x86_64', label: 'x86_64 (recommended for KVM hosts)' },
             { value: 'arm64', label: 'arm64' },
           ] },
-          { key: 'ramMb', label: 'RAM (MB)', type: 'number', required: true, default: 2048 },
+          { key: 'ramMb', label: 'RAM (MB)', type: 'number', required: true, default: 2048,
+            min: 1024, max: 8192, step: 256,
+            help: 'Pixel 8 baseline is 2 GB. Heavy apps may need 4 GB.' },
         ],
       };
     },

@@ -7007,3 +7007,130 @@ body.live-log-open .ai-chat-fab {
 }
 .settings-page-header h1 { margin: 0; font-size: 24px; }
 .settings-page-actions { display: flex; gap: 8px; }
+
+/* Create-emulator modal */
+.emulator-modal-tabs {
+  display: flex;
+  gap: 0;
+  margin: 0 -24px 16px; /* span to modal edges */
+  padding: 0 24px;
+  border-bottom: 1px solid var(--border-color);
+}
+.emulator-modal-tabs .tab-btn {
+  padding: 8px 14px 10px;
+  font-size: 13px;
+}
+.emulator-modal-tab-unavail {
+  margin-left: 6px;
+  color: var(--warning);
+  font-weight: 700;
+}
+.emulator-modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.emulator-modal-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  padding: 32px 16px;
+  color: var(--text-secondary);
+}
+.emulator-modal-empty-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-top: 4px;
+}
+.emulator-modal-empty-detail {
+  font-size: 13px;
+  max-width: 420px;
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+.emulator-modal-hint {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: 16px;
+  padding: 10px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.emulator-modal-hint svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--accent);
+}
+.form-required {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* Managed-instance card (booting/error/stopped emulators on Devices page) */
+.instance-card {
+  border-left: 3px solid var(--border-color);
+}
+.instance-card-starting,
+.instance-card-running { /* "running" here means backend says running but adb hasn't picked it up yet */
+  border-left-color: var(--accent);
+}
+.instance-card-created,
+.instance-card-stopped {
+  border-left-color: var(--text-muted);
+}
+.instance-card-error {
+  border-left-color: var(--danger);
+}
+.badge.instance-state-starting,
+.badge.instance-state-running {
+  background: var(--accent-soft, rgba(56, 189, 248, 0.15));
+  color: var(--accent);
+}
+.badge.instance-state-created,
+.badge.instance-state-stopped {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+.badge.instance-state-error {
+  background: var(--danger-soft, rgba(248, 113, 113, 0.15));
+  color: var(--danger);
+}
+.instance-card-error {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--danger-soft, rgba(248, 113, 113, 0.1));
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  font-size: 12px;
+  color: var(--danger);
+  font-family: var(--font-mono);
+  word-break: break-word;
+}
+.instance-card-progress-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.instance-card-footer {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.btn-danger-ghost {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--border-color);
+}
+.btn-danger-ghost:hover {
+  background: var(--danger-soft, rgba(248, 113, 113, 0.1));
+  border-color: var(--danger);
+}

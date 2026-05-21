@@ -87,7 +87,9 @@ describe('CreateEmulatorModal', () => {
   it('POSTs to /v1/devices/providers/:id/instances on submit', async () => {
     const ws = createWsMock();
     const { ws: w } = renderModal(ws);
-    const nameInput = await screen.findByLabelText(/^name$/i);
+    // Label includes a required-marker asterisk span — match the visible
+    // "Name" prefix rather than an exact-string equality.
+    const nameInput = await screen.findByLabelText(/^name/i);
     fireEvent.change(nameInput, { target: { value: 'my-test' } });
     fireEvent.click(screen.getByText(/create.*start/i));
     await waitFor(() => {
