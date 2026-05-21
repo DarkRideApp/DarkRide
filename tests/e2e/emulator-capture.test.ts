@@ -132,6 +132,35 @@ describe('E2E — emulator capture', () => {
         const proxyUrl = `${httpProxy!.host}:${httpProxy!.port}`;
         step(`proxy from capture response: ${proxyUrl}`);
 
+        // Diagnostic: prove mitmproxy is reachable at the advertised host
+        // from the runner (rules out host-side firewall / wrong-interface
+        // binding) and from inside the emulator (rules out QEMU NAT /
+        // bridge-routing issues). Failures here pinpoint which layer
+        // breaks the chain.
+        try {
+          const hostProbe = execFileSync(
+            'curl',
+            ['-s', '-o', '/dev/null', '-w', 'host->mitm http_code=%{http_code} time=%{time_total}s\n',
+             '--max-time', '3', '--connect-timeout', '2',
+             '-x', `http://${proxyUrl}`, 'http://e2e-diag.example.test/probe'],
+            { encoding: 'utf8' },
+          );
+          step(`HOST->MITM probe: ${hostProbe.trim()}`);
+        } catch (e: any) {
+          step(`HOST->MITM probe FAILED: ${e.message?.slice(0, 200) ?? e}`);
+        }
+        try {
+          const emuProbe = execFileSync(
+            'adb',
+            ['-s', serial, 'shell',
+             `nc -w 2 -z ${httpProxy!.host} ${httpProxy!.port} && echo EMU_REACH_OK || echo EMU_REACH_FAIL`],
+            { encoding: 'utf8' },
+          );
+          step(`EMU->MITM probe: ${emuProbe.trim()}`);
+        } catch (e: any) {
+          step(`EMU->MITM probe FAILED: ${e.message?.slice(0, 200) ?? e}`);
+        }
+
         // 6. Launch the fixture activity — it fires https://e2e.example.test/ping
         //    from onCreate(), routed through DarkRide's mitmproxy bridge.
         step(`adb -s ${serial} shell am start ... --es proxy_url ${proxyUrl}`);
