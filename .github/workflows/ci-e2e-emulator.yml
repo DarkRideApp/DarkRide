@@ -234,14 +234,17 @@ jobs:
           DARKRIDE_HOST: http://localhost:3001
         run: |
           set +e
-          npx vitest run tests/e2e/emulator-capture.test.ts
+          # The default vitest.config.ts excludes tests/e2e/**, so the test
+          # file needs the dedicated tests/e2e/vitest.config.ts to be picked
+          # up at all. Without --config, vitest finds zero files and exits 1.
+          npx vitest run --config tests/e2e/vitest.config.ts
           rc=$?
           if [ $rc -ne 0 ]; then
             echo "::warning::E2E first attempt failed (likely emulator boot flake); retrying once..."
             sleep 30
             # Clean up any lingering containers from the failed attempt
             docker ps -aq --filter "label=darkride.emulator=true" | xargs -r docker rm -f
-            npx vitest run tests/e2e/emulator-capture.test.ts
+            npx vitest run --config tests/e2e/vitest.config.ts
             rc=$?
           fi
           exit $rc
