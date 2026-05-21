@@ -133,17 +133,55 @@ export async function spawnContainerHttpForwarder(
 
   const container = d.getContainer(containerId);
   // budtmo's docker-android image doesn't have an /etc/passwd entry for
-  // root — dockerode's default User="root" username lookup fails with
-  // "unable to find user root: no matching entries in passwd file". The
+  // root — dockerode's default User="root" username lookup fails. The
   // image runs as androidusr (UID 1300); the forwarder doesn't need any
   // privileged operation (binds an unprivileged port, opens TCP), so
   // androidusr is fine.
+  //
+  // Wrap the python invocation in a shell that redirects stdout/stderr to
+  // a known file so post-mortem diagnostics survive (the exec is detached
+  // so we can't read streams directly). Background it via `nohup` so the
+  // detach actually keeps it alive after the exec stream closes.
+  const wrapped = `nohup python3 -c "$1" > /tmp/darkride-forwarder-${listenPort}.log 2>&1 &`;
   const exec = await container.exec({
-    Cmd: ['python3', '-c', script],
+    Cmd: ['sh', '-c', wrapped, 'sh', script],
     User: 'androidusr',
     AttachStdout: false,
     AttachStderr: false,
     Detach: true,
   });
   await exec.start({ Detach: true });
+
+  // Verify the listener is actually bound before returning. Without this,
+  // callers proceed under the assumption it's up and only find out it
+  // crashed when the device-side traffic fails to be captured.
+  const verifyCmd = [
+    'sh', '-c',
+    `for i in $(seq 1 20); do
+       python3 -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', ${listenPort})); s.close()" 2>/dev/null && echo FWD_READY && exit 0
+       sleep 0.25
+     done
+     echo FWD_FAILED
+     echo "===== forwarder log ====="
+     cat /tmp/darkride-forwarder-${listenPort}.log 2>/dev/null || echo "(no log)"
+     exit 1`,
+  ];
+  const verifyExec = await container.exec({
+    Cmd: verifyCmd,
+    User: 'androidusr',
+    AttachStdout: true,
+    AttachStderr: true,
+    Tty: false,
+  });
+  const stream: any = await verifyExec.start({ hijack: true, stdin: false });
+  const output: Buffer[] = await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    stream.on('data', (c: Buffer) => chunks.push(c));
+    stream.on('end', () => resolve(chunks));
+    stream.on('error', reject);
+  });
+  const text = Buffer.concat(output).toString('utf8');
+  if (!text.includes('FWD_READY')) {
+    throw new Error(`in-container forwarder failed to start on :${listenPort}\n${text.slice(0, 2000)}`);
+  }
 }
