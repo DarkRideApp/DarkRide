@@ -129,8 +129,13 @@ jobs:
       #    pre-bundles deps that may not be present in CI (e.g. leaflet
       #    used by the Maps plugin); we skip that here.
       - name: Start DarkRide backend
+        env:
+          # DarkRide defaults to PORT=3000; the E2E test (and the curl
+          # health probe below) expects :3001. Set it explicitly so the
+          # two halves agree.
+          PORT: '3001'
         run: |
-          npx tsx backend/index.ts > /tmp/darkride.log 2>&1 &
+          PORT=3001 npx tsx backend/index.ts > /tmp/darkride.log 2>&1 &
           echo $! > /tmp/darkride.pid
           # Wait until the API responds. Cold boot does db migrations +
           # plugin reconcile + provider isAvailable checks, so allow up to
