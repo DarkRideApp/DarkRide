@@ -167,6 +167,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       }
       const adbPort = Number(adbPortStr);
       const serial = `localhost:${adbPort}`;
+      log(`docker-android container ${id} started, host port ${adbPort} bound to 5555/tcp; waiting for adbd...`);
       // The container started, but the Android emulator inside takes 30-120s
       // to cold-boot. Retry adb connect, then poll sys.boot_completed until
       // Android is actually usable. Without this loop, the API returned 500
@@ -174,18 +175,38 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       // create+start cycle.
       const deadline = Date.now() + bootTimeoutMs;
       let connected = false;
+      let connectAttempts = 0;
       while (Date.now() < deadline) {
+        connectAttempts++;
         if (await adbConnect(adbPort)) { connected = true; break; }
+        // Every ~30s, emit a heartbeat so CI logs / users can see we're
+        // still alive and how long we've been waiting. This is the loudest
+        // signal of "the emulator isn't booting" — silence is the failure mode.
+        if (connectAttempts % 6 === 0) {
+          const elapsed = Math.round((Date.now() - (deadline - bootTimeoutMs)) / 1000);
+          log(`docker-android still waiting for adbd on ${serial} (attempt ${connectAttempts}, ${elapsed}s elapsed) — checking container is alive`);
+          const live = await container.inspect().catch(() => null);
+          if (!live?.State?.Running) {
+            logError(`Container ${id} has exited while we were waiting for adbd (state: ${JSON.stringify(live?.State)})`);
+            throw new Error(`Container ${id} exited before adbd came up (state=${live?.State?.Status ?? 'unknown'}, exitCode=${live?.State?.ExitCode})`);
+          }
+        }
         await new Promise((r) => setTimeout(r, bootRetryIntervalMs));
       }
       if (!connected) {
         await container.stop({ t: 5 }).catch(() => { /* best effort */ });
-        throw new Error(`adb failed to connect to ${serial} within ${bootTimeoutMs}ms (container ${id})`);
+        throw new Error(`adb failed to connect to ${serial} within ${bootTimeoutMs}ms (container ${id}, ${connectAttempts} attempts)`);
       }
+      log(`docker-android adbd ready on ${serial} after ${connectAttempts} attempt(s); waiting for Android sys.boot_completed=1...`);
+      let bootAttempts = 0;
       while (Date.now() < deadline) {
+        bootAttempts++;
         if (await bootCompleted(serial)) {
-          log(`docker-android container ${id} booted (serial=${serial})`);
+          log(`docker-android container ${id} booted (serial=${serial}, ${connectAttempts} connect attempts, ${bootAttempts} boot polls)`);
           return { id, serial };
+        }
+        if (bootAttempts % 6 === 0) {
+          log(`docker-android still waiting for sys.boot_completed=1 on ${serial} (poll ${bootAttempts})`);
         }
         await new Promise((r) => setTimeout(r, bootRetryIntervalMs));
       }

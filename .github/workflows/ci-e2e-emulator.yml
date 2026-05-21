@@ -229,22 +229,33 @@ jobs:
       #    The flake mitigation: if the FIRST attempt fails, wait 30s and
       #    retry exactly once. Per the spec's documented ~5-10% hosted-runner
       #    emulator flake rate.
+      #
+      #    Log streaming: tail the backend log to stdout in the background
+      #    so the docker-android provider's heartbeat lines ("still waiting
+      #    for adbd on...", "container exited") interleave with the vitest
+      #    output. Without this, GitHub buffers all the step output until
+      #    the step finishes — a 20-minute black box.
       - name: Run E2E test (retry-once on failure)
         env:
           DARKRIDE_HOST: http://localhost:3001
         run: |
           set +e
+          # Stream backend log to stdout for the duration of this step
+          tail -f /tmp/darkride.log &
+          tail_pid=$!
+          trap 'kill $tail_pid 2>/dev/null || true' EXIT
           # The default vitest.config.ts excludes tests/e2e/**, so the test
           # file needs the dedicated tests/e2e/vitest.config.ts to be picked
           # up at all. Without --config, vitest finds zero files and exits 1.
-          npx vitest run --config tests/e2e/vitest.config.ts
+          # --reporter=verbose surfaces our step() console.log lines in order.
+          npx vitest run --config tests/e2e/vitest.config.ts --reporter=verbose
           rc=$?
           if [ $rc -ne 0 ]; then
             echo "::warning::E2E first attempt failed (likely emulator boot flake); retrying once..."
             sleep 30
             # Clean up any lingering containers from the failed attempt
             docker ps -aq --filter "label=darkride.emulator=true" | xargs -r docker rm -f
-            npx vitest run --config tests/e2e/vitest.config.ts
+            npx vitest run --config tests/e2e/vitest.config.ts --reporter=verbose
             rc=$?
           fi
           exit $rc

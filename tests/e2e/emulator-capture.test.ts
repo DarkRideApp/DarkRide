@@ -72,14 +72,20 @@ describe('E2E — emulator capture', () => {
     'spawns docker-android, installs fixture, captures the ping, asserts the trace',
     { timeout: 12 * 60_000 },
     async () => {
+      const t0 = Date.now();
+      const step = (msg: string) => console.log(`[E2E ${((Date.now() - t0) / 1000).toFixed(1)}s] ${msg}`);
+
       // Sanity: the APK must exist (CI builds it before this test)
+      step(`check fixture APK at ${APK}`);
       expect(existsSync(APK)).toBe(true);
 
       // 1. Create the emulator instance via the API
+      step('POST /v1/devices/providers/docker-android/instances');
       const create = await rest('POST', '/v1/devices/providers/docker-android/instances', {
         displayName: `e2e-${Date.now()}`,
         config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
       });
+      step(`create response: status=${create.status} body=${JSON.stringify(create.body).slice(0, 300)}`);
       expect(create.status).toBe(200);
       const instanceId = create.body?.data?.instance?.id as number;
       expect(instanceId).toBeDefined();
@@ -87,30 +93,40 @@ describe('E2E — emulator capture', () => {
       try {
         // 2. Start the container — response carries the resolved serial
         //    (docker picks a free host port; serial = "localhost:<port>")
+        step(`POST /v1/devices/providers/docker-android/instances/${instanceId}/start (this blocks for up to ~240s while emulator cold-boots)`);
         const startRes = await rest(
           'POST',
           `/v1/devices/providers/docker-android/instances/${instanceId}/start`,
         );
+        step(`start response: status=${startRes.status} body=${JSON.stringify(startRes.body).slice(0, 500)}`);
         expect(startRes.status).toBe(200);
         const serial = startRes.body?.data?.running?.serial as string;
         expect(serial).toBeDefined();
+        step(`emulator booted, serial=${serial}`);
 
         // 3. Wait until DarkRide marks the instance as running
+        step('polling listInstances until state===running');
         await waitFor(async () => {
           const r = await rest('GET', `/v1/devices/providers/docker-android/instances`);
           const inst = r.body?.data?.instances?.find((i: any) => i.id === instanceId);
           return inst?.state === 'running' ? inst : undefined;
         }, TIMEOUT_BOOT_MS);
+        step('listInstances reports running');
 
         // 4. Install the fixture APK on the running container
+        step(`adb -s ${serial} install -r <fixture>`);
         execFileSync('adb', ['-s', serial, 'install', '-r', APK], { stdio: 'inherit' });
+        step('APK installed');
 
         // 5. Start capture session for this device
+        step(`POST /v1/capture/start { deviceId: ${serial} }`);
         const captureRes = await rest('POST', `/v1/capture/start`, { deviceId: serial });
+        step(`capture start response: status=${captureRes.status} body=${JSON.stringify(captureRes.body).slice(0, 300)}`);
         expect(captureRes.status).toBe(200);
 
         // 6. Launch the fixture activity — it fires https://e2e.example.test/ping
         //    from onCreate(), routed through DarkRide's mitmproxy bridge.
+        step(`adb -s ${serial} shell am start -n wiki.themeparks.darkride.e2efixture/.MainActivity`);
         execFileSync(
           'adb',
           [
@@ -120,6 +136,7 @@ describe('E2E — emulator capture', () => {
           ],
           { stdio: 'inherit' },
         );
+        step('app launched; polling traffic store for the captured request');
 
         // 7. Poll the traffic store until the captured request appears.
         //    Endpoint: GET /v1/traffic/list?deviceId=<serial>&hostname=e2e.example.test
@@ -141,6 +158,7 @@ describe('E2E — emulator capture', () => {
           );
           return found;
         }, TIMEOUT_CAPTURE_MS);
+        step(`captured: ${JSON.stringify(captured).slice(0, 300)}`);
 
         expect(captured).toBeDefined();
         const capturedUrl = new URL(captured.requestUrl);
