@@ -137,9 +137,9 @@ describe('docker-android provider', () => {
     await expect(p.deleteInstance!('container-test-emu')).rejects.toThrow(/running/i);
   });
 
-  it('getNetworkConfig returns wireguard mode', () => {
+  it('getNetworkConfig returns emu-http-proxy mode (HTTP forward proxy via adb reverse)', () => {
     const p = createDockerAndroidProvider(makeDockerMock());
-    expect(p.getNetworkConfig('any')).toEqual({ mode: 'wireguard' });
+    expect(p.getNetworkConfig('any')).toEqual({ mode: 'emu-http-proxy' });
   });
 
   it('startInstance stops the container and throws if adbConnect fails (no orphan)', async () => {

@@ -1,5 +1,5 @@
 import { eq } from 'drizzle-orm';
-import { automationSessions, devices as devicesTable, settings } from '../db/schema';
+import { automationSessions, devices as devicesTable, deviceInstances, settings } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
@@ -45,6 +45,25 @@ export class CaptureSessionManager {
   private getDevicePlatform(deviceId: string): 'android' | 'ios' {
     const device = this.db.select().from(devicesTable).where(eq(devicesTable.id, deviceId)).all()[0];
     return (device?.platform as 'android' | 'ios') ?? 'android';
+  }
+
+  /**
+   * Look up the provider that spawned this device, if any. Returns undefined
+   * for physical devices that came in through the bare ADB tracker rather
+   * than a managed provider instance.
+   *
+   * Used to branch the Android capture path: docker-android emulators take
+   * the HTTP-proxy route (mitmproxy in forward-proxy mode + adb reverse +
+   * `settings put global http_proxy`); physical Android devices take the
+   * WireGuard + system-CA-injection route.
+   */
+  private getProviderIdForDevice(deviceId: string): string | undefined {
+    const row = this.db
+      .select({ providerId: deviceInstances.providerId })
+      .from(deviceInstances)
+      .where(eq(deviceInstances.serial, deviceId))
+      .all()[0];
+    return row?.providerId;
   }
 
   async startCapture(deviceId: string, proxyOptions?: { mode: 'none' | 'normal' | 'nordvpn'; country?: string }, tlsProfile?: string): Promise<{ sessionId: number }> {
@@ -126,40 +145,82 @@ export class CaptureSessionManager {
         mitmOptions.useProxy = false;
       }
 
-      // Start mitmproxy capture
-      const tunnelInfo = await this.mitmproxyManager.startCapture(deviceId, mitmOptions);
-      subsystems.mitmproxy = 'ok';
-      this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
+      // Branch based on the device's provider: docker-android emulators
+      // use plain HTTP forward-proxy mode + adb reverse, while physical
+      // Android devices use the WireGuard tunnel + system-CA-injection
+      // path. iOS keeps its existing manual-tunnel flow.
+      const providerId = this.getProviderIdForDevice(deviceId);
+      const isDockerAndroid = providerId === 'docker-android';
 
-      if (tunnelInfo && platform === 'android') {
-        // Inject CA cert
-        await this.deviceManager.injectMitmproxyCaCert(deviceId);
+      if (isDockerAndroid && platform === 'android') {
+        // Start mitmproxy in regular HTTP forward-proxy mode on a free port.
+        const { port } = await this.mitmproxyManager.startHttpProxyCapture(deviceId, mitmOptions);
+        subsystems.mitmproxy = 'ok';
+        this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
+
+        // adb root, push user CA cert, adb reverse, set http_proxy.
+        await this.deviceManager.setupEmulatorHttpProxy(deviceId, port);
         subsystems.certInjection = 'ok';
-        this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
+        // WireGuard is conceptually skipped here, but the subsystems shape
+        // is shared with physical-device flows — mark it as skipped rather
+        // than failing.
+        subsystems.wireguard = 'skipped';
+        tunnelActivated = false;
 
-        // Activate WireGuard tunnel
-        await this.deviceManager.activateWireGuardTunnel(deviceId, tunnelInfo);
-        tunnelActivated = true;
-        subsystems.wireguard = 'ok';
-        this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
-
-        // Sanity-check: ensure mitmproxy didn't crash during cert/tunnel setup
         if (!this.mitmproxyManager.isCapturing(deviceId)) {
           subsystems.mitmproxy = 'error';
           throw new Error('mitmproxy process exited during capture startup');
         }
+        subsystems.connectivity = 'ok';
+        this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
+      } else if (platform === 'android') {
+        // Physical Android device: WireGuard tunnel path.
+        const tunnelInfo = await this.mitmproxyManager.startCapture(deviceId, mitmOptions);
+        subsystems.mitmproxy = 'ok';
+        this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
 
-        // Wait for tunnel connectivity
-        const ready = await this.waitForTunnelReady(deviceId);
-        subsystems.connectivity = ready ? 'ok' : 'warning';
-        if (!ready) {
-          log(`Tunnel connectivity not confirmed for device ${deviceId}, proceeding anyway`);
+        if (!tunnelInfo) {
+          // mitmproxy reports it was already running for this device; we
+          // can't set up the tunnel without fresh keys. Mark the rest of
+          // the subsystems as skipped so the UI shows the right state.
+          subsystems.certInjection = 'skipped';
+          subsystems.wireguard = 'skipped';
+          subsystems.connectivity = 'skipped';
+          this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
+        } else {
+          // Inject CA cert
+          await this.deviceManager.injectMitmproxyCaCert(deviceId);
+          subsystems.certInjection = 'ok';
+          this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
+
+          // Activate WireGuard tunnel
+          await this.deviceManager.activateWireGuardTunnel(deviceId, tunnelInfo);
+          tunnelActivated = true;
+          subsystems.wireguard = 'ok';
+          this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
+
+          // Sanity-check: ensure mitmproxy didn't crash during cert/tunnel setup
+          if (!this.mitmproxyManager.isCapturing(deviceId)) {
+            subsystems.mitmproxy = 'error';
+            throw new Error('mitmproxy process exited during capture startup');
+          }
+
+          // Wait for tunnel connectivity
+          const ready = await this.waitForTunnelReady(deviceId);
+          subsystems.connectivity = ready ? 'ok' : 'warning';
+          if (!ready) {
+            log(`Tunnel connectivity not confirmed for device ${deviceId}, proceeding anyway`);
+          }
         }
       } else {
-        // iOS: user configures WireGuard manually via QR code
+        // iOS: start mitmproxy in WireGuard mode but skip the on-device
+        // setup — the user scans a QR code to install the tunnel manually.
+        await this.mitmproxyManager.startCapture(deviceId, mitmOptions);
+        subsystems.mitmproxy = 'ok';
         subsystems.certInjection = 'skipped';
         subsystems.wireguard = 'skipped';
         subsystems.connectivity = 'skipped';
+        this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
       }
 
       this.activeSessions.set(deviceId, { sessionId, deviceId, tunnelActivated, subsystems });

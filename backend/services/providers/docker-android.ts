@@ -239,7 +239,12 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     },
 
     getNetworkConfig(_id: string): NetworkConfig {
-      return { mode: 'wireguard' };
+      // Emulators use plain HTTP forward-proxy mode (mitmproxy on host,
+      // reached via adb reverse from inside the emulator) — there's no
+      // Magisk root for the WireGuard tunnel path, and adb root + a user
+      // CA gets the chain working without /system or APEX gymnastics.
+      // See CaptureSessionManager's docker-android branch.
+      return { mode: 'emu-http-proxy' };
     },
 
     async getCreateFormSchema(): Promise<CreateFormSchema> {

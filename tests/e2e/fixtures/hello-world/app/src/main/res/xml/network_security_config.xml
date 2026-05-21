@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Trust user-installed CA certs in addition to system certs. The E2E
+  capture pipeline pushes mitmproxy's CA into the user trust store; without
+  this entry the fixture's HTTPS request would fail with
+  CertPathValidatorException (Android 7+ default rejects user CAs).
+
+  This is the minimum needed for the E2E test to validate the capture
+  chain. Real apps capturing through DarkRide either rely on Android <7
+  defaults, ship a similar config, or use the WireGuard tunnel mode where
+  the host's TLS interception is done out-of-app.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

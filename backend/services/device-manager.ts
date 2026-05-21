@@ -1531,6 +1531,75 @@ export class DeviceManager {
   }
 
   /**
+   * Configure an emulator (docker-android or AVD with userdebug build) to
+   * route HTTPS traffic through a host-side mitmproxy.
+   *
+   * Steps:
+   *  1. `adb root` to make adbd run as root (works on userdebug/eng builds)
+   *  2. push mitmproxy's CA cert into the user trust store
+   *     (`/data/misc/user/0/cacerts-added/<hash>.0`). The E2E fixture
+   *     (and any app that opts in via `networkSecurityConfig` trusting
+   *     user CAs) will then validate mitmproxy's intercepted TLS.
+   *  3. `adb reverse tcp:<port> tcp:<port>` so the emulator can reach the
+   *     host's mitmproxy via the device's own localhost
+   *  4. `adb shell settings put global http_proxy 127.0.0.1:<port>`
+   *
+   * Differs from `injectMitmproxyCaCert` in two important ways:
+   *  - Uses `adb root` instead of `su -c` (emulators don't have Magisk)
+   *  - Installs as a USER cert (no /system remount, no APEX namespace
+   *    bind-mounts) — paired with the fixture's networkSecurityConfig,
+   *    this is the minimum needed for the E2E to validate the chain.
+   */
+  async setupEmulatorHttpProxy(deviceId: string, proxyPort: number): Promise<void> {
+    const certPath = path.join(getMitmproxyConfdir(), 'mitmproxy-ca-cert.pem');
+    if (!fs.existsSync(certPath)) {
+      throw new Error(`mitmproxy CA cert not found at ${certPath}. Start mitmproxy at least once to generate it.`);
+    }
+
+    log(`Elevating adbd to root on ${deviceId}`);
+    // `adb root` restarts adbd; the connection drops and reconnects.
+    // Bake in a wait-for-device so subsequent shell commands succeed.
+    await adbCommand(['-s', deviceId, 'root'], 10_000).catch(() => {
+      // `adb root` returns success even when adbd is already root.
+      // Some emulator images print "adbd is already running as root"
+      // on stderr — that's fine.
+    });
+    await adbCommand(['-s', deviceId, 'wait-for-device'], 10_000);
+    // Confirm we have root. On user-build emulators `adb root` is a no-op
+    // and `id` still returns shell uid; fail fast in that case.
+    const idOut = await adbShell(deviceId, 'id', 5_000);
+    if (!idOut.includes('uid=0')) {
+      throw new Error(`Failed to elevate adbd to root on ${deviceId} — emulator may be a "user" build (need userdebug/eng). id=${idOut}`);
+    }
+
+    const certPem = fs.readFileSync(certPath, 'utf-8');
+    const certHash = computeSubjectHashOld(certPem);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'emu-cert-'));
+    const tmpCert = path.join(tmpDir, `${certHash}.0`);
+    try {
+      fs.copyFileSync(certPath, tmpCert);
+      // Push into the user trust store. Path is fixed across modern Android.
+      log(`Pushing user CA cert ${certHash}.0 to ${deviceId}`);
+      await adbCommand(['-s', deviceId, 'shell', 'mkdir', '-p', '/data/misc/user/0/cacerts-added'], 5_000);
+      await adbCommand(['-s', deviceId, 'push', tmpCert, `/data/misc/user/0/cacerts-added/${certHash}.0`]);
+      await adbShell(deviceId, `chmod 644 /data/misc/user/0/cacerts-added/${certHash}.0`, 5_000);
+      await adbShell(deviceId, `chown system:system /data/misc/user/0/cacerts-added/${certHash}.0`, 5_000);
+    } finally {
+      try { fs.unlinkSync(tmpCert); } catch {}
+      try { fs.rmdirSync(tmpDir); } catch {}
+    }
+
+    // Forward emulator-localhost:<port> back to host:<port> so the emulator
+    // can reach the host's mitmproxy via its own loopback. adb reverse uses
+    // the existing adb transport — no docker networking changes needed.
+    log(`adb reverse tcp:${proxyPort} tcp:${proxyPort} for ${deviceId}`);
+    await adbCommand(['-s', deviceId, 'reverse', `tcp:${proxyPort}`, `tcp:${proxyPort}`], 5_000);
+
+    log(`Setting global http_proxy=127.0.0.1:${proxyPort} on ${deviceId}`);
+    await adbShell(deviceId, `settings put global http_proxy 127.0.0.1:${proxyPort}`, 5_000);
+  }
+
+  /**
    * Inject mitmproxy's CA certificate into the device's system trust store.
    * Requires root. Skips if the cert file doesn't exist yet.
    */
