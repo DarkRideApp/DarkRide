@@ -1180,6 +1180,20 @@ httpServer.listen(PORT, HOST, () => {
     registerPluginNotificationEvents(pluginEvents);
   }
 
+  // Plugin-contributed device providers + capture handlers.
+  // Each plugin's register() may have called ctx.deviceProviders([...]) —
+  // collect those and wire them into the same registries used by the
+  // built-in providers.
+  for (const { pluginName, registration: reg } of pluginManager.getAllDeviceProviders()) {
+    try {
+      providerRegistry.register(reg.implementation);
+      captureModeRegistry.register(reg.networkMode, reg.captureHandler);
+      log(`Plugin "${pluginName}" registered device provider "${reg.id}" with capture mode "${reg.networkMode}"`);
+    } catch (err: any) {
+      error(`Plugin "${pluginName}" device provider registration failed: ${err.message}`);
+    }
+  }
+
   // Register plugin API routes
   for (const routeSetup of pluginManager.getAllRouteSetups()) {
     routeSetup(getApiRouter());

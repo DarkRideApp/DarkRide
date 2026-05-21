@@ -13,6 +13,7 @@ import type {
   PluginJob,
   PluginSetting,
   PluginNotificationEvent,
+  PluginDeviceProviderRegistration,
 } from '@darkrideapp/plugin-sdk';
 import { HookBusImpl } from '@darkrideapp/plugin-sdk';
 import { PluginContextImpl, createEmptyContributions } from './plugin-context';
@@ -202,6 +203,16 @@ export class PluginManager {
     const result: unknown[] = [];
     for (const { contributions } of this.plugins.values()) {
       result.push(...contributions.protocolDecoders);
+    }
+    return result;
+  }
+
+  getAllDeviceProviders(): Array<{ pluginName: string; registration: PluginDeviceProviderRegistration }> {
+    const result: Array<{ pluginName: string; registration: PluginDeviceProviderRegistration }> = [];
+    for (const [pluginName, { contributions }] of this.plugins) {
+      for (const registration of contributions.deviceProviders) {
+        result.push({ pluginName, registration });
+      }
     }
     return result;
   }
