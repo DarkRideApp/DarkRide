@@ -132,28 +132,17 @@ describe('E2E — emulator capture', () => {
         const proxyUrl = `${httpProxy!.host}:${httpProxy!.port}`;
         step(`proxy from capture response: ${proxyUrl}`);
 
-        // Diagnostic: prove mitmproxy is reachable at the advertised host
-        // from the runner (rules out host-side firewall / wrong-interface
-        // binding) and from inside the emulator (rules out QEMU NAT /
-        // bridge-routing issues). Failures here pinpoint which layer
-        // breaks the chain.
-        try {
-          const hostProbe = execFileSync(
-            'curl',
-            ['-s', '-o', '/dev/null', '-w', 'host->mitm http_code=%{http_code} time=%{time_total}s\n',
-             '--max-time', '3', '--connect-timeout', '2',
-             '-x', `http://${proxyUrl}`, 'http://e2e-diag.example.test/probe'],
-            { encoding: 'utf8' },
-          );
-          step(`HOST->MITM probe: ${hostProbe.trim()}`);
-        } catch (e: any) {
-          step(`HOST->MITM probe FAILED: ${e.message?.slice(0, 200) ?? e}`);
-        }
+        // Diagnostic: prove mitmproxy is reachable from inside the
+        // emulator. The previous `nc -z` approach used a flag toybox
+        // doesn't support; switch to curl, which Android 14 emulators
+        // ship with. We probe via the proxy itself (HTTP CONNECT to a
+        // throwaway URL) — a non-zero http_code returned by the proxy
+        // confirms the TCP path AND that mitmproxy is processing.
         try {
           const emuProbe = execFileSync(
             'adb',
             ['-s', serial, 'shell',
-             `nc -w 2 -z ${httpProxy!.host} ${httpProxy!.port} && echo EMU_REACH_OK || echo EMU_REACH_FAIL`],
+             `curl -s -o /dev/null -w "EMU_REACH http_code=%{http_code} time=%{time_total}s exit=%{exitcode}" --max-time 5 -x http://${httpProxy!.host}:${httpProxy!.port} http://e2e-diag.example.test/probe || echo "EMU_REACH_FAIL exit=$?"`],
             { encoding: 'utf8' },
           );
           step(`EMU->MITM probe: ${emuProbe.trim()}`);
@@ -163,6 +152,8 @@ describe('E2E — emulator capture', () => {
 
         // 6. Launch the fixture activity — it fires https://e2e.example.test/ping
         //    from onCreate(), routed through DarkRide's mitmproxy bridge.
+        // Clear logcat first so the post-mortem only shows our app's lines.
+        execFileSync('adb', ['-s', serial, 'logcat', '-c'], { stdio: 'inherit' });
         step(`adb -s ${serial} shell am start ... --es proxy_url ${proxyUrl}`);
         execFileSync(
           'adb',
@@ -175,6 +166,24 @@ describe('E2E — emulator capture', () => {
           { stdio: 'inherit' },
         );
         step('app launched; polling traffic store for the captured request');
+
+        // Wait a moment for the app to actually fire its request, then
+        // dump the fixture's logcat lines so we can see what happened
+        // even if the request never reached mitmproxy.
+        await new Promise((r) => setTimeout(r, 3000));
+        try {
+          const lc = execFileSync(
+            'adb',
+            ['-s', serial, 'logcat', '-d', '-s', 'System.err:*', 'ActivityManager:I', '*:F'],
+            { encoding: 'utf8' },
+          );
+          const filtered = lc.split('\n').filter((l) =>
+            /e2efixture|MainActivity|ping/i.test(l)
+          ).slice(0, 20).join('\n');
+          step(`logcat (fixture-filtered, first 20):\n${filtered || '(no fixture lines)'}`);
+        } catch (e: any) {
+          step(`logcat dump failed: ${e.message?.slice(0, 200) ?? e}`);
+        }
 
         // 7. Poll the traffic store until the captured request appears.
         //    Endpoint: GET /v1/traffic/list?deviceId=<serial>&hostname=e2e.example.test

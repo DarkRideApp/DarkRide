@@ -2,6 +2,7 @@ package wiki.themeparks.darkride.e2efixture
 
 import android.app.Activity
 import android.os.Bundle
+import android.util.Log
 import android.widget.TextView
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
@@ -30,14 +31,18 @@ import kotlin.concurrent.thread
  * - networkSecurityConfig (res/xml/network_security_config.xml) trusts
  *   user-installed CAs so mitmproxy's intercepted TLS validates.
  */
+private const val TAG = "e2efixture"
+
 class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val tv = TextView(this).apply { textSize = 16f }
         setContentView(tv)
         val proxyUrl = intent?.getStringExtra("proxy_url")
+        Log.i(TAG, "onCreate: proxy_url=${proxyUrl ?: "(none)"}")
         thread {
             try {
+                Log.i(TAG, "opening https://e2e.example.test/ping via proxy=${proxyUrl ?: "(direct)"}")
                 val url = URL("https://e2e.example.test/ping")
                 val conn = if (proxyUrl != null && proxyUrl.contains(':')) {
                     val (host, portStr) = proxyUrl.split(":", limit = 2)
@@ -51,9 +56,11 @@ class MainActivity : Activity() {
                 conn.requestMethod = "GET"
                 conn.connect()
                 val code = conn.responseCode
+                Log.i(TAG, "ping sent: $code")
                 runOnUiThread { tv.text = "ping sent via proxy=${proxyUrl ?: "(none)"}: $code" }
                 conn.disconnect()
             } catch (e: Exception) {
+                Log.e(TAG, "ping failed", e)
                 runOnUiThread { tv.text = "ping failed via proxy=${proxyUrl ?: "(none)"}: ${e.message}" }
             }
         }
