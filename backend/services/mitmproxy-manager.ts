@@ -10,6 +10,7 @@ import { getHiddenlistPath } from './hiddenlist-writer';
 import { SocksProxyServer } from './socks-proxy-server';
 import { syncInterceptConfig, getInterceptConfigPath } from './intercept-config-writer';
 import { clearWsFlowMap } from '../api/traffic';
+import { resolveVenvBin } from './venv-bin';
 import type { AppDatabase } from '../db';
 
 const { log, error } = createLoggers('mitmproxy-manager');
@@ -172,8 +173,9 @@ export class MitmproxyManager {
       }
     }
 
-    log(`Starting mitmdump for ${deviceId}`);
-    const child = spawn('mitmdump', mitmdumpArgs, {
+    const mitmdumpBin = resolveVenvBin('mitmdump');
+    log(`Starting mitmdump for ${deviceId} (${mitmdumpBin})`);
+    const child = spawn(mitmdumpBin, mitmdumpArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
