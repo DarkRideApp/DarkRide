@@ -123,13 +123,18 @@ jobs:
             docker save ghcr.io/darkrideapp/docker-android:14 -o /tmp/docker-image-cache/docker-android-14.tar
           fi
 
-      # 6. Start DarkRide in the background.
-      - name: Start DarkRide
+      # 6. Start DarkRide backend in the background.
+      #    Backend-only (no frontend) — the E2E hits the REST API on :3001
+      #    directly. `npm run dev` also boots the Vite dev server which
+      #    pre-bundles deps that may not be present in CI (e.g. leaflet
+      #    used by the Maps plugin); we skip that here.
+      - name: Start DarkRide backend
         run: |
-          npm run dev > /tmp/darkride.log 2>&1 &
+          npx tsx backend/index.ts > /tmp/darkride.log 2>&1 &
           echo $! > /tmp/darkride.pid
-          # Wait until the API responds. The dev server may take up to 60s
-          # to be ready (db migrations + plugin reconcile).
+          # Wait until the API responds. Cold boot does db migrations +
+          # plugin reconcile + provider isAvailable checks, so allow up to
+          # 120s.
           for i in {1..60}; do
             if curl -fsS http://localhost:3001/v1/system/health >/dev/null 2>&1; then
               echo "DarkRide ready"
