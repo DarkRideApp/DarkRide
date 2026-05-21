@@ -141,10 +141,10 @@ jobs:
           #   - core db migrations
           #   - plugin discovery + migrations + reconcile
           #   - provider isAvailable checks (some shell out)
-          #   - Python bridge venv creation + pip install (~30s + ~30s)
-          # Allow up to 6 minutes — the venv setup dominates (observed
-          # ~245s in CI; 360s gives ~50% margin).
-          for i in {1..180}; do
+          #   - Python bridge venv creation + pip install (~60-90s)
+          # Allow up to 10 minutes — the Python setup dominates.
+          # Observed ~363s in CI; 600s gives ~65% margin for slow runners.
+          for i in {1..300}; do
             if curl -fsS http://localhost:3001/v1/system/health >/dev/null 2>&1; then
               echo "DarkRide ready after ${i}*2s"
               break
@@ -152,10 +152,52 @@ jobs:
             sleep 2
           done
           curl -fsS http://localhost:3001/v1/system/health || {
-            echo "::error::DarkRide did not respond on :3001 within 360s"
+            echo "::error::DarkRide did not respond on :3001 within 600s"
             tail -300 /tmp/darkride.log
             exit 1
           }
+
+      # 7. Bootstrap an admin user + API key.
+      #    DarkRide's scoped endpoints reject unauthenticated requests;
+      #    the E2E uses an API key passed via Authorization header. We
+      #    extract the bootstrap token from the boot log, POST to
+      #    /v1/auth/setup to create the first admin, then POST to
+      #    /v1/api-keys to mint a long-lived key with the scopes the test
+      #    needs.
+      - name: Provision admin + API key for E2E
+        run: |
+          # Extract bootstrap token from "http://...:3001/ui/setup?token=<hex>"
+          TOKEN=$(grep -oE 'token=[a-f0-9]+' /tmp/darkride.log | head -1 | cut -d= -f2)
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Could not extract bootstrap token from DarkRide log"
+            tail -300 /tmp/darkride.log
+            exit 1
+          fi
+          # Create the first admin. Response includes csrfToken and a Set-Cookie
+          # we capture for follow-up authenticated requests.
+          curl -fsS -c /tmp/darkride-cookies.txt \
+            -X POST http://localhost:3001/v1/auth/setup \
+            -H 'Content-Type: application/json' \
+            -d "{\"token\":\"$TOKEN\",\"username\":\"e2e-admin\",\"password\":\"e2e-test-only-12345\"}" \
+            > /tmp/setup-response.json
+          CSRF=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/setup-response.json','utf8')).csrfToken)")
+          # Create a long-lived API key with the scopes the E2E needs.
+          # Endpoint: POST /v1/profile/api-keys with { name, scopes[] }; 201 response.
+          # Scopes: core.devices:manage (provider endpoints), core.traffic:manage (capture endpoints).
+          curl -fsS -b /tmp/darkride-cookies.txt \
+            -X POST http://localhost:3001/v1/profile/api-keys \
+            -H 'Content-Type: application/json' \
+            -H "X-CSRF-Token: $CSRF" \
+            -d '{"name":"e2e-test","scopes":["core.devices:manage","core.traffic:manage"]}' \
+            > /tmp/key-response.json
+          API_KEY=$(node -e "console.log(JSON.parse(require('fs').readFileSync('/tmp/key-response.json','utf8')).data.key)")
+          if [ -z "$API_KEY" ]; then
+            echo "::error::Could not mint API key"
+            cat /tmp/key-response.json
+            exit 1
+          fi
+          echo "DARKRIDE_API_KEY=$API_KEY" >> "$GITHUB_ENV"
+          echo "::notice::E2E admin + API key provisioned"
 
       # 7. Run the E2E test with retry-once on boot failure.
       #    The flake mitigation: if the FIRST attempt fails, wait 30s and

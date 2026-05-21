@@ -24,15 +24,19 @@ import http from 'http';
 
 const APK = resolve('./tests/e2e/fixtures/hello-world/app/build/outputs/apk/debug/app-debug.apk');
 const HOST = process.env.DARKRIDE_HOST ?? 'http://localhost:3001';
+const API_KEY = process.env.DARKRIDE_API_KEY;
 const TIMEOUT_BOOT_MS = 5 * 60_000;
 const TIMEOUT_CAPTURE_MS = 60_000;
 
 async function rest(method: string, path: string, body?: any): Promise<{ status: number; body: any }> {
   const url = new URL(path, HOST);
-  const opts: http.RequestOptions = {
-    method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-  };
+  const headers: Record<string, string> = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  // CI provisions a long-lived admin API key after DarkRide boots; the
+  // workflow exports it as DARKRIDE_API_KEY. Without auth, the
+  // core.devices:manage + core.traffic:manage scoped endpoints reject.
+  if (API_KEY) headers['Authorization'] = `Bearer ${API_KEY}`;
+  const opts: http.RequestOptions = { method, headers };
   return new Promise<{ status: number; body: any }>((resolveP, rejectP) => {
     const req = http.request(url, opts, (res) => {
       const chunks: Buffer[] = [];
