@@ -137,7 +137,12 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
           'darkride.android_version': androidVersion,
           'darkride.arch': arch,
         },
-        Env: [`EMULATOR_DEVICE=Samsung Galaxy S10`, `RAM_MB=${ramMb}`],
+        // EMULATOR_DEVICE must be a name avdmanager recognises (see
+        // `avdmanager list device`). Budtmo's whitelist includes
+        // "Samsung Galaxy S10" but the current Android SDK ships only a
+        // Pixel/Nexus-flavoured device list — Samsung profiles got dropped.
+        // Pixel 8 is both budtmo-whitelisted and avdmanager-resolvable.
+        Env: [`EMULATOR_DEVICE=Pixel 8`, `RAM_MB=${ramMb}`],
         ExposedPorts: { '5555/tcp': {} },
         HostConfig: {
           PortBindings: { '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }] },
