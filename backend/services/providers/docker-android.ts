@@ -156,7 +156,12 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
         displayName: spec.displayName,
         state: 'created',
         spawnedByDarkride: true,
-        metadata: { image, androidVersion, arch, ramMb },
+        // `metadata` is what the UI displays AND what the API's auto-recreate
+        // path passes back into createInstance when a container needs to be
+        // rebuilt (budtmo's image can't `docker start` after first exit).
+        // Include the original config field names so `spec.config` round-trips
+        // cleanly through the spawnMetadata column.
+        metadata: { image, androidVersion, architecture: arch, ramMb, arch },
       };
     },
 

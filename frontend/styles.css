@@ -7134,3 +7134,9 @@ body.live-log-open .ai-chat-fab {
   background: var(--danger-soft, rgba(248, 113, 113, 0.1));
   border-color: var(--danger);
 }
+.instance-card-progress-warn {
+  color: var(--warning, #fbbf24);
+}
+.instance-card-progress-stuck {
+  color: var(--danger);
+}

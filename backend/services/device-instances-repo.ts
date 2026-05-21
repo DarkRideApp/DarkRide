@@ -77,6 +77,21 @@ export class DeviceInstancesRepo {
       .run();
   }
 
+  /**
+   * Re-point an existing instance row at a fresh underlying container.
+   * docker-android cannot reliably restart its containers (budtmo's
+   * image removes /etc/passwd's root entry after first boot, so
+   * `docker start` on an exited container fails). The provider-side
+   * fix is delete + create a fresh container with the same spec, then
+   * update the row to track the new runtime id.
+   */
+  updateRuntimeId(id: number, runtimeId: string): void {
+    this.db.update(deviceInstances)
+      .set({ runtimeId, lastStateAt: new Date() })
+      .where(eq(deviceInstances.id, id))
+      .run();
+  }
+
   getById(id: number): DeviceInstanceRow | undefined {
     return this.db.select().from(deviceInstances).where(eq(deviceInstances.id, id)).all()[0] as DeviceInstanceRow | undefined;
   }

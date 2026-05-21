@@ -99,7 +99,26 @@ export function registerDevicesProvidersEndpoints(
     try {
       repo.updateState(row.id, 'starting');
       broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
-      const r = await p.startInstance(row.runtimeId);
+
+      // If the underlying container is in an unrecoverable post-exit
+      // state (the common case for docker-android: budtmo's image
+      // strips /etc/passwd's root entry on first boot, so `docker
+      // start` of an exited container fails with "unable to find
+      // user root"), recreate it from the saved spec rather than
+      // surfacing the alarming raw Docker error.
+      let runtimeId = row.runtimeId;
+      if ((row.state === 'error' || row.state === 'stopped') && p.createInstance && p.deleteInstance) {
+        const meta = row.spawnMetadata ?? {};
+        try { await p.deleteInstance(runtimeId); } catch { /* container may already be gone */ }
+        const fresh = await p.createInstance({
+          displayName: row.displayName ?? `instance-${row.id}`,
+          config: meta as Record<string, unknown>,
+        });
+        runtimeId = fresh.id;
+        repo.updateRuntimeId(row.id, runtimeId);
+      }
+
+      const r = await p.startInstance(runtimeId);
       // Persist the resolved serial — required for CaptureSessionManager's
       // provider lookup (it routes by deviceInstances.serial → providerId).
       repo.updateSerial(row.id, r.serial ?? null);

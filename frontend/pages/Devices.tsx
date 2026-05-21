@@ -28,6 +28,8 @@ interface ManagedInstance {
   spawnMetadata: { image?: string; androidVersion?: string; arch?: string; ramMb?: number } | null;
   lastError: string | null;
   createdAt: string | number | Date;
+  /** Updated on every state transition — best timestamp for "how long has this been in its current state". */
+  lastStateAt?: string | number | Date;
 }
 
 function isOnline(device: Device): boolean {
@@ -397,12 +399,7 @@ function InstanceCard({ instance: inst, onStart, onStop, onDelete }: InstanceCar
             {inst.lastError}
           </div>
         )}
-        {isBooting && (
-          <div className="instance-card-progress-hint">
-            Cold boot takes ~90 seconds on KVM. The device will appear
-            in your list once adbd binds.
-          </div>
-        )}
+        {isBooting && <InstanceBootProgress inst={inst} />}
       </div>
 
       <div className="device-card-footer instance-card-footer">
@@ -431,6 +428,43 @@ function InstanceCard({ instance: inst, onStart, onStop, onDelete }: InstanceCar
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Live elapsed-time + escalating helpfulness during boot. Ticks every
+ * second so the displayed counter updates without waiting for another
+ * provider-instance-updated event (boots between events are silent).
+ */
+function InstanceBootProgress({ inst }: { inst: ManagedInstance }) {
+  const since = (inst.lastStateAt ?? inst.createdAt) as string | number | Date;
+  const startMs = typeof since === 'object' ? since.getTime() : new Date(since).getTime();
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const elapsed = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+  // 0-90s: normal boot expected
+  // 90-180s: still booting, fine
+  // 180-240s: getting slow
+  // 240s+: probably stuck (server-side bootTimeoutMs default)
+  let tone: 'normal' | 'warn' | 'stuck' = 'normal';
+  let msg = 'Cold boot takes ~90 seconds on KVM. The device will appear in your list once adbd binds.';
+  if (elapsed >= 240) {
+    tone = 'stuck';
+    msg = "This is taking longer than expected (~240s) — the in-container emulator may have crashed. Try Delete + create a fresh one, or check the docker container logs.";
+  } else if (elapsed >= 90) {
+    tone = 'warn';
+    msg = 'Still booting. Cold-boot of the Android emulator inside the container can take 1–3 minutes on slower hosts.';
+  }
+  return (
+    <div className={`instance-card-progress-hint instance-card-progress-${tone}`}>
+      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
+        elapsed: {elapsed}s
+      </div>
+      {msg}
     </div>
   );
 }
