@@ -105,6 +105,39 @@ export default definePlugin({
       { slot: 'kitchen-sink:demo:extra', id: 'kitchen-sink:demo-extra', component: 'DemoExtra' },
     ]);
 
+    // --- Extension Point: ctx.deviceProviders ---
+    // Demonstrate the plugin-contributed device-provider extension point.
+    // This provider is intentionally non-functional: isAvailable() returns
+    // false so it never spawns anything in production, and its
+    // listInstances() returns empty. The point is to show plugin authors
+    // the registration shape — not to wire up a real device source.
+    //
+    // Real plugin providers (Corellium, BrowserStack, iOS Simulator) would
+    // replace this with a working implementation. See
+    // docs/specs/2026-05-20-emulator-support-design.md §9.
+    ctx.deviceProviders([{
+      id: 'kitchen-sink-demo-provider',
+      displayName: 'Kitchen Sink Demo Provider',
+      networkMode: 'kitchen-sink-mode',
+      capabilities: { canCreate: false, canDelete: false },
+      implementation: {
+        id: 'kitchen-sink-demo-provider',
+        displayName: 'Kitchen Sink Demo Provider',
+        isAvailable: async () => ({
+          available: false,
+          reason: 'demo provider — not a real device source',
+          installHint: 'This provider is for SDK demonstration only. Not installable.',
+        }),
+        listInstances: async () => [],
+        startInstance: async (id) => ({ id, serial: id }),
+        stopInstance: async () => {},
+        getNetworkConfig: () => ({ mode: 'kitchen-sink-mode' }),
+      },
+      captureHandler: async (instance) => {
+        ctx.logger().log(`[KitchenSink] capture handler invoked for ${instance.id} (no-op demo)`);
+      },
+    }]);
+
     // --- Extension Point: Hooks (define + subscribe) ---
     ctx.hooks.define('kitchen-sink:item-created', { id: 'number', title: 'string' });
 
