@@ -71,3 +71,72 @@ export async function listDarkrideContainers(d: DockerLike): Promise<DarkrideCon
 export function createDockerClient(): DockerLike {
   return new Docker();
 }
+
+// Module-level handle so non-provider services (e.g. CaptureSessionManager)
+// can exec into managed containers without plumbing dockerode through every
+// constructor. Set once at boot in index.ts after the daemon probe.
+let activeDockerClient: DockerLike | null = null;
+export function setActiveDockerClient(d: DockerLike): void { activeDockerClient = d; }
+export function getActiveDockerClient(): DockerLike | null { return activeDockerClient; }
+
+/**
+ * Spawn a TCP forwarder inside the named container. Returns once the
+ * forwarder is listening (or rejects on exec failure). Useful for the
+ * emu-http-proxy capture path: the Android emulator's QEMU NAT filters
+ * RFC1918 private IPs, so the only address the emulator can reach
+ * reliably is the QEMU host (10.0.2.2 = the container). Run a tiny
+ * Python relay inside the container that listens on listenPort and
+ * forwards to targetHost:targetPort on the docker host.
+ *
+ * Implementation: detached `python3 -c "..."` using stdlib only (every
+ * budtmo-derived image ships Python 3). The forwarder process exits when
+ * the container does — no separate cleanup needed.
+ */
+export async function spawnContainerHttpForwarder(
+  d: DockerLike,
+  containerId: string,
+  listenPort: number,
+  targetHost: string,
+  targetPort: number,
+): Promise<void> {
+  const script = [
+    'import socket, threading',
+    `LISTEN_PORT=${listenPort}`,
+    `TARGET=('${targetHost}', ${targetPort})`,
+    'srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)',
+    'srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)',
+    'srv.bind(("0.0.0.0", LISTEN_PORT))',
+    'srv.listen(16)',
+    'def shovel(a, b):',
+    '    try:',
+    '        while True:',
+    '            data = a.recv(4096)',
+    '            if not data: break',
+    '            b.sendall(data)',
+    '    except OSError: pass',
+    '    finally:',
+    '        try: a.shutdown(socket.SHUT_RD)',
+    '        except OSError: pass',
+    '        try: b.shutdown(socket.SHUT_WR)',
+    '        except OSError: pass',
+    'def fwd(c):',
+    '    try:',
+    '        u = socket.create_connection(TARGET, timeout=5)',
+    '    except Exception:',
+    '        c.close(); return',
+    '    threading.Thread(target=shovel, args=(c, u), daemon=True).start()',
+    '    threading.Thread(target=shovel, args=(u, c), daemon=True).start()',
+    'while True:',
+    '    c, _ = srv.accept()',
+    '    threading.Thread(target=fwd, args=(c,), daemon=True).start()',
+  ].join('\n');
+
+  const container = d.getContainer(containerId);
+  const exec = await container.exec({
+    Cmd: ['python3', '-c', script],
+    AttachStdout: false,
+    AttachStderr: false,
+    Detach: true,
+  });
+  await exec.start({ Detach: true });
+}

@@ -1,5 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { automationSessions, devices as devicesTable, deviceInstances, settings } from '../db/schema';
+import { getActiveDockerClient, spawnContainerHttpForwarder } from './providers/docker-helpers';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
@@ -161,18 +162,44 @@ export class CaptureSessionManager {
       if (isDockerAndroid && platform === 'android') {
         // Start mitmproxy in regular HTTP forward-proxy mode on a free port.
         const { port } = await this.mitmproxyManager.startHttpProxyCapture(deviceId, mitmOptions);
-        // 172.17.0.1: the default docker-bridge gateway on Linux — i.e. the
-        // host's IP from inside a container. Override via
-        // DARKRIDE_DOCKER_BRIDGE_GATEWAY for non-default bridge networks or
-        // Docker Desktop (where host.docker.internal works but requires DNS).
+
+        // The Android emulator's QEMU NAT filters RFC1918 private IPs —
+        // confirmed by an explicit `nc -z 172.17.0.1 <port>` probe from
+        // inside the emulator returning failure even when the host can
+        // reach the same address. Only 10.0.2.2 (the QEMU host = our
+        // container) is reliably reachable from inside the emulator.
+        //
+        // Workaround: spawn a Python TCP forwarder INSIDE the container
+        // that listens on the same port and relays to the host's docker-
+        // bridge gateway (where mitmproxy actually lives). The emulator
+        // then targets 10.0.2.2:<port> and the chain becomes:
+        //   emulator -> 10.0.2.2 (QEMU NAT to container)
+        //            -> container's forwarder
+        //            -> 172.17.0.1:<port> (host bridge gateway)
+        //            -> mitmproxy
         const gateway = process.env.DARKRIDE_DOCKER_BRIDGE_GATEWAY || '172.17.0.1';
-        emuHttpProxy = { host: gateway, port };
+        const docker = getActiveDockerClient();
+        const instRow = this.db
+          .select({ runtimeId: deviceInstances.runtimeId })
+          .from(deviceInstances)
+          .where(eq(deviceInstances.serial, deviceId))
+          .all()[0];
+        if (!docker || !instRow?.runtimeId) {
+          throw new Error(`docker-android device ${deviceId} has no container handle (docker=${!!docker} runtimeId=${instRow?.runtimeId ?? 'null'})`);
+        }
+        log(`Spawning in-container TCP forwarder for ${deviceId}: 0.0.0.0:${port} -> ${gateway}:${port}`);
+        await spawnContainerHttpForwarder(docker, instRow.runtimeId, port, gateway, port);
+        // The forwarder listens on the container's interfaces; the
+        // emulator reaches it via 10.0.2.2 (QEMU's pseudonym for the
+        // container).
+        emuHttpProxy = { host: '10.0.2.2', port };
         subsystems.mitmproxy = 'ok';
         this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
 
-        // adb root, push user CA cert, set http_proxy at the emulator's
-        // view of the host (via the bridge gateway).
-        await this.deviceManager.setupEmulatorHttpProxy(deviceId, gateway, port);
+        // adb root, push user CA cert, set system http_proxy. The system
+        // setting is best-effort (HttpURLConnection ignores it) — the
+        // E2E fixture targets the proxy explicitly via Intent extra.
+        await this.deviceManager.setupEmulatorHttpProxy(deviceId, '10.0.2.2', port);
         subsystems.certInjection = 'ok';
         // WireGuard is conceptually skipped here, but the subsystems shape
         // is shared with physical-device flows — mark it as skipped rather

@@ -136,7 +136,7 @@ import { createProviderRegistry } from './services/providers';
 import { createAdbDeviceProvider } from './services/providers/adb-device';
 import { createIosDeviceProvider } from './services/providers/ios-device';
 import { createDockerAndroidProvider } from './services/providers/docker-android';
-import { createDockerClient } from './services/providers/docker-helpers';
+import { createDockerClient, setActiveDockerClient } from './services/providers/docker-helpers';
 import { createAvdProvider } from './services/providers/avd';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
@@ -880,6 +880,9 @@ httpServer.listen(PORT, HOST, () => {
   const dockerAvailability = await dockerAndroidProvider.isAvailable();
   if (dockerAvailability.available) {
     providerRegistry.register(dockerAndroidProvider);
+    // Expose the client to non-provider services (CaptureSessionManager's
+    // emu-http-proxy path execs a TCP forwarder inside the container).
+    setActiveDockerClient(dockerClient);
     log(`docker-android provider registered (Docker daemon detected)`);
   } else {
     log(`docker-android provider NOT registered: ${dockerAvailability.reason ?? 'daemon unreachable'}`);
