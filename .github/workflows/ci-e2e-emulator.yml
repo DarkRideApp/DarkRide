@@ -172,7 +172,7 @@ jobs:
           # after the server is up.
           for i in {1..300}; do
             if curl -fsS http://localhost:3001/health >/dev/null 2>&1; then
-              echo "DarkRide ready after ${i}*2s"
+              echo "DarkRide /health responding after ${i}*2s"
               break
             fi
             sleep 2
@@ -180,6 +180,24 @@ jobs:
           curl -fsS http://localhost:3001/health || {
             echo "::error::DarkRide did not respond on :3001 within 600s"
             tail -300 /tmp/darkride.log
+            exit 1
+          }
+          # /health binds before plugins/providers register — it just means
+          # Express is up. Wait for "All services started" in the log to
+          # confirm the docker-android provider, device-manager, capture
+          # session manager, etc. are all wired before the test starts.
+          # Without this, the first test attempt often hits a 404 on
+          # /v1/devices/providers/.../instances.
+          for i in {1..120}; do
+            if grep -q "All services started" /tmp/darkride.log; then
+              echo "DarkRide fully ready (services started) after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          grep -q "All services started" /tmp/darkride.log || {
+            echo "::error::DarkRide health is up but services did not finish starting within 120s"
+            tail -200 /tmp/darkride.log
             exit 1
           }
 
