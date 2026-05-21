@@ -132,23 +132,10 @@ describe('E2E — emulator capture', () => {
         const proxyUrl = `${httpProxy!.host}:${httpProxy!.port}`;
         step(`proxy from capture response: ${proxyUrl}`);
 
-        // Diagnostic: prove mitmproxy is reachable from inside the
-        // emulator. The previous `nc -z` approach used a flag toybox
-        // doesn't support; switch to curl, which Android 14 emulators
-        // ship with. We probe via the proxy itself (HTTP CONNECT to a
-        // throwaway URL) — a non-zero http_code returned by the proxy
-        // confirms the TCP path AND that mitmproxy is processing.
-        try {
-          const emuProbe = execFileSync(
-            'adb',
-            ['-s', serial, 'shell',
-             `curl -s -o /dev/null -w "EMU_REACH http_code=%{http_code} time=%{time_total}s exit=%{exitcode}" --max-time 5 -x http://${httpProxy!.host}:${httpProxy!.port} http://e2e-diag.example.test/probe || echo "EMU_REACH_FAIL exit=$?"`],
-            { encoding: 'utf8' },
-          );
-          step(`EMU->MITM probe: ${emuProbe.trim()}`);
-        } catch (e: any) {
-          step(`EMU->MITM probe FAILED: ${e.message?.slice(0, 200) ?? e}`);
-        }
+        // Skip the emu-side probe — Android 14 stock images don't ship
+        // curl, nc -z isn't supported by toybox, and other obvious tools
+        // (wget) are also missing or limited. We get the real signal from
+        // the fixture's own logcat lines after the activity launches.
 
         // 6. Launch the fixture activity — it fires https://e2e.example.test/ping
         //    from onCreate(), routed through DarkRide's mitmproxy bridge.
@@ -167,20 +154,22 @@ describe('E2E — emulator capture', () => {
         );
         step('app launched; polling traffic store for the captured request');
 
-        // Wait a moment for the app to actually fire its request, then
-        // dump the fixture's logcat lines so we can see what happened
-        // even if the request never reached mitmproxy.
-        await new Promise((r) => setTimeout(r, 3000));
+        // Wait for the fixture's HTTPS request to fire, then dump its
+        // logcat lines. The fixture's MainActivity logs Log.i(TAG="e2efixture")
+        // for both the opening attempt and the result — so even if mitmproxy
+        // never sees the request, we know whether the app made the call,
+        // hit a TLS error, got a connect refused, etc.
+        // `-s e2efixture` filters to that tag specifically at default
+        // (INFO+) priority — without it `*:F` would mute everything.
+        await new Promise((r) => setTimeout(r, 8000));
         try {
           const lc = execFileSync(
             'adb',
-            ['-s', serial, 'logcat', '-d', '-s', 'System.err:*', 'ActivityManager:I', '*:F'],
+            ['-s', serial, 'logcat', '-d',
+             '-s', 'e2efixture:V', 'AndroidRuntime:E', 'System.err:V'],
             { encoding: 'utf8' },
           );
-          const filtered = lc.split('\n').filter((l) =>
-            /e2efixture|MainActivity|ping/i.test(l)
-          ).slice(0, 20).join('\n');
-          step(`logcat (fixture-filtered, first 20):\n${filtered || '(no fixture lines)'}`);
+          step(`logcat (e2efixture + errors):\n${lc.split('\n').slice(0, 40).join('\n')}`);
         } catch (e: any) {
           step(`logcat dump failed: ${e.message?.slice(0, 200) ?? e}`);
         }
