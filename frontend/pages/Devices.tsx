@@ -24,12 +24,21 @@ interface ManagedInstance {
   runtimeId: string;
   displayName: string | null;
   serial: string | null;
-  state: 'created' | 'starting' | 'running' | 'stopped' | 'error';
+  state: 'pulling' | 'created' | 'starting' | 'running' | 'stopped' | 'error';
   spawnMetadata: { image?: string; androidVersion?: string; arch?: string; ramMb?: number } | null;
   lastError: string | null;
   createdAt: string | number | Date;
   /** Updated on every state transition — best timestamp for "how long has this been in its current state". */
   lastStateAt?: string | number | Date;
+}
+
+interface PullProgress {
+  percent: number | null;
+  phase: string;
+  bytesDone: number;
+  bytesTotal: number;
+  completedLayers: number;
+  totalLayers: number;
 }
 
 function isOnline(device: Device): boolean {
@@ -52,6 +61,10 @@ export function Devices() {
   const navigate = useNavigate();
   const [devices, setDevices] = useState<Device[]>([]);
   const [instances, setInstances] = useState<ManagedInstance[]>([]);
+  // Live pull progress per instance — keyed by row id. Sidecar payload on
+  // `provider-instance-updated`; not persisted server-side. Cleared when
+  // the instance leaves `pulling` state.
+  const [pullProgress, setPullProgress] = useState<Map<number, PullProgress>>(new Map());
   const [loading, setLoading] = useState(true);
   const [setupDevice, setSetupDevice] = useState<Device | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -100,7 +113,27 @@ export function Devices() {
   // transition (created → starting → running → error). Refetch on each
   // event so the grid reflects the boot progress without polling.
   useEffect(() => {
-    const unsub = ws.subscribe('provider-instance-updated', () => {
+    const unsub = ws.subscribe('provider-instance-updated', (msg: any) => {
+      const inst = msg?.instance as ManagedInstance | undefined;
+      const prog = msg?.pullProgress as PullProgress | undefined;
+      if (inst?.id != null && prog) {
+        // Update progress without a refetch round-trip — sub-second updates
+        // would otherwise hammer the API.
+        setPullProgress((prev) => {
+          const next = new Map(prev);
+          next.set(inst.id, prog);
+          return next;
+        });
+      }
+      if (inst?.id != null && inst.state !== 'pulling') {
+        setPullProgress((prev) => {
+          if (!prev.has(inst.id)) return prev;
+          const next = new Map(prev);
+          next.delete(inst.id);
+          return next;
+        });
+      }
+      // Refetch on real state transitions (cheap, debounced by React batching).
       void fetchInstances();
       void fetchDevices();
     });
@@ -219,6 +252,7 @@ export function Devices() {
             <InstanceCard
               key={`inst-${inst.id}`}
               instance={inst}
+              pullProgress={pullProgress.get(inst.id) ?? null}
               onStart={() => startInstance(inst)}
               onStop={() => stopInstance(inst)}
               onDelete={() => deleteInstance(inst)}
@@ -331,6 +365,7 @@ export function Devices() {
 }
 
 const STATE_LABEL: Record<ManagedInstance['state'], string> = {
+  pulling: 'Pulling image',
   created: 'Created',
   starting: 'Booting',
   running: 'Connecting',  // running per backend, not yet visible to adb tracker
@@ -353,6 +388,8 @@ function relativeTime(input: string | number | Date): string {
 
 interface InstanceCardProps {
   instance: ManagedInstance;
+  /** Sidecar progress for state='pulling' — null otherwise. */
+  pullProgress: PullProgress | null;
   onStart: () => void;
   onStop: () => void;
   onDelete: () => void;
@@ -368,10 +405,12 @@ interface InstanceCardProps {
  * Distinct visual treatment (instance-card class) so users can tell at a
  * glance which cards are managed by DarkRide vs adb-discovered devices.
  */
-function InstanceCard({ instance: inst, onStart, onStop, onDelete }: InstanceCardProps) {
+function InstanceCard({ instance: inst, pullProgress, onStart, onStop, onDelete }: InstanceCardProps) {
+  const isPulling = inst.state === 'pulling';
   const isBooting = inst.state === 'starting' || inst.state === 'running';
   const isError = inst.state === 'error';
   const isStartable = inst.state === 'created' || inst.state === 'stopped';
+  const hasSpinner = isPulling || isBooting;
   const meta = inst.spawnMetadata ?? {};
   const subtitle: string[] = [];
   if (meta.image) subtitle.push(meta.image.split(':').pop() ?? meta.image);
@@ -395,7 +434,7 @@ function InstanceCard({ instance: inst, onStart, onStop, onDelete }: InstanceCar
           )}
           <div className="device-card-badges">
             <span className={`badge badge-sm instance-state-${inst.state}`}>
-              {isBooting && <span className="spin" aria-hidden style={{ display: 'inline-block', marginRight: 4 }}>⟳</span>}
+              {hasSpinner && <span className="spin" aria-hidden style={{ display: 'inline-block', marginRight: 4 }}>⟳</span>}
               {STATE_LABEL[inst.state]}
             </span>
             <span className="badge badge-sm badge-muted">{inst.providerId}</span>
@@ -422,6 +461,7 @@ function InstanceCard({ instance: inst, onStart, onStop, onDelete }: InstanceCar
             {inst.lastError}
           </div>
         )}
+        {isPulling && <InstancePullProgress progress={pullProgress} />}
         {isBooting && <InstanceBootProgress inst={inst} />}
       </div>
 
@@ -488,6 +528,37 @@ function InstanceBootProgress({ inst }: { inst: ManagedInstance }) {
         elapsed: {elapsed}s
       </div>
       {msg}
+    </div>
+  );
+}
+
+/**
+ * Shows aggregated image-pull progress on a 'pulling' instance card.
+ * Single percent + single phrase — no per-layer flipping. The backend
+ * (docker-android's ensureImageLocal) aggregates across all layers and
+ * throttles to ~500ms before pushing here.
+ */
+function InstancePullProgress({ progress }: { progress: PullProgress | null }) {
+  if (!progress) {
+    return (
+      <div className="instance-card-progress-hint">
+        Preparing image…
+      </div>
+    );
+  }
+  const pct = progress.percent ?? 0;
+  return (
+    <div className="instance-card-pull">
+      <div className="instance-card-pull-bar" aria-label="Image pull progress">
+        <div
+          className="instance-card-pull-bar-fill"
+          style={{ width: progress.percent === null ? '5%' : `${pct}%` }}
+        />
+      </div>
+      <div className="instance-card-pull-label">
+        <span>{progress.percent === null ? '—' : `${pct}%`}</span>
+        <span style={{ opacity: 0.7, fontSize: 11 }}>{progress.phase}</span>
+      </div>
     </div>
   );
 }

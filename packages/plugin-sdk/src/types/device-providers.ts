@@ -1,5 +1,7 @@
 /** State machine for a managed device instance. See spec §7.1. */
 export type DeviceInstanceState =
+  /** Image is being pulled. Container hasn't been created yet (no runtime id). */
+  | 'pulling'
   | 'created'
   | 'starting'
   | 'running'
@@ -62,6 +64,28 @@ export interface RunningInstance {
   serial: string;
 }
 
+/**
+ * Aggregated image-pull progress. Providers that materialise a container
+ * image (currently docker-android) push this to the orchestrator so the
+ * UI can render one stable percentage instead of per-layer noise.
+ */
+export interface PullProgress {
+  /** 0..100, or null before the total is known. */
+  percent: number | null;
+  /** Human-readable phrase, e.g. "Downloading 1.2 GB / 2.4 GB · 5 of 12 layers complete". */
+  phase: string;
+  bytesDone: number;
+  bytesTotal: number;
+  completedLayers: number;
+  totalLayers: number;
+}
+
+/** Hooks the orchestrator can pass into createInstance. All optional. */
+export interface CreateInstanceOpts {
+  /** Invoked at ~500ms intervals during a backing-image pull, if any. */
+  onPullProgress?: (progress: PullProgress) => void;
+}
+
 /** JSON-schema-shaped description of a provider's createInstance form. */
 export interface CreateFormSchema {
   fields: Array<{
@@ -105,7 +129,7 @@ export interface DeviceProvider {
    * Spawn a new instance from a provider-specific spec. Providers that can
    * only observe (adb-device, ios-device) leave this undefined.
    */
-  createInstance?(spec: CreateInstanceSpec): Promise<DeviceProviderInstance>;
+  createInstance?(spec: CreateInstanceSpec, opts?: CreateInstanceOpts): Promise<DeviceProviderInstance>;
 
   /** Start a previously-created (or stopped) instance. No-op for observe-only providers. */
   startInstance(id: string): Promise<RunningInstance>;

@@ -19,6 +19,7 @@ export interface DeviceInstanceRow {
 
 export interface DeviceInstanceInsert {
   providerId: string;
+  /** Empty string for 'pulling' rows where the container doesn't exist yet — set after pull+create. */
   runtimeId: string;
   displayName?: string | null;
   serial?: string | null;

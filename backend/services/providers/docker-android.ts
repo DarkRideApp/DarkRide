@@ -2,11 +2,10 @@ import { existsSync } from 'fs';
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import type {
-  CreateInstanceSpec, DeviceProvider, DeviceProviderInstance, NetworkConfig,
+  CreateInstanceSpec, CreateInstanceOpts, DeviceProvider, DeviceProviderInstance, NetworkConfig,
   ProviderAvailability, RunningInstance, CreateFormSchema,
 } from '@darkrideapp/plugin-sdk';
 import { type DockerLike, detectDockerDaemon, listDarkrideContainers } from './docker-helpers';
-import { broadcastToAll } from '../../websocket/index';
 import { createLoggers } from '../../logs';
 
 const execFile = promisify(execFileCb);
@@ -35,15 +34,37 @@ function budtmoImageFor(androidVersion: string): string {
 }
 const LABEL_KEY = 'darkride.emulator';
 
+/** Aggregated pull progress broadcast to the UI. One number, one phrase, no per-layer noise. */
+export interface PullProgress {
+  /** 0..100; null while we don't yet know the total layer count. */
+  percent: number | null;
+  /** Human-readable current activity, e.g. "Downloading… 1.2 GB / 2.4 GB · 5 of 12 layers complete". */
+  phase: string;
+  bytesDone: number;
+  bytesTotal: number;
+  completedLayers: number;
+  totalLayers: number;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 /**
- * Pull `image` if it isn't already local. Streams pull progress to the
- * backend log and broadcasts each progress chunk as `provider-image-pull-progress`
- * so the UI can render a real progress indicator instead of a frozen modal.
- *
- * `instanceName` is included in the broadcast so a future multi-instance UI
- * can attribute progress to the right card.
+ * Pull `image` if it isn't already local. Aggregates per-layer progress
+ * into a single PullProgress object and invokes `onProgress` at most ~every
+ * 500ms — callers (the create API endpoint) forward this as one stable
+ * payload on the row's broadcast, so the UI sees a single bytes-and-percent
+ * number instead of the wild per-layer flips Docker emits natively.
  */
-async function ensureImageLocal(d: DockerLike, image: string, instanceName: string): Promise<void> {
+async function ensureImageLocal(
+  d: DockerLike,
+  image: string,
+  onProgress?: (p: PullProgress) => void,
+): Promise<void> {
   const dAny = d as any;
   try {
     if (typeof dAny.getImage === 'function') {
@@ -53,38 +74,77 @@ async function ensureImageLocal(d: DockerLike, image: string, instanceName: stri
   } catch {
     // fall through to pull
   }
-  log(`Image ${image} not local — pulling (this is a one-time ~2-3GB compressed / ~8GB unpacked download)`);
-  broadcastToAll({ type: 'provider-image-pull-progress', image, instanceName, status: 'starting' });
+  log(`Image ${image} not local — pulling (~2-3 GB compressed)`);
+
+  interface Layer { id: string; total: number; downloaded: number; state: 'pending' | 'downloading' | 'extracting' | 'complete'; }
+  const layers = new Map<string, Layer>();
+
+  function snapshot(): PullProgress {
+    const arr = [...layers.values()];
+    const bytesTotal = arr.reduce((s, l) => s + l.total, 0);
+    const bytesDone = arr.reduce((s, l) => s + (l.state === 'complete' ? l.total : l.downloaded), 0);
+    const completedLayers = arr.filter((l) => l.state === 'complete').length;
+    const totalLayers = arr.length;
+    const percent = bytesTotal > 0 ? Math.min(100, Math.floor((bytesDone / bytesTotal) * 100)) : null;
+    let phase = 'Preparing…';
+    if (totalLayers === 0) phase = 'Connecting to registry…';
+    else if (completedLayers === totalLayers) phase = 'Finalising…';
+    else if (bytesTotal > 0) phase = `Downloading ${formatBytes(bytesDone)} / ${formatBytes(bytesTotal)} · ${completedLayers}/${totalLayers} layers complete`;
+    else phase = `Discovered ${totalLayers} layer${totalLayers === 1 ? '' : 's'}, waiting for size…`;
+    return { percent, phase, bytesDone, bytesTotal, completedLayers, totalLayers };
+  }
+
   const stream: any = await d.pull(image);
-  let lastBroadcast = 0;
+  let lastEmit = 0;
+  function maybeEmit(force = false) {
+    const now = Date.now();
+    if (!force && now - lastEmit < 500) return;
+    lastEmit = now;
+    onProgress?.(snapshot());
+  }
+  maybeEmit(true);
   await new Promise<void>((resolve, reject) => {
     const onData = (chunk: Buffer | string) => {
-      // The stream emits one JSON-per-line payload like
-      // {"status":"Downloading","progressDetail":{"current":...,"total":...},"id":"<layer>"}
       const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
       for (const line of text.split('\n')) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-        try {
-          const ev = JSON.parse(trimmed);
-          // Throttle WS broadcasts: at most one every 500ms (per-line would
-          // flood the channel during a 50k-line pull).
-          const now = Date.now();
-          if (now - lastBroadcast >= 500 || ev.status === 'Pull complete' || ev.error) {
-            broadcastToAll({ type: 'provider-image-pull-progress', image, instanceName, ...ev });
-            lastBroadcast = now;
-          }
-          if (ev.error) {
-            return reject(new Error(`docker pull ${image} failed: ${ev.error}`));
-          }
-        } catch {
-          // ignore non-JSON lines (rare)
+        let ev: any;
+        try { ev = JSON.parse(trimmed); } catch { continue; }
+        if (ev.error) return reject(new Error(`docker pull ${image} failed: ${ev.error}`));
+        const id = ev.id as string | undefined;
+        const status = ev.status as string | undefined;
+        if (!id || !status) continue;
+        if (id === image) continue; // these are the meta lines, not layer events
+        let layer = layers.get(id);
+        if (!layer) {
+          layer = { id, total: 0, downloaded: 0, state: 'pending' };
+          layers.set(id, layer);
         }
+        const pd = ev.progressDetail;
+        if (status === 'Downloading') {
+          layer.state = 'downloading';
+          if (pd?.total > 0) layer.total = pd.total;
+          if (typeof pd?.current === 'number') layer.downloaded = Math.min(pd.current, layer.total || pd.current);
+        } else if (status === 'Download complete' || status === 'Verifying Checksum') {
+          if (layer.total === 0 && pd?.total > 0) layer.total = pd.total;
+          layer.downloaded = layer.total;
+        } else if (status === 'Extracting') {
+          layer.state = 'extracting';
+          // Treat extract as already-downloaded for the byte counter (it is).
+          layer.downloaded = layer.total;
+        } else if (status === 'Pull complete') {
+          layer.state = 'complete';
+          layer.downloaded = layer.total;
+        }
+        maybeEmit();
       }
     };
     stream.on('data', onData);
     stream.on('end', () => {
-      broadcastToAll({ type: 'provider-image-pull-progress', image, instanceName, status: 'complete' });
+      // Force one final emit with 100%.
+      const final = snapshot();
+      onProgress?.({ ...final, percent: 100, phase: 'Pull complete' });
       log(`Image pull complete: ${image}`);
       resolve();
     });
@@ -186,7 +246,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       }));
     },
 
-    async createInstance(spec: CreateInstanceSpec): Promise<DeviceProviderInstance> {
+    async createInstance(spec: CreateInstanceSpec, opts?: CreateInstanceOpts): Promise<DeviceProviderInstance> {
       const androidVersion = String(spec.config.androidVersion ?? '14');
       const arch = String(spec.config.architecture ?? 'x86_64');
       const ramMb = Number(spec.config.ramMb ?? 2048);
@@ -212,7 +272,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       // Materialize the image if it isn't local yet. Docker's createContainer
       // API does NOT auto-pull (unlike `docker run`), so a first-time user
       // would otherwise see "No such image" from the daemon. ~8GB download.
-      await ensureImageLocal(d, image, spec.displayName);
+      await ensureImageLocal(d, image, opts?.onPullProgress);
 
       log(`Creating docker-android container "${spec.displayName}" image=${image} ram=${ramMb}MB arch=${arch}`);
       const container: any = await d.createContainer({

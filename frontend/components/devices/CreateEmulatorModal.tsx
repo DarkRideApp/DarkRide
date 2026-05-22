@@ -44,29 +44,6 @@ export function CreateEmulatorModal({ onCancel, onCreated }: Props) {
   const [submitting, setSubmitting] = useState(false);
   const [rechecking, setRechecking] = useState(false);
   const [providersLoaded, setProvidersLoaded] = useState(false);
-  // Live status of an in-flight image pull. Backend broadcasts
-  // `provider-image-pull-progress` with chunked Docker pull events when
-  // createInstance has to materialize the image (first-time use). We just
-  // surface the latest status string so the modal doesn't look frozen for
-  // ~10 minutes during the first ~8GB pull.
-  const [pullStatus, setPullStatus] = useState<string | null>(null);
-
-  useEffect(() => {
-    const unsub = ws.subscribe('provider-image-pull-progress', (msg: any) => {
-      if (msg?.status === 'complete') { setPullStatus(null); return; }
-      if (msg?.status === 'starting') { setPullStatus('Downloading image (one-time, ~8 GB unpacked)…'); return; }
-      // Per-layer progress: "Downloading", "Extracting", "Pull complete"…
-      const layer = msg?.id ? ` ${msg.id}` : '';
-      const pd = msg?.progressDetail;
-      let detail = '';
-      if (pd?.current && pd?.total) {
-        const pct = Math.floor((pd.current / pd.total) * 100);
-        detail = ` ${pct}%`;
-      }
-      setPullStatus(`${msg.status ?? 'Pulling'}${layer}${detail}`);
-    });
-    return unsub;
-  }, [ws]);
 
   const fetchProviders = useCallback(async () => {
     const r = await ws.sendRestApi('GET', '/v1/devices/providers');
@@ -114,20 +91,18 @@ export function CreateEmulatorModal({ onCancel, onCreated }: Props) {
     setSubmitting(true);
     let createdOk = false;
     try {
+      // autoStart=true tells the backend to chain pull → create → start
+      // in one background task. The endpoint returns immediately with the
+      // 'pulling' row, so this request completes in ~ms regardless of
+      // image-pull duration. Boot progress flows over the WebSocket to
+      // the Devices grid's InstanceCard.
       const r = await ws.sendRestApi('POST', `/v1/devices/providers/${activeId}/instances`, {
         displayName: displayName.trim(),
         config,
+        autoStart: true,
       });
       if (r.body?.success) {
-        const instanceId = r.body.data.instance.id as number;
-        // Fire-and-forget the start request. The Devices page subscribes to
-        // provider-instance-updated and renders the boot progress; blocking
-        // here would freeze the modal for ~90s with no feedback.
-        void ws.sendRestApi(
-          'POST',
-          `/v1/devices/providers/${activeId}/instances/${instanceId}/start`,
-        );
-        toast.success(`"${displayName.trim()}" created — booting in the background`);
+        toast.success(`"${displayName.trim()}" queued — image pull + boot in the background`);
         createdOk = true;
         onCreated();
       } else {
@@ -261,7 +236,7 @@ export function CreateEmulatorModal({ onCancel, onCreated }: Props) {
                   : undefined
             }
           >
-            {submitting ? (pullStatus ?? 'Creating…') : 'Create & start'}
+            {submitting ? 'Creating…' : 'Create & start'}
           </button>
         </div>
       </div>

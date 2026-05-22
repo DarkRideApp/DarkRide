@@ -1,4 +1,6 @@
+import { eq } from 'drizzle-orm';
 import { registerEndpoint } from './api-service';
+import { deviceInstances } from '../db/schema';
 import type { ProviderRegistry } from '../services/providers';
 import type { DeviceInstancesRepo } from '../services/device-instances-repo';
 import { broadcastToAll } from '../websocket/index';
@@ -61,27 +63,79 @@ export function registerDevicesProvidersEndpoints(
       res.status(400).json({ success: false, error: `Provider "${req.params.id}" does not support createInstance` });
       return;
     }
-    const { displayName, config } = req.body as { displayName?: string; config?: Record<string, unknown> };
+    const { displayName, config, autoStart } = req.body as { displayName?: string; config?: Record<string, unknown>; autoStart?: boolean };
     if (!displayName || typeof displayName !== 'string') {
       res.status(400).json({ success: false, error: 'displayName is required' });
       return;
     }
-    try {
-      const inst = await p.createInstance({ displayName, config: config ?? {} });
-      const row = repo.insert({
-        providerId: p.id ?? req.params.id,
-        runtimeId: inst.id,
-        displayName: inst.displayName,
-        serial: inst.serial ?? null,
-        state: inst.state,
-        spawnedByDarkride: true,
-        spawnMetadata: inst.metadata ?? null,
-      });
-      broadcastToAll({ type: 'provider-instance-updated', instance: row });
-      res.json({ success: true, data: { instance: row } });
-    } catch (err: any) {
-      res.status(500).json({ success: false, error: err?.message ?? String(err) });
-    }
+    // Insert the row immediately so the API can respond in milliseconds.
+    // For docker-android, the underlying createInstance may need to pull
+    // a multi-GB image first; we don't want to keep the HTTP request open
+    // for the duration of that. The row starts in 'pulling' state (with
+    // an empty runtimeId until the container materialises), the response
+    // returns instantly, and the rest runs in background — broadcasting
+    // progress + final state via WebSocket.
+    const row = repo.insert({
+      providerId: p.id ?? req.params.id,
+      runtimeId: '',
+      displayName,
+      serial: null,
+      state: 'pulling',
+      spawnedByDarkride: true,
+      spawnMetadata: (config ?? {}) as Record<string, unknown>,
+    });
+    broadcastToAll({ type: 'provider-instance-updated', instance: row });
+    res.json({ success: true, data: { instance: row } });
+
+    // Fire-and-forget the actual creation.
+    (async () => {
+      try {
+        const inst = await p.createInstance!(
+          { displayName, config: config ?? {} },
+          {
+            onPullProgress: (progress) => {
+              broadcastToAll({
+                type: 'provider-instance-updated',
+                instance: repo.getById(row.id),
+                pullProgress: progress,
+              });
+            },
+          },
+        );
+        repo.updateRuntimeId(row.id, inst.id);
+        // Preserve the provider's richer metadata (image, arch, ramMb, …)
+        // which the wizard config alone doesn't carry.
+        if (inst.metadata) {
+          // No setMetadata helper today — go direct.
+          (repo as any).db.update(deviceInstances)
+            .set({ spawnMetadata: inst.metadata, lastStateAt: new Date() })
+            .where(eq(deviceInstances.id, row.id))
+            .run();
+        }
+        repo.updateState(row.id, inst.state);
+        broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
+
+        // The modal sets autoStart=true so users get one continuous
+        // pulling → starting → running flow without having to click
+        // Start manually after the pull completes. We do it here on the
+        // server so the frontend doesn't have to race the broadcast.
+        if (autoStart && p.startInstance) {
+          repo.updateState(row.id, 'starting');
+          broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
+          try {
+            const r = await p.startInstance(inst.id);
+            repo.updateSerial(row.id, r.serial ?? null);
+            repo.updateState(row.id, 'running');
+          } catch (startErr: any) {
+            repo.updateState(row.id, 'error', startErr?.message ?? String(startErr));
+          }
+          broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
+        }
+      } catch (err: any) {
+        repo.updateState(row.id, 'error', err?.message ?? String(err));
+        broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
+      }
+    })();
   }, { requires: ['core.devices:manage'] });
 
   // POST /v1/devices/providers/:id/instances/:instId/start

@@ -50,25 +50,37 @@ describe('/v1/devices/providers endpoints', () => {
     expect(res.status).toBe(404);
   });
 
-  it('POST /v1/devices/providers/:id/instances creates + returns the instance', async () => {
-    const reg = {
-      get: () => ({
-        createInstance: vi.fn().mockResolvedValue({ id: 'inst-1', displayName: 'test', state: 'created', spawnedByDarkride: true }),
-      }),
-    };
+  it('POST /v1/devices/providers/:id/instances returns immediately in `pulling` state; provider.createInstance runs in background', async () => {
+    let resolveCreate!: (v: any) => void;
+    const createInstance = vi.fn().mockReturnValue(new Promise((r) => { resolveCreate = r; }));
+    const reg = { get: () => ({ createInstance }) };
     const repo = {
-      insert: vi.fn().mockReturnValue({ id: 99, providerId: 'docker-android', runtimeId: 'inst-1', state: 'created' }),
+      insert: vi.fn().mockReturnValue({ id: 99, providerId: 'docker-android', runtimeId: '', state: 'pulling' }),
+      getById: vi.fn().mockReturnValue({ id: 99, providerId: 'docker-android', runtimeId: '', state: 'pulling' }),
+      updateRuntimeId: vi.fn(),
+      updateState: vi.fn(),
+      // The endpoint touches `(repo as any).db` to set spawnMetadata; provide
+      // a chainable stub so the call doesn't crash the background task.
+      db: { update: () => ({ set: () => ({ where: () => ({ run: vi.fn() }) }) }) },
     };
     const app = createApp(reg, repo);
     const res = await request(app)
       .post('/v1/devices/providers/docker-android/instances')
       .send({ displayName: 'test', config: { androidVersion: '14' } });
     expect(res.status).toBe(200);
-    expect(res.body.data.instance).toMatchObject({ id: 99, state: 'created' });
+    expect(res.body.data.instance).toMatchObject({ id: 99, state: 'pulling' });
     expect(repo.insert).toHaveBeenCalledWith(expect.objectContaining({
       providerId: 'docker-android',
-      runtimeId: 'inst-1',
+      runtimeId: '',
+      state: 'pulling',
     }));
+    // Provider.createInstance was invoked but the HTTP response didn't
+    // wait for it.
+    expect(createInstance).toHaveBeenCalled();
+    // Resolve the background promise so the test's unhandled-rejection
+    // tracker doesn't fire.
+    resolveCreate({ id: 'inst-1', displayName: 'test', state: 'created', spawnedByDarkride: true });
+    await new Promise((r) => setImmediate(r));
   });
 
   it('POST .../start delegates to provider.startInstance + updates state + persists serial', async () => {

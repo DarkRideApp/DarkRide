@@ -7140,3 +7140,31 @@ body.live-log-open .ai-chat-fab {
 .instance-card-progress-stuck {
   color: var(--danger);
 }
+
+.instance-card-pull {
+  margin-top: 8px;
+}
+.instance-card-pull-bar {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  height: 8px;
+  overflow: hidden;
+}
+.instance-card-pull-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.4s ease-out;
+}
+.instance-card-pull-label {
+  margin-top: 6px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+}
+.instance-card-pulling {
+  border-left-color: var(--accent);
+}
