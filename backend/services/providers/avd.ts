@@ -6,6 +6,7 @@ import type {
   ProviderAvailability, RunningInstance, CreateInstanceSpec, CreateFormSchema,
 } from '@darkrideapp/plugin-sdk';
 import { parseAvdList, parseSystemImageList } from './avd-helpers';
+import { resolveAndroidBin, findAndroidSdkRoot } from './sdk-helpers';
 import { createLoggers } from '../../logs';
 
 const execFile = promisify(execFileCb);
@@ -47,7 +48,7 @@ export function createAvdProvider(opts: AvdProviderOptions = {}): DeviceProvider
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       try {
-        const { stdout } = await execFile('adb', ['devices'], { timeout: 5000 });
+        const { stdout } = await execFile(resolveAndroidBin('adb'), ['devices'], { timeout: 5000 });
         if (stdout.includes(`${serial}\tdevice`)) return true;
       } catch (e: any) {
         logError(`waitForAdbSerial adb devices failed: ${e.message}`);
@@ -63,15 +64,25 @@ export function createAvdProvider(opts: AvdProviderOptions = {}): DeviceProvider
 
     async isAvailable(): Promise<ProviderAvailability> {
       try {
-        await execFile('emulator', ['-help'], { timeout: 5000 });
-        await execFile('avdmanager', ['--help'], { timeout: 5000 });
+        // Resolve via the SDK installer layout first (Android Studio
+        // defaults — ANDROID_HOME / %LOCALAPPDATA%\Android\Sdk / etc.),
+        // falling back to a PATH lookup. This lets Windows/macOS users
+        // with a fresh Android Studio install work without adding the
+        // SDK to PATH manually.
+        await execFile(resolveAndroidBin('emulator'), ['-help'], { timeout: 5000 });
+        await execFile(resolveAndroidBin('avdmanager'), ['--help'], { timeout: 5000 });
         return { available: true };
       } catch (err: any) {
         if (err.code === 'ENOENT') {
+          const sdk = findAndroidSdkRoot();
           return {
             available: false,
-            reason: 'emulator and/or avdmanager not on PATH',
-            installHint: 'Install Android Studio (https://developer.android.com/studio) or the standalone command-line tools. Ensure `emulator` and `avdmanager` are on PATH.',
+            reason: sdk
+              ? `emulator and/or avdmanager not found under detected SDK (${sdk})`
+              : 'Android SDK not found — neither $ANDROID_HOME nor any standard install location resolves',
+            installHint: sdk
+              ? `Found SDK at ${sdk} but missing tools. Open Android Studio's SDK Manager and install "Android Emulator" + "Android SDK Command-line Tools (latest)".`
+              : 'Install Android Studio (https://developer.android.com/studio). On Windows the installer doesn\'t add the SDK to PATH; DarkRide will pick it up from $ANDROID_HOME or %LOCALAPPDATA%\\Android\\Sdk automatically once installed.',
           };
         }
         return { available: false, reason: err.message };
@@ -80,7 +91,7 @@ export function createAvdProvider(opts: AvdProviderOptions = {}): DeviceProvider
 
     async listInstances(): Promise<DeviceProviderInstance[]> {
       try {
-        const { stdout } = await execFile('avdmanager', ['list', 'avd'], { timeout: 10000 });
+        const { stdout } = await execFile(resolveAndroidBin('avdmanager'), ['list', 'avd'], { timeout: 10000 });
         const entries = parseAvdList(stdout);
         return entries.map((e) => ({
           id: e.name,
@@ -100,7 +111,7 @@ export function createAvdProvider(opts: AvdProviderOptions = {}): DeviceProvider
       const sysImage = String(spec.config.systemImagePackage);
       const device = String(spec.config.deviceProfile ?? 'pixel_8');
       log(`Creating AVD "${spec.displayName}" with ${sysImage} (device profile: ${device})`);
-      await execFile('avdmanager', ['create', 'avd', '-n', spec.displayName, '-k', sysImage, '-d', device], { timeout: 60_000 });
+      await execFile(resolveAndroidBin('avdmanager'), ['create', 'avd', '-n', spec.displayName, '-k', sysImage, '-d', device], { timeout: 60_000 });
       return {
         id: spec.displayName,
         displayName: spec.displayName,
@@ -115,7 +126,7 @@ export function createAvdProvider(opts: AvdProviderOptions = {}): DeviceProvider
       portByName.set(id, port);
       const serial = `emulator-${port}`;
       log(`Starting AVD "${id}" on port ${port}`);
-      const child = spawnCb('emulator', ['-avd', id, '-no-window', '-port', String(port)], {
+      const child = spawnCb(resolveAndroidBin('emulator'), ['-avd', id, '-no-window', '-port', String(port)], {
         detached: true,
         stdio: 'ignore',
       });
@@ -136,7 +147,7 @@ export function createAvdProvider(opts: AvdProviderOptions = {}): DeviceProvider
       }
       const serial = `emulator-${port}`;
       try {
-        await execFile('adb', ['-s', serial, 'emu', 'kill'], { timeout: 10_000 });
+        await execFile(resolveAndroidBin('adb'), ['-s', serial, 'emu', 'kill'], { timeout: 10_000 });
       } catch (e: any) {
         logError(`adb emu kill ${serial} failed: ${e.message}`);
       }
@@ -147,7 +158,7 @@ export function createAvdProvider(opts: AvdProviderOptions = {}): DeviceProvider
       if (portByName.has(id)) {
         throw new Error(`AVD "${id}" is running — stop it first`);
       }
-      await execFile('avdmanager', ['delete', 'avd', '-n', id], { timeout: 30_000 });
+      await execFile(resolveAndroidBin('avdmanager'), ['delete', 'avd', '-n', id], { timeout: 30_000 });
     },
 
     getNetworkConfig(_id: string): NetworkConfig {
@@ -161,7 +172,7 @@ export function createAvdProvider(opts: AvdProviderOptions = {}): DeviceProvider
         { value: 'system-images;android-34;google_apis;x86_64', label: 'Android 14 (API 34) — Google APIs x86_64' },
       ];
       try {
-        const { stdout } = await execFile('sdkmanager', ['--list'], { timeout: 30_000 });
+        const { stdout } = await execFile(resolveAndroidBin('sdkmanager'), ['--list'], { timeout: 30_000 });
         const installed = parseSystemImageList(stdout).filter((s) => s.installed);
         if (installed.length > 0) {
           imageOptions = installed.map((s) => ({

@@ -68,8 +68,12 @@ describe('avd provider', () => {
       displayName: 'test',
       config: { systemImagePackage: 'system-images;android-34;google_apis;x86_64', deviceProfile: 'pixel_8' },
     });
+    // The SDK-resolver may rewrite `avdmanager` to an absolute path
+    // (e.g. /home/x/Android/Sdk/cmdline-tools/latest/bin/avdmanager) when
+    // ANDROID_HOME or a default install dir exists on the test host. Match
+    // either form by checking the basename.
     expect(execFile).toHaveBeenCalledWith(
-      'avdmanager',
+      expect.stringMatching(/(^|\/|\\)avdmanager(\.bat)?$/),
       ['create', 'avd', '-n', 'test', '-k', 'system-images;android-34;google_apis;x86_64', '-d', 'pixel_8'],
       expect.any(Object),
       expect.any(Function),
@@ -83,7 +87,7 @@ describe('avd provider', () => {
     const p = createAvdProvider({ pickFreePort: () => 5554, waitForAdbSerial: vi.fn().mockResolvedValue(true) });
     const r = await p.startInstance('Pixel_8_API_34');
     expect(spawn).toHaveBeenCalledWith(
-      'emulator',
+      expect.stringMatching(/(^|\/|\\)emulator(\.exe)?$/),
       ['-avd', 'Pixel_8_API_34', '-no-window', '-port', '5554'],
       expect.objectContaining({ detached: true, stdio: 'ignore' }),
     );
@@ -98,7 +102,7 @@ describe('avd provider', () => {
     await p.startInstance('Pixel_8_API_34');
     await p.stopInstance('Pixel_8_API_34');
     expect(execFile).toHaveBeenCalledWith(
-      'adb',
+      expect.stringMatching(/(^|\/|\\)adb(\.exe)?$/),
       ['-s', 'emulator-5556', 'emu', 'kill'],
       expect.any(Object),
       expect.any(Function),
@@ -110,7 +114,7 @@ describe('avd provider', () => {
     const p = createAvdProvider();
     await p.deleteInstance!('Pixel_8_API_34');
     expect(execFile).toHaveBeenCalledWith(
-      'avdmanager',
+      expect.stringMatching(/(^|\/|\\)avdmanager(\.bat)?$/),
       ['delete', 'avd', '-n', 'Pixel_8_API_34'],
       expect.any(Object),
       expect.any(Function),
