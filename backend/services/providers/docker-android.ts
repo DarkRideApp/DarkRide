@@ -295,7 +295,23 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
         // "Samsung Galaxy S10" but the current Android SDK ships only a
         // Pixel/Nexus-flavoured device list — Samsung profiles got dropped.
         // Pixel 8 is both budtmo-whitelisted and avdmanager-resolvable.
-        Env: [`EMULATOR_DEVICE=Pixel 8`, `RAM_MB=${ramMb}`],
+        Env: [
+          `EMULATOR_DEVICE=Pixel 8`,
+          `RAM_MB=${ramMb}`,
+          // Disable nvidia-container-cli's legacy mode entirely. When the
+          // nvidia-container-toolkit is installed in the host environment
+          // (e.g. Docker Desktop with GPU support enabled on Windows/WSL),
+          // it injects a prestart hook into runc itself that fires for
+          // EVERY container start, regardless of HostConfig.Runtime.
+          // Without a usable GPU passthrough (the common case on WSL),
+          // the hook fails:
+          //   "Auto-detected mode as 'legacy' nvidia-container-cli:
+          //   initialization error: WSL environment detected but no
+          //   adapters were found"
+          // Setting NVIDIA_VISIBLE_DEVICES=void makes the hook a no-op
+          // before it touches the adapter probe.
+          'NVIDIA_VISIBLE_DEVICES=void',
+        ],
         ExposedPorts: { '5555/tcp': {} },
         HostConfig: {
           PortBindings: { '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }] },
