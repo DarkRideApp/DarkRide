@@ -44,6 +44,29 @@ export function CreateEmulatorModal({ onCancel, onCreated }: Props) {
   const [submitting, setSubmitting] = useState(false);
   const [rechecking, setRechecking] = useState(false);
   const [providersLoaded, setProvidersLoaded] = useState(false);
+  // Live status of an in-flight image pull. Backend broadcasts
+  // `provider-image-pull-progress` with chunked Docker pull events when
+  // createInstance has to materialize the image (first-time use). We just
+  // surface the latest status string so the modal doesn't look frozen for
+  // ~10 minutes during the first ~8GB pull.
+  const [pullStatus, setPullStatus] = useState<string | null>(null);
+
+  useEffect(() => {
+    const unsub = ws.subscribe('provider-image-pull-progress', (msg: any) => {
+      if (msg?.status === 'complete') { setPullStatus(null); return; }
+      if (msg?.status === 'starting') { setPullStatus('Downloading image (one-time, ~8 GB unpacked)…'); return; }
+      // Per-layer progress: "Downloading", "Extracting", "Pull complete"…
+      const layer = msg?.id ? ` ${msg.id}` : '';
+      const pd = msg?.progressDetail;
+      let detail = '';
+      if (pd?.current && pd?.total) {
+        const pct = Math.floor((pd.current / pd.total) * 100);
+        detail = ` ${pct}%`;
+      }
+      setPullStatus(`${msg.status ?? 'Pulling'}${layer}${detail}`);
+    });
+    return unsub;
+  }, [ws]);
 
   const fetchProviders = useCallback(async () => {
     const r = await ws.sendRestApi('GET', '/v1/devices/providers');
@@ -238,7 +261,7 @@ export function CreateEmulatorModal({ onCancel, onCreated }: Props) {
                   : undefined
             }
           >
-            {submitting ? 'Creating…' : 'Create & start'}
+            {submitting ? (pullStatus ?? 'Creating…') : 'Create & start'}
           </button>
         </div>
       </div>

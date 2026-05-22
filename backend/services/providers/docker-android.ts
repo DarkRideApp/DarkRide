@@ -6,6 +6,7 @@ import type {
   ProviderAvailability, RunningInstance, CreateFormSchema,
 } from '@darkrideapp/plugin-sdk';
 import { type DockerLike, detectDockerDaemon, listDarkrideContainers } from './docker-helpers';
+import { broadcastToAll } from '../../websocket/index';
 import { createLoggers } from '../../logs';
 
 const execFile = promisify(execFileCb);
@@ -13,6 +14,66 @@ const { log, error: logError } = createLoggers('docker-android');
 
 const IMAGE_PREFIX = 'ghcr.io/darkrideapp/docker-android';
 const LABEL_KEY = 'darkride.emulator';
+
+/**
+ * Pull `image` if it isn't already local. Streams pull progress to the
+ * backend log and broadcasts each progress chunk as `provider-image-pull-progress`
+ * so the UI can render a real progress indicator instead of a frozen modal.
+ *
+ * `instanceName` is included in the broadcast so a future multi-instance UI
+ * can attribute progress to the right card.
+ */
+async function ensureImageLocal(d: DockerLike, image: string, instanceName: string): Promise<void> {
+  const dAny = d as any;
+  try {
+    if (typeof dAny.getImage === 'function') {
+      await dAny.getImage(image).inspect();
+      return; // already local
+    }
+  } catch {
+    // fall through to pull
+  }
+  log(`Image ${image} not local — pulling (this is a one-time ~2-3GB compressed / ~8GB unpacked download)`);
+  broadcastToAll({ type: 'provider-image-pull-progress', image, instanceName, status: 'starting' });
+  const stream: any = await d.pull(image);
+  let lastBroadcast = 0;
+  await new Promise<void>((resolve, reject) => {
+    const onData = (chunk: Buffer | string) => {
+      // The stream emits one JSON-per-line payload like
+      // {"status":"Downloading","progressDetail":{"current":...,"total":...},"id":"<layer>"}
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const ev = JSON.parse(trimmed);
+          // Throttle WS broadcasts: at most one every 500ms (per-line would
+          // flood the channel during a 50k-line pull).
+          const now = Date.now();
+          if (now - lastBroadcast >= 500 || ev.status === 'Pull complete' || ev.error) {
+            broadcastToAll({ type: 'provider-image-pull-progress', image, instanceName, ...ev });
+            lastBroadcast = now;
+          }
+          if (ev.error) {
+            return reject(new Error(`docker pull ${image} failed: ${ev.error}`));
+          }
+        } catch {
+          // ignore non-JSON lines (rare)
+        }
+      }
+    };
+    stream.on('data', onData);
+    stream.on('end', () => {
+      broadcastToAll({ type: 'provider-image-pull-progress', image, instanceName, status: 'complete' });
+      log(`Image pull complete: ${image}`);
+      resolve();
+    });
+    stream.on('error', (err: Error) => {
+      logError(`Image pull stream error for ${image}: ${err.message}`);
+      reject(err);
+    });
+  });
+}
 
 /**
  * Injection-friendly options. Tests provide custom implementations of the
@@ -127,6 +188,11 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       if (nvidiaAvailable) {
         deviceRequests = [{ Driver: 'nvidia', Count: -1, Capabilities: [['gpu']] }];
       }
+
+      // Materialize the image if it isn't local yet. Docker's createContainer
+      // API does NOT auto-pull (unlike `docker run`), so a first-time user
+      // would otherwise see "No such image" from the daemon. ~8GB download.
+      await ensureImageLocal(d, image, spec.displayName);
 
       log(`Creating docker-android container "${spec.displayName}" image=${image} ram=${ramMb}MB arch=${arch}`);
       const container: any = await d.createContainer({

@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { createDockerAndroidProvider } from '../docker-android';
 import type { DockerLike } from '../docker-helpers';
 
-function makeDockerMock(overrides: Partial<DockerLike> = {}): DockerLike {
+function makeDockerMock(overrides: Partial<DockerLike> & { getImage?: any } = {}): DockerLike {
   return {
     ping: vi.fn().mockResolvedValue('OK'),
     info: vi.fn().mockResolvedValue({ Runtimes: { runc: {} } }),
@@ -21,9 +21,14 @@ function makeDockerMock(overrides: Partial<DockerLike> = {}): DockerLike {
       remove: vi.fn().mockResolvedValue(undefined),
       inspect: vi.fn().mockResolvedValue({ State: { Running: false } }),
     })),
+    // Pretend the image is always local so createInstance's
+    // ensureImageLocal helper short-circuits and tests stay fast.
+    getImage: vi.fn().mockImplementation(() => ({
+      inspect: vi.fn().mockResolvedValue({ Id: 'sha256:fake' }),
+    })),
     pull: vi.fn().mockResolvedValue({ on: vi.fn(), pipe: vi.fn() } as any),
     ...overrides,
-  } as DockerLike;
+  } as any;
 }
 
 describe('docker-android provider', () => {
