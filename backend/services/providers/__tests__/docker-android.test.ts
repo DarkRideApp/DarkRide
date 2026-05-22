@@ -95,16 +95,15 @@ describe('docker-android provider', () => {
     }));
   });
 
-  it('GPU auto-detect: passes DeviceRequests for NVIDIA when toolkit is detected', async () => {
+  it('does NOT request NVIDIA DeviceRequests by default (budtmo uses swiftshader software rendering; nvidia-container init fails on Docker Desktop WSL)', async () => {
     const d = makeDockerMock({ info: vi.fn().mockResolvedValue({ Runtimes: { nvidia: {} } }) });
     const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => true });
     await p.createInstance!({
       displayName: 'gpu-test',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
     });
-    expect(d.createContainer).toHaveBeenCalledWith(expect.objectContaining({
-      HostConfig: expect.objectContaining({ DeviceRequests: expect.any(Array) }),
-    }));
+    const call = (d.createContainer as any).mock.calls[0][0];
+    expect(call.HostConfig.DeviceRequests).toBeUndefined();
   });
 
   it('startInstance starts the container and returns serial=localhost:<port>', async () => {

@@ -252,9 +252,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       const ramMb = Number(spec.config.ramMb ?? 2048);
       const image = budtmoImageFor(androidVersion);
 
-      // GPU auto-detect — see spec §6.3.
       const devices: Array<{ PathOnHost: string; PathInContainer: string; CgroupPermissions: string }> = [];
-      let deviceRequests: any[] = [];
       // /dev/kvm: required for in-container Android emulator. Without it,
       // the container exits within seconds (no software-emulation fallback
       // worth attempting — it would never boot in CI's time budget).
@@ -264,10 +262,19 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       if (hasDevDri()) {
         devices.push({ PathOnHost: '/dev/dri', PathInContainer: '/dev/dri', CgroupPermissions: 'rwm' });
       }
-      const nvidiaAvailable = await Promise.resolve(hasNvidia());
-      if (nvidiaAvailable) {
-        deviceRequests = [{ Driver: 'nvidia', Count: -1, Capabilities: [['gpu']] }];
-      }
+      // We deliberately do NOT request the NVIDIA device. budtmo's default
+      // emulator command uses `-gpu swiftshader_indirect` (software
+      // rendering), so the GPU is unused either way; and on Docker Desktop
+      // WSL2 the nvidia-container runtime is sometimes "available" but the
+      // adapter probe fails at container-start time with:
+      //   "runc create failed: nvidia-container-cli: initialization error:
+      //   WSL environment detected but no adapters were found"
+      // Users who genuinely need GPU passthrough can opt in via a future
+      // spec.config.gpu='nvidia' option; until then we keep create simple.
+      const deviceRequests: any[] = [];
+      // hasNvidia is still detected for future use (advanced opt-in) — read it
+      // so the typecheck doesn't complain about unused options.
+      void hasNvidia;
 
       // Materialize the image if it isn't local yet. Docker's createContainer
       // API does NOT auto-pull (unlike `docker run`), so a first-time user
