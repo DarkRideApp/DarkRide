@@ -259,9 +259,15 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       if (hasDevKvm()) {
         devices.push({ PathOnHost: '/dev/kvm', PathInContainer: '/dev/kvm', CgroupPermissions: 'rwm' });
       }
-      if (hasDevDri()) {
-        devices.push({ PathOnHost: '/dev/dri', PathInContainer: '/dev/dri', CgroupPermissions: 'rwm' });
-      }
+      // Intentionally NOT auto-passing /dev/dri. It does nothing useful for
+      // budtmo's default `-gpu swiftshader_indirect` (software rendering),
+      // and on Docker Desktop WSL2 — where /dev/dri exists thanks to WSLg
+      // — its presence in HostConfig.Devices makes the nvidia GPU prestart
+      // hook fire and fail with "WSL environment detected but no adapters
+      // were found". The hasDevDri() probe stays so a future opt-in
+      // config flag can light it up for users who actually want hardware
+      // graphics.
+      void hasDevDri;
       // We deliberately do NOT request the NVIDIA device. budtmo's default
       // emulator command uses `-gpu swiftshader_indirect` (software
       // rendering), so the GPU is unused either way; and on Docker Desktop

@@ -79,20 +79,15 @@ describe('docker-android provider', () => {
     expect(call.HostConfig.Devices).toBeUndefined();
   });
 
-  it('GPU auto-detect: passes --device /dev/dri when /dev/dri exists', async () => {
+  it('does NOT auto-pass /dev/dri even if the host has it (avoids triggering the WSL nvidia prestart hook)', async () => {
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => true, hasNvidia: async () => false });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => true, hasNvidia: async () => false, hasDevKvm: () => false });
     await p.createInstance!({
       displayName: 'gpu-test',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
     });
-    expect(d.createContainer).toHaveBeenCalledWith(expect.objectContaining({
-      HostConfig: expect.objectContaining({
-        Devices: expect.arrayContaining([
-          expect.objectContaining({ PathOnHost: '/dev/dri', PathInContainer: '/dev/dri' }),
-        ]),
-      }),
-    }));
+    const call = (d.createContainer as any).mock.calls[0][0];
+    expect(call.HostConfig.Devices).toBeUndefined();
   });
 
   it('does NOT request NVIDIA DeviceRequests by default (budtmo uses swiftshader software rendering; nvidia-container init fails on Docker Desktop WSL)', async () => {
