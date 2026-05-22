@@ -107,6 +107,20 @@ export function Devices() {
     return unsub;
   }, [ws, fetchInstances, fetchDevices]);
 
+  // Deletes don't fit the "updated" event shape (the row is gone) — the
+  // backend emits a dedicated provider-instance-deleted with the row id.
+  // Remove the matching card from local state directly to avoid a full
+  // refetch round-trip.
+  useEffect(() => {
+    const unsub = ws.subscribe('provider-instance-deleted', (msg: any) => {
+      const deletedId = msg?.id as number | undefined;
+      if (typeof deletedId === 'number') {
+        setInstances((prev) => prev.filter((i) => i.id !== deletedId));
+      }
+    });
+    return unsub;
+  }, [ws]);
+
   if (auth && !auth.hasScope('core.devices:read')) return <AccessDenied scope="core.devices:read" />;
 
   const handleSetupComplete = () => {
@@ -132,10 +146,19 @@ export function Devices() {
   }
   async function deleteInstance(inst: ManagedInstance) {
     if (!window.confirm(`Delete "${inst.displayName ?? inst.runtimeId}"? This removes the container as well.`)) return;
+    // Optimistically drop the card so the click feels instant. The
+    // broadcast (`provider-instance-deleted`) handler will agree once the
+    // backend confirms; if the request fails we restore.
+    const snapshot = instances;
+    setInstances((prev) => prev.filter((i) => i.id !== inst.id));
     try {
       const r = await ws.sendRestApi('DELETE', `/v1/devices/providers/${inst.providerId}/instances/${inst.id}`);
-      if (!r.body?.success) toast.error(r.body?.error ?? 'Failed to delete');
+      if (!r.body?.success) {
+        setInstances(snapshot);
+        toast.error(r.body?.error ?? 'Failed to delete');
+      }
     } catch (e: any) {
+      setInstances(snapshot);
       toast.error(e?.message ?? 'Failed to delete');
     }
   }

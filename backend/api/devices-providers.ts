@@ -169,6 +169,12 @@ export function registerDevicesProvidersEndpoints(
     try {
       await p.deleteInstance(row.runtimeId);
       repo.delete(row.id);
+      // Broadcast so the Devices page (or any other WS client) drops the
+      // row from its UI without a full refresh. `provider-instance-updated`
+      // doesn't cover deletes — the row no longer exists to send — so we
+      // emit a dedicated event with just enough identity for clients to
+      // remove the right card.
+      broadcastToAll({ type: 'provider-instance-deleted', id: row.id, providerId: p.id });
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err?.message ?? String(err) });
