@@ -12,7 +12,27 @@ import { createLoggers } from '../../logs';
 const execFile = promisify(execFileCb);
 const { log, error: logError } = createLoggers('docker-android');
 
-const IMAGE_PREFIX = 'ghcr.io/darkrideapp/docker-android';
+/**
+ * Use budtmo's upstream image directly rather than republishing it under
+ * our org. budtmo/docker-android is on Docker Hub (anonymous pull, no
+ * auth), updated by upstream, and most users already have unrelated
+ * Docker Hub pulls cached so layer reuse across containers is better.
+ *
+ * Tag scheme: budtmo publishes `emulator_<N>.0` (e.g. `emulator_14.0`).
+ * Our UI surfaces the major version ("14") so callers stay short; we
+ * translate to the budtmo tag form when constructing the image string.
+ *
+ * We previously shipped `ghcr.io/darkrideapp/docker-android:<N>` — a thin
+ * wrapper on top of budtmo that added `wireguard-go + iproute2 + a custom
+ * entrypoint`. None of it is needed any more: capture for docker-android
+ * uses emu-http-proxy mode (no WireGuard inside the container), and our
+ * backend's adb-connect retry already gates readiness — the custom
+ * entrypoint's adbd-wait was redundant. Drops the per-version image
+ * (~8 GB) from our hosting and removes a CI publish step.
+ */
+function budtmoImageFor(androidVersion: string): string {
+  return `budtmo/docker-android:emulator_${androidVersion}.0`;
+}
 const LABEL_KEY = 'darkride.emulator';
 
 /**
@@ -170,7 +190,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       const androidVersion = String(spec.config.androidVersion ?? '14');
       const arch = String(spec.config.architecture ?? 'x86_64');
       const ramMb = Number(spec.config.ramMb ?? 2048);
-      const image = `${IMAGE_PREFIX}:${androidVersion}`;
+      const image = budtmoImageFor(androidVersion);
 
       // GPU auto-detect — see spec §6.3.
       const devices: Array<{ PathOnHost: string; PathInContainer: string; CgroupPermissions: string }> = [];

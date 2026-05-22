@@ -27,7 +27,6 @@ env:
 
 permissions:
   contents: read
-  packages: read
 
 concurrency:
   group: e2e-emulator-${{ github.ref }}
@@ -93,34 +92,31 @@ jobs:
       - name: Build plugin SDK
         run: npm run build -w @darkrideapp/plugin-sdk
 
-      # 5. Authenticate to ghcr.io so docker pull can fetch the (private-by-default)
-      #    package. The workflow's `packages: read` permission grants the
-      #    GITHUB_TOKEN scope; this step trades it for a docker login.
-      - name: Log in to ghcr.io
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # 6. Pull the docker-android image (cached).
+      # 5. Cache + pull budtmo's docker-android image directly. We don't
+      #    republish under our org any more — the wrapper layer we used
+      #    to ship was redundant once docker-android moved to
+      #    emu-http-proxy capture mode (no in-container WireGuard
+      #    needed). Saves an ~8 GB image from our hosting plus a CI
+      #    publish job. Docker Hub allows anonymous pulls; no login.
       - name: Cache docker-android image
         uses: actions/cache@v4
         id: image-cache
         with:
           path: /tmp/docker-image-cache
-          key: docker-android-14-${{ hashFiles('docker/Dockerfile.android-emulator') }}
+          # Static key — we always want budtmo/docker-android:emulator_14.0.
+          # Bump the suffix here to invalidate the cache when changing tags.
+          key: docker-android-budtmo-emulator_14.0-v1
 
-      - name: Pull or restore docker-android:14
+      - name: Pull or restore budtmo/docker-android:emulator_14.0
         run: |
           mkdir -p /tmp/docker-image-cache
-          if [ -f /tmp/docker-image-cache/docker-android-14.tar ]; then
+          if [ -f /tmp/docker-image-cache/docker-android-budtmo-14.tar ]; then
             echo "Restoring image from cache"
-            docker load -i /tmp/docker-image-cache/docker-android-14.tar
+            docker load -i /tmp/docker-image-cache/docker-android-budtmo-14.tar
           else
-            echo "Pulling fresh image from ghcr.io"
-            docker pull ghcr.io/darkrideapp/docker-android:14
-            docker save ghcr.io/darkrideapp/docker-android:14 -o /tmp/docker-image-cache/docker-android-14.tar
+            echo "Pulling fresh image from Docker Hub"
+            docker pull budtmo/docker-android:emulator_14.0
+            docker save budtmo/docker-android:emulator_14.0 -o /tmp/docker-image-cache/docker-android-budtmo-14.tar
           fi
 
       # 6. Start DarkRide backend in the background.

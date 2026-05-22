@@ -46,7 +46,7 @@ describe('docker-android provider', () => {
     });
     expect(inst.state).toBe('created');
     expect(d.createContainer).toHaveBeenCalledWith(expect.objectContaining({
-      Image: 'ghcr.io/darkrideapp/docker-android:14',
+      Image: 'budtmo/docker-android:emulator_14.0',
       Labels: expect.objectContaining({ 'darkride.emulator': 'true' }),
       ExposedPorts: { '5555/tcp': {} },
     }));
