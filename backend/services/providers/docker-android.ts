@@ -301,6 +301,13 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
           PortBindings: { '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }] },
           Devices: devices.length > 0 ? devices : undefined,
           DeviceRequests: deviceRequests.length > 0 ? deviceRequests : undefined,
+          // Force the default OCI runtime explicitly. Without this, daemons
+          // configured with `default-runtime: nvidia` (some Docker Desktop
+          // WSL installs ship this way) invoke the nvidia-container prestart
+          // hook for every container — which fails at start with
+          // "WSL environment detected but no adapters were found" if no GPU
+          // is actually passthrough'd. Setting Runtime here bypasses that.
+          Runtime: 'runc',
         },
       });
 
