@@ -1,5 +1,5 @@
 import { mkdirSync, statSync, existsSync } from 'fs';
-import { join as pathJoin, dirname as pathDirname } from 'path';
+import { join as pathJoin } from 'path';
 import { app, httpServer, mountApiRouter } from './app';
 import { initDatabase } from './db/index';
 import { pruneOldData, cleanStaleSessions } from './db/prune';
@@ -1262,11 +1262,12 @@ function captureDbSize() {
   }
 }
 
-// Capture per-directory disk usage snapshot (data root = dir holding the SQLite DB)
+// Capture per-directory disk usage snapshot. Anchored on getDataRoot() — the
+// canonical artifact root (apks/, plugins/, screenshots/, ...) — so the
+// breakdown measures the directories that actually consume the volume.
 async function captureDirSizes() {
   try {
-    const rootPath = pathDirname(DATABASE_PATH);
-    const usage = await measureDiskUsage(rootPath);
+    const usage = await measureDiskUsage(getDataRoot());
     db.insert(diskUsageSnapshots).values({
       capturedAt: new Date(),
       volumeTotalBytes: usage.volumeTotalBytes,
