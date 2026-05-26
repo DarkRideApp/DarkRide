@@ -20,6 +20,19 @@ interface TableSize {
   percentage: number;
 }
 
+interface DiskUsage {
+  capturedAt: string;
+  volumeTotalBytes: number;
+  volumeFreeBytes: number;
+  volumeUsedBytes: number;
+  dirs: { name: string; sizeBytes: number }[];
+}
+
+interface DiskUsagePoint {
+  usedBytes: number;
+  capturedAt: string;
+}
+
 const PIE_COLORS = [
   '#6366f1', '#ec4899', '#f59e0b', '#10b981', '#3b82f6',
   '#8b5cf6', '#ef4444', '#14b8a6', '#f97316', '#06b6d4',
@@ -28,7 +41,7 @@ const PIE_COLORS = [
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   let i = 0;
   let val = bytes;
   while (val >= 1024 && i < units.length - 1) {
@@ -50,6 +63,8 @@ export function Utils() {
   const [dbSize, setDbSize] = useState<string>('Unknown');
   const [sizeHistory, setSizeHistory] = useState<DbSizeSnapshot[]>([]);
   const [tableSizes, setTableSizes] = useState<TableSize[]>([]);
+  const [diskUsage, setDiskUsage] = useState<DiskUsage | null>(null);
+  const [diskHistory, setDiskHistory] = useState<DiskUsagePoint[]>([]);
   const [cloudErrors, setCloudErrors] = useState<CloudError[]>([]);
   const [cloudConfigured, setCloudConfigured] = useState<boolean>(false);
   const [retryingKeys, setRetryingKeys] = useState<Set<string>>(new Set());
@@ -75,6 +90,16 @@ export function Utils() {
       if (Array.isArray(data)) {
         setTableSizes(data);
       }
+    }).catch(() => {});
+
+    ws.sendRestApi('GET', '/v1/utils/disk-usage').then(res => {
+      const data = res.body?.data;
+      if (data && !Array.isArray(data) && typeof data.volumeTotalBytes === 'number') setDiskUsage(data);
+    }).catch(() => {});
+
+    ws.sendRestApi('GET', '/v1/utils/disk-usage-history').then(res => {
+      const data = res.body?.data;
+      if (Array.isArray(data)) setDiskHistory(data);
     }).catch(() => {});
 
     ws.sendRestApi('GET', '/v1/cloud/status').then(res => {
@@ -121,6 +146,19 @@ export function Utils() {
     }));
   }, [sizeHistory]);
 
+  const diskChartData = useMemo(() => {
+    return diskHistory.map(s => ({
+      date: new Date(s.capturedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      usedGB: Number((s.usedBytes / 1024 / 1024 / 1024).toFixed(2)),
+      fullDate: new Date(s.capturedAt).toLocaleString(),
+    }));
+  }, [diskHistory]);
+
+  const diskUsedPercent = useMemo(() => {
+    if (!diskUsage || diskUsage.volumeTotalBytes === 0) return 0;
+    return Number(((diskUsage.volumeUsedBytes / diskUsage.volumeTotalBytes) * 100).toFixed(1));
+  }, [diskUsage]);
+
   const handleDownloadDb = () => {
     const a = document.createElement('a');
     a.href = '/v1/utils/backup';
@@ -144,6 +182,86 @@ export function Utils() {
       <header className="settings-page-header">
         <h1>Utilities</h1>
       </header>
+
+      <div className="utils-section" data-testid="disk-usage-section">
+        <h2>Disk Usage</h2>
+        {!diskUsage ? (
+          <div className="card" data-testid="disk-usage-no-data" style={{ color: 'var(--text-secondary, #888)', fontSize: 13 }}>
+            No disk usage data yet. Data is recorded hourly.
+          </div>
+        ) : (
+        <>
+          <div className="card" style={{ marginBottom: 16 }} data-testid="disk-volume-gauge">
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 13 }}>
+              <span>
+                <strong>{formatBytes(diskUsage.volumeUsedBytes)}</strong> used of {formatBytes(diskUsage.volumeTotalBytes)}
+              </span>
+              <span style={{ color: 'var(--text-secondary, #888)' }}>
+                {formatBytes(diskUsage.volumeFreeBytes)} free ({diskUsedPercent}% used)
+              </span>
+            </div>
+            <div style={{ height: 10, borderRadius: 5, background: 'var(--bg-secondary, #1e1e2e)', overflow: 'hidden' }}>
+              <div style={{
+                width: `${diskUsedPercent}%`, height: '100%',
+                background: diskUsedPercent >= 90 ? 'var(--color-error, #ef4444)' : 'var(--color-primary, #6366f1)',
+              }} />
+            </div>
+          </div>
+
+          {diskUsage.dirs.length > 0 && (
+            <div className="card" data-testid="disk-dir-breakdown" style={{ marginBottom: 16 }}>
+              <h3 style={{ margin: '0 0 12px 0', fontSize: 14, fontWeight: 500, color: 'var(--text-secondary, #888)' }}>
+                Directory Breakdown
+              </h3>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid var(--border-color, #333)' }}>
+                    <th style={{ textAlign: 'left', padding: '4px 8px', fontWeight: 500, color: 'var(--text-secondary)' }}>Directory</th>
+                    <th style={{ textAlign: 'right', padding: '4px 8px', fontWeight: 500, color: 'var(--text-secondary)' }}>Size</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {diskUsage.dirs.map(d => (
+                    <tr key={d.name}>
+                      <td style={{ padding: '4px 8px', fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.name}/</td>
+                      <td style={{ padding: '4px 8px', textAlign: 'right', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                        {formatBytes(d.sizeBytes)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {diskChartData.length > 0 && (
+            <div className="card" data-testid="disk-usage-chart">
+              <h3 style={{ margin: '0 0 12px 0', fontSize: 14, fontWeight: 500, color: 'var(--text-secondary, #888)' }}>
+                Volume Usage (Last 60 Days)
+              </h3>
+              <ResponsiveContainer width="100%" height={240}>
+                <AreaChart data={diskChartData} margin={{ top: 4, right: 12, bottom: 0, left: 0 }}>
+                  <defs>
+                    <linearGradient id="diskGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="var(--color-primary, #6366f1)" stopOpacity={0.3} />
+                      <stop offset="95%" stopColor="var(--color-primary, #6366f1)" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <XAxis dataKey="date" tick={{ fontSize: 11, fill: 'var(--text-secondary, #888)' }} tickLine={false} axisLine={false} />
+                  <YAxis tick={{ fontSize: 11, fill: 'var(--text-secondary, #888)' }} tickLine={false} axisLine={false} tickFormatter={(v: number) => `${v} GB`} width={64} />
+                  <Tooltip
+                    contentStyle={{ background: 'var(--bg-secondary, #1e1e2e)', border: '1px solid var(--border-color, #333)', borderRadius: 6, fontSize: 12 }}
+                    formatter={(value: number) => [`${value} GB`, 'Used']}
+                    labelFormatter={(_label: string, payload: any[]) => payload?.[0]?.payload?.fullDate || _label}
+                  />
+                  <Area type="monotone" dataKey="usedGB" stroke="var(--color-primary, #6366f1)" strokeWidth={2} fill="url(#diskGradient)" />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </>
+        )}
+      </div>
 
       <div className="utils-section">
         <h2>Database</h2>
@@ -214,7 +332,7 @@ export function Utils() {
         {pieData.length > 0 && (
           <div className="card" data-testid="db-table-sizes" style={{ marginTop: 16 }}>
             <h3 style={{ margin: '0 0 12px 0', fontSize: 14, fontWeight: 500, color: 'var(--text-secondary, #888)' }}>
-              Storage Breakdown
+              Metadata Database (darkride.db)
             </h3>
             <div style={{ display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap' }}>
               <ResponsiveContainer width={280} height={280} style={{ flex: '0 0 280px' }}>

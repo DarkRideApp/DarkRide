@@ -229,6 +229,15 @@ export const dbSizeSnapshots = sqliteTable('db_size_snapshots', {
   capturedAt: integer('captured_at', { mode: 'timestamp' }).notNull(),
 });
 
+export const diskUsageSnapshots = sqliteTable('disk_usage_snapshots', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  capturedAt: integer('captured_at', { mode: 'timestamp' }).notNull(),
+  volumeTotalBytes: integer('volume_total_bytes').notNull(),
+  volumeFreeBytes: integer('volume_free_bytes').notNull(),
+  // JSON map of top-level subdir name -> size in bytes, e.g. {"couchbase":23622320128}
+  dirSizes: text('dir_sizes', { mode: 'json' }).$type<Record<string, number>>().notNull(),
+});
+
 export const cloudFiles = sqliteTable('cloud_files', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   namespace: text('namespace').notNull().default(''),

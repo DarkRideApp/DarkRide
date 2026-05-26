@@ -33,7 +33,7 @@ import { registerAiCompleteEndpoints } from './api/ai-complete';
 import { registerAiChatApiEndpoints } from './api/ai-chat';
 import { registerAppEndpoints } from './api/apps';
 import { registerUtilsEndpoints } from './api/utils';
-import { dbSizeSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, aiModels, aiProviders, capturedTraffic } from './db/schema';
+import { dbSizeSnapshots, diskUsageSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, aiModels, aiProviders, capturedTraffic } from './db/schema';
 import * as schema from './db/schema';
 import { SavedTrafficStore } from './services/saved-traffic-store';
 import { registerSavedTrafficEndpoints } from './api/saved-traffic';
@@ -132,6 +132,7 @@ import { AiAgentFactory } from './services/ai-agent-factory';
 import { AiCallLogger } from './services/ai-call-logger';
 import { ServiceUserManager } from './auth/service-user-manager';
 import { backfillFailedDiffs } from './services/apk-diff-backfill';
+import { measureDiskUsage } from './services/disk-usage';
 
 const { log, error } = createLoggers('server');
 
@@ -657,11 +658,11 @@ jobRegistry.register({
 jobRegistry.register({
   id: 'db-size-snapshot',
   name: 'Database Size Snapshot',
-  description: 'Record current database file size and check disk space',
+  description: 'Record current database file size, per-directory disk usage, and check disk space',
   category: 'maintenance',
   defaultSchedule: 'Every 60 minutes',
   canRunManually: true,
-  run: async () => { captureDbSize(); await checkDiskSpace(); },
+  run: async () => { captureDbSize(); await checkDiskSpace(); await captureDirSizes(); },
 });
 jobRegistry.register({
   id: 'cloud-backup',
@@ -1261,6 +1262,23 @@ function captureDbSize() {
   }
 }
 
+// Capture per-directory disk usage snapshot. Anchored on getDataRoot() — the
+// canonical artifact root (apks/, plugins/, screenshots/, ...) — so the
+// breakdown measures the directories that actually consume the volume.
+async function captureDirSizes() {
+  try {
+    const usage = await measureDiskUsage(getDataRoot());
+    db.insert(diskUsageSnapshots).values({
+      capturedAt: new Date(),
+      volumeTotalBytes: usage.volumeTotalBytes,
+      volumeFreeBytes: usage.volumeFreeBytes,
+      dirSizes: usage.dirSizes,
+    }).run();
+  } catch (err: any) {
+    error(`Failed to capture disk usage: ${err.message}`);
+  }
+}
+
 // Check disk space — warn if below threshold
 let diskSpaceWarned = false;
 async function checkDiskSpace() {
@@ -1302,8 +1320,11 @@ async function checkDiskSpace() {
 // Capture on startup
 captureDbSize();
 checkDiskSpace();
+captureDirSizes();
 
-// Capture hourly
+// Capture hourly. Disk-usage snapshots are NOT run here — they go through the
+// 'db-size-snapshot' JobRegistry entry (canonical scheduler + manual trigger)
+// so the relatively expensive `du` walk runs at most once per hour.
 const DB_SIZE_INTERVAL = 60 * 60 * 1000; // 1 hour
 const dbSizeInterval = setInterval(() => { captureDbSize(); checkDiskSpace(); }, DB_SIZE_INTERVAL);
 

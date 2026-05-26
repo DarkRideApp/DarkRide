@@ -526,6 +526,13 @@
 			"when": 1777105478462,
 			"tag": "0091_plugin_state_last_error",
 			"breakpoints": true
+		},
+		{
+			"idx": 92,
+			"version": "7",
+			"when": 1779785033963,
+			"tag": "0092_disk_usage_snapshots",
+			"breakpoints": true
 		}
 	]
 }
