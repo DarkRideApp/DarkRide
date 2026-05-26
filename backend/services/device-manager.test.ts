@@ -12,6 +12,7 @@ import {
   MIN_BATTERY_LEVEL,
   adbShell,
   adbCommand,
+  suShell,
 } from './device-manager';
 
 const { devices } = schema;
@@ -792,5 +793,31 @@ describe('adb helpers — command-injection prevention', () => {
     const lastCall = execFileMock.mock.calls[execFileMock.mock.calls.length - 1];
     expect(lastCall[0]).toBe('adb');
     expect(lastCall[1]).toEqual(['-s', 'DEV001', 'push', hostilePath, '/data/local/tmp/x']);
+  });
+
+  it('suShell invokes su unwrapped so the device shell can execute it', async () => {
+    // Faithful device-shell simulation. adbShell runs adb via execFile with NO
+    // host shell, so whatever string we pass reaches the device shell verbatim.
+    // A command wrapped in literal double quotes (`"su -c id"`) is parsed by the
+    // device shell as ONE bogus command word named `su -c id` → "inaccessible or
+    // not found". Only a bare `su -c '<cmd>'` actually invokes su and runs as root.
+    // This is the exact false "Root access unavailable" failure from production.
+    let sentToDevice = '';
+    execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+      sentToDevice = cmd.replace(/^adb -s \S+ shell /, '');
+      if (sentToDevice.startsWith('"')) {
+        cb(new Error('Command failed'), '', '/system/bin/sh: su -c id: inaccessible or not found');
+      } else if (/^su -c /.test(sentToDevice)) {
+        cb(null, 'uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0', '');
+      } else {
+        cb(new Error('unexpected command'), '', sentToDevice);
+      }
+    });
+
+    const out = await suShell('DEV001', 'id', 3000);
+
+    expect(out).toContain('uid=0');                 // su actually ran as root
+    expect(sentToDevice).not.toMatch(/^"/);         // never wrapped in literal quotes
+    expect(sentToDevice).toBe("su -c 'id'");        // exact form sent to the device
   });
 });
