@@ -1317,22 +1317,18 @@ async function checkDiskSpace() {
   }
 }
 
-// Capture on startup
+// Capture once on startup for an immediate baseline after deploy. The recurring
+// hourly run is owned solely by the 'db-size-snapshot' JobRegistry entry
+// (canonical scheduler + manual trigger), so these snapshots run once per hour
+// rather than twice.
 captureDbSize();
 checkDiskSpace();
 captureDirSizes();
-
-// Capture hourly. Disk-usage snapshots are NOT run here — they go through the
-// 'db-size-snapshot' JobRegistry entry (canonical scheduler + manual trigger)
-// so the relatively expensive `du` walk runs at most once per hour.
-const DB_SIZE_INTERVAL = 60 * 60 * 1000; // 1 hour
-const dbSizeInterval = setInterval(() => { captureDbSize(); checkDiskSpace(); }, DB_SIZE_INTERVAL);
 
 // Graceful shutdown
 async function shutdown() {
   log('Shutting down...');
   clearInterval(staleInterval);
-  clearInterval(dbSizeInterval);
   claudeCliProvider?.killAll();
 
   // Stop capture sessions (deactivates WireGuard tunnels)
