@@ -820,4 +820,23 @@ describe('adb helpers — command-injection prevention', () => {
     expect(sentToDevice).not.toMatch(/^"/);         // never wrapped in literal quotes
     expect(sentToDevice).toBe("su -c 'id'");        // exact form sent to the device
   });
+
+  it('suShell escapes single quotes so the device shell reconstructs the exact command', async () => {
+    // Defense-in-depth: a command containing a single quote must still reach the
+    // device shell as one intact argument to `su -c`, not break out of the quoting.
+    let payload = '';
+    execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+      payload = cmd.replace(/^adb -s \S+ shell su -c /, ''); // the `'...'` literal passed to su -c
+      cb(null, '', '');
+    });
+
+    const tricky = "echo 'a b' c"; // single quotes + a space that must stay grouped
+    await suShell('DEV001', tricky, 3000);
+
+    // Verify with a REAL shell (the suite mocks child_process) so the assertion
+    // checks POSIX correctness rather than re-implementing the escape algorithm.
+    const realCp = await vi.importActual<typeof import('child_process')>('child_process');
+    const reconstructed = realCp.execFileSync('/bin/sh', ['-c', `printf %s ${payload}`]).toString();
+    expect(reconstructed).toBe(tricky);
+  });
 });

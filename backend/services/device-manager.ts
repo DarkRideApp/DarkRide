@@ -88,10 +88,13 @@ export async function adbShell(deviceId: string, command: string, timeout: numbe
  * or not found". That surfaced as a false "Root access unavailable" error even
  * on properly-rooted devices. The bare `su -c '<cmd>'` form is correct.
  *
- * `command` must not itself contain a single quote (none of our callers do).
+ * `command` is wrapped in single quotes and any single quote within it is
+ * escaped with the POSIX `'\''` idiom (close quote, escaped quote, reopen), so
+ * an embedded `'` can never break out of the quoting or alter the root command.
  */
 export async function suShell(deviceId: string, command: string, timeout: number = 10000): Promise<string> {
-  return adbShell(deviceId, `su -c '${command}'`, timeout);
+  const escaped = command.replace(/'/g, `'\\''`);
+  return adbShell(deviceId, `su -c '${escaped}'`, timeout);
 }
 
 /**
