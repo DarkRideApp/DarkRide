@@ -1322,9 +1322,11 @@ captureDbSize();
 checkDiskSpace();
 captureDirSizes();
 
-// Capture hourly
+// Capture hourly. Disk-usage snapshots are NOT run here — they go through the
+// 'db-size-snapshot' JobRegistry entry (canonical scheduler + manual trigger)
+// so the relatively expensive `du` walk runs at most once per hour.
 const DB_SIZE_INTERVAL = 60 * 60 * 1000; // 1 hour
-const dbSizeInterval = setInterval(() => { captureDbSize(); checkDiskSpace(); captureDirSizes(); }, DB_SIZE_INTERVAL);
+const dbSizeInterval = setInterval(() => { captureDbSize(); checkDiskSpace(); }, DB_SIZE_INTERVAL);
 
 // Graceful shutdown
 async function shutdown() {

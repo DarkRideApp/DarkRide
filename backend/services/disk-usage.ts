@@ -42,8 +42,11 @@ export async function measureDiskUsage(rootPath: string): Promise<DiskUsage> {
       try {
         const { stdout } = await execFileAsync(
           'du',
-          ['-s', '--block-size=1', path.join(rootPath, dir.name)],
-          { maxBuffer: 1024 * 1024 },
+          // `--` ends option parsing so a subdir whose name starts with `-`
+          // can't be read as a flag. `timeout` bounds a stuck du (e.g. a hung
+          // network mount) so it can't wedge the snapshot job.
+          ['-s', '--block-size=1', '--', path.join(rootPath, dir.name)],
+          { maxBuffer: 1024 * 1024, timeout: 30_000 },
         );
         const bytes = parseInt(stdout.split(/\s+/)[0], 10);
         if (Number.isFinite(bytes)) {

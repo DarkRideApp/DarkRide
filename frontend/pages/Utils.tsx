@@ -41,7 +41,7 @@ const PIE_COLORS = [
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   let i = 0;
   let val = bytes;
   while (val >= 1024 && i < units.length - 1) {
@@ -183,9 +183,14 @@ export function Utils() {
         <h1>Utilities</h1>
       </header>
 
-      {diskUsage && (
-        <div className="utils-section" data-testid="disk-usage-section">
-          <h2>Disk Usage</h2>
+      <div className="utils-section" data-testid="disk-usage-section">
+        <h2>Disk Usage</h2>
+        {!diskUsage ? (
+          <div className="card" data-testid="disk-usage-no-data" style={{ color: 'var(--text-secondary, #888)', fontSize: 13 }}>
+            No disk usage data yet. Data is recorded hourly.
+          </div>
+        ) : (
+        <>
           <div className="card" style={{ marginBottom: 16 }} data-testid="disk-volume-gauge">
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 13 }}>
               <span>
@@ -254,8 +259,9 @@ export function Utils() {
               </ResponsiveContainer>
             </div>
           )}
-        </div>
-      )}
+        </>
+        )}
+      </div>
 
       <div className="utils-section">
         <h2>Database</h2>
