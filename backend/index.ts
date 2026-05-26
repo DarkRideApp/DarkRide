@@ -1,5 +1,5 @@
 import { mkdirSync, statSync, existsSync } from 'fs';
-import { join as pathJoin } from 'path';
+import { join as pathJoin, dirname as pathDirname } from 'path';
 import { app, httpServer, mountApiRouter } from './app';
 import { initDatabase } from './db/index';
 import { pruneOldData, cleanStaleSessions } from './db/prune';
@@ -33,7 +33,7 @@ import { registerAiCompleteEndpoints } from './api/ai-complete';
 import { registerAiChatApiEndpoints } from './api/ai-chat';
 import { registerAppEndpoints } from './api/apps';
 import { registerUtilsEndpoints } from './api/utils';
-import { dbSizeSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, aiModels, aiProviders, capturedTraffic } from './db/schema';
+import { dbSizeSnapshots, diskUsageSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, aiModels, aiProviders, capturedTraffic } from './db/schema';
 import * as schema from './db/schema';
 import { SavedTrafficStore } from './services/saved-traffic-store';
 import { registerSavedTrafficEndpoints } from './api/saved-traffic';
@@ -132,6 +132,7 @@ import { AiAgentFactory } from './services/ai-agent-factory';
 import { AiCallLogger } from './services/ai-call-logger';
 import { ServiceUserManager } from './auth/service-user-manager';
 import { backfillFailedDiffs } from './services/apk-diff-backfill';
+import { measureDiskUsage } from './services/disk-usage';
 
 const { log, error } = createLoggers('server');
 
@@ -657,11 +658,11 @@ jobRegistry.register({
 jobRegistry.register({
   id: 'db-size-snapshot',
   name: 'Database Size Snapshot',
-  description: 'Record current database file size and check disk space',
+  description: 'Record current database file size, per-directory disk usage, and check disk space',
   category: 'maintenance',
   defaultSchedule: 'Every 60 minutes',
   canRunManually: true,
-  run: async () => { captureDbSize(); await checkDiskSpace(); },
+  run: async () => { captureDbSize(); await checkDiskSpace(); await captureDirSizes(); },
 });
 jobRegistry.register({
   id: 'cloud-backup',
@@ -1261,6 +1262,22 @@ function captureDbSize() {
   }
 }
 
+// Capture per-directory disk usage snapshot (data root = dir holding the SQLite DB)
+async function captureDirSizes() {
+  try {
+    const rootPath = pathDirname(DATABASE_PATH);
+    const usage = await measureDiskUsage(rootPath);
+    db.insert(diskUsageSnapshots).values({
+      capturedAt: new Date(),
+      volumeTotalBytes: usage.volumeTotalBytes,
+      volumeFreeBytes: usage.volumeFreeBytes,
+      dirSizes: usage.dirSizes,
+    }).run();
+  } catch (err: any) {
+    error(`Failed to capture disk usage: ${err.message}`);
+  }
+}
+
 // Check disk space — warn if below threshold
 let diskSpaceWarned = false;
 async function checkDiskSpace() {
@@ -1302,10 +1319,11 @@ async function checkDiskSpace() {
 // Capture on startup
 captureDbSize();
 checkDiskSpace();
+captureDirSizes();
 
 // Capture hourly
 const DB_SIZE_INTERVAL = 60 * 60 * 1000; // 1 hour
-const dbSizeInterval = setInterval(() => { captureDbSize(); checkDiskSpace(); }, DB_SIZE_INTERVAL);
+const dbSizeInterval = setInterval(() => { captureDbSize(); checkDiskSpace(); captureDirSizes(); }, DB_SIZE_INTERVAL);
 
 // Graceful shutdown
 async function shutdown() {
