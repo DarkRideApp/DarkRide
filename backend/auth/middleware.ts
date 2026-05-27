@@ -5,7 +5,11 @@ import { sessions, users, apiKeys } from '../db/schema';
 import { oauthAccessTokens } from '../db/oauth-schema';
 import { scopeMatches } from './scope-matcher';
 import { OAuthTokenManager } from './oauth-token-manager';
+import { tokenPrefix } from './oauth-crypto';
+import { createLoggers } from '../logs';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+
+const { log: authLog } = createLoggers('auth');
 
 export interface AuthUser {
   userId: number;
@@ -128,6 +132,9 @@ export function createAuthMiddleware(
       const tokenMgr = new OAuthTokenManager(db);
       const tokenRow = tokenMgr.findAccessTokenByPlaintext(tokenPlain);
       if (!tokenRow) {
+        // Diagnostic: classify WHY the presented token was rejected so we can
+        // tell expired vs revoked vs unknown when chasing re-auth churn.
+        authLog(`OAuth token rejected: prefix=${tokenPrefix(tokenPlain)} reason=${tokenMgr.classifyAccessToken(tokenPlain)} method=${req.method} path=${req.path}`);
         if (isAllowlisted) { next(); return; }
         res.status(401).json({ success: false, error: 'Authentication required' });
         return;

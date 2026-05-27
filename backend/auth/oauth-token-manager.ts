@@ -94,6 +94,20 @@ export class OAuthTokenManager {
     return row ?? null;
   }
 
+  /**
+   * Diagnostic: why a presented access token would be rejected. Looks the token
+   * up by hash ignoring the validity filters so callers can distinguish an
+   * expired token from a revoked or entirely unknown one. For logging only.
+   */
+  classifyAccessToken(token: string): 'valid' | 'expired' | 'revoked' | 'unknown' {
+    const row = this.db.select().from(oauthAccessTokens)
+      .where(eq(oauthAccessTokens.tokenHash, sha256Hex(token))).get();
+    if (!row) return 'unknown';
+    if (row.revokedAt) return 'revoked';
+    if (row.expiresAt.getTime() <= Date.now()) return 'expired';
+    return 'valid';
+  }
+
   rotateRefreshToken(plaintext: string, clientId: string): RotateResult {
     const hash = sha256Hex(plaintext);
     const rt = this.db.select().from(oauthRefreshTokens)

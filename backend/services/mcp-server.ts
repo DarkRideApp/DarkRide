@@ -111,6 +111,22 @@ export function mountMcpSseServer(app: Express, registry: AiToolRegistry, db: Ap
 
     const authUser = (req as any).authUser as AuthUser | undefined;
     if (!authUser) {
+      // Diagnostic: did this 401-triggering request even carry a token? Helps
+      // distinguish reconnect/discovery (no header) from a rejected token.
+      const rawAuth = req.headers.authorization ?? '';
+      let authScheme = 'none';
+      if (rawAuth) {
+        const m = rawAuth.match(/^(\S+)\s+(.*)$/);
+        if (!m) {
+          authScheme = 'malformed';
+        } else {
+          // Log scheme + non-secret token-type prefix only (e.g. "Bearer oauth_at_").
+          const tok = m[2];
+          const li = tok.lastIndexOf('_');
+          authScheme = `${m[1]} ${li >= 0 ? tok.slice(0, li + 1) : '?'}`;
+        }
+      }
+      error(`MCP 401 challenge: method=${req.method} hasAuth=${!!rawAuth} scheme="${authScheme}" ua="${req.get('user-agent') ?? ''}" ${describeMcpRequest(req.body)}`);
       const proto = req.protocol;
       const host = req.get('host') ?? 'localhost';
       const resourceMetadataUrl = `${proto}://${host}/.well-known/oauth-protected-resource`;
