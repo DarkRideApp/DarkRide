@@ -103,43 +103,63 @@ export interface AiAgentInterface {
 // ── Standalone helpers ───────────────────────────────────────────────
 
 /**
- * Detect and parse text-based tool calls emitted by models that do not support
- * the OpenAI function-calling API (common with some OpenRouter models).
+ * Detect and parse text-based tool calls emitted by models that do not use
+ * the API `tool_use` block format (common with smaller models / OpenRouter).
  *
- * Handles the most common formats:
- *   <TOOLCALL>[{"name":"fn","arguments":{}}]</TOOLCALL>   – array
- *   <tool_call>{"name":"fn","arguments":{}}</tool_call>   – Qwen / single object
- *   [TOOL_CALLS][{"name":"fn","arguments":{}}]            – Mistral text fallback
+ * Handles five formats:
+ *   <TOOLCALL>[{"name":"fn","arguments":{}}]</TOOLCALL>            — JSON array
+ *   <tool_call>{"name":"fn","arguments":{}}</tool_call>            — JSON object
+ *   [TOOL_CALLS][{"name":"fn","arguments":{}}]                     — Mistral text
+ *   <tool_call> fn({json args}) </tool_call>                       — tagged fn-call
+ *   fn({json args})                                                — bare fn-call (only when validNames is provided)
  *
- * Returns an array of AiToolUseBlock ready for execution, or [] if no pattern matched.
+ * When `validNames` is supplied, every emitted block's `name` must be in the
+ * set; unknown names are dropped. Bare fn-call parsing requires `validNames`
+ * to avoid grabbing arbitrary `something({...})` from prose.
  */
-function parseTextBasedToolUses(text: string): AiToolUseBlock[] {
+export function parseTextBasedToolUses(text: string, validNames?: Set<string>): AiToolUseBlock[] {
   const t = text.trim();
   if (!t) return [];
 
   const makeId = () => `text-tool-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const okName = (name: string) => !validNames || validNames.has(name);
 
   const toBlocks = (raw: unknown): AiToolUseBlock[] => {
     const calls = Array.isArray(raw) ? raw : [raw];
     const blocks: AiToolUseBlock[] = [];
     for (const call of calls) {
-      if (call && typeof call === 'object' && typeof (call as any).name === 'string') {
-        blocks.push({
-          type: 'tool_use',
-          id: makeId(),
-          name: (call as any).name,
-          input: (call as any).arguments ?? (call as any).parameters ?? (call as any).input ?? {},
-        });
-      }
+      if (!call || typeof call !== 'object') continue;
+      const name = (call as any).name;
+      if (typeof name !== 'string' || !okName(name)) continue;
+      blocks.push({
+        type: 'tool_use',
+        id: makeId(),
+        name,
+        input: (call as any).arguments ?? (call as any).parameters ?? (call as any).input ?? {},
+      });
     }
     return blocks;
   };
 
-  // <TOOLCALL>...</TOOLCALL>  (case-insensitive)
+  // Try the JSON-payload tag formats first.
   const tagMatch = t.match(/<TOOLCALL>([\s\S]*?)<\/TOOLCALL>/i)
     ?? t.match(/<tool_call>([\s\S]*?)<\/tool_call>/i);
   if (tagMatch) {
-    try { return toBlocks(JSON.parse(tagMatch[1].trim())); } catch { /* fall through */ }
+    const inner = tagMatch[1].trim();
+    // JSON path.
+    try { return toBlocks(JSON.parse(inner)); } catch { /* fall through */ }
+    // Tagged function-call path: `name(json_args)`.
+    const fn = inner.match(/^([A-Za-z_][\w.-]*)\s*\(([\s\S]*)\)\s*$/);
+    if (fn) {
+      const [, name, argsText] = fn;
+      if (okName(name)) {
+        try {
+          const args = JSON.parse(argsText.trim() || '{}');
+          return toBlocks({ name, arguments: args });
+        } catch { /* fall through */ }
+      }
+    }
+    return [];
   }
 
   // [TOOL_CALLS][{...}]
@@ -148,7 +168,38 @@ function parseTextBasedToolUses(text: string): AiToolUseBlock[] {
     try { return toBlocks(JSON.parse(mistralMatch[1])); } catch { /* fall through */ }
   }
 
+  // Bare fn-call: only when validNames is provided, otherwise too risky.
+  // Iterate all matches so an unknown call earlier in the text doesn't shadow
+  // a valid one later (LLMs commonly mention a function name in passing before
+  // the real call).
+  if (validNames) {
+    const bareRe = /\b([A-Za-z_][\w.-]*)\s*\((\{[\s\S]*?\})\)/g;
+    for (const m of t.matchAll(bareRe)) {
+      const [, name, argsText] = m;
+      if (!okName(name)) continue;
+      try {
+        return toBlocks({ name, arguments: JSON.parse(argsText) });
+      } catch { /* try the next candidate */ }
+    }
+  }
+
   return [];
+}
+
+/**
+ * Returns true when text contains evidence the model attempted to call a tool
+ * but the parser couldn't decode it: any tool-call marker, OR any registered
+ * tool name immediately followed by "(". Used by callers as the escalation
+ * trigger when `parseTextBasedToolUses` returned [].
+ */
+export function containsUnparsedToolCallAttempt(text: string, validNames: Set<string>): boolean {
+  if (!text) return false;
+  if (/<tool_call>|<TOOLCALL>|\[TOOL_CALLS\]/i.test(text)) return true;
+  for (const name of validNames) {
+    const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`);
+    if (re.test(text)) return true;
+  }
+  return false;
 }
 
 export function generateTitle(firstMessage: string): string {

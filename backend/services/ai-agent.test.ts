@@ -1,7 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
-import { AiAgent, buildSystemPrompt, type TierConfig } from './ai-agent';
+import {
+  AiAgent,
+  buildSystemPrompt,
+  parseTextBasedToolUses,
+  containsUnparsedToolCallAttempt,
+  type TierConfig,
+} from './ai-agent';
 import { AiToolRegistry, type AiToolRegistration } from './ai-tools';
 import type { AiProvider } from './ai-provider';
 import { createTestDb } from '../test-utils/create-test-db';
@@ -56,6 +62,121 @@ function makeRegistry(tools: Partial<AiToolRegistration>[] = []): AiToolRegistry
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+describe('parseTextBasedToolUses', () => {
+  const names = new Set(['get_installed_apps', 'list_frida_scripts']);
+
+  it('parses <TOOLCALL>[{...}]</TOOLCALL> JSON array', () => {
+    const out = parseTextBasedToolUses(
+      '<TOOLCALL>[{"name":"get_installed_apps","arguments":{"filter":"x"}}]</TOOLCALL>',
+      names,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('get_installed_apps');
+    expect(out[0].input).toEqual({ filter: 'x' });
+  });
+
+  it('parses <tool_call>{...}</tool_call> JSON object (single)', () => {
+    const out = parseTextBasedToolUses(
+      '<tool_call>{"name":"list_frida_scripts","arguments":{}}</tool_call>',
+      names,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('list_frida_scripts');
+  });
+
+  it('parses [TOOL_CALLS][{...}] (Mistral text fallback)', () => {
+    const out = parseTextBasedToolUses(
+      '[TOOL_CALLS][{"name":"get_installed_apps","arguments":{"filter":"y"}}]',
+      names,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].input).toEqual({ filter: 'y' });
+  });
+
+  it('parses <tool_call>name(json_args)</tool_call> (tagged function-call)', () => {
+    const out = parseTextBasedToolUses(
+      '<tool_call> get_installed_apps({"filter":"genting"}) </tool_call>',
+      names,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('get_installed_apps');
+    expect(out[0].input).toEqual({ filter: 'genting' });
+  });
+
+  it('parses bare name({json}) only when name is in validNames', () => {
+    const text = 'I will call get_installed_apps({"filter":"z"}) now.';
+    expect(parseTextBasedToolUses(text, names)).toEqual([
+      expect.objectContaining({ name: 'get_installed_apps', input: { filter: 'z' } }),
+    ]);
+    expect(parseTextBasedToolUses('frobnicate({"x":1})', names)).toEqual([]);
+  });
+
+  it('skips bare fn-calls with unknown names and finds the valid one that follows', () => {
+    // An LLM commonly mentions another function before the real call. The
+    // parser must not be shadowed by an earlier unknown call.
+    const text = 'Not frobnicate({"x":1}); use get_installed_apps({"filter":"q"}).';
+    expect(parseTextBasedToolUses(text, names)).toEqual([
+      expect.objectContaining({ name: 'get_installed_apps', input: { filter: 'q' } }),
+    ]);
+  });
+
+  it('rejects known formats whose name is not in validNames', () => {
+    const out = parseTextBasedToolUses(
+      '<tool_call>{"name":"not_a_real_tool","arguments":{}}</tool_call>',
+      names,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('returns [] when the tagged content is neither valid JSON nor a parseable fn-call', () => {
+    const out = parseTextBasedToolUses(
+      '<tool_call>just some prose with no args</tool_call>',
+      names,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('keeps working when validNames is omitted (back-compat for JSON formats)', () => {
+    const out = parseTextBasedToolUses(
+      '<TOOLCALL>[{"name":"anything","arguments":{}}]</TOOLCALL>',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('anything');
+  });
+});
+
+describe('containsUnparsedToolCallAttempt', () => {
+  const names = new Set(['get_installed_apps', 'list_frida_scripts']);
+
+  it('detects a <tool_call> marker', () => {
+    expect(containsUnparsedToolCallAttempt('<tool_call>anything</tool_call>', names)).toBe(true);
+  });
+
+  it('detects an upper-case <TOOLCALL> marker', () => {
+    expect(containsUnparsedToolCallAttempt('<TOOLCALL>...</TOOLCALL>', names)).toBe(true);
+  });
+
+  it('detects [TOOL_CALLS] marker', () => {
+    expect(containsUnparsedToolCallAttempt('[TOOL_CALLS][...]', names)).toBe(true);
+  });
+
+  it('detects a registered tool name followed by "("', () => {
+    expect(containsUnparsedToolCallAttempt('Use get_installed_apps( ... )', names)).toBe(true);
+  });
+
+  it('does NOT trigger on a registered name without a "(" nearby', () => {
+    expect(containsUnparsedToolCallAttempt('list_frida_scripts is helpful', names)).toBe(false);
+  });
+
+  it('does NOT trigger on an unregistered name with "("', () => {
+    expect(containsUnparsedToolCallAttempt('foo({"x":1})', names)).toBe(false);
+  });
+
+  it('does NOT trigger on empty text', () => {
+    expect(containsUnparsedToolCallAttempt('', names)).toBe(false);
+  });
+});
 
 describe('AiAgent', () => {
   let db: BetterSQLite3Database<typeof schema>;
