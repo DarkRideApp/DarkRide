@@ -14,6 +14,7 @@ import logging
 import socket
 import subprocess
 import sys
+import time
 import traceback
 
 from flask import Flask, request, jsonify
@@ -1298,20 +1299,67 @@ def _frida_stderr_reader(proc):
 
 # ---- Frida RPC Handlers ----
 
+def _kill_all_frida_processes(timeout_s=5):
+    """Kill frida-server and every re.frida.* helper/agent/server child,
+    looping until pgrep shows nothing matching or `timeout_s` elapses.
+
+    Why this is more than `pkill -9 -f "re\\.frida"`:
+      - re.frida.helper/agent reparent to PID 1 after frida-server dies and
+        continue to hold IPC state that prevents a fresh frida-server from
+        starting (it gets SIGKILLed on launch).
+      - `pkill -f` matches on the full command line, which has been observed
+        to miss these on some Android builds (the matchable command-line is
+        truncated or empty for some reparented children). Using `killall`
+        with explicit names is reliable because it matches on the kernel
+        comm name (set at exec time, ≤15 chars, e.g. "re.frida.helper").
+      - We loop and re-probe with pgrep so we don't relaunch frida-server
+        while a stale child is still draining.
+
+    Best-effort: gives up after `timeout_s` rather than hanging the bridge.
+    The next start_server call will fail loudly if there's still contention.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            _adb_run([
+                "su -c '"
+                "killall -9 frida-server 2>/dev/null; "
+                "killall -9 re.frida.server.32 2>/dev/null; "
+                "killall -9 re.frida.server.64 2>/dev/null; "
+                "killall -9 re.frida.helper.32 2>/dev/null; "
+                "killall -9 re.frida.helper.64 2>/dev/null; "
+                "killall -9 re.frida.agent.32 2>/dev/null; "
+                "killall -9 re.frida.agent.64 2>/dev/null; "
+                "pkill -9 -f \"re\\.frida\" 2>/dev/null; "
+                "true'"
+            ], timeout=3)
+        except Exception:
+            # Best-effort cleanup: kill failures are expected (e.g. su denied
+            # on dev images, or no matching processes). We keep looping and
+            # re-probe with pgrep below; the loop terminates on clean or
+            # timeout, not on a single kill error.
+            pass
+        try:
+            remaining = _adb_run(
+                ["su -c 'pgrep -f \"re\\.frida|frida-server\" 2>/dev/null'"],
+                timeout=2,
+            ).strip()
+        except Exception:
+            # Can't probe — treat as "clean" so we don't loop forever on a
+            # broken adb. start_server will surface the real problem later.
+            remaining = ''
+        if not remaining:
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.3)
+
+
 def handle_frida_start_server(params):
     global _frida_device
     _frida_device = None  # Clear stale handle immediately before any operation
-    import time
-    # Kill frida-server AND every re.frida.* child (helper, agent, server).
-    # Children spawned by frida-server reparent to PID 1 when it dies and
-    # continue to hold IPC state that prevents a fresh frida-server from
-    # starting cleanly — it gets SIGKILLed on launch. sleep 2 gives the
-    # process table time to settle under load before we relaunch.
-    try:
-        _adb_run(["su -c 'killall frida-server 2>/dev/null; pkill -9 -f \"re\\.frida\" 2>/dev/null; true'"], timeout=5)
-    except Exception:
-        pass
-    time.sleep(2)
+    # Aggressive cleanup loop — see _kill_all_frida_processes for rationale.
+    _kill_all_frida_processes(timeout_s=5)
     subprocess.Popen(
         ['adb', '-s', device_serial, 'shell', "su -c '/data/local/tmp/frida-server -D'"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1351,12 +1399,8 @@ def handle_frida_stop_server(params):
             _frida_process.kill()
     _frida_process = None
     _frida_device = None
-    # Kill frida-server AND every re.frida.* child to prevent orphans
-    # from blocking the next server launch.
-    try:
-        _adb_run(["su -c 'killall frida-server 2>/dev/null; pkill -9 -f \"re\\.frida\" 2>/dev/null; true'"], timeout=5)
-    except Exception:
-        pass
+    # Aggressive cleanup loop — see _kill_all_frida_processes for rationale.
+    _kill_all_frida_processes(timeout_s=5)
     return {'status': 'stopped'}
 
 def handle_frida_list_apps(params):
@@ -1516,30 +1560,63 @@ def handle_frida_spawn_controlled(params):
         _append_frida_message('log', msg)
         print(f"[DarkRide] {msg}", file=sys.stderr, flush=True)
 
-    # 1. Spawn suspended
-    print(f"[DarkRide] Spawning {bundle_id} (suspended)...", file=sys.stderr, flush=True)
-    pid = device.spawn([bundle_id])
-    _frida_spawned_pid = pid
+    # Wrap the Frida-API calls so domain errors (e.g. frida.NotSupportedError
+    # "need Gadget to attach on jailed Android" — see Android 10+ stale
+    # zygote-injection state) propagate as a BridgeError whose message reaches
+    # the caller, instead of being collapsed into the dispatcher's generic
+    # "Internal error — see server logs" fallback.
+    try:
+        # 1. Spawn suspended
+        print(f"[DarkRide] Spawning {bundle_id} (suspended)...", file=sys.stderr, flush=True)
+        pid = device.spawn([bundle_id])
+        _frida_spawned_pid = pid
 
-    # 2. Attach
-    session = device.attach(pid)
-    session.on('detached', on_detached)
-    _frida_session = session
+        # 2. Attach
+        session = device.attach(pid)
+        session.on('detached', on_detached)
+        _frida_session = session
 
-    # 3. Load script (process is still suspended)
-    script = session.create_script(code)
-    script.on('message', on_message)
-    script.load()
-    _frida_script = script
-    _append_frida_message('log', '[DarkRide] Script loaded, process still suspended')
-    print(f"[DarkRide] Script loaded for PID {pid}, resuming...", file=sys.stderr, flush=True)
+        # 3. Load script (process is still suspended)
+        script = session.create_script(code)
+        script.on('message', on_message)
+        script.load()
+        _frida_script = script
+        _append_frida_message('log', '[DarkRide] Script loaded, process still suspended')
+        print(f"[DarkRide] Script loaded for PID {pid}, resuming...", file=sys.stderr, flush=True)
 
-    # 4. Resume — now the hooks are in place
-    device.resume(pid)
-    _append_frida_message('log', '[DarkRide] Process resumed')
-    print(f"[DarkRide] Process {pid} resumed", file=sys.stderr, flush=True)
+        # 4. Resume — now the hooks are in place
+        device.resume(pid)
+        _append_frida_message('log', '[DarkRide] Process resumed')
+        print(f"[DarkRide] Process {pid} resumed", file=sys.stderr, flush=True)
 
-    return {'pid': pid, 'status': 'running'}
+        return {'pid': pid, 'status': 'running'}
+    except BridgeError:
+        raise
+    except Exception as e:
+        raise BridgeError(
+            _map_frida_exception_code(e),
+            f"frida_spawn_controlled: {type(e).__name__}: {e}",
+        ) from e
+
+
+def _map_frida_exception_code(e):
+    """Map a frida.* exception class name to one of the bridge ErrorCodes.
+    Defaults to FRIDA_NOT_AVAILABLE; the original message is preserved by the
+    caller regardless of which code is chosen."""
+    name = type(e).__name__
+    if name == 'NotSupportedError':
+        return ErrorCode.FRIDA_SPAWN_FAILED
+    if name == 'ServerNotRunningError':
+        return ErrorCode.FRIDA_SERVER_NOT_RUNNING
+    if name == 'ProcessNotFoundError':
+        return ErrorCode.APP_NOT_INSTALLED
+    if name == 'PermissionDeniedError':
+        return ErrorCode.PERMISSION_DENIED
+    if name == 'InvalidArgumentError':
+        return ErrorCode.INVALID_PARAMS
+    if name in ('TransportError', 'ProtocolError'):
+        return ErrorCode.FRIDA_NOT_AVAILABLE
+    return ErrorCode.FRIDA_NOT_AVAILABLE
 
 
 def handle_frida_get_messages(params):
