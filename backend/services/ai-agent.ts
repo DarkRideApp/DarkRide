@@ -638,8 +638,11 @@ export class AiAgent implements AiAgentInterface {
       buffered.push(event);
     }
 
-    // Check if any tool_use targets a write tool
-    const hasWriteTool = buffered.some(
+    // Check if any tool_use targets a write tool. Mutable so the text-based
+    // parser path below can flip it true when it extracts a write-class call
+    // from the cheap model's text — otherwise that path would bypass tiered
+    // escalation (write-class calls would silently execute on the cheap model).
+    let hasWriteTool = buffered.some(
       (e) => e.type === 'tool_use' && tierConfig.writeToolNames.includes(e.name),
     );
 
@@ -680,15 +683,23 @@ export class AiAgent implements AiAgentInterface {
         const textToolUses = parseTextBasedToolUses(fullText, validNames);
         if (textToolUses.length > 0) {
           log(`Detected ${textToolUses.length} text-based tool call(s) in tiered turn`);
-          return { textChunks: [], toolUses: textToolUses, turnInputTokens, parseMissAttempt: false };
-        }
-        if (containsUnparsedToolCallAttempt(fullText, validNames)) {
+          // If any of the parsed calls are write-class tools, fall through to
+          // the escalation path so the expensive provider re-runs the turn —
+          // text-format write-tool calls must NOT bypass the tiered policy.
+          // The text tool_uses are discarded on this path; the write provider
+          // will emit its own properly-formatted tool_use blocks.
+          if (textToolUses.some((e) => tierConfig.writeToolNames.includes(e.name))) {
+            hasWriteTool = true;
+          } else {
+            return { textChunks: [], toolUses: textToolUses, turnInputTokens, parseMissAttempt: false };
+          }
+        } else if (containsUnparsedToolCallAttempt(fullText, validNames)) {
           log(`Unparsed tool-call attempt in tiered turn — escalating. Snippet: "${fullText.slice(0, 200)}"`);
           parseMissAttempt = true;
         }
       }
 
-      if (!parseMissAttempt) {
+      if (!parseMissAttempt && !hasWriteTool) {
         return { textChunks, toolUses, turnInputTokens, parseMissAttempt: false };
       }
     }

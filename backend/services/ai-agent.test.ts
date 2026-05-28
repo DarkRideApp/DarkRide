@@ -2215,5 +2215,76 @@ describe('AiAgent', () => {
         'w1', 'get_installed_apps', { filter: 'x' }, expect.any(Number), expect.any(Number),
       );
     });
+
+    it('escalates when the cheap model emits a write-class tool in TEXT format', async () => {
+      // Regression for a bug Copilot caught on PR #6: when parseTextBasedToolUses
+      // extracted tool_uses successfully, the function early-returned without
+      // re-checking whether any of the parsed calls were write-class. A cheap
+      // model emitting `<tool_call>write_notes({...})</tool_call>` would bypass
+      // the tiered-escalation policy and silently run write_notes on the cheap
+      // provider. After the fix, the parsed-text-write-tool case must escalate
+      // to the write provider just like a native write-tool tool_use would.
+      const writeCreateStream = vi.fn(() => {
+        return (async function* () {
+          yield { type: 'tool_use' as const, id: 'w1', name: 'write_notes', input: { text: 'from expensive' } };
+          yield { type: 'usage' as const, inputTokens: 30, outputTokens: 15 };
+        })();
+      });
+      const writeProvider = makeMockProvider(writeCreateStream);
+
+      let researchCallCount = 0;
+      const researchProvider = makeMockProvider(() => {
+        researchCallCount++;
+        if (researchCallCount === 1) {
+          // Cheap model emits a write-tool call in TAGGED-fn TEXT format —
+          // the parser DOES decode this; before the fix it would have been
+          // returned directly without escalating.
+          return (async function* () {
+            yield { type: 'text' as const, text: '<tool_call>write_notes({"text":"from cheap"})</tool_call>' };
+            yield { type: 'usage' as const, inputTokens: 10, outputTokens: 5 };
+          })();
+        }
+        return (async function* () {
+          yield { type: 'text' as const, text: 'Done' };
+          yield { type: 'usage' as const, inputTokens: 20, outputTokens: 8 };
+        })();
+      });
+
+      const registry = makeRegistry([
+        { name: 'write_notes', context: ['devices'], execute: async () => 'ok' },
+      ]);
+
+      const tierConfig = makeTierConfig({
+        researchProvider,
+        writeProvider,
+        writeToolNames: ['write_notes'], // write_notes IS a write tool
+      });
+
+      const onToolStart = vi.fn();
+
+      const agent = new AiAgent(db, registry, researchProvider);
+      const result = await agent.handleMessageWithIdentity(coreIdentity, {
+        conversationId: null,
+        message: 'Write a note',
+        pageContext: 'devices',
+        contextId: '',
+        onToken: vi.fn(),
+        onToolStart,
+        onToolResult: vi.fn(),
+        tierConfig,
+        mode: 'streaming',
+      });
+
+      // Escalation must have fired — the WRITE provider got the turn.
+      expect(writeCreateStream).toHaveBeenCalled();
+      expect(result.error).toBeUndefined();
+      // The executed tool_use must be the WRITE provider's (id 'w1' + its input),
+      // NOT the cheap model's text-extracted block. If the bug were still present
+      // the cheap model's parsed write_notes call would have been executed instead
+      // and onToolStart would have received a different id / args.
+      expect(onToolStart).toHaveBeenCalledWith(
+        'w1', 'write_notes', { text: 'from expensive' }, expect.any(Number), expect.any(Number),
+      );
+    });
   });
 });
