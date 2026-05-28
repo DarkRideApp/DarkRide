@@ -2346,20 +2346,88 @@ class AuthManager {
       expect(fetchSpy).not.toHaveBeenCalled();
     });
 
-    it('run_adb_command calls deviceManager.executeShellCommand directly', async () => {
-      const executeShellCommand = vi.fn().mockResolvedValue('total 0\n');
+    it('run_adb_command returns {output, stderr, exitCode} on a successful run', async () => {
+      const runShellCommandWithExitCode = vi.fn().mockResolvedValue({
+        stdout: 'total 0\n', stderr: '', exitCode: 0,
+      });
       const getDeviceStatus = vi.fn().mockResolvedValue({ isOnline: true });
-      const fakeDeviceManager = { executeShellCommand, getDeviceStatus } as any;
+      const fakeDeviceManager = { runShellCommandWithExitCode, getDeviceStatus } as any;
 
-      // Rebuild registry with the deviceManager injected.
       const r = new AiToolRegistry();
       registerAllTools(r, db as any, { deviceManager: fakeDeviceManager });
 
       const result = await r.executeTool('run_adb_command', { deviceId: 'dev-1', command: 'ls' });
 
-      expect(executeShellCommand).toHaveBeenCalledWith('dev-1', 'ls');
-      expect(result).toEqual({ deviceId: 'dev-1', command: 'ls', output: 'total 0\n' });
-      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(runShellCommandWithExitCode).toHaveBeenCalledWith('dev-1', 'ls');
+      expect(result).toEqual({
+        deviceId: 'dev-1',
+        command: 'ls',
+        output: 'total 0',     // trimmed
+        stderr: '',
+        exitCode: 0,
+      });
+    });
+
+    it('run_adb_command returns non-zero exits as data, does NOT throw', async () => {
+      // `killall x` when nothing matches — exit 1 is a benign outcome the AI
+      // should be able to branch on rather than retry with `cmd; true`.
+      const runShellCommandWithExitCode = vi.fn().mockResolvedValue({
+        stdout: '', stderr: 'no process found\n', exitCode: 1,
+      });
+      const getDeviceStatus = vi.fn().mockResolvedValue({ isOnline: true });
+      const fakeDeviceManager = { runShellCommandWithExitCode, getDeviceStatus } as any;
+
+      const r = new AiToolRegistry();
+      registerAllTools(r, db as any, { deviceManager: fakeDeviceManager });
+
+      const result = await r.executeTool('run_adb_command', {
+        deviceId: 'dev-1', command: 'killall frida-server',
+      });
+
+      expect(result).toEqual({
+        deviceId: 'dev-1',
+        command: 'killall frida-server',
+        output: '',
+        stderr: 'no process found',
+        exitCode: 1,
+      });
+      expect((result as any).error).toBeUndefined();
+    });
+
+    it('run_adb_command rethrows transport errors (adb missing, timeout, etc.)', async () => {
+      // ENOENT / ETIMEDOUT come back as a thrown error from the helper — the
+      // tool must NOT swallow these as exit codes; they indicate ADB itself
+      // is broken, not that the command exited non-zero.
+      const transportErr = Object.assign(new Error('spawn adb ENOENT'), { code: 'ENOENT' });
+      const runShellCommandWithExitCode = vi.fn().mockRejectedValue(transportErr);
+      const getDeviceStatus = vi.fn().mockResolvedValue({ isOnline: true });
+      const fakeDeviceManager = { runShellCommandWithExitCode, getDeviceStatus } as any;
+
+      const r = new AiToolRegistry();
+      registerAllTools(r, db as any, { deviceManager: fakeDeviceManager });
+
+      const result = await r.executeTool('run_adb_command', { deviceId: 'dev-1', command: 'ls' });
+      // The tool's own try/catch wraps thrown errors into a {error} payload
+      // (file convention; AiToolRegistry.executeTool itself rethrows).
+      expect((result as any).error).toMatch(/ENOENT|spawn adb/);
+    });
+
+    it('run_adb_command treats timeout (err.code === null) as a transport error', async () => {
+      // Node's execFile signals timeout by rejecting with `err.code === null`
+      // (a different branch of the helper's `typeof err.code !== 'number'`
+      // guard than ENOENT, which is the string 'ENOENT'). Both must surface
+      // as a {error} payload, not as an exit-code data shape.
+      const timeoutErr = Object.assign(new Error('Command failed: adb -s dev-1 shell sleep 60'), { code: null });
+      const runShellCommandWithExitCode = vi.fn().mockRejectedValue(timeoutErr);
+      const getDeviceStatus = vi.fn().mockResolvedValue({ isOnline: true });
+      const fakeDeviceManager = { runShellCommandWithExitCode, getDeviceStatus } as any;
+
+      const r = new AiToolRegistry();
+      registerAllTools(r, db as any, { deviceManager: fakeDeviceManager });
+
+      const result = await r.executeTool('run_adb_command', { deviceId: 'dev-1', command: 'sleep 60' });
+      expect((result as any).error).toMatch(/Command failed/);
+      expect((result as any).exitCode).toBeUndefined();
     });
   });
 
