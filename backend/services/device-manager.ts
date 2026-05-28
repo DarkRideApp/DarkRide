@@ -16,6 +16,8 @@ import type { DeviceFilter } from '../../shared/types/api';
 import { matchesDeviceFilter, migrateDeviceFilter } from '../../shared/lib/device-filter';
 import { getMitmproxyConfdir } from './mitmproxy-manager';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
+import type { ProviderRegistry } from './providers';
+import type { CaptureModeRegistry } from './capture-mode-registry';
 
 const execFileAsync = promisify(execFile);
 
@@ -286,11 +288,35 @@ export class DeviceManager {
   private stayAwakeDevices = new Set<string>(); // devices with stay_on_while_plugged_in enabled
   private offlineListeners: Array<(deviceId: string) => void> = [];
   private hookBus: HookBus | null = null;
+  private providerRegistry: ProviderRegistry | null = null;
+  // TODO(phase-2): read in capture-startup path. Setter is present so the
+  // boot wiring (Task 1.6) can install it now; the read site lands when
+  // Phase 2 implements the capture-mode dispatch.
+  private captureModeRegistry: CaptureModeRegistry | null = null;
 
   constructor(private db: AppDatabase) {}
 
   setHookBus(bus: HookBus): void {
     this.hookBus = bus;
+  }
+
+  /**
+   * Wire the provider registry. Once wired, `pollDevicesFromProviders()`
+   * routes device discovery through registered DeviceProviders instead of
+   * the legacy inline `adb devices` parsing. Existing `pollAdbDevices()`
+   * remains as the no-registry fallback during the refactor.
+   */
+  setProviderRegistry(reg: ProviderRegistry): void {
+    this.providerRegistry = reg;
+  }
+
+  /**
+   * Wire the capture-mode registry for per-mode capture dispatch.
+   * Phase 1 wires a no-op stub for `wireguard` mode; Phase 2 replaces it
+   * with the real handler.
+   */
+  setCaptureModeRegistry(reg: CaptureModeRegistry): void {
+    this.captureModeRegistry = reg;
   }
 
   /** Register a callback to check if a device has active stream viewers. */
@@ -471,6 +497,47 @@ export class DeviceManager {
       }
     } catch (err: any) {
       error(`ADB poll failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * New provider-driven polling path. Asks the registry for all instances
+   * across all registered providers and upserts them into the devices
+   * table. Falls through (returns early) if no registry is wired —
+   * backwards-compat for the refactor period.
+   *
+   * Phase 1 only: inserts new serials / updates lastSeen for existing ones.
+   * Root checks and property collection are ADB-specific and remain in
+   * `pollAdbDevices`; they will be wired in Phase 2 once the provider
+   * contract surfaces those capabilities.
+   */
+  async pollDevicesFromProviders(): Promise<void> {
+    if (!this.providerRegistry) {
+      return;
+    }
+    const all = await this.providerRegistry.listInstancesAll();
+    for (const row of all) {
+      if (!row.instance.serial) continue;
+      const id = row.instance.serial;
+
+      const existing = this.db
+        .select()
+        .from(devices)
+        .where(eq(devices.id, id))
+        .all();
+
+      if (existing.length === 0) {
+        log(`New device discovered via provider ${row.providerId}: ${id}`);
+        this.db.insert(devices).values({
+          id,
+          lastSeen: new Date(),
+        }).run();
+      } else {
+        this.db.update(devices)
+          .set({ lastSeen: new Date() })
+          .where(eq(devices.id, id))
+          .run();
+      }
     }
   }
 
@@ -664,7 +731,7 @@ export class DeviceManager {
               binPath = await this.fridaReleaseManager.downloadVersion(version);
             }
             await adbCommand(['-s', deviceId, 'push', binPath, '/data/local/tmp/frida-server']);
-            await suShell(deviceId, 'chmod 755 /data/local/tmp/frida-server');
+            await adbShell(deviceId, '"su -c \'chmod 755 /data/local/tmp/frida-server\'"');
             this.db.update(devices)
               .set({ fridaVersion: version })
               .where(eq(devices.id, deviceId))
@@ -1163,7 +1230,7 @@ export class DeviceManager {
   async findWgTool(deviceId: string): Promise<string | null> {
     // 1. Check system PATH
     try {
-      const result = await suShell(deviceId, 'which wg');
+      const result = await adbShell(deviceId, `"su -c 'which wg'"`);
       if (result && !result.includes('not found')) {
         return result.trim();
       }
@@ -1173,7 +1240,7 @@ export class DeviceManager {
 
     // 2. Check our pushed binary
     try {
-      const result = await suShell(deviceId, `test -x ${DeviceManager.WG_DEVICE_PATH} && echo ok`);
+      const result = await adbShell(deviceId, `"su -c 'test -x ${DeviceManager.WG_DEVICE_PATH} && echo ok'"`);
       if (result && result.includes('ok')) {
         return DeviceManager.WG_DEVICE_PATH;
       }
@@ -1203,7 +1270,7 @@ export class DeviceManager {
 
     // Push to device and make executable
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_DEVICE_PATH]);
-    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_DEVICE_PATH}`);
+    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_DEVICE_PATH}'"`);
     log(`Pushed wg binary to ${deviceId} (${arch})`);
   }
 
@@ -1231,9 +1298,9 @@ export class DeviceManager {
     if (cached !== undefined) return cached;
 
     try {
-      await suShell(
+      await adbShell(
         deviceId,
-        'ip link add wg_test type wireguard && ip link del wg_test',
+        `"su -c 'ip link add wg_test type wireguard && ip link del wg_test'"`,
       );
       log(`Device ${deviceId}: kernel WireGuard support confirmed`);
       this.kernelWgSupport.set(deviceId, true);
@@ -1250,9 +1317,9 @@ export class DeviceManager {
    */
   async findWgGoTool(deviceId: string): Promise<string | null> {
     try {
-      const result = await suShell(
+      const result = await adbShell(
         deviceId,
-        `test -x ${DeviceManager.WG_GO_DEVICE_PATH} && echo ok`,
+        `"su -c 'test -x ${DeviceManager.WG_GO_DEVICE_PATH} && echo ok'"`,
       );
       if (result && result.includes('ok')) {
         return DeviceManager.WG_GO_DEVICE_PATH;
@@ -1279,7 +1346,7 @@ export class DeviceManager {
     }
 
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_GO_DEVICE_PATH]);
-    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_GO_DEVICE_PATH}`);
+    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_GO_DEVICE_PATH}'"`);
     log(`Pushed wireguard-go binary to ${deviceId} (${abi})`);
   }
 
@@ -1305,9 +1372,9 @@ export class DeviceManager {
    */
   async findWgUapiTool(deviceId: string): Promise<string | null> {
     try {
-      const result = await suShell(
+      const result = await adbShell(
         deviceId,
-        `test -x ${DeviceManager.WG_UAPI_DEVICE_PATH} && echo ok`,
+        `"su -c 'test -x ${DeviceManager.WG_UAPI_DEVICE_PATH} && echo ok'"`,
       );
       if (result && result.includes('ok')) {
         return DeviceManager.WG_UAPI_DEVICE_PATH;
@@ -1333,7 +1400,7 @@ export class DeviceManager {
     }
 
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_UAPI_DEVICE_PATH]);
-    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_UAPI_DEVICE_PATH}`);
+    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_UAPI_DEVICE_PATH}'"`);
     log(`Pushed wg-uapi binary to ${deviceId} (${abi})`);
   }
 
@@ -1456,7 +1523,7 @@ export class DeviceManager {
       'rm -f /data/local/tmp/wg_peer.conf',
     ];
 
-    await suShell(deviceId, commands.join(' && '));
+    await adbShell(deviceId, `"su -c '${commands.join(' && ')}'"`);
 
     log(`WireGuard tunnel activated on ${deviceId} (${mode})`);
   }
@@ -1472,9 +1539,9 @@ export class DeviceManager {
   ): Promise<{ success: boolean; details: string }> {
     // Try curl first (fast and reliable when available)
     try {
-      const result = await suShell(
+      const result = await adbShell(
         deviceId,
-        `curl -sf --max-time 10 ${testUrl}`,
+        `"su -c 'curl -sf --max-time 10 ${testUrl}'"`,
       );
       if (result && result.trim().length > 0) {
         return { success: true, details: result.substring(0, 200) };
@@ -1489,9 +1556,9 @@ export class DeviceManager {
     try {
       const wgPath = await this.findWgTool(deviceId);
       if (wgPath) {
-        const result = await suShell(
+        const result = await adbShell(
           deviceId,
-          `${wgPath} show wg0 latest-handshakes`,
+          `"su -c '${wgPath} show wg0 latest-handshakes'"`,
         );
         if (result) {
           const ts = parseInt(result.trim().split('\t')[1], 10);
@@ -1517,9 +1584,9 @@ export class DeviceManager {
   async deactivateWireGuardTunnel(deviceId: string): Promise<void> {
     log(`Deactivating WireGuard tunnel on ${deviceId}`);
     try {
-      await suShell(
+      await adbShell(
         deviceId,
-        'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true',
+        `"su -c 'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true'"`,
       );
     } catch {
       // Interface may not exist — that's fine
@@ -1617,7 +1684,7 @@ export class DeviceManager {
 
     // Quick root check — fails fast (3s) instead of hanging 30s on Magisk prompt
     try {
-      await suShell(deviceId, 'id', 3000);
+      await adbShell(deviceId, '"su -c id"', 3000);
     } catch {
       throw new Error(
         'Root access unavailable — check the phone for a Magisk superuser prompt, or grant shell permanent su access in Magisk settings',
@@ -1729,7 +1796,7 @@ export class DeviceManager {
       try { fs.rmdirSync(tmpDir3); } catch {}
     }
 
-    await suShell(deviceId, 'chmod +x /data/local/tmp/inject_cert.sh && /data/local/tmp/inject_cert.sh 2>&1 && rm /data/local/tmp/inject_cert.sh', 30000);
+    await adbShell(deviceId, `"su -c 'chmod +x /data/local/tmp/inject_cert.sh && /data/local/tmp/inject_cert.sh 2>&1 && rm /data/local/tmp/inject_cert.sh'"`, 30000);
     log(`CA cert injected on ${deviceId}`);
   }
 }
