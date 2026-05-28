@@ -436,12 +436,18 @@ export class AiAgent implements AiAgentInterface {
         // Check if the buffered text is actually a text-based tool call
         if (pendingText.length > 0 && toolUses.length === 0) {
           const fullPending = pendingText.join('');
-          const textToolUses = parseTextBasedToolUses(fullPending);
+          const validNames = new Set(tools.map(t => t.name));
+          const textToolUses = parseTextBasedToolUses(fullPending, validNames);
           if (textToolUses.length > 0) {
             log(`Detected ${textToolUses.length} text-based tool call(s) — parsing instead of emitting as text`);
             toolUses.push(...textToolUses);
             textChunks = []; // Don't store raw tool-call XML in conversation history
           } else {
+            if (containsUnparsedToolCallAttempt(fullPending, validNames)) {
+              // No write provider available in the non-tiered path — log so new
+              // formats are visible, but emit the text as the model produced it.
+              log(`Unparsed tool-call attempt (non-tiered, no escalation). Snippet: "${fullPending.slice(0, 200)}"`);
+            }
             for (const chunk of pendingText) onToken(chunk);
           }
         } else if (pendingText.length > 0) {
