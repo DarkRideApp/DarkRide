@@ -2953,4 +2953,82 @@ class AuthManager {
       expect(result).toEqual([]);
     });
   });
+
+  // ── Frida collector helper (spawnWaitCollectStop, exercised through
+  //    run_frida_and_collect) ──────────────────────────────────────────
+
+  describe('run_frida_and_collect — controlled-mode routing', () => {
+    it('routes through frida_spawn_controlled, not frida_run', async () => {
+      mockCallFridaBridge.mockImplementation(async (_bm, _dev, method, _params) => {
+        if (method === 'frida_spawn_controlled') return { pid: 123, status: 'running' };
+        if (method === 'frida_get_messages') return { messages: [], next_index: 0 };
+        if (method === 'frida_stop_server') return { status: 'stopped' };
+        throw new Error(`Unexpected bridge method: ${method}`);
+      });
+
+      await registry.executeTool('run_frida_and_collect', {
+        deviceId: 'd1', bundleId: 'com.example', code: 'send({hi:1});', durationMs: 1,
+      });
+
+      const spawnCall = mockCallFridaBridge.mock.calls.find(
+        (c: any[]) => c[2] === 'frida_spawn_controlled',
+      );
+      expect(spawnCall, 'expected frida_spawn_controlled to be invoked').toBeDefined();
+      const runCall = mockCallFridaBridge.mock.calls.find(
+        (c: any[]) => c[2] === 'frida_run',
+      );
+      expect(runCall, 'frida_run should NOT be called from the collector helper').toBeUndefined();
+      // mode must NOT be passed (controlled mode ignores it; passing it
+      // would just mislead future readers).
+      expect(spawnCall![3]).not.toHaveProperty('mode');
+    });
+
+    it('returns send() payloads from the bridge {messages, next_index} shape', async () => {
+      mockCallFridaBridge.mockImplementation(async (_bm, _dev, method, _params) => {
+        if (method === 'frida_spawn_controlled') return { pid: 1, status: 'running' };
+        if (method === 'frida_get_messages') {
+          return {
+            messages: [
+              { type: 'send', payload: { found: 1 } },
+              { type: 'send', payload: { found: 2 } },
+            ],
+            next_index: 2,
+          };
+        }
+        if (method === 'frida_stop_server') return { status: 'stopped' };
+        return null;
+      });
+
+      const result = await registry.executeTool('run_frida_and_collect', {
+        deviceId: 'd1', bundleId: 'com.example', code: 'send({found:1});', durationMs: 1,
+      });
+
+      expect((result as any).messageCount).toBe(2);
+      expect((result as any).messages).toEqual([
+        { type: 'send', payload: { found: 1 } },
+        { type: 'send', payload: { found: 2 } },
+      ]);
+    });
+
+    it('still calls frida_stop_server after collection (best-effort cleanup)', async () => {
+      mockCallFridaBridge.mockImplementation(async (_bm, _dev, method) => {
+        if (method === 'frida_spawn_controlled') return { pid: 1, status: 'running' };
+        if (method === 'frida_get_messages') return { messages: [], next_index: 0 };
+        if (method === 'frida_stop_server') return { status: 'stopped' };
+        return null;
+      });
+
+      await registry.executeTool('run_frida_and_collect', {
+        deviceId: 'd1', bundleId: 'com.example', code: 'send({})', durationMs: 1,
+      });
+
+      const methods = mockCallFridaBridge.mock.calls.map((c: any[]) => c[2]);
+      expect(methods).toContain('frida_stop_server');
+      const spawnIdx = methods.indexOf('frida_spawn_controlled');
+      const msgsIdx = methods.indexOf('frida_get_messages');
+      const stopIdx = methods.indexOf('frida_stop_server');
+      expect(stopIdx).toBeGreaterThan(spawnIdx);
+      expect(stopIdx).toBeGreaterThan(msgsIdx);
+    });
+  });
 });

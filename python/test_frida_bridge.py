@@ -107,6 +107,51 @@ class TestFridaStopServer:
             bridge._adb_run = original
 
 
+class TestFridaScriptMessageHandler:
+    """Bug #3 (collector follow-up): _handle_frida_script_message must store
+    send() payloads AS-IS under type='send', not str()ified under type='log'.
+    TypeScript callers (inspect_runtime_classes / inspect_class_methods /
+    run_frida_and_collect) read structured fields like payload.type and
+    payload.methods — they need the dict, not its string repr."""
+
+    def setup_method(self):
+        import bridge
+        bridge._frida_message_lock = threading.Lock()
+        bridge._frida_messages.clear()
+
+    def test_send_message_preserves_dict_payload(self):
+        import bridge
+        bridge._handle_frida_script_message(
+            {'type': 'send', 'payload': {'type': 'class', 'name': 'com.example.Foo'}},
+            None,
+        )
+        last = bridge._frida_messages[-1]
+        assert last['type'] == 'send', f"expected type='send', got {last['type']!r}"
+        assert last['payload'] == {'type': 'class', 'name': 'com.example.Foo'}, \
+            f"payload must be the original dict, not str()ified; got {last['payload']!r}"
+
+    def test_send_message_preserves_list_in_payload(self):
+        # Mirrors inspect_class_methods' send({methods:[...]}) shape.
+        import bridge
+        bridge._handle_frida_script_message(
+            {'type': 'send', 'payload': {'methods': ['a()', 'b()']}},
+            None,
+        )
+        last = bridge._frida_messages[-1]
+        assert last['type'] == 'send'
+        assert last['payload'] == {'methods': ['a()', 'b()']}
+
+    def test_error_message_stores_description(self):
+        import bridge
+        bridge._handle_frida_script_message(
+            {'type': 'error', 'description': 'TypeError: something went wrong', 'stack': 'at line 1'},
+            None,
+        )
+        last = bridge._frida_messages[-1]
+        assert last['type'] == 'error'
+        assert 'TypeError' in last['payload']
+
+
 class TestFridaErrorPreservation:
     """Bug #5: known frida errors must propagate with their original message
     instead of being swallowed into a generic 'Internal error'."""
