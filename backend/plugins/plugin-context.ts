@@ -9,6 +9,7 @@ import type {
   PluginTool,
   PluginToolContext,
   PluginJob,
+  DeviceProviderContribution,
   PluginSetting,
   PluginCommand,
   PluginNotificationEvent,
@@ -48,6 +49,7 @@ export interface CollectedContributions {
   tools: PluginTool[];
   toolContexts: PluginToolContext[];
   jobs: PluginJob[];
+  deviceProviders: DeviceProviderContribution[];
   settings: PluginSetting[];
   commands: PluginCommand[];
   notificationEvents: PluginNotificationEvent[];
@@ -73,6 +75,7 @@ export function createEmptyContributions(): CollectedContributions {
     tools: [],
     toolContexts: [],
     jobs: [],
+    deviceProviders: [],
     settings: [],
     commands: [],
     notificationEvents: [],
@@ -174,6 +177,10 @@ export class PluginContextImpl implements PluginContext {
 
   jobs(jobs: PluginJob[]): void {
     this.collected.jobs.push(...jobs);
+  }
+
+  deviceProviders(providers: DeviceProviderContribution[]): void {
+    this.collected.deviceProviders.push(...providers);
   }
 
   settingsDefs(defs: PluginSetting[]): void {

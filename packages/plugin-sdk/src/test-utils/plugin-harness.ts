@@ -59,6 +59,7 @@ function createDefaultMockCtx(pluginName: string): PluginContext {
     tools: () => {},
     toolContexts: () => {},
     jobs: () => {},
+    deviceProviders: () => {},
     settingsDefs: () => {},
     commands: () => {},
     notificationEvents: () => {},

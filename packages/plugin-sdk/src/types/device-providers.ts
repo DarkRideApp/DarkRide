@@ -146,3 +146,26 @@ export interface DeviceProvider {
   /** Form schema for the wizard, if this provider supports createInstance. */
   getCreateFormSchema?(): Promise<CreateFormSchema>;
 }
+
+/**
+ * What a plugin passes to `ctx.deviceProviders([...])` to register one or more
+ * managed-device providers. The host collects these and adds them to its
+ * provider registry alongside the built-in `adb-device` / `avd` / `docker-android`
+ * / `ios-device` providers.
+ */
+export interface DeviceProviderContribution {
+  /** Stable provider id (must not collide with built-ins). */
+  id: string;
+  displayName: string;
+  /** Network mode the host should use when capturing traffic from this provider's instances. */
+  networkMode: NetworkMode;
+  /** The DeviceProvider implementation (called by the registry/manager). */
+  implementation: DeviceProvider;
+  /** Per-mode capture handler, invoked during capture-session setup. */
+  captureHandler: CaptureHandler;
+  /** Coarse-grained capability hints surfaced in the UI. */
+  capabilities: {
+    canCreate: boolean;
+    canDelete: boolean;
+  };
+}

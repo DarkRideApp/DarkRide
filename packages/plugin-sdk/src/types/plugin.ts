@@ -5,6 +5,7 @@ import type { PluginAiApi, PluginAiTool, PluginAiContext } from './ai';
 import type { PluginTool, PluginToolContext } from './tools';
 import type { PluginNavItem, PluginPageDef, PluginSetting, PluginCommand, UiSlotDefinition, UiContribution } from './ui';
 import type { PluginJob } from './jobs';
+import type { DeviceProviderContribution } from './device-providers';
 import type { PluginNotificationEvent, PluginNotifyEvent } from './notify';
 import type { HookBus } from './hooks';
 import type { NamespacedStorage } from './storage';
@@ -71,6 +72,8 @@ export interface PluginContext {
   uiSlots(defs: UiSlotDefinition[]): void;
   uiContributions(contribs: UiContribution[]): void;
   jobs(jobs: PluginJob[]): void;
+  /** Register one or more managed-device providers (emulator support). */
+  deviceProviders(providers: DeviceProviderContribution[]): void;
   settingsDefs(defs: PluginSetting[]): void;
   commands(cmds: PluginCommand[]): void;
   notificationEvents(events: PluginNotificationEvent[]): void;
