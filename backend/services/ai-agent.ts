@@ -103,43 +103,63 @@ export interface AiAgentInterface {
 // ── Standalone helpers ───────────────────────────────────────────────
 
 /**
- * Detect and parse text-based tool calls emitted by models that do not support
- * the OpenAI function-calling API (common with some OpenRouter models).
+ * Detect and parse text-based tool calls emitted by models that do not use
+ * the API `tool_use` block format (common with smaller models / OpenRouter).
  *
- * Handles the most common formats:
- *   <TOOLCALL>[{"name":"fn","arguments":{}}]</TOOLCALL>   – array
- *   <tool_call>{"name":"fn","arguments":{}}</tool_call>   – Qwen / single object
- *   [TOOL_CALLS][{"name":"fn","arguments":{}}]            – Mistral text fallback
+ * Handles five formats:
+ *   <TOOLCALL>[{"name":"fn","arguments":{}}]</TOOLCALL>            — JSON array
+ *   <tool_call>{"name":"fn","arguments":{}}</tool_call>            — JSON object
+ *   [TOOL_CALLS][{"name":"fn","arguments":{}}]                     — Mistral text
+ *   <tool_call> fn({json args}) </tool_call>                       — tagged fn-call
+ *   fn({json args})                                                — bare fn-call (only when validNames is provided)
  *
- * Returns an array of AiToolUseBlock ready for execution, or [] if no pattern matched.
+ * When `validNames` is supplied, every emitted block's `name` must be in the
+ * set; unknown names are dropped. Bare fn-call parsing requires `validNames`
+ * to avoid grabbing arbitrary `something({...})` from prose.
  */
-function parseTextBasedToolUses(text: string): AiToolUseBlock[] {
+export function parseTextBasedToolUses(text: string, validNames?: Set<string>): AiToolUseBlock[] {
   const t = text.trim();
   if (!t) return [];
 
   const makeId = () => `text-tool-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const okName = (name: string) => !validNames || validNames.has(name);
 
   const toBlocks = (raw: unknown): AiToolUseBlock[] => {
     const calls = Array.isArray(raw) ? raw : [raw];
     const blocks: AiToolUseBlock[] = [];
     for (const call of calls) {
-      if (call && typeof call === 'object' && typeof (call as any).name === 'string') {
-        blocks.push({
-          type: 'tool_use',
-          id: makeId(),
-          name: (call as any).name,
-          input: (call as any).arguments ?? (call as any).parameters ?? (call as any).input ?? {},
-        });
-      }
+      if (!call || typeof call !== 'object') continue;
+      const name = (call as any).name;
+      if (typeof name !== 'string' || !okName(name)) continue;
+      blocks.push({
+        type: 'tool_use',
+        id: makeId(),
+        name,
+        input: (call as any).arguments ?? (call as any).parameters ?? (call as any).input ?? {},
+      });
     }
     return blocks;
   };
 
-  // <TOOLCALL>...</TOOLCALL>  (case-insensitive)
+  // Try the JSON-payload tag formats first.
   const tagMatch = t.match(/<TOOLCALL>([\s\S]*?)<\/TOOLCALL>/i)
     ?? t.match(/<tool_call>([\s\S]*?)<\/tool_call>/i);
   if (tagMatch) {
-    try { return toBlocks(JSON.parse(tagMatch[1].trim())); } catch { /* fall through */ }
+    const inner = tagMatch[1].trim();
+    // JSON path.
+    try { return toBlocks(JSON.parse(inner)); } catch { /* fall through */ }
+    // Tagged function-call path: `name(json_args)`.
+    const fn = inner.match(/^([A-Za-z_][\w.-]*)\s*\(([\s\S]*)\)\s*$/);
+    if (fn) {
+      const [, name, argsText] = fn;
+      if (okName(name)) {
+        try {
+          const args = JSON.parse(argsText.trim() || '{}');
+          return toBlocks({ name, arguments: args });
+        } catch { /* fall through */ }
+      }
+    }
+    return [];
   }
 
   // [TOOL_CALLS][{...}]
@@ -148,7 +168,38 @@ function parseTextBasedToolUses(text: string): AiToolUseBlock[] {
     try { return toBlocks(JSON.parse(mistralMatch[1])); } catch { /* fall through */ }
   }
 
+  // Bare fn-call: only when validNames is provided, otherwise too risky.
+  // Iterate all matches so an unknown call earlier in the text doesn't shadow
+  // a valid one later (LLMs commonly mention a function name in passing before
+  // the real call).
+  if (validNames) {
+    const bareRe = /\b([A-Za-z_][\w.-]*)\s*\((\{[\s\S]*?\})\)/g;
+    for (const m of t.matchAll(bareRe)) {
+      const [, name, argsText] = m;
+      if (!okName(name)) continue;
+      try {
+        return toBlocks({ name, arguments: JSON.parse(argsText) });
+      } catch { /* try the next candidate */ }
+    }
+  }
+
   return [];
+}
+
+/**
+ * Returns true when text contains evidence the model attempted to call a tool
+ * but the parser couldn't decode it: any tool-call marker, OR any registered
+ * tool name immediately followed by "(". Used by callers as the escalation
+ * trigger when `parseTextBasedToolUses` returned [].
+ */
+export function containsUnparsedToolCallAttempt(text: string, validNames: Set<string>): boolean {
+  if (!text) return false;
+  if (/<tool_call>|<TOOLCALL>|\[TOOL_CALLS\]/i.test(text)) return true;
+  for (const name of validNames) {
+    const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`);
+    if (re.test(text)) return true;
+  }
+  return false;
 }
 
 export function generateTitle(firstMessage: string): string {
@@ -385,12 +436,18 @@ export class AiAgent implements AiAgentInterface {
         // Check if the buffered text is actually a text-based tool call
         if (pendingText.length > 0 && toolUses.length === 0) {
           const fullPending = pendingText.join('');
-          const textToolUses = parseTextBasedToolUses(fullPending);
+          const validNames = new Set(tools.map(t => t.name));
+          const textToolUses = parseTextBasedToolUses(fullPending, validNames);
           if (textToolUses.length > 0) {
             log(`Detected ${textToolUses.length} text-based tool call(s) — parsing instead of emitting as text`);
             toolUses.push(...textToolUses);
             textChunks = []; // Don't store raw tool-call XML in conversation history
           } else {
+            if (containsUnparsedToolCallAttempt(fullPending, validNames)) {
+              // No write provider available in the non-tiered path — log so new
+              // formats are visible, but emit the text as the model produced it.
+              log(`Unparsed tool-call attempt (non-tiered, no escalation). Snippet: "${fullPending.slice(0, 200)}"`);
+            }
             for (const chunk of pendingText) onToken(chunk);
           }
         } else if (pendingText.length > 0) {
@@ -571,7 +628,7 @@ export class AiAgent implements AiAgentInterface {
     tools: AiToolDefinition[],
     totalUsage: { inputTokens: number; outputTokens: number },
     options?: { signal?: AbortSignal },
-  ): Promise<{ textChunks: string[]; toolUses: AiToolUseBlock[]; turnInputTokens: number }> {
+  ): Promise<{ textChunks: string[]; toolUses: AiToolUseBlock[]; turnInputTokens: number; parseMissAttempt: boolean }> {
     // Phase 1: Run cheap research model, buffering all events
     const buffered: AiStreamEvent[] = [];
     const researchStream = tierConfig.researchProvider.createStreamingRequest(
@@ -581,10 +638,19 @@ export class AiAgent implements AiAgentInterface {
       buffered.push(event);
     }
 
-    // Check if any tool_use targets a write tool
-    const hasWriteTool = buffered.some(
+    // Check if any tool_use targets a write tool. Mutable so the text-based
+    // parser path below can flip it true when it extracts a write-class call
+    // from the cheap model's text — otherwise that path would bypass tiered
+    // escalation (write-class calls would silently execute on the cheap model).
+    let hasWriteTool = buffered.some(
       (e) => e.type === 'tool_use' && tierConfig.writeToolNames.includes(e.name),
     );
+
+    // Track research usage added in the Phase-1 replay so we can subtract it on the
+    // parseMissAttempt escalation path (where Phase-2 discarded accounting takes over).
+    let researchInputAdded = 0;
+    let researchOutputAdded = 0;
+    let parseMissAttempt = false;
 
     if (!hasWriteTool) {
       // No write tool — replay buffered events
@@ -604,24 +670,53 @@ export class AiAgent implements AiAgentInterface {
             if (event.inputTokens > 0) turnInputTokens = event.inputTokens;
             totalUsage.inputTokens += event.inputTokens;
             totalUsage.outputTokens += event.outputTokens;
+            researchInputAdded += event.inputTokens;
+            researchOutputAdded += event.outputTokens;
             break;
         }
       }
 
       // Detect text-based tool calls from models that don't use the API format
       if (toolUses.length === 0 && textChunks.length > 0) {
-        const textToolUses = parseTextBasedToolUses(textChunks.join(''));
+        const fullText = textChunks.join('');
+        const validNames = new Set(tools.map(t => t.name));
+        const textToolUses = parseTextBasedToolUses(fullText, validNames);
         if (textToolUses.length > 0) {
           log(`Detected ${textToolUses.length} text-based tool call(s) in tiered turn`);
-          return { textChunks: [], toolUses: textToolUses, turnInputTokens };
+          // If any of the parsed calls are write-class tools, fall through to
+          // the escalation path so the expensive provider re-runs the turn —
+          // text-format write-tool calls must NOT bypass the tiered policy.
+          // The text tool_uses are discarded on this path; the write provider
+          // will emit its own properly-formatted tool_use blocks.
+          if (textToolUses.some((e) => tierConfig.writeToolNames.includes(e.name))) {
+            hasWriteTool = true;
+          } else {
+            return { textChunks: [], toolUses: textToolUses, turnInputTokens, parseMissAttempt: false };
+          }
+        } else if (containsUnparsedToolCallAttempt(fullText, validNames)) {
+          log(`Unparsed tool-call attempt in tiered turn — escalating. Snippet: "${fullText.slice(0, 200)}"`);
+          parseMissAttempt = true;
         }
       }
 
-      return { textChunks, toolUses, turnInputTokens };
+      if (!parseMissAttempt && !hasWriteTool) {
+        return { textChunks, toolUses, turnInputTokens, parseMissAttempt: false };
+      }
     }
 
-    // Write tool detected — escalate to write provider
-    log('Write tool detected — escalating to write provider');
+    // Escalate to write provider
+    log(hasWriteTool
+      ? 'Write tool detected — escalating to write provider'
+      : 'Parser-miss attempt detected — escalating to write provider');
+
+    // On a parseMissAttempt escalation, Phase-1 already added the research model's
+    // usage to totalUsage. Phase-2 will re-account whichever buffer (writeBuffered
+    // or buffered) it actually uses, so subtracting the Phase-1 contribution here
+    // avoids double-counting research tokens regardless of which buffer wins.
+    if (parseMissAttempt) {
+      totalUsage.inputTokens -= researchInputAdded;
+      totalUsage.outputTokens -= researchOutputAdded;
+    }
 
     // Phase 2: Re-run with expensive write model, buffering to check if it actually writes
     let writeBuffered: AiStreamEvent[] = [];
@@ -644,11 +739,14 @@ export class AiAgent implements AiAgentInterface {
     const writeModelUsedWriteTool = writeBuffered.some(
       (e) => e.type === 'tool_use' && tierConfig.writeToolNames.includes(e.name),
     );
+    // On a parseMissAttempt escalation any tool_use counts — the point was to
+    // get a parseable call back, not specifically a write-class tool.
+    const useWriteOutput = writeModelUsedWriteTool
+      || (parseMissAttempt && writeBuffered.some(e => e.type === 'tool_use'));
+    const eventsToUse = useWriteOutput ? writeBuffered : buffered;
+    const discarded = useWriteOutput ? buffered : writeBuffered;
 
-    const eventsToUse = writeModelUsedWriteTool ? writeBuffered : buffered;
-    const discarded = writeModelUsedWriteTool ? buffered : writeBuffered;
-
-    if (!writeModelUsedWriteTool) {
+    if (!useWriteOutput) {
       log('Write model declined to write — falling back to research model response');
     }
 
@@ -681,7 +779,7 @@ export class AiAgent implements AiAgentInterface {
       }
     }
 
-    return { textChunks, toolUses, turnInputTokens };
+    return { textChunks, toolUses, turnInputTokens, parseMissAttempt };
   }
 
   private async compactMessages(
