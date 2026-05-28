@@ -209,9 +209,16 @@ export function Devices() {
   const offlineCount = devices.length - onlineCount;
   // Show every managed instance EXCEPT ones whose serial already appears
   // as an adb-tracked device. Once the emulator's adbd binds, the device
-  // tracker picks it up and the device card supersedes the instance card.
+  // tracker picks it up and the device card supersedes the instance card —
+  // but the device card needs to know about the backing instance so it can
+  // surface Stop/Delete (the emulator-lifecycle ops the device card has
+  // no analogue for). Build the lookup here and pass it through below.
   const deviceSerials = new Set(devices.map((d) => d.id));
   const visibleInstances = instances.filter((i) => !i.serial || !deviceSerials.has(i.serial));
+  const instanceBySerial = new Map<string, ManagedInstance>();
+  for (const i of instances) {
+    if (i.serial) instanceBySerial.set(i.serial, i);
+  }
   const bootingCount = visibleInstances.filter((i) => i.state === 'created' || i.state === 'starting').length;
   const errorCount = visibleInstances.filter((i) => i.state === 'error').length;
   const subtitle = [
@@ -267,6 +274,7 @@ export function Devices() {
           ))}
           {devices.map(device => {
             const online = isOnline(device);
+            const backingInstance = instanceBySerial.get(device.id) ?? null;
             return (
               <div
                 key={device.id}
@@ -290,6 +298,11 @@ export function Devices() {
                       )}
                       {device.platform !== 'ios' && !device.isRooted && (
                         <span className="badge badge-sm badge-muted">Factory</span>
+                      )}
+                      {backingInstance && (
+                        <span className="badge badge-sm badge-muted" title={`${backingInstance.providerId} instance #${backingInstance.id}`}>
+                          Emulator
+                        </span>
                       )}
                     </div>
                   </div>
@@ -344,6 +357,32 @@ export function Devices() {
                     <span className="device-card-action">
                       {online ? 'Connect' : 'View Details'}
                     </span>
+                  )}
+                  {backingInstance && (
+                    // Emulator-lifecycle actions surface on the device card
+                    // ONLY when this device is backed by a managed instance.
+                    // Without this row the only way to stop/delete the
+                    // emulator was to manually `docker rm -f` the container,
+                    // because the instance card is hidden once adb sees it.
+                    <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
+                      <button
+                        className="device-card-action"
+                        onClick={e => { e.stopPropagation(); stopInstance(backingInstance); }}
+                        data-testid={`emu-stop-${device.id}`}
+                        title="Stop the emulator container"
+                      >
+                        Stop
+                      </button>
+                      <button
+                        className="device-card-action"
+                        onClick={e => { e.stopPropagation(); deleteInstance(backingInstance); }}
+                        data-testid={`emu-delete-${device.id}`}
+                        title="Delete the emulator container (irreversible)"
+                        style={{ borderColor: 'var(--danger)', color: 'var(--danger)' }}
+                      >
+                        Delete
+                      </button>
+                    </div>
                   )}
                 </div>
               </div>

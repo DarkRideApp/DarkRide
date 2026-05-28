@@ -131,4 +131,65 @@ describe('Devices', () => {
       expect(screen.queryByTestId('setup-wizard')).not.toBeInTheDocument();
     });
   });
+
+  it('surfaces emulator Stop/Delete on the device card when an instance backs the device', async () => {
+    // Regression for the emulator-branch UX gap: once the docker-android
+    // emulator's adb binds and the device card supersedes the instance
+    // card, the user had no way to stop/delete the container from the UI.
+    // We now thread the matched instance into the device card so its
+    // footer renders Stop + Delete that target the instance lifecycle API.
+    const emulatorDevice = {
+      id: 'localhost:32770', name: 'localhost:32770', platform: 'android',
+      isRooted: true, setupVersion: 4, bridgePort: null,
+      lastSeen: new Date().toISOString(),
+    };
+    const matchingInstance = {
+      id: 7, providerId: 'docker-android', runtimeId: 'container-abc',
+      displayName: 'test', serial: 'localhost:32770', state: 'running',
+      spawnedByDarkride: true,
+    };
+    const ws: WebSocketContextValue = {
+      connected: true,
+      sendMessage: vi.fn(),
+      sendRestApi: vi.fn().mockImplementation(async (_method: string, path: string) => {
+        if (path === '/v1/device/list') {
+          return { type: 'restapi', id: '1', status: 200, body: { data: [emulatorDevice] } };
+        }
+        if (path === '/v1/devices/providers') {
+          return { type: 'restapi', id: '2', status: 200, body: { data: { providers: [
+            { id: 'docker-android', capabilities: { canCreate: true }, available: true },
+          ] } } };
+        }
+        if (path === '/v1/devices/providers/docker-android/instances') {
+          return { type: 'restapi', id: '3', status: 200, body: { data: { instances: [matchingInstance] } } };
+        }
+        return { type: 'restapi', id: '4', status: 200, body: { data: {} } };
+      }),
+      subscribe: vi.fn().mockReturnValue(() => {}),
+    };
+
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <ToastProvider>
+          <MemoryRouter>
+            <Devices />
+          </MemoryRouter>
+        </ToastProvider>
+      </WebSocketContext.Provider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('emu-stop-localhost:32770')).toBeInTheDocument();
+      expect(screen.getByTestId('emu-delete-localhost:32770')).toBeInTheDocument();
+    });
+
+    // Clicking Stop calls the instance-stop endpoint, not the device card's navigate.
+    fireEvent.click(screen.getByTestId('emu-stop-localhost:32770'));
+    await waitFor(() => {
+      expect(ws.sendRestApi).toHaveBeenCalledWith(
+        'POST',
+        '/v1/devices/providers/docker-android/instances/7/stop',
+      );
+    });
+  });
 });
