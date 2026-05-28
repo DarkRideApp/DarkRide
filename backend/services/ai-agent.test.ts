@@ -1,7 +1,14 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
-import { AiAgent, buildSystemPrompt, type TierConfig } from './ai-agent';
+import {
+  AiAgent,
+  buildSystemPrompt,
+  parseTextBasedToolUses,
+  containsUnparsedToolCallAttempt,
+  type TierConfig,
+  type AgentIdentity,
+} from './ai-agent';
 import { AiToolRegistry, type AiToolRegistration } from './ai-tools';
 import type { AiProvider } from './ai-provider';
 import { createTestDb } from '../test-utils/create-test-db';
@@ -56,6 +63,121 @@ function makeRegistry(tools: Partial<AiToolRegistration>[] = []): AiToolRegistry
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+describe('parseTextBasedToolUses', () => {
+  const names = new Set(['get_installed_apps', 'list_frida_scripts']);
+
+  it('parses <TOOLCALL>[{...}]</TOOLCALL> JSON array', () => {
+    const out = parseTextBasedToolUses(
+      '<TOOLCALL>[{"name":"get_installed_apps","arguments":{"filter":"x"}}]</TOOLCALL>',
+      names,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('get_installed_apps');
+    expect(out[0].input).toEqual({ filter: 'x' });
+  });
+
+  it('parses <tool_call>{...}</tool_call> JSON object (single)', () => {
+    const out = parseTextBasedToolUses(
+      '<tool_call>{"name":"list_frida_scripts","arguments":{}}</tool_call>',
+      names,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('list_frida_scripts');
+  });
+
+  it('parses [TOOL_CALLS][{...}] (Mistral text fallback)', () => {
+    const out = parseTextBasedToolUses(
+      '[TOOL_CALLS][{"name":"get_installed_apps","arguments":{"filter":"y"}}]',
+      names,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].input).toEqual({ filter: 'y' });
+  });
+
+  it('parses <tool_call>name(json_args)</tool_call> (tagged function-call)', () => {
+    const out = parseTextBasedToolUses(
+      '<tool_call> get_installed_apps({"filter":"genting"}) </tool_call>',
+      names,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('get_installed_apps');
+    expect(out[0].input).toEqual({ filter: 'genting' });
+  });
+
+  it('parses bare name({json}) only when name is in validNames', () => {
+    const text = 'I will call get_installed_apps({"filter":"z"}) now.';
+    expect(parseTextBasedToolUses(text, names)).toEqual([
+      expect.objectContaining({ name: 'get_installed_apps', input: { filter: 'z' } }),
+    ]);
+    expect(parseTextBasedToolUses('frobnicate({"x":1})', names)).toEqual([]);
+  });
+
+  it('skips bare fn-calls with unknown names and finds the valid one that follows', () => {
+    // An LLM commonly mentions another function before the real call. The
+    // parser must not be shadowed by an earlier unknown call.
+    const text = 'Not frobnicate({"x":1}); use get_installed_apps({"filter":"q"}).';
+    expect(parseTextBasedToolUses(text, names)).toEqual([
+      expect.objectContaining({ name: 'get_installed_apps', input: { filter: 'q' } }),
+    ]);
+  });
+
+  it('rejects known formats whose name is not in validNames', () => {
+    const out = parseTextBasedToolUses(
+      '<tool_call>{"name":"not_a_real_tool","arguments":{}}</tool_call>',
+      names,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('returns [] when the tagged content is neither valid JSON nor a parseable fn-call', () => {
+    const out = parseTextBasedToolUses(
+      '<tool_call>just some prose with no args</tool_call>',
+      names,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('keeps working when validNames is omitted (back-compat for JSON formats)', () => {
+    const out = parseTextBasedToolUses(
+      '<TOOLCALL>[{"name":"anything","arguments":{}}]</TOOLCALL>',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('anything');
+  });
+});
+
+describe('containsUnparsedToolCallAttempt', () => {
+  const names = new Set(['get_installed_apps', 'list_frida_scripts']);
+
+  it('detects a <tool_call> marker', () => {
+    expect(containsUnparsedToolCallAttempt('<tool_call>anything</tool_call>', names)).toBe(true);
+  });
+
+  it('detects an upper-case <TOOLCALL> marker', () => {
+    expect(containsUnparsedToolCallAttempt('<TOOLCALL>...</TOOLCALL>', names)).toBe(true);
+  });
+
+  it('detects [TOOL_CALLS] marker', () => {
+    expect(containsUnparsedToolCallAttempt('[TOOL_CALLS][...]', names)).toBe(true);
+  });
+
+  it('detects a registered tool name followed by "("', () => {
+    expect(containsUnparsedToolCallAttempt('Use get_installed_apps( ... )', names)).toBe(true);
+  });
+
+  it('does NOT trigger on a registered name without a "(" nearby', () => {
+    expect(containsUnparsedToolCallAttempt('list_frida_scripts is helpful', names)).toBe(false);
+  });
+
+  it('does NOT trigger on an unregistered name with "("', () => {
+    expect(containsUnparsedToolCallAttempt('foo({"x":1})', names)).toBe(false);
+  });
+
+  it('does NOT trigger on empty text', () => {
+    expect(containsUnparsedToolCallAttempt('', names)).toBe(false);
+  });
+});
 
 describe('AiAgent', () => {
   let db: BetterSQLite3Database<typeof schema>;
@@ -2005,6 +2127,164 @@ describe('AiAgent', () => {
       // After sanitisation and slicing, contextId portion should be at most 64 chars
       expect(prompt).toContain('a'.repeat(64));
       expect(prompt).not.toContain('a'.repeat(65));
+    });
+  });
+
+  // ── Tiered Phase-1 parseMissAttempt escalation ────────────────────
+
+  describe('tiered execution — parseMissAttempt escalation', () => {
+    const coreIdentity: AgentIdentity = {
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: ['devices:read', 'devices:write'],
+      onBehalfOfService: 'test',
+    };
+
+    function makeTierConfig(overrides: Partial<TierConfig> = {}): TierConfig {
+      return {
+        researchProvider: overrides.researchProvider ?? makeMockProvider(() => textOnlyStream('cheap')),
+        writeProvider: overrides.writeProvider ?? makeMockProvider(() => textOnlyStream('expensive')),
+        writeToolNames: overrides.writeToolNames ?? ['write_notes'],
+      };
+    }
+
+    it('escalates to write provider when cheap-model output looks like an unparsed tool call', async () => {
+      // Research provider emits text that looks like a tool call but is not in API format
+      // and is not parseable by any known format — just a bare function-call pattern.
+      // writeToolNames is empty so the *write-tool* escalation trigger does NOT fire;
+      // only parseMissAttempt should trigger escalation.
+      const writeCreateStream = vi.fn(() => {
+        return (async function* () {
+          yield { type: 'tool_use' as const, id: 'w1', name: 'get_installed_apps', input: { filter: 'x' } };
+          yield { type: 'usage' as const, inputTokens: 30, outputTokens: 15 };
+        })();
+      });
+
+      const writeProvider = makeMockProvider(writeCreateStream);
+
+      // Research provider emits text that contains a registered tool name followed by '('
+      // but with non-JSON arguments — the parser cannot decode it, so containsUnparsedToolCallAttempt
+      // fires and parseMissAttempt is set, triggering escalation.
+      let researchCallCount = 0;
+      const researchProvider = makeMockProvider(() => {
+        researchCallCount++;
+        if (researchCallCount === 1) {
+          return (async function* () {
+            // Name followed by '(' but the args are prose, not JSON — parser will miss it
+            yield { type: 'text' as const, text: 'I will call get_installed_apps(filter=games)' };
+            yield { type: 'usage' as const, inputTokens: 10, outputTokens: 5 };
+          })();
+        }
+        // After write provider executes the tool, return final text
+        return (async function* () {
+          yield { type: 'text' as const, text: 'Done' };
+          yield { type: 'usage' as const, inputTokens: 20, outputTokens: 8 };
+        })();
+      });
+
+      const registry = makeRegistry([
+        { name: 'get_installed_apps', context: ['devices'], execute: async () => '[{"pkg":"com.example"}]' },
+      ]);
+
+      const tierConfig = makeTierConfig({
+        researchProvider,
+        writeProvider,
+        writeToolNames: [], // must be empty so only parseMissAttempt can trigger escalation
+      });
+
+      const onToolStart = vi.fn();
+
+      const agent = new AiAgent(db, registry, researchProvider);
+      const result = await agent.handleMessageWithIdentity(coreIdentity, {
+        conversationId: null,
+        message: 'List installed apps',
+        pageContext: 'devices',
+        contextId: '',
+        onToken: vi.fn(),
+        onToolStart,
+        onToolResult: vi.fn(),
+        tierConfig,
+        mode: 'streaming',
+      });
+
+      // writeProvider must have been called — escalation happened via parseMissAttempt
+      expect(writeCreateStream).toHaveBeenCalled();
+      expect(result.error).toBeUndefined();
+      // The tool_use emitted by the write provider must have been executed
+      expect(onToolStart).toHaveBeenCalledWith(
+        'w1', 'get_installed_apps', { filter: 'x' }, expect.any(Number), expect.any(Number),
+      );
+    });
+
+    it('escalates when the cheap model emits a write-class tool in TEXT format', async () => {
+      // Regression for a bug Copilot caught on PR #6: when parseTextBasedToolUses
+      // extracted tool_uses successfully, the function early-returned without
+      // re-checking whether any of the parsed calls were write-class. A cheap
+      // model emitting `<tool_call>write_notes({...})</tool_call>` would bypass
+      // the tiered-escalation policy and silently run write_notes on the cheap
+      // provider. After the fix, the parsed-text-write-tool case must escalate
+      // to the write provider just like a native write-tool tool_use would.
+      const writeCreateStream = vi.fn(() => {
+        return (async function* () {
+          yield { type: 'tool_use' as const, id: 'w1', name: 'write_notes', input: { text: 'from expensive' } };
+          yield { type: 'usage' as const, inputTokens: 30, outputTokens: 15 };
+        })();
+      });
+      const writeProvider = makeMockProvider(writeCreateStream);
+
+      let researchCallCount = 0;
+      const researchProvider = makeMockProvider(() => {
+        researchCallCount++;
+        if (researchCallCount === 1) {
+          // Cheap model emits a write-tool call in TAGGED-fn TEXT format —
+          // the parser DOES decode this; before the fix it would have been
+          // returned directly without escalating.
+          return (async function* () {
+            yield { type: 'text' as const, text: '<tool_call>write_notes({"text":"from cheap"})</tool_call>' };
+            yield { type: 'usage' as const, inputTokens: 10, outputTokens: 5 };
+          })();
+        }
+        return (async function* () {
+          yield { type: 'text' as const, text: 'Done' };
+          yield { type: 'usage' as const, inputTokens: 20, outputTokens: 8 };
+        })();
+      });
+
+      const registry = makeRegistry([
+        { name: 'write_notes', context: ['devices'], execute: async () => 'ok' },
+      ]);
+
+      const tierConfig = makeTierConfig({
+        researchProvider,
+        writeProvider,
+        writeToolNames: ['write_notes'], // write_notes IS a write tool
+      });
+
+      const onToolStart = vi.fn();
+
+      const agent = new AiAgent(db, registry, researchProvider);
+      const result = await agent.handleMessageWithIdentity(coreIdentity, {
+        conversationId: null,
+        message: 'Write a note',
+        pageContext: 'devices',
+        contextId: '',
+        onToken: vi.fn(),
+        onToolStart,
+        onToolResult: vi.fn(),
+        tierConfig,
+        mode: 'streaming',
+      });
+
+      // Escalation must have fired — the WRITE provider got the turn.
+      expect(writeCreateStream).toHaveBeenCalled();
+      expect(result.error).toBeUndefined();
+      // The executed tool_use must be the WRITE provider's (id 'w1' + its input),
+      // NOT the cheap model's text-extracted block. If the bug were still present
+      // the cheap model's parsed write_notes call would have been executed instead
+      // and onToolStart would have received a different id / args.
+      expect(onToolStart).toHaveBeenCalledWith(
+        'w1', 'write_notes', { text: 'from expensive' }, expect.any(Number), expect.any(Number),
+      );
     });
   });
 });

@@ -128,17 +128,6 @@ describe('Kitchen Sink Plugin', () => {
     expect(() => hookBus.emit('device:connected', { id: 'test-device' })).not.toThrow();
   });
 
-  it('registers a demo device provider via ctx.deviceProviders()', async () => {
-    const module = await import('../darkride-plugin');
-    const manager = new PluginManager();
-    manager.loadPlugin(module.default);
-    const registered = manager.getAllDeviceProviders();
-    const ksProvider = registered.find((r) => r.registration.id === 'kitchen-sink-demo-provider');
-    expect(ksProvider).toBeDefined();
-    expect(ksProvider!.registration.networkMode).toBe('kitchen-sink-mode');
-    expect(ksProvider!.pluginName).toBe('kitchen-sink');
-  });
-
   // Note: the "ctx.files() route file serving" coverage moved to the
   // integration test (Kitchen Sink Integration > "start()-registered
   // route is reachable"). Loading the plugin without running start()

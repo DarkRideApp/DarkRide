@@ -33,7 +33,7 @@ import { registerAiCompleteEndpoints } from './api/ai-complete';
 import { registerAiChatApiEndpoints } from './api/ai-chat';
 import { registerAppEndpoints } from './api/apps';
 import { registerUtilsEndpoints } from './api/utils';
-import { dbSizeSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, aiModels, aiProviders, capturedTraffic } from './db/schema';
+import { dbSizeSnapshots, diskUsageSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, aiModels, aiProviders, capturedTraffic } from './db/schema';
 import * as schema from './db/schema';
 import { SavedTrafficStore } from './services/saved-traffic-store';
 import { registerSavedTrafficEndpoints } from './api/saved-traffic';
@@ -142,6 +142,7 @@ import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
 import { registerDevicesProvidersEndpoints } from './api/devices-providers';
+import { measureDiskUsage } from './services/disk-usage';
 
 const { log, error } = createLoggers('server');
 
@@ -261,24 +262,6 @@ registerLicenseEndpoints(licenseService);
 
 // Initialize services
 const deviceManager = DeviceManager.getInstance(db);
-
-// Emulator support — provider abstraction (spec docs/specs/2026-05-20-emulator-support-design.md §4).
-// Phase 1 wires the registry + adb-device provider but does not yet drive it
-// from DeviceManager.start() — the legacy pollAdbDevices interval keeps
-// running. Phase 2 swaps the interval to call pollDevicesFromProviders.
-const providerRegistry = createProviderRegistry();
-providerRegistry.register(createAdbDeviceProvider());
-deviceManager.setProviderRegistry(providerRegistry);
-
-const captureModeRegistry = createCaptureModeRegistry();
-// The wireguard capture handler is a Phase 1 no-op shim. Phase 2 replaces
-// it with the real per-device capture setup that today lives inline in
-// DeviceManager's setup path.
-captureModeRegistry.register('wireguard', async (_instance, _cfg) => {
-  // Phase 1: no-op. See spec §5.
-});
-deviceManager.setCaptureModeRegistry(captureModeRegistry);
-
 const proxyRotator = new ProxyRotator(db);
 const bridgeManager = new PythonBridgeManager(db);
 const compiler = new AutomationCompiler();
@@ -298,13 +281,6 @@ const captureManager = new CaptureSessionManager(db, mitmproxyManager, deviceMan
 captureManager.setIosDeviceManager(iosDeviceManager);
 runner.setNotificationService(notificationService);
 runner.setIosDeviceManager(iosDeviceManager);
-
-// Register iOS devices as a first-class provider. iosDeviceManager must be
-// constructed first (above) because the provider holds a reference to it.
-providerRegistry.register(createIosDeviceProvider(iosDeviceManager));
-captureModeRegistry.register('ios-bridge', async (_instance, _cfg) => {
-  // Phase 2: no-op shim. The existing iOS capture pipeline (capture-session-manager + IosDeviceManager.markBusy/markIdle) handles the actual wiring. This dispatch seam exists so future plugin providers can register alternative iOS-bridge modes too.
-});
 
 
 // pluginManager is initialized in the async startup IIFE but referenced in
@@ -692,11 +668,11 @@ jobRegistry.register({
 jobRegistry.register({
   id: 'db-size-snapshot',
   name: 'Database Size Snapshot',
-  description: 'Record current database file size and check disk space',
+  description: 'Record current database file size, per-directory disk usage, and check disk space',
   category: 'maintenance',
   defaultSchedule: 'Every 60 minutes',
   canRunManually: true,
-  run: async () => { captureDbSize(); await checkDiskSpace(); },
+  run: async () => { captureDbSize(); await checkDiskSpace(); await captureDirSizes(); },
 });
 jobRegistry.register({
   id: 'cloud-backup',
@@ -903,6 +879,7 @@ httpServer.listen(PORT, HOST, () => {
   const deviceInstancesRepo = new DeviceInstancesRepo(db);
   await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
   registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo);
+
 
   // Phase 1: Python environment
   setStartupPhase('preparing_python', 'Preparing Python environment...');
@@ -1183,20 +1160,6 @@ httpServer.listen(PORT, HOST, () => {
     registerPluginNotificationEvents(pluginEvents);
   }
 
-  // Plugin-contributed device providers + capture handlers.
-  // Each plugin's register() may have called ctx.deviceProviders([...]) —
-  // collect those and wire them into the same registries used by the
-  // built-in providers.
-  for (const { pluginName, registration: reg } of pluginManager.getAllDeviceProviders()) {
-    try {
-      providerRegistry.register(reg.implementation);
-      captureModeRegistry.register(reg.networkMode, reg.captureHandler);
-      log(`Plugin "${pluginName}" registered device provider "${reg.id}" with capture mode "${reg.networkMode}"`);
-    } catch (err: any) {
-      error(`Plugin "${pluginName}" device provider registration failed: ${err.message}`);
-    }
-  }
-
   // Register plugin API routes
   for (const routeSetup of pluginManager.getAllRouteSetups()) {
     routeSetup(getApiRouter());
@@ -1345,6 +1308,23 @@ function captureDbSize() {
   }
 }
 
+// Capture per-directory disk usage snapshot. Anchored on getDataRoot() — the
+// canonical artifact root (apks/, plugins/, screenshots/, ...) — so the
+// breakdown measures the directories that actually consume the volume.
+async function captureDirSizes() {
+  try {
+    const usage = await measureDiskUsage(getDataRoot());
+    db.insert(diskUsageSnapshots).values({
+      capturedAt: new Date(),
+      volumeTotalBytes: usage.volumeTotalBytes,
+      volumeFreeBytes: usage.volumeFreeBytes,
+      dirSizes: usage.dirSizes,
+    }).run();
+  } catch (err: any) {
+    error(`Failed to capture disk usage: ${err.message}`);
+  }
+}
+
 // Check disk space — warn if below threshold
 let diskSpaceWarned = false;
 async function checkDiskSpace() {
@@ -1383,19 +1363,18 @@ async function checkDiskSpace() {
   }
 }
 
-// Capture on startup
+// Capture once on startup for an immediate baseline after deploy. The recurring
+// hourly run is owned solely by the 'db-size-snapshot' JobRegistry entry
+// (canonical scheduler + manual trigger), so these snapshots run once per hour
+// rather than twice.
 captureDbSize();
 checkDiskSpace();
-
-// Capture hourly
-const DB_SIZE_INTERVAL = 60 * 60 * 1000; // 1 hour
-const dbSizeInterval = setInterval(() => { captureDbSize(); checkDiskSpace(); }, DB_SIZE_INTERVAL);
+captureDirSizes();
 
 // Graceful shutdown
 async function shutdown() {
   log('Shutting down...');
   clearInterval(staleInterval);
-  clearInterval(dbSizeInterval);
   claudeCliProvider?.killAll();
 
   // Stop capture sessions (deactivates WireGuard tunnels)

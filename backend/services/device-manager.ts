@@ -16,8 +16,6 @@ import type { DeviceFilter } from '../../shared/types/api';
 import { matchesDeviceFilter, migrateDeviceFilter } from '../../shared/lib/device-filter';
 import { getMitmproxyConfdir } from './mitmproxy-manager';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
-import type { ProviderRegistry } from './providers';
-import type { CaptureModeRegistry } from './capture-mode-registry';
 
 const execFileAsync = promisify(execFile);
 
@@ -76,6 +74,27 @@ export async function adbShell(deviceId: string, command: string, timeout: numbe
     }
     throw err;
   }
+}
+
+/**
+ * Run `command` as root on the device via `su -c`.
+ *
+ * CRITICAL — do NOT wrap the result in extra double quotes. `adbShell` runs adb
+ * through `execFile` with no host shell, so whatever string we pass reaches the
+ * *device* shell verbatim. The host-shell idiom `adb shell "su -c '<cmd>'"`
+ * relies on the host shell stripping the outer quotes; here there is no host
+ * shell, so a literal `"su -c '<cmd>'"` arrives at the device, which parses it
+ * as a single bogus command word (`su -c <cmd>`) and fails with "inaccessible
+ * or not found". That surfaced as a false "Root access unavailable" error even
+ * on properly-rooted devices. The bare `su -c '<cmd>'` form is correct.
+ *
+ * `command` is wrapped in single quotes and any single quote within it is
+ * escaped with the POSIX `'\''` idiom (close quote, escaped quote, reopen), so
+ * an embedded `'` can never break out of the quoting or alter the root command.
+ */
+export async function suShell(deviceId: string, command: string, timeout: number = 10000): Promise<string> {
+  const escaped = command.replace(/'/g, `'\\''`);
+  return adbShell(deviceId, `su -c '${escaped}'`, timeout);
 }
 
 /**
@@ -267,35 +286,11 @@ export class DeviceManager {
   private stayAwakeDevices = new Set<string>(); // devices with stay_on_while_plugged_in enabled
   private offlineListeners: Array<(deviceId: string) => void> = [];
   private hookBus: HookBus | null = null;
-  private providerRegistry: ProviderRegistry | null = null;
-  // TODO(phase-2): read in capture-startup path. Setter is present so the
-  // boot wiring (Task 1.6) can install it now; the read site lands when
-  // Phase 2 implements the capture-mode dispatch.
-  private captureModeRegistry: CaptureModeRegistry | null = null;
 
   constructor(private db: AppDatabase) {}
 
   setHookBus(bus: HookBus): void {
     this.hookBus = bus;
-  }
-
-  /**
-   * Wire the provider registry. Once wired, `pollDevicesFromProviders()`
-   * routes device discovery through registered DeviceProviders instead of
-   * the legacy inline `adb devices` parsing. Existing `pollAdbDevices()`
-   * remains as the no-registry fallback during the refactor.
-   */
-  setProviderRegistry(reg: ProviderRegistry): void {
-    this.providerRegistry = reg;
-  }
-
-  /**
-   * Wire the capture-mode registry for per-mode capture dispatch.
-   * Phase 1 wires a no-op stub for `wireguard` mode; Phase 2 replaces it
-   * with the real handler.
-   */
-  setCaptureModeRegistry(reg: CaptureModeRegistry): void {
-    this.captureModeRegistry = reg;
   }
 
   /** Register a callback to check if a device has active stream viewers. */
@@ -476,47 +471,6 @@ export class DeviceManager {
       }
     } catch (err: any) {
       error(`ADB poll failed: ${err.message}`);
-    }
-  }
-
-  /**
-   * New provider-driven polling path. Asks the registry for all instances
-   * across all registered providers and upserts them into the devices
-   * table. Falls through (returns early) if no registry is wired —
-   * backwards-compat for the refactor period.
-   *
-   * Phase 1 only: inserts new serials / updates lastSeen for existing ones.
-   * Root checks and property collection are ADB-specific and remain in
-   * `pollAdbDevices`; they will be wired in Phase 2 once the provider
-   * contract surfaces those capabilities.
-   */
-  async pollDevicesFromProviders(): Promise<void> {
-    if (!this.providerRegistry) {
-      return;
-    }
-    const all = await this.providerRegistry.listInstancesAll();
-    for (const row of all) {
-      if (!row.instance.serial) continue;
-      const id = row.instance.serial;
-
-      const existing = this.db
-        .select()
-        .from(devices)
-        .where(eq(devices.id, id))
-        .all();
-
-      if (existing.length === 0) {
-        log(`New device discovered via provider ${row.providerId}: ${id}`);
-        this.db.insert(devices).values({
-          id,
-          lastSeen: new Date(),
-        }).run();
-      } else {
-        this.db.update(devices)
-          .set({ lastSeen: new Date() })
-          .where(eq(devices.id, id))
-          .run();
-      }
     }
   }
 
@@ -710,7 +664,7 @@ export class DeviceManager {
               binPath = await this.fridaReleaseManager.downloadVersion(version);
             }
             await adbCommand(['-s', deviceId, 'push', binPath, '/data/local/tmp/frida-server']);
-            await adbShell(deviceId, '"su -c \'chmod 755 /data/local/tmp/frida-server\'"');
+            await suShell(deviceId, 'chmod 755 /data/local/tmp/frida-server');
             this.db.update(devices)
               .set({ fridaVersion: version })
               .where(eq(devices.id, deviceId))
@@ -1039,6 +993,49 @@ export class DeviceManager {
   }
 
   /**
+   * Execute an arbitrary ADB shell command, returning {stdout, stderr,
+   * exitCode} on any exit status. Unlike executeShellCommand (which throws
+   * on non-zero), this surfaces non-zero exits as data so callers can
+   * branch on the code without losing stdout/stderr.
+   *
+   * Used by the run_adb_command AI tool — `killall x` returning 1 when no
+   * process matches is a benign outcome the model should be able to handle
+   * without forcing a `cmd; true` retry.
+   *
+   * Transport errors (ENOENT for missing adb, ETIMEDOUT, etc.) still throw
+   * — those indicate ADB itself is broken, not that the command exited
+   * non-zero.
+   */
+  async runShellCommandWithExitCode(
+    deviceId: string,
+    command: string,
+    // 30s rather than executeShellCommand's 10s default — AI-tool shell
+    // commands are sometimes longer-running (package install, logcat flush,
+    // settings dump). Callers wanting the shorter bound can pass it.
+    timeoutMs: number = 30_000,
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    try {
+      const r = await execFileAsync(
+        'adb', ['-s', deviceId, 'shell', command], { timeout: timeoutMs },
+      );
+      // Node's execFile contract: stdout/stderr are always strings on the
+      // resolved value and on the rejected error object (see below).
+      return { stdout: r.stdout, stderr: r.stderr, exitCode: 0 };
+    } catch (err: any) {
+      // Node's execFile rejects with err.code === <number> for non-zero exits,
+      // === 'ENOENT' / etc. for transport errors, and === null for timeouts.
+      // Rethrow non-numeric codes — the caller surfaces them as transport
+      // failures rather than misreporting them as command exit codes.
+      if (typeof err.code !== 'number') throw err;
+      return {
+        stdout: err.stdout,
+        stderr: err.stderr,
+        exitCode: err.code,
+      };
+    }
+  }
+
+  /**
    * Run a device command (restart, sleep, wake).
    */
   async runDeviceCommand(deviceId: string, command: 'restart' | 'sleep' | 'wake' | 'unlock' | 'stopall'): Promise<void> {
@@ -1166,7 +1163,7 @@ export class DeviceManager {
   async findWgTool(deviceId: string): Promise<string | null> {
     // 1. Check system PATH
     try {
-      const result = await adbShell(deviceId, `"su -c 'which wg'"`);
+      const result = await suShell(deviceId, 'which wg');
       if (result && !result.includes('not found')) {
         return result.trim();
       }
@@ -1176,7 +1173,7 @@ export class DeviceManager {
 
     // 2. Check our pushed binary
     try {
-      const result = await adbShell(deviceId, `"su -c 'test -x ${DeviceManager.WG_DEVICE_PATH} && echo ok'"`);
+      const result = await suShell(deviceId, `test -x ${DeviceManager.WG_DEVICE_PATH} && echo ok`);
       if (result && result.includes('ok')) {
         return DeviceManager.WG_DEVICE_PATH;
       }
@@ -1206,7 +1203,7 @@ export class DeviceManager {
 
     // Push to device and make executable
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_DEVICE_PATH]);
-    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_DEVICE_PATH}'"`);
+    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_DEVICE_PATH}`);
     log(`Pushed wg binary to ${deviceId} (${arch})`);
   }
 
@@ -1234,9 +1231,9 @@ export class DeviceManager {
     if (cached !== undefined) return cached;
 
     try {
-      await adbShell(
+      await suShell(
         deviceId,
-        `"su -c 'ip link add wg_test type wireguard && ip link del wg_test'"`,
+        'ip link add wg_test type wireguard && ip link del wg_test',
       );
       log(`Device ${deviceId}: kernel WireGuard support confirmed`);
       this.kernelWgSupport.set(deviceId, true);
@@ -1253,9 +1250,9 @@ export class DeviceManager {
    */
   async findWgGoTool(deviceId: string): Promise<string | null> {
     try {
-      const result = await adbShell(
+      const result = await suShell(
         deviceId,
-        `"su -c 'test -x ${DeviceManager.WG_GO_DEVICE_PATH} && echo ok'"`,
+        `test -x ${DeviceManager.WG_GO_DEVICE_PATH} && echo ok`,
       );
       if (result && result.includes('ok')) {
         return DeviceManager.WG_GO_DEVICE_PATH;
@@ -1282,7 +1279,7 @@ export class DeviceManager {
     }
 
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_GO_DEVICE_PATH]);
-    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_GO_DEVICE_PATH}'"`);
+    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_GO_DEVICE_PATH}`);
     log(`Pushed wireguard-go binary to ${deviceId} (${abi})`);
   }
 
@@ -1308,9 +1305,9 @@ export class DeviceManager {
    */
   async findWgUapiTool(deviceId: string): Promise<string | null> {
     try {
-      const result = await adbShell(
+      const result = await suShell(
         deviceId,
-        `"su -c 'test -x ${DeviceManager.WG_UAPI_DEVICE_PATH} && echo ok'"`,
+        `test -x ${DeviceManager.WG_UAPI_DEVICE_PATH} && echo ok`,
       );
       if (result && result.includes('ok')) {
         return DeviceManager.WG_UAPI_DEVICE_PATH;
@@ -1336,7 +1333,7 @@ export class DeviceManager {
     }
 
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_UAPI_DEVICE_PATH]);
-    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_UAPI_DEVICE_PATH}'"`);
+    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_UAPI_DEVICE_PATH}`);
     log(`Pushed wg-uapi binary to ${deviceId} (${abi})`);
   }
 
@@ -1459,7 +1456,7 @@ export class DeviceManager {
       'rm -f /data/local/tmp/wg_peer.conf',
     ];
 
-    await adbShell(deviceId, `"su -c '${commands.join(' && ')}'"`);
+    await suShell(deviceId, commands.join(' && '));
 
     log(`WireGuard tunnel activated on ${deviceId} (${mode})`);
   }
@@ -1475,9 +1472,9 @@ export class DeviceManager {
   ): Promise<{ success: boolean; details: string }> {
     // Try curl first (fast and reliable when available)
     try {
-      const result = await adbShell(
+      const result = await suShell(
         deviceId,
-        `"su -c 'curl -sf --max-time 10 ${testUrl}'"`,
+        `curl -sf --max-time 10 ${testUrl}`,
       );
       if (result && result.trim().length > 0) {
         return { success: true, details: result.substring(0, 200) };
@@ -1492,9 +1489,9 @@ export class DeviceManager {
     try {
       const wgPath = await this.findWgTool(deviceId);
       if (wgPath) {
-        const result = await adbShell(
+        const result = await suShell(
           deviceId,
-          `"su -c '${wgPath} show wg0 latest-handshakes'"`,
+          `${wgPath} show wg0 latest-handshakes`,
         );
         if (result) {
           const ts = parseInt(result.trim().split('\t')[1], 10);
@@ -1520,9 +1517,9 @@ export class DeviceManager {
   async deactivateWireGuardTunnel(deviceId: string): Promise<void> {
     log(`Deactivating WireGuard tunnel on ${deviceId}`);
     try {
-      await adbShell(
+      await suShell(
         deviceId,
-        `"su -c 'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true'"`,
+        'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true',
       );
     } catch {
       // Interface may not exist — that's fine
@@ -1620,7 +1617,7 @@ export class DeviceManager {
 
     // Quick root check — fails fast (3s) instead of hanging 30s on Magisk prompt
     try {
-      await adbShell(deviceId, '"su -c id"', 3000);
+      await suShell(deviceId, 'id', 3000);
     } catch {
       throw new Error(
         'Root access unavailable — check the phone for a Magisk superuser prompt, or grant shell permanent su access in Magisk settings',
@@ -1732,7 +1729,7 @@ export class DeviceManager {
       try { fs.rmdirSync(tmpDir3); } catch {}
     }
 
-    await adbShell(deviceId, `"su -c 'chmod +x /data/local/tmp/inject_cert.sh && /data/local/tmp/inject_cert.sh 2>&1 && rm /data/local/tmp/inject_cert.sh'"`, 30000);
+    await suShell(deviceId, 'chmod +x /data/local/tmp/inject_cert.sh && /data/local/tmp/inject_cert.sh 2>&1 && rm /data/local/tmp/inject_cert.sh', 30000);
     log(`CA cert injected on ${deviceId}`);
   }
 }

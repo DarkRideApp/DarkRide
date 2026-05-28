@@ -18,29 +18,8 @@ import type {
   PathsApi,
   DispatcherApi,
 } from './ctx-extensions';
-import type { DeviceProvider, CaptureHandler } from './device-providers';
 
 export type { PluginNavItem, PluginPageDef, PluginSetting, PluginCommand, UiSlotDefinition, UiContribution };
-
-/**
- * A plugin's registration of a custom DeviceProvider + its CaptureHandler.
- * Each registration is one entry in the array passed to `ctx.deviceProviders([...])`.
- *
- * See spec §9. Plugins use this to add device sources (cloud farms, iOS
- * Simulator, in-house testing rigs) without core changes.
- */
-export interface PluginDeviceProviderRegistration {
-  /** Unique provider ID — must not collide with built-ins or other plugins. */
-  id: string;
-  displayName: string;
-  /** The networkMode this provider's instances declare (e.g. 'corellium-tunnel'). */
-  networkMode: string;
-  /** The DeviceProvider implementation. */
-  implementation: DeviceProvider;
-  /** Handler invoked when capture dispatch sees this networkMode. */
-  captureHandler: CaptureHandler;
-  capabilities?: { canCreate?: boolean; canDelete?: boolean };
-}
 
 // --- Logger ---
 
@@ -97,11 +76,6 @@ export interface PluginContext {
   notificationEvents(events: PluginNotificationEvent[]): void;
   protocolDecoders(decoders: unknown[]): void;
   scopes(scopes: Array<{ key: string; label: string; description: string; category: string }>): void;
-  /**
-   * Register one or more custom DeviceProviders with their CaptureHandlers.
-   * See PluginDeviceProviderRegistration. Called from register().
-   */
-  deviceProviders(registrations: PluginDeviceProviderRegistration[]): void;
   hooks: HookBus;
   /** AI analysis API — trigger AI analysis with access to registered tools */
   readonly ai: PluginAiApi;

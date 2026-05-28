@@ -29,9 +29,6 @@ export const devices = sqliteTable('devices', {
   cpuAbi: text('cpu_abi'),
   serialNumber: text('serial_number'),
   bootloaderLocked: integer('bootloader_locked', { mode: 'boolean' }),
-  // Nullable link to the managed instance row (set on reconcile when this
-  // device is one DarkRide spawned or BYOE-discovered). See spec §7.2.
-  instanceId: integer('instance_id'),
 });
 
 export const automations = sqliteTable('automations', {
@@ -230,6 +227,15 @@ export const dbSizeSnapshots = sqliteTable('db_size_snapshots', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   sizeBytes: integer('size_bytes').notNull(),
   capturedAt: integer('captured_at', { mode: 'timestamp' }).notNull(),
+});
+
+export const diskUsageSnapshots = sqliteTable('disk_usage_snapshots', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  capturedAt: integer('captured_at', { mode: 'timestamp' }).notNull(),
+  volumeTotalBytes: integer('volume_total_bytes').notNull(),
+  volumeFreeBytes: integer('volume_free_bytes').notNull(),
+  // JSON map of top-level subdir name -> size in bytes, e.g. {"couchbase":23622320128}
+  dirSizes: text('dir_sizes', { mode: 'json' }).$type<Record<string, number>>().notNull(),
 });
 
 export const cloudFiles = sqliteTable('cloud_files', {
@@ -509,26 +515,6 @@ export const pluginInstalls = sqliteTable('plugin_installs', {
   authToken: text('auth_token'),
   installedAt: integer('installed_at').notNull(),
 });
-
-export const deviceInstances = sqliteTable('device_instances', {
-  id: integer('id').primaryKey({ autoIncrement: true }),
-  providerId: text('provider_id').notNull(),
-  runtimeId: text('runtime_id').notNull(),
-  displayName: text('display_name'),
-  serial: text('serial'),
-  state: text('state').notNull(),
-  spawnedByDarkride: integer('spawned_by_darkride', { mode: 'boolean' }).notNull().default(false),
-  spawnMetadata: text('spawn_metadata', { mode: 'json' }).$type<Record<string, unknown>>(),
-  lastError: text('last_error'),
-  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
-  lastStateAt: integer('last_state_at', { mode: 'timestamp' }).notNull(),
-});
-
-export const deviceInstanceConfig = sqliteTable('device_instance_config', {
-  instanceId: integer('instance_id').notNull().references(() => deviceInstances.id, { onDelete: 'cascade' }),
-  key: text('key').notNull(),
-  value: text('value').notNull(),
-}, (t) => ({ pk: primaryKey({ columns: [t.instanceId, t.key] }) }));
 
 export const trustedSigningKeys = sqliteTable('trusted_signing_keys', {
   id: text('id').primaryKey(),

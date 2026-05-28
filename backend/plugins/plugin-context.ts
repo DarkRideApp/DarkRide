@@ -31,7 +31,6 @@ import type {
   ApkApi,
   PathsApi,
   DispatcherApi,
-  PluginDeviceProviderRegistration,
 } from '@darkrideapp/plugin-sdk';
 import { registerEndpoint } from '../api/api-service';
 import { registerPluginScopes, type ScopeMetadata } from '../auth/scopes-registry';
@@ -56,7 +55,6 @@ export interface CollectedContributions {
   dbTables: Record<string, unknown>;
   uiSlots: UiSlotDefinition[];
   uiContributions: UiContribution[];
-  deviceProviders: PluginDeviceProviderRegistration[];
 }
 
 export interface ServiceRegistryCallbacks {
@@ -82,7 +80,6 @@ export function createEmptyContributions(): CollectedContributions {
     dbTables: {},
     uiSlots: [],
     uiContributions: [],
-    deviceProviders: [],
   };
 }
 
@@ -201,10 +198,6 @@ export class PluginContextImpl implements PluginContext {
 
   uiContributions(contribs: UiContribution[]): void {
     this.collected.uiContributions.push(...contribs);
-  }
-
-  deviceProviders(registrations: PluginDeviceProviderRegistration[]): void {
-    this.collected.deviceProviders.push(...registrations);
   }
 
   scopes(scopes: ScopeMetadata[]): void {

@@ -105,3 +105,175 @@ class TestFridaStopServer:
             assert bridge._frida_device is None
         finally:
             bridge._adb_run = original
+
+
+class TestFridaScriptMessageHandler:
+    """Bug #3 (collector follow-up): _handle_frida_script_message must store
+    send() payloads AS-IS under type='send', not str()ified under type='log'.
+    TypeScript callers (inspect_runtime_classes / inspect_class_methods /
+    run_frida_and_collect) read structured fields like payload.type and
+    payload.methods — they need the dict, not its string repr."""
+
+    def setup_method(self):
+        import bridge
+        bridge._frida_message_lock = threading.Lock()
+        bridge._frida_messages.clear()
+
+    def test_send_message_preserves_dict_payload(self):
+        import bridge
+        bridge._handle_frida_script_message(
+            {'type': 'send', 'payload': {'type': 'class', 'name': 'com.example.Foo'}},
+            None,
+        )
+        last = bridge._frida_messages[-1]
+        assert last['type'] == 'send', f"expected type='send', got {last['type']!r}"
+        assert last['payload'] == {'type': 'class', 'name': 'com.example.Foo'}, \
+            f"payload must be the original dict, not str()ified; got {last['payload']!r}"
+
+    def test_send_message_preserves_list_in_payload(self):
+        # Mirrors inspect_class_methods' send({methods:[...]}) shape.
+        import bridge
+        bridge._handle_frida_script_message(
+            {'type': 'send', 'payload': {'methods': ['a()', 'b()']}},
+            None,
+        )
+        last = bridge._frida_messages[-1]
+        assert last['type'] == 'send'
+        assert last['payload'] == {'methods': ['a()', 'b()']}
+
+    def test_error_message_stores_description(self):
+        import bridge
+        bridge._handle_frida_script_message(
+            {'type': 'error', 'description': 'TypeError: something went wrong', 'stack': 'at line 1'},
+            None,
+        )
+        last = bridge._frida_messages[-1]
+        assert last['type'] == 'error'
+        assert 'TypeError' in last['payload']
+
+
+class TestFridaErrorPreservation:
+    """Bug #5: known frida errors must propagate with their original message
+    instead of being swallowed into a generic 'Internal error'."""
+
+    def setup_method(self):
+        import bridge
+        bridge._frida_device = None
+        bridge._frida_session = None
+        bridge._frida_script = None
+        bridge._frida_message_lock = threading.Lock()
+
+    def test_spawn_controlled_preserves_frida_error_message(self):
+        """When device.spawn raises (e.g. frida.NotSupportedError 'need Gadget
+        to attach on jailed Android'), the original message must reach the
+        caller as a BridgeError — not be hidden by the dispatcher's generic
+        'Internal error — see server logs' fallback."""
+        import bridge
+        from bridge import handle_frida_spawn_controlled, BridgeError
+        from unittest.mock import MagicMock
+
+        original_start = bridge.handle_frida_start_server
+        original_get_dev = bridge._get_frida_device
+        bridge.handle_frida_start_server = lambda *a, **kw: {'status': 'running'}
+
+        # Real frida exception subclasses Exception; the bridge fix should
+        # propagate by class name, not require a frida-package import. Use
+        # `type(...)` so the created class's `__name__` is exactly
+        # 'NotSupportedError' to match what _map_frida_exception_code reads.
+        boom = type('NotSupportedError', (Exception,), {})('need Gadget to attach on jailed Android')
+        fake_device = MagicMock()
+        fake_device.spawn.side_effect = boom
+        bridge._get_frida_device = lambda: fake_device
+
+        try:
+            with pytest.raises(BridgeError) as exc:
+                handle_frida_spawn_controlled({'bundle_id': 'com.x', 'code': ''})
+            assert 'need Gadget to attach on jailed Android' in str(exc.value), \
+                f"original frida error message lost; got: {exc.value}"
+        finally:
+            bridge.handle_frida_start_server = original_start
+            bridge._get_frida_device = original_get_dev
+
+
+class TestFridaProcessCleanup:
+    """Bug #6: re.frida.helper / re.frida.agent / re.frida.server children
+    survive after pkill, holding IPC state that blocks the next frida-server
+    launch. The cleanup helper must use explicit `killall <name>` against the
+    known process names AND loop until pgrep shows nothing left (or timeout)."""
+
+    def setup_method(self):
+        import bridge
+        bridge._frida_device = None
+        bridge._frida_message_lock = threading.Lock()
+
+    def test_cleanup_uses_killall_with_explicit_names(self):
+        import bridge
+        calls = []
+        def fake_adb(args, timeout=10):
+            calls.append(args[0] if args else '')
+            return ''  # pgrep returns empty → cleanup terminates after one round
+        original = bridge._adb_run
+        bridge._adb_run = fake_adb
+        try:
+            bridge._kill_all_frida_processes(timeout_s=2)
+        finally:
+            bridge._adb_run = original
+
+        joined = ' ; '.join(calls)
+        # Must explicitly killall each known frida process name (Linux comm
+        # name limit + reparenting to PID 1 makes pkill -f unreliable on
+        # some Android builds).
+        for name in ['frida-server', 're.frida.server.32', 're.frida.server.64',
+                     're.frida.helper.32', 're.frida.helper.64']:
+            assert name in joined, f"cleanup should explicitly killall {name}; calls: {calls}"
+
+    def test_cleanup_loops_until_pgrep_empty(self):
+        import bridge
+        import time as _t
+
+        # First pgrep call returns processes; second returns empty.
+        pgrep_responses = iter([
+            're.frida.helper.64\n12345\n',  # first probe: still running
+            '',                              # second probe: clean
+        ])
+        kill_count = [0]
+        def fake_adb(args, timeout=10):
+            cmd = args[0] if args else ''
+            if 'pgrep' in cmd:
+                try:
+                    return next(pgrep_responses)
+                except StopIteration:
+                    return ''
+            if 'killall' in cmd or 'pkill' in cmd:
+                kill_count[0] += 1
+            return ''
+        original = bridge._adb_run
+        bridge._adb_run = fake_adb
+        try:
+            bridge._kill_all_frida_processes(timeout_s=2)
+        finally:
+            bridge._adb_run = original
+
+        # Should have issued kill commands at least twice (once per loop iter
+        # while pgrep was non-empty, plus a final pass).
+        assert kill_count[0] >= 2, \
+            f"cleanup should loop while pgrep shows processes; kill_count={kill_count[0]}"
+
+    def test_cleanup_terminates_on_timeout(self):
+        """If processes never go away, the cleanup must give up (best-effort)
+        rather than hanging the bridge forever."""
+        import bridge
+        def fake_adb(args, timeout=10):
+            cmd = args[0] if args else ''
+            if 'pgrep' in cmd:
+                return 'frida-server\n9999\n'  # always non-empty
+            return ''
+        original = bridge._adb_run
+        bridge._adb_run = fake_adb
+        try:
+            t0 = __import__('time').monotonic()
+            bridge._kill_all_frida_processes(timeout_s=0.5)
+            elapsed = __import__('time').monotonic() - t0
+        finally:
+            bridge._adb_run = original
+        assert elapsed < 2.0, f"cleanup should time out promptly; took {elapsed:.2f}s"

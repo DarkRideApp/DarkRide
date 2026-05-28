@@ -2346,20 +2346,88 @@ class AuthManager {
       expect(fetchSpy).not.toHaveBeenCalled();
     });
 
-    it('run_adb_command calls deviceManager.executeShellCommand directly', async () => {
-      const executeShellCommand = vi.fn().mockResolvedValue('total 0\n');
+    it('run_adb_command returns {output, stderr, exitCode} on a successful run', async () => {
+      const runShellCommandWithExitCode = vi.fn().mockResolvedValue({
+        stdout: 'total 0\n', stderr: '', exitCode: 0,
+      });
       const getDeviceStatus = vi.fn().mockResolvedValue({ isOnline: true });
-      const fakeDeviceManager = { executeShellCommand, getDeviceStatus } as any;
+      const fakeDeviceManager = { runShellCommandWithExitCode, getDeviceStatus } as any;
 
-      // Rebuild registry with the deviceManager injected.
       const r = new AiToolRegistry();
       registerAllTools(r, db as any, { deviceManager: fakeDeviceManager });
 
       const result = await r.executeTool('run_adb_command', { deviceId: 'dev-1', command: 'ls' });
 
-      expect(executeShellCommand).toHaveBeenCalledWith('dev-1', 'ls');
-      expect(result).toEqual({ deviceId: 'dev-1', command: 'ls', output: 'total 0\n' });
-      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(runShellCommandWithExitCode).toHaveBeenCalledWith('dev-1', 'ls');
+      expect(result).toEqual({
+        deviceId: 'dev-1',
+        command: 'ls',
+        output: 'total 0',     // trimmed
+        stderr: '',
+        exitCode: 0,
+      });
+    });
+
+    it('run_adb_command returns non-zero exits as data, does NOT throw', async () => {
+      // `killall x` when nothing matches — exit 1 is a benign outcome the AI
+      // should be able to branch on rather than retry with `cmd; true`.
+      const runShellCommandWithExitCode = vi.fn().mockResolvedValue({
+        stdout: '', stderr: 'no process found\n', exitCode: 1,
+      });
+      const getDeviceStatus = vi.fn().mockResolvedValue({ isOnline: true });
+      const fakeDeviceManager = { runShellCommandWithExitCode, getDeviceStatus } as any;
+
+      const r = new AiToolRegistry();
+      registerAllTools(r, db as any, { deviceManager: fakeDeviceManager });
+
+      const result = await r.executeTool('run_adb_command', {
+        deviceId: 'dev-1', command: 'killall frida-server',
+      });
+
+      expect(result).toEqual({
+        deviceId: 'dev-1',
+        command: 'killall frida-server',
+        output: '',
+        stderr: 'no process found',
+        exitCode: 1,
+      });
+      expect((result as any).error).toBeUndefined();
+    });
+
+    it('run_adb_command rethrows transport errors (adb missing, timeout, etc.)', async () => {
+      // ENOENT / ETIMEDOUT come back as a thrown error from the helper — the
+      // tool must NOT swallow these as exit codes; they indicate ADB itself
+      // is broken, not that the command exited non-zero.
+      const transportErr = Object.assign(new Error('spawn adb ENOENT'), { code: 'ENOENT' });
+      const runShellCommandWithExitCode = vi.fn().mockRejectedValue(transportErr);
+      const getDeviceStatus = vi.fn().mockResolvedValue({ isOnline: true });
+      const fakeDeviceManager = { runShellCommandWithExitCode, getDeviceStatus } as any;
+
+      const r = new AiToolRegistry();
+      registerAllTools(r, db as any, { deviceManager: fakeDeviceManager });
+
+      const result = await r.executeTool('run_adb_command', { deviceId: 'dev-1', command: 'ls' });
+      // The tool's own try/catch wraps thrown errors into a {error} payload
+      // (file convention; AiToolRegistry.executeTool itself rethrows).
+      expect((result as any).error).toMatch(/ENOENT|spawn adb/);
+    });
+
+    it('run_adb_command treats timeout (err.code === null) as a transport error', async () => {
+      // Node's execFile signals timeout by rejecting with `err.code === null`
+      // (a different branch of the helper's `typeof err.code !== 'number'`
+      // guard than ENOENT, which is the string 'ENOENT'). Both must surface
+      // as a {error} payload, not as an exit-code data shape.
+      const timeoutErr = Object.assign(new Error('Command failed: adb -s dev-1 shell sleep 60'), { code: null });
+      const runShellCommandWithExitCode = vi.fn().mockRejectedValue(timeoutErr);
+      const getDeviceStatus = vi.fn().mockResolvedValue({ isOnline: true });
+      const fakeDeviceManager = { runShellCommandWithExitCode, getDeviceStatus } as any;
+
+      const r = new AiToolRegistry();
+      registerAllTools(r, db as any, { deviceManager: fakeDeviceManager });
+
+      const result = await r.executeTool('run_adb_command', { deviceId: 'dev-1', command: 'sleep 60' });
+      expect((result as any).error).toMatch(/Command failed/);
+      expect((result as any).exitCode).toBeUndefined();
     });
   });
 
@@ -2855,6 +2923,180 @@ class AuthManager {
         reportId: 99999, section: 'X', content: 'y',
       });
       expect(result).toEqual({ error: 'Diff report not found' });
+    });
+  });
+
+  // ── Frida tool-definition correctness ─────────────────────────
+
+  describe('run_frida_script — scriptId resolution', () => {
+    it('looks up scriptId and passes its code to the bridge', async () => {
+      db.insert(schema.fridaScripts).values({
+        name: 'AppGuard',
+        code: 'send({type:"guard",enabled:true});',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }).run();
+      const row = db.select().from(schema.fridaScripts).all()[0];
+
+      mockCallFridaBridge.mockResolvedValue({ ok: true });
+      await registry.executeTool('run_frida_script', {
+        deviceId: 'd1', bundleId: 'com.example', scriptId: row.id,
+      });
+
+      expect(mockCallFridaBridge).toHaveBeenCalledWith(
+        expect.anything(), 'd1', 'frida_run',
+        expect.objectContaining({ code: 'send({type:"guard",enabled:true});' }),
+      );
+    });
+
+    it('prefers inline code over scriptId when both are given', async () => {
+      db.insert(schema.fridaScripts).values({
+        name: 'S', code: 'send("from-db");', createdAt: new Date(), updatedAt: new Date(),
+      }).run();
+      const row = db.select().from(schema.fridaScripts).all()[0];
+
+      mockCallFridaBridge.mockResolvedValue({ ok: true });
+      await registry.executeTool('run_frida_script', {
+        deviceId: 'd1', bundleId: 'com.example', scriptId: row.id, code: 'send("inline");',
+      });
+
+      expect(mockCallFridaBridge).toHaveBeenCalledWith(
+        expect.anything(), 'd1', 'frida_run',
+        expect.objectContaining({ code: 'send("inline");' }),
+      );
+    });
+
+    it('rejects when scriptId does not exist', async () => {
+      const result = await registry.executeTool('run_frida_script', {
+        deviceId: 'd1', bundleId: 'com.example', scriptId: 99999,
+      });
+      expect(result).toMatchObject({ error: expect.stringMatching(/script.*99999/i) });
+    });
+
+    it('rejects when neither code nor scriptId is provided', async () => {
+      const result = await registry.executeTool('run_frida_script', {
+        deviceId: 'd1', bundleId: 'com.example',
+      });
+      expect(result).toMatchObject({ error: expect.stringMatching(/code.*scriptId|scriptId.*code/i) });
+    });
+  });
+
+  describe('run_frida_script — schema documents controlled mode', () => {
+    it('lists controlled in the mode enum with send-capture guidance', () => {
+      const tool = registry
+        .getToolsForContext('frida')
+        .find((t) => t.name === 'run_frida_script');
+      expect(tool).toBeDefined();
+      const modeProp = (tool!.inputSchema as any).properties.mode;
+      expect(modeProp.enum).toEqual(expect.arrayContaining(['spawn', 'attach', 'controlled']));
+      expect(String(modeProp.description).toLowerCase()).toMatch(/controlled/);
+      expect(String(modeProp.description).toLowerCase()).toMatch(/send/);
+    });
+  });
+
+  describe('get_frida_output — reads bridge {messages,next_index} shape', () => {
+    it('returns the messages array from the bridge object', async () => {
+      mockCallFridaBridge.mockResolvedValue({
+        messages: [{ type: 'send', payload: { x: 1 } }, { type: 'send', payload: { x: 2 } }],
+        next_index: 2,
+      });
+      const result = await registry.executeTool('get_frida_output', { deviceId: 'd1' });
+      expect(result).toEqual([
+        { type: 'send', payload: { x: 1 } },
+        { type: 'send', payload: { x: 2 } },
+      ]);
+    });
+
+    it('respects the limit param', async () => {
+      mockCallFridaBridge.mockResolvedValue({
+        messages: [1, 2, 3, 4, 5], next_index: 5,
+      });
+      const result = await registry.executeTool('get_frida_output', { deviceId: 'd1', limit: 2 });
+      expect(result).toEqual([1, 2]);
+    });
+
+    it('returns [] gracefully when the bridge returns nothing useful', async () => {
+      mockCallFridaBridge.mockResolvedValue(null);
+      const result = await registry.executeTool('get_frida_output', { deviceId: 'd1' });
+      expect(result).toEqual([]);
+    });
+  });
+
+  // ── Frida collector helper (spawnWaitCollectStop, exercised through
+  //    run_frida_and_collect) ──────────────────────────────────────────
+
+  describe('run_frida_and_collect — controlled-mode routing', () => {
+    it('routes through frida_spawn_controlled, not frida_run', async () => {
+      mockCallFridaBridge.mockImplementation(async (_bm, _dev, method, _params) => {
+        if (method === 'frida_spawn_controlled') return { pid: 123, status: 'running' };
+        if (method === 'frida_get_messages') return { messages: [], next_index: 0 };
+        if (method === 'frida_stop_server') return { status: 'stopped' };
+        throw new Error(`Unexpected bridge method: ${method}`);
+      });
+
+      await registry.executeTool('run_frida_and_collect', {
+        deviceId: 'd1', bundleId: 'com.example', code: 'send({hi:1});', durationMs: 1,
+      });
+
+      const spawnCall = mockCallFridaBridge.mock.calls.find(
+        (c: any[]) => c[2] === 'frida_spawn_controlled',
+      );
+      expect(spawnCall, 'expected frida_spawn_controlled to be invoked').toBeDefined();
+      const runCall = mockCallFridaBridge.mock.calls.find(
+        (c: any[]) => c[2] === 'frida_run',
+      );
+      expect(runCall, 'frida_run should NOT be called from the collector helper').toBeUndefined();
+      // mode must NOT be passed (controlled mode ignores it; passing it
+      // would just mislead future readers).
+      expect(spawnCall![3]).not.toHaveProperty('mode');
+    });
+
+    it('returns send() payloads from the bridge {messages, next_index} shape', async () => {
+      mockCallFridaBridge.mockImplementation(async (_bm, _dev, method, _params) => {
+        if (method === 'frida_spawn_controlled') return { pid: 1, status: 'running' };
+        if (method === 'frida_get_messages') {
+          return {
+            messages: [
+              { type: 'send', payload: { found: 1 } },
+              { type: 'send', payload: { found: 2 } },
+            ],
+            next_index: 2,
+          };
+        }
+        if (method === 'frida_stop_server') return { status: 'stopped' };
+        return null;
+      });
+
+      const result = await registry.executeTool('run_frida_and_collect', {
+        deviceId: 'd1', bundleId: 'com.example', code: 'send({found:1});', durationMs: 1,
+      });
+
+      expect((result as any).messageCount).toBe(2);
+      expect((result as any).messages).toEqual([
+        { type: 'send', payload: { found: 1 } },
+        { type: 'send', payload: { found: 2 } },
+      ]);
+    });
+
+    it('still calls frida_stop_server after collection (best-effort cleanup)', async () => {
+      mockCallFridaBridge.mockImplementation(async (_bm, _dev, method) => {
+        if (method === 'frida_spawn_controlled') return { pid: 1, status: 'running' };
+        if (method === 'frida_get_messages') return { messages: [], next_index: 0 };
+        if (method === 'frida_stop_server') return { status: 'stopped' };
+        return null;
+      });
+
+      await registry.executeTool('run_frida_and_collect', {
+        deviceId: 'd1', bundleId: 'com.example', code: 'send({})', durationMs: 1,
+      });
+
+      const methods = mockCallFridaBridge.mock.calls.map((c: any[]) => c[2]);
+      expect(methods).toContain('frida_stop_server');
+      const spawnIdx = methods.indexOf('frida_spawn_controlled');
+      const msgsIdx = methods.indexOf('frida_get_messages');
+      const stopIdx = methods.indexOf('frida_stop_server');
+      expect(stopIdx).toBeGreaterThan(spawnIdx);
+      expect(stopIdx).toBeGreaterThan(msgsIdx);
     });
   });
 });

@@ -12,6 +12,7 @@ import {
   MIN_BATTERY_LEVEL,
   adbShell,
   adbCommand,
+  suShell,
 } from './device-manager';
 
 const { devices } = schema;
@@ -758,63 +759,6 @@ describe('DeviceManager', () => {
   });
 });
 
-describe('DeviceManager — provider-driven polling', () => {
-  let db: BetterSQLite3Database<typeof schema>;
-  let manager: DeviceManager;
-
-  beforeEach(() => {
-    DeviceManager.resetInstance();
-    db = createTestDb();
-    manager = new DeviceManager(db);
-  });
-
-  afterEach(() => {
-    manager.stop();
-    DeviceManager.resetInstance();
-  });
-
-  it('pollDevicesFromProviders upserts each serial returned by the registry', async () => {
-    const mockRegistry = {
-      list: () => [],
-      get: () => undefined,
-      register: () => {},
-      listInstancesAll: async () => [
-        { providerId: 'adb-device', instance: { id: 'S1', displayName: 'S1', serial: 'S1', state: 'running' as const, spawnedByDarkride: false } },
-        { providerId: 'adb-device', instance: { id: 'S2', displayName: 'S2', serial: 'S2', state: 'stopped' as const, spawnedByDarkride: false } },
-      ],
-    };
-    manager.setProviderRegistry(mockRegistry as any);
-    await manager.pollDevicesFromProviders();
-
-    const rows = db.select().from(devices).all();
-    expect(rows.map((d) => d.id).sort()).toEqual(['S1', 'S2']);
-  });
-
-  it('pollDevicesFromProviders returns early when no registry is wired', async () => {
-    // No setProviderRegistry call — should not throw and should not insert anything
-    await expect(manager.pollDevicesFromProviders()).resolves.toBeUndefined();
-    const rows = db.select().from(devices).all();
-    expect(rows).toHaveLength(0);
-  });
-
-  it('pollDevicesFromProviders skips instances without a serial', async () => {
-    const mockRegistry = {
-      list: () => [],
-      get: () => undefined,
-      register: () => {},
-      listInstancesAll: async () => [
-        { providerId: 'avd', instance: { id: 'AVD1', displayName: 'AVD1', state: 'stopped' as const, spawnedByDarkride: true } },
-        { providerId: 'adb-device', instance: { id: 'S3', displayName: 'S3', serial: 'S3', state: 'running' as const, spawnedByDarkride: false } },
-      ],
-    };
-    manager.setProviderRegistry(mockRegistry as any);
-    await manager.pollDevicesFromProviders();
-
-    const rows = db.select().from(devices).all();
-    expect(rows.map((d) => d.id)).toEqual(['S3']);
-  });
-});
-
 describe('adb helpers — command-injection prevention', () => {
   let execFileMock: ReturnType<typeof vi.fn>;
   let execMock: ReturnType<typeof vi.fn>;
@@ -849,5 +793,50 @@ describe('adb helpers — command-injection prevention', () => {
     const lastCall = execFileMock.mock.calls[execFileMock.mock.calls.length - 1];
     expect(lastCall[0]).toBe('adb');
     expect(lastCall[1]).toEqual(['-s', 'DEV001', 'push', hostilePath, '/data/local/tmp/x']);
+  });
+
+  it('suShell invokes su unwrapped so the device shell can execute it', async () => {
+    // Faithful device-shell simulation. adbShell runs adb via execFile with NO
+    // host shell, so whatever string we pass reaches the device shell verbatim.
+    // A command wrapped in literal double quotes (`"su -c id"`) is parsed by the
+    // device shell as ONE bogus command word named `su -c id` → "inaccessible or
+    // not found". Only a bare `su -c '<cmd>'` actually invokes su and runs as root.
+    // This is the exact false "Root access unavailable" failure from production.
+    let sentToDevice = '';
+    execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+      sentToDevice = cmd.replace(/^adb -s \S+ shell /, '');
+      if (sentToDevice.startsWith('"')) {
+        cb(new Error('Command failed'), '', '/system/bin/sh: su -c id: inaccessible or not found');
+      } else if (/^su -c /.test(sentToDevice)) {
+        cb(null, 'uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0', '');
+      } else {
+        cb(new Error('unexpected command'), '', sentToDevice);
+      }
+    });
+
+    const out = await suShell('DEV001', 'id', 3000);
+
+    expect(out).toContain('uid=0');                 // su actually ran as root
+    expect(sentToDevice).not.toMatch(/^"/);         // never wrapped in literal quotes
+    expect(sentToDevice).toBe("su -c 'id'");        // exact form sent to the device
+  });
+
+  it('suShell escapes single quotes so the device shell reconstructs the exact command', async () => {
+    // Defense-in-depth: a command containing a single quote must still reach the
+    // device shell as one intact argument to `su -c`, not break out of the quoting.
+    let payload = '';
+    execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+      payload = cmd.replace(/^adb -s \S+ shell su -c /, ''); // the `'...'` literal passed to su -c
+      cb(null, '', '');
+    });
+
+    const tricky = "echo 'a b' c"; // single quotes + a space that must stay grouped
+    await suShell('DEV001', tricky, 3000);
+
+    // Verify with a REAL shell (the suite mocks child_process) so the assertion
+    // checks POSIX correctness rather than re-implementing the escape algorithm.
+    const realCp = await vi.importActual<typeof import('child_process')>('child_process');
+    const reconstructed = realCp.execFileSync('/bin/sh', ['-c', `printf %s ${payload}`]).toString();
+    expect(reconstructed).toBe(tricky);
   });
 });

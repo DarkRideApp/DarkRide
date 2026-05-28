@@ -36,10 +36,6 @@ export default defineConfig({
       // Plugin install root contains tarball-bundled test files from
       // third-party deps that should never run as part of our suite.
       '**/data/installed-plugins/**',
-      // E2E tests require a live DarkRide process + Docker + emulator image.
-      // They run only in the ci-e2e-emulator.yml workflow, not in the standard
-      // `npx vitest run backend/` pass.
-      'tests/e2e/**',
     ],
     // Use process forks (not threads) — each fork is an isolated process whose
     // memory is fully reclaimed on exit. With 24 CPU cores and 130+ test files

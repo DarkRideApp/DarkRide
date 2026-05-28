@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import { applyMigrations } from '../migrator';
 import { resolve } from 'path';
 
-describe('migration 0092 — device_instances', () => {
+describe('migration 0093 — device_instances', () => {
   it('creates device_instances + device_instance_config + adds devices.instance_id', () => {
     const db = new Database(':memory:');
     applyMigrations(db, [resolve('./migrations')]);

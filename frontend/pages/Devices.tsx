@@ -10,7 +10,6 @@ import { Smartphone, Apple, RefreshCw, Server, AlertTriangle } from 'lucide-reac
 import { CURRENT_SETUP_VERSION } from '../../shared/types/api';
 import type { Device } from '../../shared/types/api';
 import { SetupWizardModal } from '../components/devices/SetupWizardModal';
-import { CreateEmulatorModal } from '../components/devices/CreateEmulatorModal';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
 
@@ -67,7 +66,6 @@ export function Devices() {
   const [pullProgress, setPullProgress] = useState<Map<number, PullProgress>>(new Map());
   const [loading, setLoading] = useState(true);
   const [setupDevice, setSetupDevice] = useState<Device | null>(null);
-  const [showCreateModal, setShowCreateModal] = useState(false);
 
   const fetchDevices = useCallback(async () => {
     try {
@@ -349,15 +347,6 @@ export function Devices() {
           device={setupDevice}
           onClose={() => setSetupDevice(null)}
           onSetupComplete={handleSetupComplete}
-        />
-      )}
-      {showCreateModal && (
-        <CreateEmulatorModal
-          onCancel={() => setShowCreateModal(false)}
-          onCreated={() => {
-            setShowCreateModal(false);
-            fetchDevices();
-          }}
         />
       )}
     </div>

@@ -194,4 +194,77 @@ describe('Utils API Endpoints', () => {
       expect(res.body.data[0].sizeBytes).toBe(5000000);
     });
   });
+
+  describe('GET /v1/utils/disk-usage', () => {
+    it('returns null data when no snapshot exists', async () => {
+      const res = await request(app).get('/v1/utils/disk-usage');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data).toBeNull();
+    });
+
+    it('returns the latest snapshot with computed used bytes and sorted dirs', async () => {
+      const older = new Date(Date.now() - 2 * 60 * 60 * 1000);
+      const newer = new Date(Date.now() - 1 * 60 * 60 * 1000);
+      db.insert(schema.diskUsageSnapshots).values({
+        capturedAt: older,
+        volumeTotalBytes: 100, volumeFreeBytes: 90, dirSizes: { apks: 1 },
+      }).run();
+      db.insert(schema.diskUsageSnapshots).values({
+        capturedAt: newer,
+        volumeTotalBytes: 1000, volumeFreeBytes: 400,
+        dirSizes: { apks: 200, couchbase: 500, tools: 50 },
+      }).run();
+
+      const res = await request(app).get('/v1/utils/disk-usage');
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.volumeTotalBytes).toBe(1000);
+      expect(res.body.data.volumeFreeBytes).toBe(400);
+      expect(res.body.data.volumeUsedBytes).toBe(600);
+      expect(res.body.data.dirs).toEqual([
+        { name: 'couchbase', sizeBytes: 500 },
+        { name: 'apks', sizeBytes: 200 },
+        { name: 'tools', sizeBytes: 50 },
+      ]);
+    });
+  });
+
+  describe('GET /v1/utils/disk-usage-history', () => {
+    it('returns empty array when no snapshots exist', async () => {
+      const res = await request(app).get('/v1/utils/disk-usage-history');
+      expect(res.status).toBe(200);
+      expect(res.body.data).toEqual([]);
+    });
+
+    it('returns usedBytes per snapshot within 60 days, ordered asc, excluding older', async () => {
+      const now = Date.now();
+      const recentOlder = new Date(now - 10 * 24 * 60 * 60 * 1000);
+      const recentNewer = new Date(now - 5 * 24 * 60 * 60 * 1000);
+      const old = new Date(now - 90 * 24 * 60 * 60 * 1000);
+      // Out-of-window row: must be excluded.
+      db.insert(schema.diskUsageSnapshots).values({
+        capturedAt: old, volumeTotalBytes: 1000, volumeFreeBytes: 900, dirSizes: {},
+      }).run();
+      // Two in-window rows inserted newest-first so the test fails if the
+      // endpoint doesn't explicitly order ascending by capturedAt.
+      db.insert(schema.diskUsageSnapshots).values({
+        capturedAt: recentNewer, volumeTotalBytes: 1000, volumeFreeBytes: 250, dirSizes: {},
+      }).run();
+      db.insert(schema.diskUsageSnapshots).values({
+        capturedAt: recentOlder, volumeTotalBytes: 1000, volumeFreeBytes: 600, dirSizes: {},
+      }).run();
+
+      const res = await request(app).get('/v1/utils/disk-usage-history');
+
+      expect(res.status).toBe(200);
+      expect(res.body.data).toHaveLength(2);
+      // Ascending by capturedAt: the older in-window row (used 400) comes first.
+      expect(res.body.data[0].usedBytes).toBe(400);
+      expect(res.body.data[1].usedBytes).toBe(750);
+      expect(new Date(res.body.data[0].capturedAt).getTime())
+        .toBeLessThan(new Date(res.body.data[1].capturedAt).getTime());
+      expect(typeof res.body.data[0].capturedAt).toBe('string');
+    });
+  });
 });

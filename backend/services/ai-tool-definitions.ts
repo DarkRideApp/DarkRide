@@ -90,15 +90,22 @@ async function spawnWaitCollectStop(
   bridgeManager: PythonBridgeManager,
   deviceManager: DeviceManager | undefined,
   deviceId: string,
-  spawnParams: Record<string, any>,
+  spawnParams: { bundle_id: string; code: string },
   durationMs: number,
 ): Promise<{ messages: any[] }> {
   deviceManager?.markBusy?.(deviceId);
   try {
-    await callFridaBridge(bridgeManager, deviceId, 'frida_run', spawnParams);
+    // Use the Python-API path (frida_spawn_controlled) so the bridge's
+    // on_message handler captures send() payloads into _frida_messages.
+    // The frida_run CLI path only surfaces console.log, not send() — which
+    // is what `inspect_runtime_classes`/`inspect_class_methods`/most
+    // collector scripts actually emit.
+    await callFridaBridge(bridgeManager, deviceId, 'frida_spawn_controlled', spawnParams);
     await new Promise(resolve => setTimeout(resolve, durationMs));
+    // frida_get_messages returns `{messages, next_index}` — not a bare array,
+    // so reading `data.messages` rather than treating `data` itself as a list.
     const data = await callFridaBridge(bridgeManager, deviceId, 'frida_get_messages', {});
-    const messages = Array.isArray(data) ? data : [];
+    const messages = Array.isArray((data as any)?.messages) ? (data as any).messages : [];
     try { await callFridaBridge(bridgeManager, deviceId, 'frida_stop_server', {}); } catch { /* best-effort */ }
     return { messages };
   } finally {
@@ -2530,9 +2537,13 @@ export function registerAllTools(
       properties: {
         deviceId: { type: 'string', description: 'The device ID' },
         bundleId: { type: 'string', description: 'App bundle/package ID to attach to' },
-        scriptId: { type: 'number', description: 'ID of a saved Frida script to run' },
-        code: { type: 'string', description: 'Inline Frida script code (used if scriptId is not provided)' },
-        mode: { type: 'string', description: 'Spawn mode: "spawn" or "attach" (default: spawn)' },
+        scriptId: { type: 'number', description: 'ID of a saved Frida script to run. Mutually exclusive with `code` — if both are given, `code` wins.' },
+        code: { type: 'string', description: 'Inline Frida script code. Mutually exclusive with `scriptId`.' },
+        mode: {
+          type: 'string',
+          enum: ['spawn', 'attach', 'controlled'],
+          description: 'Spawn mode (default: "spawn"). "spawn" launches via the Frida CLI — fast, but its on-message hook cannot capture send() payloads (only console.log goes to stdout). "attach" attaches to an already-running process. "controlled" spawns via the Frida Python API and captures send() payloads; recommended for hooks that emit structured data via send() or that need to run at zygote/early-init.',
+        },
       },
       required: ['deviceId', 'bundleId'],
     },
@@ -2542,15 +2553,29 @@ export function registerAllTools(
     allowUnattended: false,
     async execute(params: { deviceId: string; bundleId: string; scriptId?: number; code?: string; mode?: string }) {
       if (!bridgeManager) throw new Error('PythonBridgeManager not wired into AI tools');
-      // scriptId is part of the input schema but historically silently
-      // ignored (the route reads `scripts` as an array of names, never
-      // `scriptId`). Preserved as-is to avoid changing tool behaviour.
+
+      // Resolve script code: inline `code` wins; otherwise look up the saved
+      // script by id; otherwise reject. Running Frida with empty code silently
+      // spawns the target unprotected (see AppGuard crashes from a bug where
+      // scriptId was historically ignored and code defaulted to "").
+      let code: string;
+      if (params.code != null && params.code !== '') {
+        code = params.code;
+      } else if (params.scriptId != null) {
+        const row = db.select().from(schema.fridaScripts)
+          .where(eq(schema.fridaScripts.id, params.scriptId)).all()[0];
+        if (!row) return { error: `Frida script not found: scriptId=${params.scriptId}` };
+        code = row.code;
+      } else {
+        return { error: 'run_frida_script requires either `code` or `scriptId`' };
+      }
+
       deviceManager?.markBusy?.(params.deviceId);
       try {
         const bridgeMethod = params.mode === 'controlled' ? 'frida_spawn_controlled' : 'frida_run';
         return await callFridaBridge(bridgeManager, params.deviceId, bridgeMethod, {
           bundle_id: params.bundleId,
-          code: params.code ?? '',
+          code,
           mode: params.mode === 'controlled' ? undefined : (params.mode || 'spawn'),
         });
       } catch (err) {
@@ -2835,7 +2860,7 @@ export function registerAllTools(
 
   registry.register({
     name: 'run_adb_command',
-    description: 'Run an ADB shell command on a device. WARNING: This executes commands directly on the device — use with caution.',
+    description: 'Run an ADB shell command on a device. Returns {output, stderr, exitCode} regardless of the command\'s exit status — non-zero exits (e.g. `killall x` when nothing matches) are returned as data, not thrown errors. Check `exitCode` to interpret success. WARNING: This executes commands directly on the device — use with caution.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2853,8 +2878,24 @@ export function registerAllTools(
       const status = await deviceManager.getDeviceStatus(params.deviceId);
       if (!status) throw new Error('Device not found');
       if (!status.isOnline) throw new Error('Device is offline');
-      const output = await deviceManager.executeShellCommand(params.deviceId, params.command);
-      return { deviceId: params.deviceId, command: params.command, output };
+      // Use runShellCommandWithExitCode so common ADB patterns that exit
+      // non-zero on benign outcomes (killall when no match, pgrep when no
+      // process, grep when no lines) come back as data the AI can branch
+      // on, rather than thrown errors that burn a turn.
+      try {
+        const r = await deviceManager.runShellCommandWithExitCode(params.deviceId, params.command);
+        return {
+          deviceId: params.deviceId,
+          command: params.command,
+          output: r.stdout.trim(),
+          stderr: r.stderr.trim(),
+          exitCode: r.exitCode,
+        };
+      } catch (err: any) {
+        // Transport errors (ENOENT, ETIMEDOUT) come back as thrown errors —
+        // surface them as {error} so the AI can report the problem clearly.
+        return { error: err.message ?? String(err) };
+      }
     },
   });
 
@@ -2880,8 +2921,11 @@ export function registerAllTools(
       if (!bridgeManager) throw new Error('PythonBridgeManager not wired into AI tools');
       const bridgeParams: Record<string, any> = {};
       if (params.since != null) bridgeParams.since = params.since;
+      // The bridge returns `{messages: [...], next_index: N}` — not a bare
+      // array — so the old `Array.isArray(data)` check always failed and
+      // get_frida_output silently returned []. Read the nested array.
       const data = await callFridaBridge(bridgeManager, params.deviceId, 'frida_get_messages', bridgeParams);
-      const messages = Array.isArray(data) ? data : [];
+      const messages = Array.isArray((data as any)?.messages) ? (data as any).messages : [];
       const limit = params.limit ?? 50;
       return messages.slice(0, limit);
     },
@@ -2911,7 +2955,7 @@ export function registerAllTools(
         bridgeManager,
         deviceManager,
         params.deviceId,
-        { bundle_id: params.bundleId, code: params.code, mode: 'spawn' },
+        { bundle_id: params.bundleId, code: params.code },
         duration,
       );
       return { messages: result.messages, durationMs: duration, messageCount: result.messages.length };
@@ -2944,7 +2988,7 @@ export function registerAllTools(
         bridgeManager,
         deviceManager,
         params.deviceId,
-        { bundle_id: params.bundleId, code, mode: 'spawn' },
+        { bundle_id: params.bundleId, code },
         5000,
       );
       const classes = result.messages
@@ -2978,7 +3022,7 @@ export function registerAllTools(
         bridgeManager,
         deviceManager,
         params.deviceId,
-        { bundle_id: params.bundleId, code, mode: 'spawn' },
+        { bundle_id: params.bundleId, code },
         3000,
       );
       const methodMsg = result.messages.find((m: any) => m?.payload?.methods);

@@ -1,9 +1,9 @@
 import { statSync, readdirSync } from 'fs';
 import path from 'path';
-import { gte, sql } from 'drizzle-orm';
+import { gte, desc, sql } from 'drizzle-orm';
 import { registerEndpoint } from './api-service';
 import type { AppDatabase } from '../db/index';
-import { dbSizeSnapshots } from '../db/schema';
+import { dbSizeSnapshots, diskUsageSnapshots } from '../db/schema';
 
 const TABLE_LABELS: Record<string, string> = {
   captured_traffic: 'Traffic',
@@ -128,6 +128,59 @@ export function registerUtilsEndpoints(dbPath: string, db: AppDatabase): void {
     const mapTileDir = path.resolve('./data/plugins/maps');
     const sizeBytes = getDirSize(mapTileDir);
     res.json({ success: true, data: { sizeBytes } });
+  });
+
+  registerEndpoint('GET', '/v1/utils/disk-usage', (_req, res) => {
+    const row = db
+      .select()
+      .from(diskUsageSnapshots)
+      .orderBy(desc(diskUsageSnapshots.capturedAt))
+      .limit(1)
+      .all()[0];
+
+    if (!row) {
+      res.json({ success: true, data: null });
+      return;
+    }
+
+    // dirSizes is a notNull json column (Record<string, number>); ?? {} guards
+    // only against malformed legacy rows, no cast needed.
+    const dirSizes = row.dirSizes ?? {};
+    const dirs = Object.entries(dirSizes)
+      .map(([name, sizeBytes]) => ({ name, sizeBytes }))
+      .sort((a, b) => b.sizeBytes - a.sizeBytes);
+
+    res.json({
+      success: true,
+      data: {
+        capturedAt: row.capturedAt,
+        volumeTotalBytes: row.volumeTotalBytes,
+        volumeFreeBytes: row.volumeFreeBytes,
+        volumeUsedBytes: row.volumeTotalBytes - row.volumeFreeBytes,
+        dirs,
+      },
+    });
+  });
+
+  registerEndpoint('GET', '/v1/utils/disk-usage-history', (_req, res) => {
+    const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+    const rows = db
+      .select({
+        volumeTotalBytes: diskUsageSnapshots.volumeTotalBytes,
+        volumeFreeBytes: diskUsageSnapshots.volumeFreeBytes,
+        capturedAt: diskUsageSnapshots.capturedAt,
+      })
+      .from(diskUsageSnapshots)
+      .where(gte(diskUsageSnapshots.capturedAt, sixtyDaysAgo))
+      .orderBy(diskUsageSnapshots.capturedAt)
+      .all();
+
+    const data = rows.map(r => ({
+      usedBytes: r.volumeTotalBytes - r.volumeFreeBytes,
+      capturedAt: r.capturedAt,
+    }));
+
+    res.json({ success: true, data });
   });
 
   registerEndpoint('GET', '/v1/utils/backup', (_req, res) => {
