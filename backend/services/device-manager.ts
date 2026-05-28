@@ -993,6 +993,49 @@ export class DeviceManager {
   }
 
   /**
+   * Execute an arbitrary ADB shell command, returning {stdout, stderr,
+   * exitCode} on any exit status. Unlike executeShellCommand (which throws
+   * on non-zero), this surfaces non-zero exits as data so callers can
+   * branch on the code without losing stdout/stderr.
+   *
+   * Used by the run_adb_command AI tool — `killall x` returning 1 when no
+   * process matches is a benign outcome the model should be able to handle
+   * without forcing a `cmd; true` retry.
+   *
+   * Transport errors (ENOENT for missing adb, ETIMEDOUT, etc.) still throw
+   * — those indicate ADB itself is broken, not that the command exited
+   * non-zero.
+   */
+  async runShellCommandWithExitCode(
+    deviceId: string,
+    command: string,
+    // 30s rather than executeShellCommand's 10s default — AI-tool shell
+    // commands are sometimes longer-running (package install, logcat flush,
+    // settings dump). Callers wanting the shorter bound can pass it.
+    timeoutMs: number = 30_000,
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    try {
+      const r = await execFileAsync(
+        'adb', ['-s', deviceId, 'shell', command], { timeout: timeoutMs },
+      );
+      // Node's execFile contract: stdout/stderr are always strings on the
+      // resolved value and on the rejected error object (see below).
+      return { stdout: r.stdout, stderr: r.stderr, exitCode: 0 };
+    } catch (err: any) {
+      // Node's execFile rejects with err.code === <number> for non-zero exits,
+      // === 'ENOENT' / etc. for transport errors, and === null for timeouts.
+      // Rethrow non-numeric codes — the caller surfaces them as transport
+      // failures rather than misreporting them as command exit codes.
+      if (typeof err.code !== 'number') throw err;
+      return {
+        stdout: err.stdout,
+        stderr: err.stderr,
+        exitCode: err.code,
+      };
+    }
+  }
+
+  /**
    * Run a device command (restart, sleep, wake).
    */
   async runDeviceCommand(deviceId: string, command: 'restart' | 'sleep' | 'wake' | 'unlock' | 'stopall'): Promise<void> {

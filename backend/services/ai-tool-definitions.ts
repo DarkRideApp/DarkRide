@@ -2860,7 +2860,7 @@ export function registerAllTools(
 
   registry.register({
     name: 'run_adb_command',
-    description: 'Run an ADB shell command on a device. WARNING: This executes commands directly on the device — use with caution.',
+    description: 'Run an ADB shell command on a device. Returns {output, stderr, exitCode} regardless of the command\'s exit status — non-zero exits (e.g. `killall x` when nothing matches) are returned as data, not thrown errors. Check `exitCode` to interpret success. WARNING: This executes commands directly on the device — use with caution.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2878,8 +2878,24 @@ export function registerAllTools(
       const status = await deviceManager.getDeviceStatus(params.deviceId);
       if (!status) throw new Error('Device not found');
       if (!status.isOnline) throw new Error('Device is offline');
-      const output = await deviceManager.executeShellCommand(params.deviceId, params.command);
-      return { deviceId: params.deviceId, command: params.command, output };
+      // Use runShellCommandWithExitCode so common ADB patterns that exit
+      // non-zero on benign outcomes (killall when no match, pgrep when no
+      // process, grep when no lines) come back as data the AI can branch
+      // on, rather than thrown errors that burn a turn.
+      try {
+        const r = await deviceManager.runShellCommandWithExitCode(params.deviceId, params.command);
+        return {
+          deviceId: params.deviceId,
+          command: params.command,
+          output: r.stdout.trim(),
+          stderr: r.stderr.trim(),
+          exitCode: r.exitCode,
+        };
+      } catch (err: any) {
+        // Transport errors (ENOENT, ETIMEDOUT) come back as thrown errors —
+        // surface them as {error} so the AI can report the problem clearly.
+        return { error: err.message ?? String(err) };
+      }
     },
   });
 
