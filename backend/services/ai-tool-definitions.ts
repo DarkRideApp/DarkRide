@@ -2530,9 +2530,13 @@ export function registerAllTools(
       properties: {
         deviceId: { type: 'string', description: 'The device ID' },
         bundleId: { type: 'string', description: 'App bundle/package ID to attach to' },
-        scriptId: { type: 'number', description: 'ID of a saved Frida script to run' },
-        code: { type: 'string', description: 'Inline Frida script code (used if scriptId is not provided)' },
-        mode: { type: 'string', description: 'Spawn mode: "spawn" or "attach" (default: spawn)' },
+        scriptId: { type: 'number', description: 'ID of a saved Frida script to run. Mutually exclusive with `code` — if both are given, `code` wins.' },
+        code: { type: 'string', description: 'Inline Frida script code. Mutually exclusive with `scriptId`.' },
+        mode: {
+          type: 'string',
+          enum: ['spawn', 'attach', 'controlled'],
+          description: 'Spawn mode (default: "spawn"). "spawn" launches via the Frida CLI — fast, but its on-message hook cannot capture send() payloads (only console.log goes to stdout). "attach" attaches to an already-running process. "controlled" spawns via the Frida Python API and captures send() payloads; recommended for hooks that emit structured data via send() or that need to run at zygote/early-init.',
+        },
       },
       required: ['deviceId', 'bundleId'],
     },
@@ -2542,15 +2546,29 @@ export function registerAllTools(
     allowUnattended: false,
     async execute(params: { deviceId: string; bundleId: string; scriptId?: number; code?: string; mode?: string }) {
       if (!bridgeManager) throw new Error('PythonBridgeManager not wired into AI tools');
-      // scriptId is part of the input schema but historically silently
-      // ignored (the route reads `scripts` as an array of names, never
-      // `scriptId`). Preserved as-is to avoid changing tool behaviour.
+
+      // Resolve script code: inline `code` wins; otherwise look up the saved
+      // script by id; otherwise reject. Running Frida with empty code silently
+      // spawns the target unprotected (see AppGuard crashes from a bug where
+      // scriptId was historically ignored and code defaulted to "").
+      let code: string;
+      if (params.code != null && params.code !== '') {
+        code = params.code;
+      } else if (params.scriptId != null) {
+        const row = db.select().from(schema.fridaScripts)
+          .where(eq(schema.fridaScripts.id, params.scriptId)).all()[0];
+        if (!row) return { error: `Frida script not found: scriptId=${params.scriptId}` };
+        code = row.code;
+      } else {
+        return { error: 'run_frida_script requires either `code` or `scriptId`' };
+      }
+
       deviceManager?.markBusy?.(params.deviceId);
       try {
         const bridgeMethod = params.mode === 'controlled' ? 'frida_spawn_controlled' : 'frida_run';
         return await callFridaBridge(bridgeManager, params.deviceId, bridgeMethod, {
           bundle_id: params.bundleId,
-          code: params.code ?? '',
+          code,
           mode: params.mode === 'controlled' ? undefined : (params.mode || 'spawn'),
         });
       } catch (err) {
@@ -2880,8 +2898,11 @@ export function registerAllTools(
       if (!bridgeManager) throw new Error('PythonBridgeManager not wired into AI tools');
       const bridgeParams: Record<string, any> = {};
       if (params.since != null) bridgeParams.since = params.since;
+      // The bridge returns `{messages: [...], next_index: N}` — not a bare
+      // array — so the old `Array.isArray(data)` check always failed and
+      // get_frida_output silently returned []. Read the nested array.
       const data = await callFridaBridge(bridgeManager, params.deviceId, 'frida_get_messages', bridgeParams);
-      const messages = Array.isArray(data) ? data : [];
+      const messages = Array.isArray((data as any)?.messages) ? (data as any).messages : [];
       const limit = params.limit ?? 50;
       return messages.slice(0, limit);
     },

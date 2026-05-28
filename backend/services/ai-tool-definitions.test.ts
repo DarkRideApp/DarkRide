@@ -2857,4 +2857,100 @@ class AuthManager {
       expect(result).toEqual({ error: 'Diff report not found' });
     });
   });
+
+  // ── Frida tool-definition correctness ─────────────────────────
+
+  describe('run_frida_script — scriptId resolution', () => {
+    it('looks up scriptId and passes its code to the bridge', async () => {
+      db.insert(schema.fridaScripts).values({
+        name: 'AppGuard',
+        code: 'send({type:"guard",enabled:true});',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }).run();
+      const row = db.select().from(schema.fridaScripts).all()[0];
+
+      mockCallFridaBridge.mockResolvedValue({ ok: true });
+      await registry.executeTool('run_frida_script', {
+        deviceId: 'd1', bundleId: 'com.example', scriptId: row.id,
+      });
+
+      expect(mockCallFridaBridge).toHaveBeenCalledWith(
+        expect.anything(), 'd1', 'frida_run',
+        expect.objectContaining({ code: 'send({type:"guard",enabled:true});' }),
+      );
+    });
+
+    it('prefers inline code over scriptId when both are given', async () => {
+      db.insert(schema.fridaScripts).values({
+        name: 'S', code: 'send("from-db");', createdAt: new Date(), updatedAt: new Date(),
+      }).run();
+      const row = db.select().from(schema.fridaScripts).all()[0];
+
+      mockCallFridaBridge.mockResolvedValue({ ok: true });
+      await registry.executeTool('run_frida_script', {
+        deviceId: 'd1', bundleId: 'com.example', scriptId: row.id, code: 'send("inline");',
+      });
+
+      expect(mockCallFridaBridge).toHaveBeenCalledWith(
+        expect.anything(), 'd1', 'frida_run',
+        expect.objectContaining({ code: 'send("inline");' }),
+      );
+    });
+
+    it('rejects when scriptId does not exist', async () => {
+      const result = await registry.executeTool('run_frida_script', {
+        deviceId: 'd1', bundleId: 'com.example', scriptId: 99999,
+      });
+      expect(result).toMatchObject({ error: expect.stringMatching(/script.*99999/i) });
+    });
+
+    it('rejects when neither code nor scriptId is provided', async () => {
+      const result = await registry.executeTool('run_frida_script', {
+        deviceId: 'd1', bundleId: 'com.example',
+      });
+      expect(result).toMatchObject({ error: expect.stringMatching(/code.*scriptId|scriptId.*code/i) });
+    });
+  });
+
+  describe('run_frida_script — schema documents controlled mode', () => {
+    it('lists controlled in the mode enum with send-capture guidance', () => {
+      const tool = registry
+        .getToolsForContext('frida')
+        .find((t) => t.name === 'run_frida_script');
+      expect(tool).toBeDefined();
+      const modeProp = (tool!.inputSchema as any).properties.mode;
+      expect(modeProp.enum).toEqual(expect.arrayContaining(['spawn', 'attach', 'controlled']));
+      expect(String(modeProp.description).toLowerCase()).toMatch(/controlled/);
+      expect(String(modeProp.description).toLowerCase()).toMatch(/send/);
+    });
+  });
+
+  describe('get_frida_output — reads bridge {messages,next_index} shape', () => {
+    it('returns the messages array from the bridge object', async () => {
+      mockCallFridaBridge.mockResolvedValue({
+        messages: [{ type: 'send', payload: { x: 1 } }, { type: 'send', payload: { x: 2 } }],
+        next_index: 2,
+      });
+      const result = await registry.executeTool('get_frida_output', { deviceId: 'd1' });
+      expect(result).toEqual([
+        { type: 'send', payload: { x: 1 } },
+        { type: 'send', payload: { x: 2 } },
+      ]);
+    });
+
+    it('respects the limit param', async () => {
+      mockCallFridaBridge.mockResolvedValue({
+        messages: [1, 2, 3, 4, 5], next_index: 5,
+      });
+      const result = await registry.executeTool('get_frida_output', { deviceId: 'd1', limit: 2 });
+      expect(result).toEqual([1, 2]);
+    });
+
+    it('returns [] gracefully when the bridge returns nothing useful', async () => {
+      mockCallFridaBridge.mockResolvedValue(null);
+      const result = await registry.executeTool('get_frida_output', { deviceId: 'd1' });
+      expect(result).toEqual([]);
+    });
+  });
 });
