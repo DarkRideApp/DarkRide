@@ -579,9 +579,14 @@ export class DeviceManager {
    */
   async collectDeviceProperties(deviceId: string): Promise<void> {
     try {
+      // No literal double-quote wrapping — adbShell uses execFile, so the
+      // string arrives at the device shell verbatim. The bare `cmd1; cmd2`
+      // form is what /system/bin/sh actually parses; wrapped in `"..."` it
+      // becomes a single bogus command word that fails "inaccessible or not
+      // found". Same pattern as the suShell fix (see test at L798).
       const output = await adbShell(
         deviceId,
-        '"getprop ro.product.manufacturer; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.cpu.abi; getprop ro.serialno; getprop ro.boot.flash.locked; getprop ro.boot.verifiedbootstate"',
+        'getprop ro.product.manufacturer; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.cpu.abi; getprop ro.serialno; getprop ro.boot.flash.locked; getprop ro.boot.verifiedbootstate',
         10000,
       );
       const lines = output.split('\n').map(l => l.trim());
@@ -731,7 +736,7 @@ export class DeviceManager {
               binPath = await this.fridaReleaseManager.downloadVersion(version);
             }
             await adbCommand(['-s', deviceId, 'push', binPath, '/data/local/tmp/frida-server']);
-            await adbShell(deviceId, '"su -c \'chmod 755 /data/local/tmp/frida-server\'"');
+            await suShell(deviceId, 'chmod 755 /data/local/tmp/frida-server');
             this.db.update(devices)
               .set({ fridaVersion: version })
               .where(eq(devices.id, deviceId))
@@ -1684,7 +1689,7 @@ export class DeviceManager {
 
     // Quick root check — fails fast (3s) instead of hanging 30s on Magisk prompt
     try {
-      await adbShell(deviceId, '"su -c id"', 3000);
+      await suShell(deviceId, 'id', 3000);
     } catch {
       throw new Error(
         'Root access unavailable — check the phone for a Magisk superuser prompt, or grant shell permanent su access in Magisk settings',

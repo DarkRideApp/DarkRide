@@ -839,4 +839,22 @@ describe('adb helpers — command-injection prevention', () => {
     const reconstructed = realCp.execFileSync('/bin/sh', ['-c', `printf %s ${payload}`]).toString();
     expect(reconstructed).toBe(tricky);
   });
+
+  it('adbShell sends a multi-statement getprop chain unwrapped (no literal "..." around it)', async () => {
+    // Regression for the collectDeviceProperties bug — the chain was wrapped in
+    // literal double quotes, so the device shell parsed the whole quoted string
+    // as a single command word and reported "inaccessible or not found". Same
+    // failure mode as the wrapped-suShell case above. The chain must arrive at
+    // the device shell as a bare `getprop A; getprop B; ...` so `;` is parsed
+    // as a statement separator.
+    const chain = 'getprop ro.product.manufacturer; getprop ro.product.model';
+    await adbShell('DEV001', chain, 1000);
+
+    const lastCall = execFileMock.mock.calls[execFileMock.mock.calls.length - 1];
+    const argv = lastCall[1] as string[];
+    const sent = argv[argv.length - 1];
+    expect(sent).toBe(chain);                 // exact bare form
+    expect(sent).not.toMatch(/^"/);           // never wrapped in literal quotes
+    expect(sent).not.toMatch(/"$/);
+  });
 });
