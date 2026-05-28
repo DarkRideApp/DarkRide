@@ -52,9 +52,14 @@ describe('docker-android provider', () => {
     }));
   });
 
-  it('passes --device /dev/kvm when /dev/kvm exists (required for in-container emulator)', async () => {
+  it('always passes --device /dev/kvm (required for in-container emulator; daemon-side check, not host-side)', async () => {
+    // Regression: probing the Node host's filesystem for /dev/kvm produces
+    // a false negative on Docker Desktop (Mac / Windows), where the daemon's
+    // VM has /dev/kvm but the host running the Node process doesn't. The
+    // resulting container spawn omitted Devices → budtmo fell back to
+    // software emulation and the container exited 137 within seconds.
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevKvm: () => true, hasDevDri: () => false, hasNvidia: async () => false });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     await p.createInstance!({
       displayName: 'kvm-test',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
@@ -68,26 +73,45 @@ describe('docker-android provider', () => {
     }));
   });
 
-  it('omits /dev/kvm when not present on the host (no Devices array entry)', async () => {
-    const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevKvm: () => false, hasDevDri: () => false, hasNvidia: async () => false });
-    await p.createInstance!({
-      displayName: 'no-kvm',
-      config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
+  it('wraps the daemon\'s "no such file" /dev/kvm error into an actionable message', async () => {
+    // When the daemon itself can't expose /dev/kvm (Mac, Windows without
+    // nested-virt for WSL2, Linux without kvm modules loaded), createContainer
+    // rejects synchronously. Surface a clearer error than the raw runc string.
+    const d = makeDockerMock({
+      createContainer: vi.fn().mockRejectedValue(
+        new Error('error gathering device information while adding custom device "/dev/kvm": no such file or directory'),
+      ),
     });
-    const call = (d.createContainer as any).mock.calls[0][0];
-    expect(call.HostConfig.Devices).toBeUndefined();
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    await expect(p.createInstance!({
+      displayName: 'kvm-missing',
+      config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
+    })).rejects.toThrow(/hardware virtualization/i);
+  });
+
+  it('rethrows unrelated createContainer errors unchanged', async () => {
+    const d = makeDockerMock({
+      createContainer: vi.fn().mockRejectedValue(new Error('Conflict. The container name "/foo" is already in use')),
+    });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    await expect(p.createInstance!({
+      displayName: 'name-conflict',
+      config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
+    })).rejects.toThrow(/already in use/);
   });
 
   it('does NOT auto-pass /dev/dri even if the host has it (avoids triggering the WSL nvidia prestart hook)', async () => {
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => true, hasNvidia: async () => false, hasDevKvm: () => false });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => true, hasNvidia: async () => false });
     await p.createInstance!({
       displayName: 'gpu-test',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
     });
     const call = (d.createContainer as any).mock.calls[0][0];
-    expect(call.HostConfig.Devices).toBeUndefined();
+    // /dev/kvm is the only device we mount; /dev/dri should not appear.
+    expect(call.HostConfig.Devices).toEqual([
+      expect.objectContaining({ PathOnHost: '/dev/kvm' }),
+    ]);
   });
 
   it('does NOT request NVIDIA DeviceRequests by default (budtmo uses swiftshader software rendering; nvidia-container init fails on Docker Desktop WSL)', async () => {

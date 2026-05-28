@@ -166,7 +166,6 @@ async function ensureImageLocal(
  */
 export interface DockerAndroidOptions {
   hasDevDri?: () => boolean;
-  hasDevKvm?: () => boolean;
   hasNvidia?: () => boolean | Promise<boolean>;
   adbConnect?: (port: number) => Promise<boolean>;
   bootCompleted?: (serial: string) => Promise<boolean>;
@@ -184,8 +183,11 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   // /dev/kvm is what makes the in-container Android emulator able to use
   // hardware virtualization. Without it, budtmo/docker-android falls back
   // to software emulation that effectively never boots — the container
-  // exits within seconds.
-  const hasDevKvm = opts.hasDevKvm ?? (() => existsSync('/dev/kvm'));
+  // exits within seconds. We deliberately do NOT probe the Node host's
+  // own filesystem for /dev/kvm: when DarkRide runs on Windows/Mac and
+  // talks to a Docker Desktop VM, the host has no /dev/kvm but the
+  // daemon's VM does. Always request it; the daemon's createContainer
+  // call surfaces a clear error if it can't expose it (handled below).
   const hasNvidia = opts.hasNvidia ?? (async () => (await detectDockerDaemon(d)).nvidiaContainerToolkit === true);
   // Single-shot adb connect attempt. The retry loop lives in startInstance
   // so injection-tests can drive it via a sequence of resolved values.
@@ -252,13 +254,17 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       const ramMb = Number(spec.config.ramMb ?? 2048);
       const image = budtmoImageFor(androidVersion);
 
-      const devices: Array<{ PathOnHost: string; PathInContainer: string; CgroupPermissions: string }> = [];
       // /dev/kvm: required for in-container Android emulator. Without it,
       // the container exits within seconds (no software-emulation fallback
-      // worth attempting — it would never boot in CI's time budget).
-      if (hasDevKvm()) {
-        devices.push({ PathOnHost: '/dev/kvm', PathInContainer: '/dev/kvm', CgroupPermissions: 'rwm' });
-      }
+      // worth attempting — it would never boot in CI's time budget). We
+      // always request it; the daemon rejects the create with "no such
+      // file" if its own host can't expose it (caught below with a
+      // clearer message). See the note on the hasDevKvm removal above —
+      // probing the Node host is the wrong check on Docker Desktop, where
+      // /dev/kvm lives in the daemon's VM, not on the Windows/Mac host.
+      const devices: Array<{ PathOnHost: string; PathInContainer: string; CgroupPermissions: string }> = [
+        { PathOnHost: '/dev/kvm', PathInContainer: '/dev/kvm', CgroupPermissions: 'rwm' },
+      ];
       // Intentionally NOT auto-passing /dev/dri. It does nothing useful for
       // budtmo's default `-gpu swiftshader_indirect` (software rendering),
       // and on Docker Desktop WSL2 — where /dev/dri exists thanks to WSLg
@@ -288,50 +294,69 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       await ensureImageLocal(d, image, opts?.onPullProgress);
 
       log(`Creating docker-android container "${spec.displayName}" image=${image} ram=${ramMb}MB arch=${arch}`);
-      const container: any = await d.createContainer({
-        Image: image,
-        name: `darkride-${spec.displayName}`.replace(/[^a-zA-Z0-9_-]/g, '-'),
-        Labels: {
-          [LABEL_KEY]: 'true',
-          'darkride.android_version': androidVersion,
-          'darkride.arch': arch,
-        },
-        // EMULATOR_DEVICE must be a name avdmanager recognises (see
-        // `avdmanager list device`). Budtmo's whitelist includes
-        // "Samsung Galaxy S10" but the current Android SDK ships only a
-        // Pixel/Nexus-flavoured device list — Samsung profiles got dropped.
-        // Pixel 8 is both budtmo-whitelisted and avdmanager-resolvable.
-        Env: [
-          `EMULATOR_DEVICE=Pixel 8`,
-          `RAM_MB=${ramMb}`,
-          // Disable nvidia-container-cli's legacy mode entirely. When the
-          // nvidia-container-toolkit is installed in the host environment
-          // (e.g. Docker Desktop with GPU support enabled on Windows/WSL),
-          // it injects a prestart hook into runc itself that fires for
-          // EVERY container start, regardless of HostConfig.Runtime.
-          // Without a usable GPU passthrough (the common case on WSL),
-          // the hook fails:
-          //   "Auto-detected mode as 'legacy' nvidia-container-cli:
-          //   initialization error: WSL environment detected but no
-          //   adapters were found"
-          // Setting NVIDIA_VISIBLE_DEVICES=void makes the hook a no-op
-          // before it touches the adapter probe.
-          'NVIDIA_VISIBLE_DEVICES=void',
-        ],
-        ExposedPorts: { '5555/tcp': {} },
-        HostConfig: {
-          PortBindings: { '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }] },
-          Devices: devices.length > 0 ? devices : undefined,
-          DeviceRequests: deviceRequests.length > 0 ? deviceRequests : undefined,
-          // Force the default OCI runtime explicitly. Without this, daemons
-          // configured with `default-runtime: nvidia` (some Docker Desktop
-          // WSL installs ship this way) invoke the nvidia-container prestart
-          // hook for every container — which fails at start with
-          // "WSL environment detected but no adapters were found" if no GPU
-          // is actually passthrough'd. Setting Runtime here bypasses that.
-          Runtime: 'runc',
-        },
-      });
+      let container: any;
+      try {
+        container = await d.createContainer({
+          Image: image,
+          name: `darkride-${spec.displayName}`.replace(/[^a-zA-Z0-9_-]/g, '-'),
+          Labels: {
+            [LABEL_KEY]: 'true',
+            'darkride.android_version': androidVersion,
+            'darkride.arch': arch,
+          },
+          // EMULATOR_DEVICE must be a name avdmanager recognises (see
+          // `avdmanager list device`). Budtmo's whitelist includes
+          // "Samsung Galaxy S10" but the current Android SDK ships only a
+          // Pixel/Nexus-flavoured device list — Samsung profiles got dropped.
+          // Pixel 8 is both budtmo-whitelisted and avdmanager-resolvable.
+          Env: [
+            `EMULATOR_DEVICE=Pixel 8`,
+            `RAM_MB=${ramMb}`,
+            // Disable nvidia-container-cli's legacy mode entirely. When the
+            // nvidia-container-toolkit is installed in the host environment
+            // (e.g. Docker Desktop with GPU support enabled on Windows/WSL),
+            // it injects a prestart hook into runc itself that fires for
+            // EVERY container start, regardless of HostConfig.Runtime.
+            // Without a usable GPU passthrough (the common case on WSL),
+            // the hook fails:
+            //   "Auto-detected mode as 'legacy' nvidia-container-cli:
+            //   initialization error: WSL environment detected but no
+            //   adapters were found"
+            // Setting NVIDIA_VISIBLE_DEVICES=void makes the hook a no-op
+            // before it touches the adapter probe.
+            'NVIDIA_VISIBLE_DEVICES=void',
+          ],
+          ExposedPorts: { '5555/tcp': {} },
+          HostConfig: {
+            PortBindings: { '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }] },
+            Devices: devices,
+            DeviceRequests: deviceRequests.length > 0 ? deviceRequests : undefined,
+            // Force the default OCI runtime explicitly. Without this, daemons
+            // configured with `default-runtime: nvidia` (some Docker Desktop
+            // WSL installs ship this way) invoke the nvidia-container prestart
+            // hook for every container — which fails at start with
+            // "WSL environment detected but no adapters were found" if no GPU
+            // is actually passthrough'd. Setting Runtime here bypasses that.
+            Runtime: 'runc',
+          },
+        });
+      } catch (e: any) {
+        // The daemon rejects the create with a "no such file" message when
+        // it can't expose /dev/kvm — typically on Mac, on a Windows host
+        // without Hyper-V virt enabled for WSL2, or on a Linux box where
+        // KVM isn't loaded. Software emulation is not a useful fallback for
+        // budtmo's image, so surface an actionable error rather than
+        // silently spawning a container that will exit within seconds.
+        const msg = String(e?.message ?? e);
+        if (/\/dev\/kvm/i.test(msg) && /no such file|not found|cannot find/i.test(msg)) {
+          throw new Error(
+            'Docker daemon cannot expose /dev/kvm — Android emulator requires hardware virtualization. ' +
+            'On Docker Desktop, enable nested virtualization for the WSL2 / Linux VM. ' +
+            `On Linux hosts, ensure kvm modules are loaded. (Underlying error: ${msg})`,
+          );
+        }
+        throw e;
+      }
 
       return {
         id: container.id,
