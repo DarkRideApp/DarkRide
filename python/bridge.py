@@ -1498,6 +1498,30 @@ _frida_session = None
 _frida_script = None
 _frida_spawned_pid = None
 
+
+def _handle_frida_script_message(message, data):
+    """Process a 'message' event from a controlled Frida script and push it
+    into the shared _frida_messages list.
+
+    Critical: send() payloads are stored AS-IS (not str(payload)) under
+    type='send' so TypeScript callers can read structured fields like
+    payload.type or payload.methods. The CLI path's _frida_output_reader
+    stores stdout lines under type='log'; downstream code distinguishes
+    structured send() messages from console.log lines via the 'type' field.
+
+    Exposed at module scope so unit tests can invoke it without spawning a
+    real Frida session.
+    """
+    if message['type'] == 'send':
+        payload = message.get('payload', '')
+        _append_frida_message('send', payload)
+        print(f"[DarkRide] frida-api: {str(payload)[:200]}", file=sys.stderr, flush=True)
+    elif message['type'] == 'error':
+        desc = message.get('description', '') or message.get('stack', str(message))
+        _append_frida_message('error', desc)
+        print(f"[DarkRide] frida-api error: {desc[:200]}", file=sys.stderr, flush=True)
+
+
 def handle_frida_spawn_controlled(params):
     """Spawn with explicit resume control using Frida Python API.
 
@@ -1543,16 +1567,6 @@ def handle_frida_spawn_controlled(params):
 
     device = _get_frida_device()
 
-    def on_message(message, data):
-        if message['type'] == 'send':
-            payload = message.get('payload', '')
-            _append_frida_message('log', str(payload))
-            print(f"[DarkRide] frida-api: {str(payload)[:200]}", file=sys.stderr, flush=True)
-        elif message['type'] == 'error':
-            desc = message.get('description', '') or message.get('stack', str(message))
-            _append_frida_message('error', desc)
-            print(f"[DarkRide] frida-api error: {desc[:200]}", file=sys.stderr, flush=True)
-
     def on_detached(reason, crash=None):
         msg = f"Session detached: {reason}"
         if crash:
@@ -1578,7 +1592,7 @@ def handle_frida_spawn_controlled(params):
 
         # 3. Load script (process is still suspended)
         script = session.create_script(code)
-        script.on('message', on_message)
+        script.on('message', _handle_frida_script_message)
         script.load()
         _frida_script = script
         _append_frida_message('log', '[DarkRide] Script loaded, process still suspended')

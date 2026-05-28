@@ -90,15 +90,22 @@ async function spawnWaitCollectStop(
   bridgeManager: PythonBridgeManager,
   deviceManager: DeviceManager | undefined,
   deviceId: string,
-  spawnParams: Record<string, any>,
+  spawnParams: { bundle_id: string; code: string },
   durationMs: number,
 ): Promise<{ messages: any[] }> {
   deviceManager?.markBusy?.(deviceId);
   try {
-    await callFridaBridge(bridgeManager, deviceId, 'frida_run', spawnParams);
+    // Use the Python-API path (frida_spawn_controlled) so the bridge's
+    // on_message handler captures send() payloads into _frida_messages.
+    // The frida_run CLI path only surfaces console.log, not send() — which
+    // is what `inspect_runtime_classes`/`inspect_class_methods`/most
+    // collector scripts actually emit.
+    await callFridaBridge(bridgeManager, deviceId, 'frida_spawn_controlled', spawnParams);
     await new Promise(resolve => setTimeout(resolve, durationMs));
+    // frida_get_messages returns `{messages, next_index}` — not a bare array,
+    // so reading `data.messages` rather than treating `data` itself as a list.
     const data = await callFridaBridge(bridgeManager, deviceId, 'frida_get_messages', {});
-    const messages = Array.isArray(data) ? data : [];
+    const messages = Array.isArray((data as any)?.messages) ? (data as any).messages : [];
     try { await callFridaBridge(bridgeManager, deviceId, 'frida_stop_server', {}); } catch { /* best-effort */ }
     return { messages };
   } finally {
@@ -2932,7 +2939,7 @@ export function registerAllTools(
         bridgeManager,
         deviceManager,
         params.deviceId,
-        { bundle_id: params.bundleId, code: params.code, mode: 'spawn' },
+        { bundle_id: params.bundleId, code: params.code },
         duration,
       );
       return { messages: result.messages, durationMs: duration, messageCount: result.messages.length };
@@ -2965,7 +2972,7 @@ export function registerAllTools(
         bridgeManager,
         deviceManager,
         params.deviceId,
-        { bundle_id: params.bundleId, code, mode: 'spawn' },
+        { bundle_id: params.bundleId, code },
         5000,
       );
       const classes = result.messages
@@ -2999,7 +3006,7 @@ export function registerAllTools(
         bridgeManager,
         deviceManager,
         params.deviceId,
-        { bundle_id: params.bundleId, code, mode: 'spawn' },
+        { bundle_id: params.bundleId, code },
         3000,
       );
       const methodMsg = result.messages.find((m: any) => m?.payload?.methods);
