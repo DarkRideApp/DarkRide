@@ -628,7 +628,7 @@ export class AiAgent implements AiAgentInterface {
     tools: AiToolDefinition[],
     totalUsage: { inputTokens: number; outputTokens: number },
     options?: { signal?: AbortSignal },
-  ): Promise<{ textChunks: string[]; toolUses: AiToolUseBlock[]; turnInputTokens: number }> {
+  ): Promise<{ textChunks: string[]; toolUses: AiToolUseBlock[]; turnInputTokens: number; parseMissAttempt: boolean }> {
     // Phase 1: Run cheap research model, buffering all events
     const buffered: AiStreamEvent[] = [];
     const researchStream = tierConfig.researchProvider.createStreamingRequest(
@@ -642,6 +642,12 @@ export class AiAgent implements AiAgentInterface {
     const hasWriteTool = buffered.some(
       (e) => e.type === 'tool_use' && tierConfig.writeToolNames.includes(e.name),
     );
+
+    // Track research usage added in the Phase-1 replay so we can subtract it on the
+    // parseMissAttempt escalation path (where Phase-2 discarded accounting takes over).
+    let researchInputAdded = 0;
+    let researchOutputAdded = 0;
+    let parseMissAttempt = false;
 
     if (!hasWriteTool) {
       // No write tool — replay buffered events
@@ -661,24 +667,45 @@ export class AiAgent implements AiAgentInterface {
             if (event.inputTokens > 0) turnInputTokens = event.inputTokens;
             totalUsage.inputTokens += event.inputTokens;
             totalUsage.outputTokens += event.outputTokens;
+            researchInputAdded += event.inputTokens;
+            researchOutputAdded += event.outputTokens;
             break;
         }
       }
 
       // Detect text-based tool calls from models that don't use the API format
       if (toolUses.length === 0 && textChunks.length > 0) {
-        const textToolUses = parseTextBasedToolUses(textChunks.join(''));
+        const fullText = textChunks.join('');
+        const validNames = new Set(tools.map(t => t.name));
+        const textToolUses = parseTextBasedToolUses(fullText, validNames);
         if (textToolUses.length > 0) {
           log(`Detected ${textToolUses.length} text-based tool call(s) in tiered turn`);
-          return { textChunks: [], toolUses: textToolUses, turnInputTokens };
+          return { textChunks: [], toolUses: textToolUses, turnInputTokens, parseMissAttempt: false };
+        }
+        if (containsUnparsedToolCallAttempt(fullText, validNames)) {
+          log(`Unparsed tool-call attempt in tiered turn — escalating. Snippet: "${fullText.slice(0, 200)}"`);
+          parseMissAttempt = true;
         }
       }
 
-      return { textChunks, toolUses, turnInputTokens };
+      if (!parseMissAttempt) {
+        return { textChunks, toolUses, turnInputTokens, parseMissAttempt: false };
+      }
     }
 
-    // Write tool detected — escalate to write provider
-    log('Write tool detected — escalating to write provider');
+    // Escalate to write provider
+    log(hasWriteTool
+      ? 'Write tool detected — escalating to write provider'
+      : 'Parser-miss attempt detected — escalating to write provider');
+
+    // On a parseMissAttempt escalation, Phase-1 already added the research model's
+    // usage to totalUsage. Phase-2 will re-account whichever buffer (writeBuffered
+    // or buffered) it actually uses, so subtracting the Phase-1 contribution here
+    // avoids double-counting research tokens regardless of which buffer wins.
+    if (parseMissAttempt) {
+      totalUsage.inputTokens -= researchInputAdded;
+      totalUsage.outputTokens -= researchOutputAdded;
+    }
 
     // Phase 2: Re-run with expensive write model, buffering to check if it actually writes
     let writeBuffered: AiStreamEvent[] = [];
@@ -701,11 +728,14 @@ export class AiAgent implements AiAgentInterface {
     const writeModelUsedWriteTool = writeBuffered.some(
       (e) => e.type === 'tool_use' && tierConfig.writeToolNames.includes(e.name),
     );
+    // On a parseMissAttempt escalation any tool_use counts — the point was to
+    // get a parseable call back, not specifically a write-class tool.
+    const useWriteOutput = writeModelUsedWriteTool
+      || (parseMissAttempt && writeBuffered.some(e => e.type === 'tool_use'));
+    const eventsToUse = useWriteOutput ? writeBuffered : buffered;
+    const discarded = useWriteOutput ? buffered : writeBuffered;
 
-    const eventsToUse = writeModelUsedWriteTool ? writeBuffered : buffered;
-    const discarded = writeModelUsedWriteTool ? buffered : writeBuffered;
-
-    if (!writeModelUsedWriteTool) {
+    if (!useWriteOutput) {
       log('Write model declined to write — falling back to research model response');
     }
 
@@ -738,7 +768,7 @@ export class AiAgent implements AiAgentInterface {
       }
     }
 
-    return { textChunks, toolUses, turnInputTokens };
+    return { textChunks, toolUses, turnInputTokens, parseMissAttempt };
   }
 
   private async compactMessages(

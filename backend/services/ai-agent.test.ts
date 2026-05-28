@@ -7,6 +7,7 @@ import {
   parseTextBasedToolUses,
   containsUnparsedToolCallAttempt,
   type TierConfig,
+  type AgentIdentity,
 } from './ai-agent';
 import { AiToolRegistry, type AiToolRegistration } from './ai-tools';
 import type { AiProvider } from './ai-provider';
@@ -2126,6 +2127,93 @@ describe('AiAgent', () => {
       // After sanitisation and slicing, contextId portion should be at most 64 chars
       expect(prompt).toContain('a'.repeat(64));
       expect(prompt).not.toContain('a'.repeat(65));
+    });
+  });
+
+  // ── Tiered Phase-1 parseMissAttempt escalation ────────────────────
+
+  describe('tiered execution — parseMissAttempt escalation', () => {
+    const coreIdentity: AgentIdentity = {
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: ['devices:read', 'devices:write'],
+      onBehalfOfService: 'test',
+    };
+
+    function makeTierConfig(overrides: Partial<TierConfig> = {}): TierConfig {
+      return {
+        researchProvider: overrides.researchProvider ?? makeMockProvider(() => textOnlyStream('cheap')),
+        writeProvider: overrides.writeProvider ?? makeMockProvider(() => textOnlyStream('expensive')),
+        writeToolNames: overrides.writeToolNames ?? ['write_notes'],
+      };
+    }
+
+    it('escalates to write provider when cheap-model output looks like an unparsed tool call', async () => {
+      // Research provider emits text that looks like a tool call but is not in API format
+      // and is not parseable by any known format — just a bare function-call pattern.
+      // writeToolNames is empty so the *write-tool* escalation trigger does NOT fire;
+      // only parseMissAttempt should trigger escalation.
+      const writeCreateStream = vi.fn(() => {
+        return (async function* () {
+          yield { type: 'tool_use' as const, id: 'w1', name: 'get_installed_apps', input: { filter: 'x' } };
+          yield { type: 'usage' as const, inputTokens: 30, outputTokens: 15 };
+        })();
+      });
+
+      const writeProvider = makeMockProvider(writeCreateStream);
+
+      // Research provider emits text that contains a registered tool name followed by '('
+      // but with non-JSON arguments — the parser cannot decode it, so containsUnparsedToolCallAttempt
+      // fires and parseMissAttempt is set, triggering escalation.
+      let researchCallCount = 0;
+      const researchProvider = makeMockProvider(() => {
+        researchCallCount++;
+        if (researchCallCount === 1) {
+          return (async function* () {
+            // Name followed by '(' but the args are prose, not JSON — parser will miss it
+            yield { type: 'text' as const, text: 'I will call get_installed_apps(filter=games)' };
+            yield { type: 'usage' as const, inputTokens: 10, outputTokens: 5 };
+          })();
+        }
+        // After write provider executes the tool, return final text
+        return (async function* () {
+          yield { type: 'text' as const, text: 'Done' };
+          yield { type: 'usage' as const, inputTokens: 20, outputTokens: 8 };
+        })();
+      });
+
+      const registry = makeRegistry([
+        { name: 'get_installed_apps', context: ['devices'], execute: async () => '[{"pkg":"com.example"}]' },
+      ]);
+
+      const tierConfig = makeTierConfig({
+        researchProvider,
+        writeProvider,
+        writeToolNames: [], // must be empty so only parseMissAttempt can trigger escalation
+      });
+
+      const onToolStart = vi.fn();
+
+      const agent = new AiAgent(db, registry, researchProvider);
+      const result = await agent.handleMessageWithIdentity(coreIdentity, {
+        conversationId: null,
+        message: 'List installed apps',
+        pageContext: 'devices',
+        contextId: '',
+        onToken: vi.fn(),
+        onToolStart,
+        onToolResult: vi.fn(),
+        tierConfig,
+        mode: 'streaming',
+      });
+
+      // writeProvider must have been called — escalation happened via parseMissAttempt
+      expect(writeCreateStream).toHaveBeenCalled();
+      expect(result.error).toBeUndefined();
+      // The tool_use emitted by the write provider must have been executed
+      expect(onToolStart).toHaveBeenCalledWith(
+        'w1', 'get_installed_apps', { filter: 'x' }, expect.any(Number), expect.any(Number),
+      );
     });
   });
 });
