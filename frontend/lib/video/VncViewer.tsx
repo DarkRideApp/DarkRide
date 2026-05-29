@@ -12,9 +12,9 @@ export interface VncViewerProps {
   wsPath: string;
   /** Fired once the RFB session is established. */
   onReady?: () => void;
-  /** Fired on RFB error events (securityfailure, etc.). */
+  /** Fired on RFB error events (securityfailure, constructor throw, unclean disconnect). */
   onError?: (err: Error) => void;
-  /** Fired when the remote drops the connection. */
+  /** Fired when the remote drops the connection CLEANLY. Unclean drops surface via onError. */
   onDisconnect?: () => void;
 }
 
@@ -23,44 +23,70 @@ export interface VncViewerProps {
  * existing scrcpy DeviceViewer's callback shape so the device-detail
  * page can swap between them with a single conditional.
  *
+ * Callbacks are held in refs so a parent passing inline closures
+ * doesn't cause the effect to re-run and tear down the live VNC
+ * session on every render. The main effect only re-runs when serial
+ * or wsPath actually change (which always means a different bridge).
+ *
  * Reconnect-on-drop is deliberately NOT implemented here in Phase 1 —
  * the parent component owns retry policy (the existing DeviceViewer
  * does the same). onDisconnect fires once and stays.
  */
 export function VncViewer({ serial, wsPath, onReady, onError, onDisconnect }: VncViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const onReadyRef = useRef(onReady);
+  const onErrorRef = useRef(onError);
+  const onDisconnectRef = useRef(onDisconnect);
+
+  // Keep callback refs fresh without making them dependencies of the
+  // main mount effect. Without this, inline-callback parents would
+  // re-mount the RFB on every render (a tear-down + reconnect storm).
+  useEffect(() => {
+    onReadyRef.current = onReady;
+    onErrorRef.current = onError;
+    onDisconnectRef.current = onDisconnect;
+  });
 
   useEffect(() => {
     if (!containerRef.current) return;
-    // Build the absolute WS URL from the relative wsPath. window.location
-    // gives us host + protocol (http→ws, https→wss).
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${proto}//${window.location.host}${wsPath}`;
 
-    const rfb = new RFB(containerRef.current, url, {});
+    let rfb: RFB | null = null;
+    try {
+      rfb = new RFB(containerRef.current, url, {});
+    } catch (e: any) {
+      onErrorRef.current?.(new Error(`VNC failed to initialise for ${serial}: ${e?.message ?? String(e)}`));
+      return;
+    }
     rfb.scaleViewport = true;
     rfb.resizeSession = false;
 
-    const onConnect = () => { onReady?.(); };
+    const onConnect = () => { onReadyRef.current?.(); };
     const onDisc = (e: any) => {
       if (e?.detail?.clean === false) {
-        onError?.(new Error(`VNC disconnected uncleanly for ${serial}`));
+        // Unclean disconnect — surface as error only, do NOT also fire onDisconnect.
+        onErrorRef.current?.(new Error(`VNC disconnected uncleanly for ${serial}`));
+        return;
       }
-      onDisconnect?.();
+      onDisconnectRef.current?.();
     };
     const onSecFail = (e: any) => {
-      onError?.(new Error(`VNC security failure for ${serial}: ${e?.detail?.reason ?? 'unknown'}`));
+      onErrorRef.current?.(new Error(`VNC security failure for ${serial}: ${e?.detail?.reason ?? 'unknown'}`));
     };
     rfb.addEventListener('connect', onConnect);
     rfb.addEventListener('disconnect', onDisc);
     rfb.addEventListener('securityfailure', onSecFail);
 
     return () => {
-      try { rfb.disconnect(); } catch { /* best effort */ }
+      try {
+        rfb!.removeEventListener('connect', onConnect);
+        rfb!.removeEventListener('disconnect', onDisc);
+        rfb!.removeEventListener('securityfailure', onSecFail);
+        rfb!.disconnect();
+      } catch { /* best effort: cleanup must not throw */ }
     };
-    // serial/wsPath are stable for the lifetime of this mount; the parent
-    // unmounts to switch devices, so a tight dep array is intentional.
-  }, [serial, wsPath, onReady, onError, onDisconnect]);
+  }, [serial, wsPath]);
 
   return (
     <div
