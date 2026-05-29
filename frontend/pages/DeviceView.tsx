@@ -6,6 +6,7 @@ import { LoadingSpinner } from '@darkrideapp/plugin-sdk/react';
 import { AppsTab } from '../components/devices/AppsTab';
 import { WireGuardSetup } from '../components/devices/WireGuardSetup';
 import { DeviceViewer, DeviceAction } from '../components/devices/DeviceViewer';
+import { VncViewer } from '../lib/video/VncViewer';
 import { SetupWizardModal } from '../components/devices/SetupWizardModal';
 import { CURRENT_SETUP_VERSION } from '../../shared/types/api';
 import type { Device, Setting } from '../../shared/types/api';
@@ -54,6 +55,8 @@ export function DeviceView() {
   const [reprobing, setReprobing] = useState(false);
   const [pairing, setPairing] = useState(false);
   const [busyWarning, setBusyWarning] = useState<number | null>(null); // remaining seconds
+  const [videoTransport, setVideoTransport] = useState<'vnc' | 'scrcpy' | null>(null);
+  const [vncWsPath, setVncWsPath] = useState<string | null>(null);
   const [showSyslog, setShowSyslog] = useState(false);
   const [syslogRunning, setSyslogRunning] = useState(false);
   const [syslogEntries, setSyslogEntries] = useState<Array<{
@@ -72,6 +75,20 @@ export function DeviceView() {
       setLoading(false);
     }).catch(() => setLoading(false));
   }, [ws, deviceId]);
+
+  // Fetch video transport type — determines whether to render VncViewer
+  // (docker-android emulators) or the default scrcpy DeviceViewer.
+  useEffect(() => {
+    if (!deviceId) return;
+    let cancelled = false;
+    void ws.sendRestApi('GET', `/v1/devices/${encodeURIComponent(deviceId)}/video-transport`).then((r: any) => {
+      if (cancelled) return;
+      const data = r?.body?.data ?? {};
+      setVideoTransport(data.transport === 'vnc' ? 'vnc' : 'scrcpy');
+      setVncWsPath(data.wsPath ?? null);
+    });
+    return () => { cancelled = true; };
+  }, [deviceId, ws]);
 
   // DeviceViewer drives the live stream. When it fires onStreamReady we treat
   // the stream as live and clear any prior polling/error state.
@@ -544,13 +561,22 @@ export function DeviceView() {
 
   const canvasSection = (
     <div className="device-canvas-container">
-      <DeviceViewer
-        deviceId={deviceId!}
-        captureSessionId={captureSessionId ?? undefined}
-        extraActions={extraActions}
-        onStreamReady={handleStreamReady}
-        onError={handleStreamError}
-      />
+      {videoTransport === 'vnc' && vncWsPath ? (
+        <VncViewer
+          serial={deviceId!}
+          wsPath={vncWsPath}
+          onReady={() => handleStreamReady({ screenWidth: 0, screenHeight: 0, backend: 'vnc' })}
+          onError={(e) => handleStreamError(e.message)}
+        />
+      ) : (
+        <DeviceViewer
+          deviceId={deviceId!}
+          captureSessionId={captureSessionId ?? undefined}
+          extraActions={extraActions}
+          onStreamReady={handleStreamReady}
+          onError={handleStreamError}
+        />
+      )}
       {automationLog.length > 0 && (
         <div className="automation-overlay" data-testid="automation-overlay">
           <strong>Automation Running</strong>

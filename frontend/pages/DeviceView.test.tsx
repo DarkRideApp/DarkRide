@@ -1,3 +1,16 @@
+// Mock noVNC so VncViewer renders a plain div (data-testid=vnc-viewer-*)
+// without trying to open a real WebSocket in jsdom.
+vi.mock('@novnc/novnc', () => ({
+  default: class MockRFB {
+    addEventListener() {}
+    removeEventListener() {}
+    disconnect() {}
+    scaleViewport = false;
+    resizeSession = false;
+    constructor(_target: HTMLElement, _url: string, _opts: any) {}
+  },
+}));
+
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, waitFor, fireEvent, screen } from '@testing-library/react';
@@ -409,6 +422,45 @@ describe('DeviceView — Capture tab session actions', () => {
     const label = await findByTestId('capture-session-id');
     await waitFor(() => {
       expect(label.textContent).toContain('Nightly run');
+    });
+  });
+});
+
+describe('DeviceView — video transport gating', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('renders <VncViewer> when video-transport endpoint returns transport=vnc', async () => {
+    const ws: WebSocketContextValue = {
+      connected: true,
+      sendMessage: vi.fn(),
+      sendRestApi: vi.fn().mockImplementation(async (_m: string, path: string) => {
+        if (path.endsWith('/video-transport')) {
+          return { type: 'restapi', id: '1', status: 200, body: { data: { transport: 'vnc', wsPath: '/ws/vnc?serial=localhost%3A32770' } } };
+        }
+        if (path.startsWith('/v1/device/view/')) {
+          return { type: 'restapi', id: '2', status: 200, body: { data: { id: 'localhost:32770', name: 'localhost:32770', platform: 'android', isRooted: true, setupVersion: 4, lastSeen: Date.now() } } };
+        }
+        // Permissive defaults so other DeviceView fetches don't blow up.
+        return { type: 'restapi', id: '3', status: 200, body: { data: {} } };
+      }),
+      subscribe: vi.fn().mockReturnValue(() => {}),
+    } as any;
+
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={['/ui/devices/localhost%3A32770/details']}>
+            <Routes>
+              <Route path="/ui/devices/:id" element={<DeviceView />} />
+              <Route path="/ui/devices/:id/:tab" element={<DeviceView />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </WebSocketContext.Provider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('vnc-viewer-localhost:32770')).toBeInTheDocument();
     });
   });
 });
