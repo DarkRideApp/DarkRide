@@ -125,11 +125,14 @@ export function VncViewer({ serial, wsPath, onReady, onError, onDisconnect }: Vn
   return (
     <div
       ref={containerRef}
+      className="vnc-viewer"
       data-testid={`vnc-viewer-${serial}`}
       // No fixed height — let the noVNC canvas inside drive the size, then
       // the global `.device-canvas-container canvas { max-width: 100% }`
       // rule constrains it. width:100% on the wrapper lets the canvas
-      // know how much horizontal room it can shrink-to-fit into.
+      // know how much horizontal room it can shrink-to-fit into. The
+      // .vnc-viewer class adds max-height so a 1080x2400 phone canvas
+      // doesn't blow past the viewport.
       style={{ width: '100%', background: '#000' }}
     />
   );

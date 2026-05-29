@@ -1878,6 +1878,17 @@ body.live-log-open .main-content {
   max-width: 100%;
   cursor: pointer;
 }
+/* Cap the VNC canvas height so a 1080x2400 portrait Pixel doesn't blow
+ * past the viewport. max-width:100% (inherited from .device-canvas-
+ * container canvas above) constrains width; max-height bounds the other
+ * axis. Canvases preserve aspect ratio when both max-* are set and no
+ * explicit width/height CSS is given, so the canvas fits whichever
+ * dimension is tighter. ~220px subtracted accounts for the device-view
+ * header, tab strip, and bottom padding. */
+.vnc-viewer canvas {
+  max-height: calc(100vh - 220px);
+  margin: 0 auto;
+}
 .device-info-sidebar .info-row {
   display: flex;
   justify-content: space-between;

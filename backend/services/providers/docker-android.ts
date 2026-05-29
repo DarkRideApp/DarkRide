@@ -323,6 +323,12 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             // be looked up from EMULATOR_DEVICE.
             'SCREEN_WIDTH=1080',
             'SCREEN_HEIGHT=2400',
+            // `-no-skin` drops the Android emulator's phone-bezel "skin"
+            // (the device frame rendered around the actual screen). Without
+            // it the VNC stream shows a phone-shaped window-within-the-
+            // window — useful when you want to demo on a real device, but
+            // pure overhead for our headless-control use case.
+            'EMULATOR_ADDITIONAL_ARGS=-no-skin',
             // Disable nvidia-container-cli's legacy mode entirely. When the
             // nvidia-container-toolkit is installed in the host environment
             // (e.g. Docker Desktop with GPU support enabled on Windows/WSL),
