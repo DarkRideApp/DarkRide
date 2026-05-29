@@ -5,7 +5,7 @@ import { eq } from 'drizzle-orm';
 import { registerEndpoint } from './api-service';
 import { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
-import { screenshots, devices } from '../db/schema';
+import { screenshots, devices, automationSessions, capturedTraffic, websocketMessages } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { createLoggers } from '../logs';
 import { generateWireGuardQrCode } from '../utils/qr-code';
@@ -94,6 +94,12 @@ export function registerDeviceEndpoints(deviceManager: DeviceManager, db?: AppDa
   // devices that won't be reconnected, etc.). The device-manager will
   // re-add the row on the next adb poll if it actually sees the device,
   // so this only sticks for genuinely-absent devices.
+  //
+  // Three other tables hold device_id FKs that we deliberately keep as
+  // historical records: automation_sessions, captured_traffic,
+  // websocket_messages. SQLite's default FK action is NO ACTION which
+  // would reject the delete; we explicitly NULL the references in a
+  // single transaction so the history survives the rename event.
   registerEndpoint('DELETE', '/v1/device/:id', async (req, res) => {
     try {
       const deviceId = req.params.id;
@@ -106,7 +112,12 @@ export function registerDeviceEndpoints(deviceManager: DeviceManager, db?: AppDa
         res.status(404).json({ success: false, error: 'Device not found' });
         return;
       }
-      db.delete(devices).where(eq(devices.id, deviceId)).run();
+      db.transaction((tx) => {
+        tx.update(automationSessions).set({ deviceId: null }).where(eq(automationSessions.deviceId, deviceId)).run();
+        tx.update(capturedTraffic).set({ deviceId: null }).where(eq(capturedTraffic.deviceId, deviceId)).run();
+        tx.update(websocketMessages).set({ deviceId: null }).where(eq(websocketMessages.deviceId, deviceId)).run();
+        tx.delete(devices).where(eq(devices.id, deviceId)).run();
+      });
       log(`Forgot device ${deviceId}`);
       res.json({ success: true });
     } catch (err: any) {
