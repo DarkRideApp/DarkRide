@@ -22,6 +22,8 @@ export function createInMemoryDocStore(): DocStoreApi & {
       const raw = store.get(key);
       return raw === undefined ? null : (JSON.parse(raw) as T);
     },
+    // Returns a fresh snapshot Map on each access (not a live view); read it
+    // again after each mutation rather than holding a reference.
     get _store(): ReadonlyMap<string, unknown> {
       const out = new Map<string, unknown>();
       for (const [k, v] of store) out.set(k, JSON.parse(v));
