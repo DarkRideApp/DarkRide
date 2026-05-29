@@ -13,6 +13,12 @@ export default defineConfig({
   build: {
     outDir: '../dist/frontend',
     emptyOutDir: true,
+    // ES2022 baseline so esbuild accepts top-level await — @novnc/novnc v1.7
+    // uses it in core/util/browser.js. Vite's default ('modules' = es2020 +
+    // chrome87+ / firefox78+ / safari14+) errors out at prebundle time.
+    // ES2022 corresponds to chrome89+ / firefox89+ / safari15+ which are all
+    // 2021+ browsers — fine for DarkRide's audience.
+    target: 'es2022',
     commonjsOptions: {
       // Workspace package outputs CJS; tell Rollup to transform it so named
       // exports are statically visible (e.g. pluginRegistry from /react).
@@ -30,6 +36,11 @@ export default defineConfig({
   // scanner crawls every `../../../../frontend/...` relative import in plugins/,
   // which can take 4+ minutes on cold start.
   optimizeDeps: {
+    // Match the build target so the dev prebundle accepts top-level await
+    // (used by @novnc/novnc 1.7+). Without this, esbuild errors at startup
+    // with "Top-level await is not available in the configured target
+    // environment".
+    esbuildOptions: { target: 'es2022' },
     include: [
       'react',
       'react-dom',
@@ -58,6 +69,10 @@ export default defineConfig({
       '@darkrideapp/plugin-sdk',
       '@darkrideapp/plugin-sdk/react',
       '@darkrideapp/plugin-sdk/utils',
+      // noVNC ships pure ESM with top-level await; prebundle so esbuild
+      // resolves it once with the ES2022 target above instead of touching
+      // it per-request.
+      '@novnc/novnc',
     ],
   },
   server: {
