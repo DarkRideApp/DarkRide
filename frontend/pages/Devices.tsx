@@ -203,6 +203,22 @@ export function Devices() {
     }
   }
 
+  async function forgetDevice(device: Device) {
+    if (!window.confirm(`Forget "${device.name || device.id}"? This removes the row from the devices table — useful for cleaning up stale emulator serials. If the device is still reachable via adb it will be re-added on the next poll.`)) return;
+    const snapshot = devices;
+    setDevices((prev) => prev.filter((d) => d.id !== device.id));
+    try {
+      const r = await ws.sendRestApi('DELETE', `/v1/device/${encodeURIComponent(device.id)}`);
+      if (!r.body?.success) {
+        setDevices(snapshot);
+        toast.error(r.body?.error ?? 'Failed to forget device');
+      }
+    } catch (e: any) {
+      setDevices(snapshot);
+      toast.error(e?.message ?? 'Failed to forget device');
+    }
+  }
+
   if (loading) return <div className="skeleton-grid"><SkeletonCard /><SkeletonCard /><SkeletonCard /></div>;
 
   // Two sources of cards: managed-instance rows and adb-tracked device
@@ -405,6 +421,22 @@ export function Devices() {
                         Delete
                       </button>
                     </div>
+                  )}
+                  {!online && !backingInstance && (
+                    // Forget action for genuinely-orphaned offline rows.
+                    // Common case: stale `localhost:NNNNN` serials from old
+                    // emulator sessions that the device-manager never cleaned
+                    // up. Hidden for online devices (they're real) and for
+                    // backing-instance devices (use the instance lifecycle).
+                    <button
+                      className="device-card-action"
+                      onClick={e => { e.stopPropagation(); forgetDevice(device); }}
+                      data-testid={`forget-btn-${device.id}`}
+                      title="Remove this row from the devices table. If the device reconnects via adb it will re-appear."
+                      style={{ marginLeft: 'auto', borderColor: 'var(--text-muted)', color: 'var(--text-muted)' }}
+                    >
+                      Forget
+                    </button>
                   )}
                 </div>
               </div>

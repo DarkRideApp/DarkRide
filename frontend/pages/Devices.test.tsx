@@ -193,6 +193,56 @@ describe('Devices', () => {
     });
   });
 
+  it('shows a Forget button on offline device cards with no backing instance', async () => {
+    // Regression for the "8 stale device rows from old emulators" case.
+    // Each emulator spawn picks a new random port, so old serials like
+    // localhost:32770 accumulate in the devices table after the matching
+    // instance/container is gone. Forget removes the row server-side.
+    const staleOrphan = {
+      id: 'localhost:32770', name: 'localhost:32770', platform: 'android',
+      isRooted: false, setupVersion: 0, bridgePort: null,
+      lastSeen: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(), // yesterday
+    };
+    const ws: WebSocketContextValue = {
+      connected: true,
+      sendMessage: vi.fn(),
+      sendRestApi: vi.fn().mockImplementation(async (_method: string, path: string) => {
+        if (path === '/v1/device/list') {
+          return { type: 'restapi', id: '1', status: 200, body: { data: [staleOrphan] } };
+        }
+        if (path === '/v1/devices/providers') {
+          return { type: 'restapi', id: '2', status: 200, body: { data: { providers: [] } } };
+        }
+        return { type: 'restapi', id: '3', status: 200, body: { data: {} } };
+      }),
+      subscribe: vi.fn().mockReturnValue(() => {}),
+    };
+
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <ToastProvider>
+          <MemoryRouter>
+            <Devices />
+          </MemoryRouter>
+        </ToastProvider>
+      </WebSocketContext.Provider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('forget-btn-localhost:32770')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId('forget-btn-localhost:32770'));
+    await waitFor(() => {
+      expect(ws.sendRestApi).toHaveBeenCalledWith(
+        'DELETE',
+        '/v1/device/localhost%3A32770',
+      );
+    });
+  });
+
   it('shows the instance card (not a stale device card) when the backing emulator is stopped', async () => {
     // Regression: when a docker-android emulator is stopped, the device row
     // from when it was running stays in the devices table (offline). Before

@@ -89,6 +89,32 @@ export function registerDeviceEndpoints(deviceManager: DeviceManager, db?: AppDa
     }
   }, { requires: ['core.devices:manage'] });
 
+  // DELETE /v1/device/:id — remove the row from the devices table.
+  // Used for "Forget" on stale rows (emulators that no longer exist, USB
+  // devices that won't be reconnected, etc.). The device-manager will
+  // re-add the row on the next adb poll if it actually sees the device,
+  // so this only sticks for genuinely-absent devices.
+  registerEndpoint('DELETE', '/v1/device/:id', async (req, res) => {
+    try {
+      const deviceId = req.params.id;
+      if (!db) {
+        res.status(500).json({ success: false, error: 'Database not available' });
+        return;
+      }
+      const existing = db.select().from(devices).where(eq(devices.id, deviceId)).all()[0];
+      if (!existing) {
+        res.status(404).json({ success: false, error: 'Device not found' });
+        return;
+      }
+      db.delete(devices).where(eq(devices.id, deviceId)).run();
+      log(`Forgot device ${deviceId}`);
+      res.json({ success: true });
+    } catch (err: any) {
+      error(`Failed to forget device ${req.params.id}: ${err.message}`);
+      res.status(500).json({ success: false, error: 'Failed to forget device' });
+    }
+  }, { requires: ['core.devices:manage'] });
+
   // POST /v1/device/setup/:id — trigger device setup flow
   registerEndpoint('POST', '/v1/device/setup/:id', async (req, res) => {
     try {
