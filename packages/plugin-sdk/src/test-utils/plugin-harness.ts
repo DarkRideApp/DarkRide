@@ -1,6 +1,7 @@
 import type { PluginContext, PluginDefinition } from '../types/plugin';
 import type { HookBus } from '../types/hooks';
 import type { PluginAiApi } from '../types/ai';
+import type { DocStoreApi } from '../types/doc-store';
 
 export interface PluginHarness {
   /** The mocked context the plugin's register/start ran against. */
@@ -154,7 +155,7 @@ function createNoopPaths() {
   };
 }
 
-function createNoopDocStore() {
+function createNoopDocStore(): DocStoreApi {
   return {
     putDoc: async () => {},
     getDoc: async () => null,

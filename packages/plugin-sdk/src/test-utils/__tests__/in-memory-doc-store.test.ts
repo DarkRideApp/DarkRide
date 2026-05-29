@@ -34,4 +34,13 @@ describe('createInMemoryDocStore', () => {
     expect(ds._store.size).toBe(0);
     expect(await ds.getDoc('k')).toBeNull();
   });
+
+  it('rejects keys prod would reject (parity with the host adapter)', async () => {
+    const ds = createInMemoryDocStore();
+    await expect(ds.putDoc('', { v: 1 })).rejects.toThrow('non-empty string');
+    await expect(ds.putDoc('has space', { v: 1 })).rejects.toThrow('whitespace or control');
+    await expect(ds.getDoc('x'.repeat(257))).rejects.toThrow('256 bytes');
+    // a valid key with hyphen/underscore is NOT rejected
+    await expect(ds.putDoc('genting-skyworlds_token', { v: 1 })).resolves.toBeUndefined();
+  });
 });

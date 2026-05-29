@@ -5,8 +5,8 @@ import type { AppDatabase } from '../db/index';
 
 export class DocumentStoreHttpError extends Error {
   readonly status: number;
-  constructor(status: number, message: string, options?: { cause?: unknown }) {
-    super(message, options);
+  constructor(status: number, message: string) {
+    super(message);
     this.name = 'DocumentStoreHttpError';
     this.status = status;
   }

@@ -179,6 +179,9 @@ describe('DocumentStore', () => {
 
     it('getDoc throws a DocumentStoreHttpError carrying the status', async () => {
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404 }));
+      // Assert the concrete class too — the ctx adapter's 404->null mapping
+      // relies on `err instanceof DocumentStoreHttpError`.
+      await expect(store.getDoc('missing')).rejects.toBeInstanceOf(DocumentStoreHttpError);
       await expect(store.getDoc('missing')).rejects.toMatchObject({
         name: 'DocumentStoreHttpError',
         status: 404,

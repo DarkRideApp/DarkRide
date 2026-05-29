@@ -1,7 +1,6 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { definePlugin, HookBusImpl } from '@darkrideapp/plugin-sdk';
 import { createInMemoryDocStore } from '@darkrideapp/plugin-sdk/test-utils';
-import { createPluginTestHarness, type PluginTestHarness } from '../../test-utils/plugin-harness';
 import { PluginContextImpl, createEmptyContributions } from '../plugin-context';
 
 describe('ctx.documentStore — lifecycle guard', () => {
@@ -25,13 +24,6 @@ describe('ctx.documentStore — lifecycle guard', () => {
 });
 
 describe('ctx.documentStore — start() round-trip', () => {
-  let harness: PluginTestHarness | null = null;
-
-  afterEach(async () => {
-    await harness?.cleanup();
-    harness = null;
-  });
-
   it('(b) putDoc/getDoc round-trips through the injected DocStoreApi from start()', async () => {
     const ds = createInMemoryDocStore();
 
@@ -49,9 +41,8 @@ describe('ctx.documentStore — start() round-trip', () => {
       },
     });
 
-    // We need to use the harness's pluginManager-level API, but createPluginTestHarness
-    // only accepts a pluginDir path. Use PluginManager directly instead, mirroring
-    // how plugin-lifecycle.test.ts tests start() behaviour without the filesystem harness.
+    // Drive PluginManager directly (the filesystem harness only accepts a
+    // pluginDir path), mirroring how plugin-lifecycle.test.ts exercises start().
     const { PluginManager } = await import('../plugin-manager');
     const mgr = new PluginManager();
     mgr.loadPlugin(testPlugin);
