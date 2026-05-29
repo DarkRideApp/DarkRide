@@ -192,4 +192,60 @@ describe('Devices', () => {
       );
     });
   });
+
+  it('shows the instance card (not a stale device card) when the backing emulator is stopped', async () => {
+    // Regression: when a docker-android emulator is stopped, the device row
+    // from when it was running stays in the devices table (offline). Before
+    // this fix the instance card was hidden by the serial-collision dedupe
+    // and the user was left with an unactionable offline device card (no
+    // Start, because Start is an instance-lifecycle op). The fix:
+    //   1. Non-running instances always show their card (with Start).
+    //   2. Stale device cards backed by a non-running instance are hidden.
+    const staleDevice = {
+      id: 'localhost:32770', name: 'localhost:32770', platform: 'android',
+      isRooted: false, setupVersion: 0, bridgePort: null,
+      lastSeen: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(), // yesterday
+    };
+    const stoppedInstance = {
+      id: 9, providerId: 'docker-android', runtimeId: 'container-old',
+      displayName: 'test-yesterday', serial: 'localhost:32770', state: 'stopped',
+      spawnedByDarkride: true,
+    };
+    const ws: WebSocketContextValue = {
+      connected: true,
+      sendMessage: vi.fn(),
+      sendRestApi: vi.fn().mockImplementation(async (_method: string, path: string) => {
+        if (path === '/v1/device/list') {
+          return { type: 'restapi', id: '1', status: 200, body: { data: [staleDevice] } };
+        }
+        if (path === '/v1/devices/providers') {
+          return { type: 'restapi', id: '2', status: 200, body: { data: { providers: [
+            { id: 'docker-android', capabilities: { canCreate: true }, available: true },
+          ] } } };
+        }
+        if (path === '/v1/devices/providers/docker-android/instances') {
+          return { type: 'restapi', id: '3', status: 200, body: { data: { instances: [stoppedInstance] } } };
+        }
+        return { type: 'restapi', id: '4', status: 200, body: { data: {} } };
+      }),
+      subscribe: vi.fn().mockReturnValue(() => {}),
+    };
+
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <ToastProvider>
+          <MemoryRouter>
+            <Devices />
+          </MemoryRouter>
+        </ToastProvider>
+      </WebSocketContext.Provider>
+    );
+
+    // The instance card should be visible (it owns the lifecycle controls).
+    await waitFor(() => {
+      expect(screen.getByText('test-yesterday')).toBeInTheDocument();
+    });
+    // The stale device card must NOT also be on the page.
+    expect(screen.queryByTestId('device-card-localhost:32770')).not.toBeInTheDocument();
+  });
 });

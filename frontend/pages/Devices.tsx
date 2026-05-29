@@ -205,20 +205,42 @@ export function Devices() {
 
   if (loading) return <div className="skeleton-grid"><SkeletonCard /><SkeletonCard /><SkeletonCard /></div>;
 
-  const onlineCount = devices.filter(isOnline).length;
-  const offlineCount = devices.length - onlineCount;
-  // Show every managed instance EXCEPT ones whose serial already appears
-  // as an adb-tracked device. Once the emulator's adbd binds, the device
-  // tracker picks it up and the device card supersedes the instance card —
-  // but the device card needs to know about the backing instance so it can
-  // surface Stop/Delete (the emulator-lifecycle ops the device card has
-  // no analogue for). Build the lookup here and pass it through below.
-  const deviceSerials = new Set(devices.map((d) => d.id));
-  const visibleInstances = instances.filter((i) => !i.serial || !deviceSerials.has(i.serial));
+  // Two sources of cards: managed-instance rows and adb-tracked device
+  // rows. They overlap when a running docker-android emulator is reachable
+  // via adb (same serial in both tables). The rules:
+  //
+  //   1. RUNNING instance + matching device row → show device card only.
+  //      The device card has its own Stop/Delete surfaced via the
+  //      backing-instance lookup below.
+  //   2. NON-RUNNING instance (stopped/created/error/pulling) → show
+  //      instance card. Its serial may still match a stale device row
+  //      because the device-manager doesn't clean those up when the
+  //      container dies (separate issue); we hide the stale device card
+  //      in that case so the user sees one card, not two.
+  //   3. Device row with no matching instance (USB phones, iOS, etc.) →
+  //      show device card.
+  //
+  // Without rule 2 a stopped emulator leaves the user staring at an
+  // unactionable device card (no Start, because Start is an instance op).
   const instanceBySerial = new Map<string, ManagedInstance>();
   for (const i of instances) {
     if (i.serial) instanceBySerial.set(i.serial, i);
   }
+  const deviceSerials = new Set(devices.map((d) => d.id));
+  const visibleInstances = instances.filter((i) => {
+    // Rule 2: non-running instances always show their card.
+    if (i.state !== 'running') return true;
+    // Rule 1: running instance is superseded by the device card if one exists.
+    return !i.serial || !deviceSerials.has(i.serial);
+  });
+  const visibleDevices = devices.filter((d) => {
+    // Rule 2: hide stale device cards backed by non-running instances.
+    const inst = instanceBySerial.get(d.id);
+    return !inst || inst.state === 'running';
+  });
+  // Counts reflect what the user actually sees, not raw row counts.
+  const onlineCount = visibleDevices.filter(isOnline).length;
+  const offlineCount = visibleDevices.length - onlineCount;
   const bootingCount = visibleInstances.filter((i) => i.state === 'created' || i.state === 'starting').length;
   const errorCount = visibleInstances.filter((i) => i.state === 'error').length;
   const subtitle = [
@@ -228,7 +250,7 @@ export function Devices() {
     errorCount > 0 ? `${errorCount} error` : null,
   ].filter(Boolean).join(' · ');
 
-  const hasAnything = devices.length > 0 || visibleInstances.length > 0;
+  const hasAnything = visibleDevices.length > 0 || visibleInstances.length > 0;
 
   return (
     <div data-testid="devices-page">
@@ -272,7 +294,7 @@ export function Devices() {
               onDelete={() => deleteInstance(inst)}
             />
           ))}
-          {devices.map(device => {
+          {visibleDevices.map(device => {
             const online = isOnline(device);
             const backingInstance = instanceBySerial.get(device.id) ?? null;
             return (
