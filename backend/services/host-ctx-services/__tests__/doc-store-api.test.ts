@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import * as schema from '../db/schema';
-import { createDocStoreApi } from './doc-store-api';
-import { createTestDb } from '../test-utils/create-test-db';
+import * as schema from '../../../db/schema';
+import { createDocStoreApi } from '../doc-store-api';
+import { createTestDb } from '../../../test-utils/create-test-db';
 
 describe('createDocStoreApi', () => {
   let db: ReturnType<typeof createTestDb>;

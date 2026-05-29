@@ -1,6 +1,6 @@
 import type { DocStoreApi } from '@darkrideapp/plugin-sdk';
-import type { AppDatabase } from '../db/index';
-import { DocumentStore, DocumentStoreHttpError } from './document-store';
+import type { AppDatabase } from '../../db/index';
+import { DocumentStore, DocumentStoreHttpError } from '../document-store';
 
 function validateKey(key: string): void {
   if (typeof key !== 'string' || key.length === 0) {
