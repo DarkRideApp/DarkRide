@@ -3,6 +3,15 @@ import { eq } from 'drizzle-orm';
 import { settings } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 
+export class DocumentStoreHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'DocumentStoreHttpError';
+    this.status = status;
+  }
+}
+
 export class DocumentStore {
   constructor(private db: AppDatabase) {}
 
@@ -35,22 +44,22 @@ export class DocumentStore {
   }
 
   async getDoc(docId: string): Promise<any> {
-    const resp = await fetch(`${this.getBaseUrl()}/id/${docId}`, {
+    const resp = await fetch(`${this.getBaseUrl()}/id/${encodeURIComponent(docId)}`, {
       method: 'GET',
       headers: this.buildHeaders({ 'Content-Type': 'application/json' }),
     });
-    if (!resp.ok) throw new Error(`Document store GET failed: ${resp.status}`);
+    if (!resp.ok) throw new DocumentStoreHttpError(resp.status, `Document store GET failed: ${resp.status}`);
     return resp.json();
   }
 
   async putDoc(docId: string, doc: any): Promise<any> {
     const body = gzipSync(JSON.stringify(doc), { level: 9 });
-    const resp = await fetch(`${this.getBaseUrl()}/id/${docId}`, {
+    const resp = await fetch(`${this.getBaseUrl()}/id/${encodeURIComponent(docId)}`, {
       method: 'PUT',
       headers: this.buildHeaders({ 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' }),
       body,
     });
-    if (!resp.ok) throw new Error(`Document store PUT failed: ${resp.status}`);
+    if (!resp.ok) throw new DocumentStoreHttpError(resp.status, `Document store PUT failed: ${resp.status}`);
     return resp.json();
   }
 }
