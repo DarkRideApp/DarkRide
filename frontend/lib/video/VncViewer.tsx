@@ -52,18 +52,28 @@ export function VncViewer({ serial, wsPath, onReady, onError, onDisconnect }: Vn
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${proto}//${window.location.host}${wsPath}`;
 
+    // Console-level lifecycle logging so a blank canvas can be diagnosed
+    // from devtools without backend log access. Prefixed so users can grep.
+    const tag = `[VncViewer ${serial}]`;
+    console.log(`${tag} connecting to ${url}`);
+
     let rfb: RFB | null = null;
     try {
       rfb = new RFB(containerRef.current, url, {});
     } catch (e: any) {
+      console.error(`${tag} RFB constructor threw:`, e);
       onErrorRef.current?.(new Error(`VNC failed to initialise for ${serial}: ${e?.message ?? String(e)}`));
       return;
     }
     rfb.scaleViewport = true;
     rfb.resizeSession = false;
 
-    const onConnect = () => { onReadyRef.current?.(); };
+    const onConnect = () => {
+      console.log(`${tag} connect event fired — RFB session established`);
+      onReadyRef.current?.();
+    };
     const onDisc = (e: any) => {
+      console.log(`${tag} disconnect event fired, detail:`, e?.detail);
       if (e?.detail?.clean === false) {
         // Unclean disconnect — surface as error only, do NOT also fire onDisconnect.
         onErrorRef.current?.(new Error(`VNC disconnected uncleanly for ${serial}`));
@@ -72,17 +82,29 @@ export function VncViewer({ serial, wsPath, onReady, onError, onDisconnect }: Vn
       onDisconnectRef.current?.();
     };
     const onSecFail = (e: any) => {
+      console.error(`${tag} securityfailure:`, e?.detail);
       onErrorRef.current?.(new Error(`VNC security failure for ${serial}: ${e?.detail?.reason ?? 'unknown'}`));
+    };
+    // 'credentialsrequired' is a *separate* event from securityfailure and
+    // means the server asked for a password but we didn't pre-supply one.
+    // budtmo's image leaves VNC password-less in our spawn path, so seeing
+    // this in the wild means the image was rebuilt with a password set —
+    // worth logging explicitly so the cause isn't mistaken for a bridge bug.
+    const onCredentialsRequired = () => {
+      console.error(`${tag} credentialsrequired — server is asking for a VNC password but the spawn path doesn't set one. Did budtmo's VNC_PASSWORD env get inherited from elsewhere?`);
+      onErrorRef.current?.(new Error(`VNC server requested credentials for ${serial}; check VNC_PASSWORD env on the container`));
     };
     rfb.addEventListener('connect', onConnect);
     rfb.addEventListener('disconnect', onDisc);
     rfb.addEventListener('securityfailure', onSecFail);
+    rfb.addEventListener('credentialsrequired', onCredentialsRequired);
 
     return () => {
       try {
         rfb!.removeEventListener('connect', onConnect);
         rfb!.removeEventListener('disconnect', onDisc);
         rfb!.removeEventListener('securityfailure', onSecFail);
+        rfb!.removeEventListener('credentialsrequired', onCredentialsRequired);
         rfb!.disconnect();
       } catch { /* best effort: cleanup must not throw */ }
     };
