@@ -142,6 +142,7 @@ import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
 import { registerDevicesProvidersEndpoints } from './api/devices-providers';
+import { registerVideoTransportEndpoint } from './api/video-transport';
 import { measureDiskUsage } from './services/disk-usage';
 
 const { log, error } = createLoggers('server');
@@ -899,6 +900,7 @@ httpServer.listen(PORT, HOST, () => {
   await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
   registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo);
   vncWss = setupVncProxy(httpServer, { repo: deviceInstancesRepo, registry: providerRegistry });
+  registerVideoTransportEndpoint(deviceInstancesRepo, providerRegistry);
 
   // Phase 1: Python environment
   setStartupPhase('preparing_python', 'Preparing Python environment...');
