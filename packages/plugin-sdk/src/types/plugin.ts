@@ -9,6 +9,7 @@ import type { PluginNotificationEvent, PluginNotifyEvent } from './notify';
 import type { HookBus } from './hooks';
 import type { NamespacedStorage } from './storage';
 import type { CloudStorageService, FileStorageService, AutomationRunner } from './services';
+import type { DocStoreApi } from './doc-store';
 import type {
   SettingsApi,
   CloudFilesApi,
@@ -163,6 +164,15 @@ export interface PluginContext {
    * during `register()`.
    */
   fileSync: FileStorageService;
+
+  /**
+   * Host's Document Store. Write-through to the same external store that
+   * automation scripts reach via the ambient `documentStore` global.
+   *
+   * Available from `start()` onwards. Accessing during `register()` throws,
+   * matching `notify`, `cloudStorage`, `runner`, `fileSync`.
+   */
+  readonly documentStore: DocStoreApi;
 
   /** Host's settings table — key/value persistence. */
   settings: SettingsApi;

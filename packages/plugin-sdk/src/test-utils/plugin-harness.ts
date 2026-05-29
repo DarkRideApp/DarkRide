@@ -85,6 +85,7 @@ function createDefaultMockCtx(pluginName: string): PluginContext {
     apks: createNoopApks(),
     paths: createNoopPaths(),
     dispatcher: () => { throw new Error('dispatcher() not available in default mock — pass via mocks'); },
+    documentStore: createNoopDocStore(),
   } as PluginContext;
 }
 
@@ -150,6 +151,13 @@ function createNoopApks() {
 function createNoopPaths() {
   return {
     fileStorage: (rel: string) => `/tmp/${rel}`,
+  };
+}
+
+function createNoopDocStore() {
+  return {
+    putDoc: async () => {},
+    getDoc: async () => null,
   };
 }
 
