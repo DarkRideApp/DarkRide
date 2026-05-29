@@ -3,7 +3,12 @@ import { registerEndpoint } from './api-service';
 import { deviceInstances } from '../db/schema';
 import type { ProviderRegistry } from '../services/providers';
 import type { DeviceInstancesRepo } from '../services/device-instances-repo';
+import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
+import { forgetDeviceRow } from '../services/forget-device';
+import { createLoggers } from '../logs';
+
+const { log: dpLog } = createLoggers('devices-providers-api');
 
 /**
  * Register the `/v1/devices/providers/*` REST endpoints. See spec §10.
@@ -14,6 +19,7 @@ import { broadcastToAll } from '../websocket/index';
 export function registerDevicesProvidersEndpoints(
   registry: ProviderRegistry,
   repo: DeviceInstancesRepo,
+  db?: AppDatabase,
 ): void {
   // GET /v1/devices/providers — list providers + availability + capabilities
   registerEndpoint('GET', '/v1/devices/providers', async (_req, res) => {
@@ -223,6 +229,22 @@ export function registerDevicesProvidersEndpoints(
     try {
       await p.deleteInstance(row.runtimeId);
       repo.delete(row.id);
+      // The container is gone, so any adb-discovered `devices` row that
+      // was tracking this instance's serial is now stale. Drop it so the
+      // user doesn't end up with an unactionable "online" device card
+      // (lastSeen is still recent for ~2 minutes after the container dies,
+      // which suppresses the Forget button on the device card).
+      if (row.serial && db) {
+        try {
+          if (forgetDeviceRow(db, row.serial)) {
+            dpLog(`Cleaned up devices row ${row.serial} after instance ${row.id} delete`);
+          }
+        } catch (e: any) {
+          // Don't fail the whole request — the instance IS gone; an
+          // orphaned device row is recoverable via the Forget button.
+          dpLog(`Failed to clean up devices row ${row.serial}: ${e?.message ?? e}`);
+        }
+      }
       // Broadcast so the Devices page (or any other WS client) drops the
       // row from its UI without a full refresh. `provider-instance-updated`
       // doesn't cover deletes — the row no longer exists to send — so we

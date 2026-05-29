@@ -898,7 +898,7 @@ httpServer.listen(PORT, HOST, () => {
   // Runs before plugins load so DB state is accurate before any plugin queries it.
   const deviceInstancesRepo = new DeviceInstancesRepo(db);
   await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
-  registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo);
+  registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo, db);
   vncWss = setupVncProxy(httpServer, { repo: deviceInstancesRepo, registry: providerRegistry });
   registerVideoTransportEndpoint(deviceInstancesRepo, providerRegistry);
 

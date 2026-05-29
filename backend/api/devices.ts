@@ -5,7 +5,8 @@ import { eq } from 'drizzle-orm';
 import { registerEndpoint } from './api-service';
 import { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
-import { screenshots, devices, automationSessions, capturedTraffic, websocketMessages } from '../db/schema';
+import { screenshots, devices } from '../db/schema';
+import { forgetDeviceRow } from '../services/forget-device';
 import type { AppDatabase } from '../db/index';
 import { createLoggers } from '../logs';
 import { generateWireGuardQrCode } from '../utils/qr-code';
@@ -107,17 +108,11 @@ export function registerDeviceEndpoints(deviceManager: DeviceManager, db?: AppDa
         res.status(500).json({ success: false, error: 'Database not available' });
         return;
       }
-      const existing = db.select().from(devices).where(eq(devices.id, deviceId)).all()[0];
-      if (!existing) {
+      const removed = forgetDeviceRow(db, deviceId);
+      if (!removed) {
         res.status(404).json({ success: false, error: 'Device not found' });
         return;
       }
-      db.transaction((tx) => {
-        tx.update(automationSessions).set({ deviceId: null }).where(eq(automationSessions.deviceId, deviceId)).run();
-        tx.update(capturedTraffic).set({ deviceId: null }).where(eq(capturedTraffic.deviceId, deviceId)).run();
-        tx.update(websocketMessages).set({ deviceId: null }).where(eq(websocketMessages.deviceId, deviceId)).run();
-        tx.delete(devices).where(eq(devices.id, deviceId)).run();
-      });
       log(`Forgot device ${deviceId}`);
       res.json({ success: true });
     } catch (err: any) {

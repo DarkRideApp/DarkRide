@@ -127,4 +127,47 @@ describe('/v1/devices/providers endpoints', () => {
     expect(remove).toHaveBeenCalledWith('inst-1');
     expect(repo.delete).toHaveBeenCalledWith(99);
   });
+
+  it('DELETE also drops the stale devices row matching the instance serial', async () => {
+    // Regression for the post-delete UX glitch: after deleting an emulator
+    // the container is gone but the adb-seeded devices row stayed around
+    // for ~2 minutes (until lastSeen aged out), shown as an unactionable
+    // "online" device card (no Forget button because online + no backing
+    // instance, no Stop/Delete because no backing instance).
+    const sqlite = new (await import('better-sqlite3')).default(':memory:');
+    sqlite.pragma('foreign_keys = ON');
+    const { applyMigrations } = await import('../../test-utils/create-test-db');
+    applyMigrations(sqlite);
+    const { drizzle } = await import('drizzle-orm/better-sqlite3');
+    const schema = await import('../../db/schema');
+    const db = drizzle(sqlite, { schema }) as any;
+    db.insert(schema.devices).values({
+      id: 'localhost:32768', name: 'pixel-emu', platform: 'android',
+      isRooted: true, setupVersion: 0, lastSeen: new Date(),
+    } as any).run();
+
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const reg = { get: () => ({ deleteInstance: remove }) };
+    const repo = {
+      getById: vi.fn().mockReturnValue({
+        id: 7, providerId: 'docker-android', runtimeId: 'inst-1',
+        state: 'running', serial: 'localhost:32768',
+      }),
+      delete: vi.fn(),
+    };
+    clearEndpoints();
+    registerDevicesProvidersEndpoints(reg as any, repo as any, db);
+    const app = express();
+    app.use(express.json());
+    app.use(getApiRouter());
+
+    const res = await request(app).delete('/v1/devices/providers/docker-android/instances/7');
+    expect(res.status).toBe(200);
+    expect(remove).toHaveBeenCalledWith('inst-1');
+
+    // The orphaned device row should be gone.
+    const { eq } = await import('drizzle-orm');
+    const rows = db.select().from(schema.devices).where(eq(schema.devices.id, 'localhost:32768')).all();
+    expect(rows).toEqual([]);
+  });
 });
