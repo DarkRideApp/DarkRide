@@ -313,6 +313,16 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
           Env: [
             `EMULATOR_DEVICE=Pixel 8`,
             `RAM_MB=${ramMb}`,
+            // Match the Xvfb desktop size to the Pixel 8's native portrait
+            // resolution so the VNC stream is just the emulator surface,
+            // not a 1600x900 Linux desktop with the emulator floating in
+            // the middle of it (budtmo's default). 1080x2400 is Pixel 8's
+            // pixel resolution; the emulator window fills the desktop and
+            // the noVNC client renders only the framebuffer we care about.
+            // If we ever support multiple device profiles, this needs to
+            // be looked up from EMULATOR_DEVICE.
+            'SCREEN_WIDTH=1080',
+            'SCREEN_HEIGHT=2400',
             // Disable nvidia-container-cli's legacy mode entirely. When the
             // nvidia-container-toolkit is installed in the host environment
             // (e.g. Docker Desktop with GPU support enabled on Windows/WSL),
