@@ -305,6 +305,8 @@ runner.setIosDeviceManager(iosDeviceManager);
 let pluginManager: PluginManager | null = null;
 // dispatcherApi likewise: constructed during startup, closed during shutdown.
 let dispatcherApi: ReturnType<typeof createDispatcherApi> | null = null;
+// vncWss is set up during startup and must be closed on shutdown alongside wss.
+let vncWss: import('ws').WebSocketServer | null = null;
 
 // Initialize saved traffic store and wire to hook registry
 const savedTrafficStore = new SavedTrafficStore(db);
@@ -896,7 +898,7 @@ httpServer.listen(PORT, HOST, () => {
   const deviceInstancesRepo = new DeviceInstancesRepo(db);
   await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
   registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo);
-  setupVncProxy(httpServer, { repo: deviceInstancesRepo, registry: providerRegistry });
+  vncWss = setupVncProxy(httpServer, { repo: deviceInstancesRepo, registry: providerRegistry });
 
   // Phase 1: Python environment
   setStartupPhase('preparing_python', 'Preparing Python environment...');
@@ -1437,9 +1439,16 @@ async function shutdown() {
   const wss = getWebSocketServer();
   if (wss) {
     for (const client of wss.clients) {
-      client.close();
+      client.close(1001, 'Server shutting down');
     }
     wss.close();
+  }
+  // VNC proxy WSS is separate — close it too so its clients drop cleanly.
+  if (vncWss) {
+    for (const client of vncWss.clients) {
+      client.close(1001, 'Server shutting down');
+    }
+    vncWss.close();
   }
 
   httpServer.close(() => {

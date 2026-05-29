@@ -96,18 +96,47 @@ export function setupWebSocket(
   );
   const allowedOrigins = opts?.allowedOrigins ?? [...defaultOrigins, ...envOrigins];
 
-  wss = new WebSocketServer({
-    server,
-    path: '/ws',
-    verifyClient: (info, callback) => {
-      if (verifyOrigin(info.origin, allowedOrigins)) {
-        callback(true);
-        return;
-      }
-      log(`ws upgrade rejected: disallowed origin "${info.origin}" — add it to WEBSOCKET_ALLOWED_ORIGINS env var to allow (current allowlist: ${allowedOrigins.join(',') || '(empty=disabled)'})`);
-      callback(false, 403, 'Origin not allowed');
-    },
+  // Use noServer mode so we can share a single 'upgrade' listener on the HTTP
+  // server across multiple WSS instances (/ws and /ws/vnc). Two WSS instances
+  // both wired to the same server via {server, path} each register their own
+  // 'upgrade' listener; when one calls abortHandshake on a path mismatch it
+  // destroys the socket before the other handler can claim it.
+  wss = new WebSocketServer({ noServer: true });
+
+  // Shared upgrade router: a single 'upgrade' listener dispatches to the
+  // right WSS instance based on the request path. Additional routes are
+  // registered via registerRoute (see _darkrideRegisterRoute below).
+  const routes = new Map<string, WebSocketServer>([['/ws', wss]]);
+
+  server.on('upgrade', (req, socket, head) => {
+    // Origin allow-list check (CSWSH defence) — was previously handled by
+    // the verifyClient callback in the WSS constructor options.
+    if (!verifyOrigin(req.headers.origin, allowedOrigins)) {
+      log(`ws upgrade rejected: disallowed origin "${req.headers.origin}" — add it to WEBSOCKET_ALLOWED_ORIGINS env var to allow (current allowlist: ${allowedOrigins.join(',') || '(empty=disabled)'})`);
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    const path = (req.url ?? '/').split('?')[0];
+    const target = routes.get(path);
+    if (!target) {
+      socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    target.handleUpgrade(req, socket, head, (ws) => {
+      target.emit('connection', ws, req);
+    });
   });
+
+  // Extension hook: other setup* functions (e.g. setupVncProxy) call this to
+  // register additional WSS instances on the shared upgrade router without
+  // touching the HTTP server directly.
+  function registerRoute(path: string, instance: WebSocketServer): void {
+    routes.set(path, instance);
+  }
+  (wss as any)._darkrideRegisterRoute = registerRoute;
 
   wss.on('connection', (socket: WebSocket, req) => {
     // Authenticate the WebSocket connection via session cookie
@@ -261,17 +290,34 @@ export interface VncProxyDeps {
 }
 
 /**
- * Mount a second WebSocketServer at /ws/vnc on the shared HTTP server.
+ * Mount a WebSocketServer at /ws/vnc on the shared upgrade router.
  * The serial is passed via ?serial=<urlencoded>. Per-connection lifecycle
  * lives in createVncBridge; this function only handles the upgrade and
  * resolves serial → provider.getVncEndpoint().
  *
- * The ws library matches distinct `path` options on the same HTTP server
- * independently, so this coexists with the main /ws connection without
- * any upgrade-event routing.
+ * Requires setupWebSocket to have been called first — it installs the
+ * shared upgrade router (_darkrideRegisterRoute) that this function uses.
+ * Using a shared router (instead of two separate WSS({server, path})
+ * instances) avoids the ws library v8 bug where each WSS registers its own
+ * 'upgrade' listener and the path-mismatch branch calls abortHandshake,
+ * destroying the socket before the correct handler can claim it.
+ *
+ * The `server` parameter is accepted for API stability but is not used
+ * internally; routing is handled via the shared router from setupWebSocket.
  */
-export function setupVncProxy(server: HttpServer, deps: VncProxyDeps): WebSocketServer {
-  const vncWss = new WebSocketServer({ server, path: '/ws/vnc' });
+export function setupVncProxy(_server: HttpServer, deps: VncProxyDeps): WebSocketServer {
+  const mainWss = getWebSocketServer();
+  if (!mainWss) {
+    throw new Error('setupVncProxy: setupWebSocket must be called first');
+  }
+  const registerRoute = (mainWss as any)._darkrideRegisterRoute as
+    ((path: string, instance: WebSocketServer) => void) | undefined;
+  if (typeof registerRoute !== 'function') {
+    throw new Error('setupVncProxy: shared upgrade router not initialized (setupWebSocket out of date?)');
+  }
+
+  const vncWss = new WebSocketServer({ noServer: true });
+
   vncWss.on('connection', (socket, req) => {
     const serial = new URL(req.url ?? '', 'http://localhost').searchParams.get('serial');
     if (!serial) {
@@ -289,6 +335,8 @@ export function setupVncProxy(server: HttpServer, deps: VncProxyDeps): WebSocket
       connectTcp: defaultConnectTcp,
     });
   });
+
+  registerRoute('/ws/vnc', vncWss);
   log(`VNC proxy mounted at /ws/vnc`);
   return vncWss;
 }
