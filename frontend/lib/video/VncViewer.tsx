@@ -65,8 +65,20 @@ export function VncViewer({ serial, wsPath, onReady, onError, onDisconnect }: Vn
       onErrorRef.current?.(new Error(`VNC failed to initialise for ${serial}: ${e?.message ?? String(e)}`));
       return;
     }
-    rfb.scaleViewport = true;
+    // scaleViewport=true sizes noVNC's canvas to fit the wrapper div's
+    // offsetWidth/offsetHeight. That fails for us because the existing
+    // .device-canvas-container CSS has no explicit height — it's content-
+    // sized — so a wrapper with height:100% collapses to 0 and the canvas
+    // becomes invisible. Match the scrcpy player's pattern instead: let
+    // the canvas take its natural framebuffer dimensions (e.g. 1080x2400
+    // for a Pixel 8), and let the existing global CSS rule
+    // `.device-canvas-container canvas { max-width: 100% }` scale it to
+    // fit width while preserving aspect ratio.
+    rfb.scaleViewport = false;
     rfb.resizeSession = false;
+    // The wrapper's inline width/height:100% are removed below; clipping
+    // is unnecessary now (the canvas drives the height), and the parent
+    // already has overflow:hidden + a black background.
 
     const onConnect = () => {
       console.log(`${tag} connect event fired — RFB session established`);
@@ -114,7 +126,11 @@ export function VncViewer({ serial, wsPath, onReady, onError, onDisconnect }: Vn
     <div
       ref={containerRef}
       data-testid={`vnc-viewer-${serial}`}
-      style={{ width: '100%', height: '100%', background: '#000' }}
+      // No fixed height — let the noVNC canvas inside drive the size, then
+      // the global `.device-canvas-container canvas { max-width: 100% }`
+      // rule constrains it. width:100% on the wrapper lets the canvas
+      // know how much horizontal room it can shrink-to-fit into.
+      style={{ width: '100%', background: '#000' }}
     />
   );
 }
