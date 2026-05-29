@@ -79,14 +79,21 @@ export function DeviceView() {
   // Fetch video transport type — determines whether to render VncViewer
   // (docker-android emulators) or the default scrcpy DeviceViewer.
   useEffect(() => {
-    if (!deviceId) return;
+    if (!deviceId || !ws.connected) return;
     let cancelled = false;
-    void ws.sendRestApi('GET', `/v1/devices/${encodeURIComponent(deviceId)}/video-transport`).then((r: any) => {
-      if (cancelled) return;
-      const data = r?.body?.data ?? {};
-      setVideoTransport(data.transport === 'vnc' ? 'vnc' : 'scrcpy');
-      setVncWsPath(data.wsPath ?? null);
-    });
+    ws.sendRestApi('GET', `/v1/devices/${encodeURIComponent(deviceId)}/video-transport`)
+      .then((r: any) => {
+        if (cancelled) return;
+        const data = r?.body?.data ?? {};
+        setVideoTransport(data.transport === 'vnc' ? 'vnc' : 'scrcpy');
+        setVncWsPath(data.wsPath ?? null);
+      })
+      .catch(() => {
+        // Network/WS errors are non-fatal — fall through to the scrcpy
+        // default. A docker-android emulator will retry on the next mount
+        // once the WS reconnects (this effect re-runs when ws changes).
+        if (!cancelled) setVideoTransport('scrcpy');
+      });
     return () => { cancelled = true; };
   }, [deviceId, ws]);
 

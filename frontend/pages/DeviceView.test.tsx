@@ -463,4 +463,41 @@ describe('DeviceView — video transport gating', () => {
       expect(screen.getByTestId('vnc-viewer-localhost:32770')).toBeInTheDocument();
     });
   });
+
+  it('renders the existing DeviceViewer (no VncViewer) when transport=scrcpy', async () => {
+    const ws: WebSocketContextValue = {
+      connected: true,
+      sendMessage: vi.fn(),
+      sendRestApi: vi.fn().mockImplementation(async (_m: string, path: string) => {
+        if (path.endsWith('/video-transport')) {
+          return { type: 'restapi', id: '1', status: 200, body: { data: { transport: 'scrcpy' } } };
+        }
+        if (path.startsWith('/v1/device/view/')) {
+          return { type: 'restapi', id: '2', status: 200, body: { data: { id: 'usb-pixel-001', name: 'usb-pixel-001', platform: 'android', isRooted: true, setupVersion: 4, lastSeen: Date.now() } } };
+        }
+        return { type: 'restapi', id: '3', status: 200, body: { data: {} } };
+      }),
+      subscribe: vi.fn().mockReturnValue(() => {}),
+    };
+
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={['/ui/devices/usb-pixel-001/details']}>
+            <Routes>
+              <Route path="/ui/devices/:id" element={<DeviceView />} />
+              <Route path="/ui/devices/:id/:tab" element={<DeviceView />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </WebSocketContext.Provider>
+    );
+
+    // Wait for the video-transport fetch to settle so we know the conditional ran.
+    await waitFor(() => {
+      expect(ws.sendRestApi).toHaveBeenCalledWith('GET', '/v1/devices/usb-pixel-001/video-transport');
+    });
+    // VncViewer must NOT be in the document for a scrcpy-transport device.
+    expect(screen.queryByTestId('vnc-viewer-usb-pixel-001')).not.toBeInTheDocument();
+  });
 });
