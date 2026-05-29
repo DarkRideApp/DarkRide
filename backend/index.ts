@@ -3,7 +3,7 @@ import { join as pathJoin } from 'path';
 import { app, httpServer, mountApiRouter } from './app';
 import { initDatabase } from './db/index';
 import { pruneOldData, cleanStaleSessions } from './db/prune';
-import { setupWebSocket, getWebSocketServer, setStartupPhase, broadcastToAll } from './websocket/index';
+import { setupWebSocket, getWebSocketServer, setStartupPhase, broadcastToAll, setupVncProxy } from './websocket/index';
 import { createLoggers } from './logs';
 import { DeviceManager } from './services/device-manager';
 import { ProxyRotator } from './services/proxy-rotator';
@@ -896,7 +896,7 @@ httpServer.listen(PORT, HOST, () => {
   const deviceInstancesRepo = new DeviceInstancesRepo(db);
   await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
   registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo);
-
+  setupVncProxy(httpServer, { repo: deviceInstancesRepo, registry: providerRegistry });
 
   // Phase 1: Python environment
   setStartupPhase('preparing_python', 'Preparing Python environment...');

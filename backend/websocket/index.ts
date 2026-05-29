@@ -1,5 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server as HttpServer } from 'http';
+import { URL } from 'url';
 import { handleWebSocketRestApi } from '../api/api-service';
 import { getWebsocketHandler, registerWebsocketEndpoint } from './handlers';
 import { createLoggers } from '../logs';
@@ -9,6 +10,9 @@ import { users } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { isFilteredChannel, getRequiredScopes } from './channel-registry';
 import { verifyOrigin, buildDefaultAllowedOrigins, parseAllowedOriginsEnv } from './origin-check';
+import { createVncBridge, defaultConnectTcp } from './vnc-proxy';
+import type { ProviderRegistry } from '../services/providers';
+import type { DeviceInstancesRepo } from '../services/device-instances-repo';
 
 const { log, error } = createLoggers('websocket');
 
@@ -249,4 +253,42 @@ export function broadcastToAll(message: Record<string, any>): void {
 
 export function getWebSocketServer(): WebSocketServer | null {
   return wss;
+}
+
+export interface VncProxyDeps {
+  repo: DeviceInstancesRepo;
+  registry: ProviderRegistry;
+}
+
+/**
+ * Mount a second WebSocketServer at /ws/vnc on the shared HTTP server.
+ * The serial is passed via ?serial=<urlencoded>. Per-connection lifecycle
+ * lives in createVncBridge; this function only handles the upgrade and
+ * resolves serial → provider.getVncEndpoint().
+ *
+ * The ws library matches distinct `path` options on the same HTTP server
+ * independently, so this coexists with the main /ws connection without
+ * any upgrade-event routing.
+ */
+export function setupVncProxy(server: HttpServer, deps: VncProxyDeps): WebSocketServer {
+  const vncWss = new WebSocketServer({ server, path: '/ws/vnc' });
+  vncWss.on('connection', (socket, req) => {
+    const serial = new URL(req.url ?? '', 'http://localhost').searchParams.get('serial');
+    if (!serial) {
+      socket.close(1008, 'missing ?serial=');
+      return;
+    }
+    void createVncBridge(socket, serial, {
+      resolveEndpoint: async (s) => {
+        const row = deps.repo.getBySerial(s);
+        if (!row) return null;
+        const provider = deps.registry.get(row.providerId);
+        if (!provider?.getVncEndpoint) return null;
+        return provider.getVncEndpoint(row.runtimeId);
+      },
+      connectTcp: defaultConnectTcp,
+    });
+  });
+  log(`VNC proxy mounted at /ws/vnc`);
+  return vncWss;
 }

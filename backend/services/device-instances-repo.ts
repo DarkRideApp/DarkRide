@@ -93,6 +93,12 @@ export class DeviceInstancesRepo {
       .run();
   }
 
+  /** Lookup an instance by its (adb) serial. Returns null when unknown. */
+  getBySerial(serial: string): DeviceInstanceRow | null {
+    return this.db.select().from(deviceInstances)
+      .where(eq(deviceInstances.serial, serial)).get() as DeviceInstanceRow ?? null;
+  }
+
   getById(id: number): DeviceInstanceRow | undefined {
     return this.db.select().from(deviceInstances).where(eq(deviceInstances.id, id)).all()[0] as DeviceInstanceRow | undefined;
   }
