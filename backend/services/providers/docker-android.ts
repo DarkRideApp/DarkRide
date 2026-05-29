@@ -458,6 +458,19 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       await container.remove();
     },
 
+    async getVncEndpoint(id: string): Promise<{ host: string; port: number }> {
+      const container = d.getContainer(id);
+      const info = await container.inspect();
+      if (!info?.State?.Running) {
+        throw new Error(`Container ${id} is not running — cannot resolve VNC endpoint`);
+      }
+      const portStr = info?.NetworkSettings?.Ports?.['5900/tcp']?.[0]?.HostPort;
+      if (!portStr) {
+        throw new Error(`Container ${id} has no host binding for 5900/tcp — VNC unavailable`);
+      }
+      return { host: '127.0.0.1', port: Number(portStr) };
+    },
+
     getNetworkConfig(_id: string): NetworkConfig {
       // Emulators use plain HTTP forward-proxy mode (mitmproxy on host,
       // reached via adb reverse from inside the emulator) — there's no

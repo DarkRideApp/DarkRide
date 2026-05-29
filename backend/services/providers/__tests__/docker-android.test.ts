@@ -249,4 +249,53 @@ describe('docker-android provider', () => {
     await expect(p.startInstance('container-test-emu')).rejects.toThrow(/boot did not complete/i);
     expect(stop).toHaveBeenCalled();
   });
+
+  it('getVncEndpoint returns the bound loopback host port for a running container', async () => {
+    // After startInstance binds the container's 5900/tcp to a random host
+    // port, getVncEndpoint inspects the container and returns the bound
+    // port so the VNC proxy knows where to connect.
+    const d = makeDockerMock({
+      getContainer: vi.fn().mockImplementation((id: string) => ({
+        id,
+        start: vi.fn().mockResolvedValue(undefined),
+        stop: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+        inspect: vi.fn().mockResolvedValue({
+          State: { Running: true },
+          NetworkSettings: { Ports: {
+            '5555/tcp': [{ HostPort: '6001' }],
+            '5900/tcp': [{ HostPort: '7777' }],
+          } },
+        }),
+      })),
+    });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const endpoint = await p.getVncEndpoint!('container-abc');
+    expect(endpoint).toEqual({ host: '127.0.0.1', port: 7777 });
+  });
+
+  it('getVncEndpoint throws when the container is not running', async () => {
+    const d = makeDockerMock({
+      getContainer: vi.fn().mockImplementation((id: string) => ({
+        id,
+        inspect: vi.fn().mockResolvedValue({ State: { Running: false }, NetworkSettings: { Ports: {} } }),
+      })),
+    });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    await expect(p.getVncEndpoint!('container-abc')).rejects.toThrow(/not running/i);
+  });
+
+  it('getVncEndpoint throws when 5900 is not bound', async () => {
+    const d = makeDockerMock({
+      getContainer: vi.fn().mockImplementation((id: string) => ({
+        id,
+        inspect: vi.fn().mockResolvedValue({
+          State: { Running: true },
+          NetworkSettings: { Ports: { '5555/tcp': [{ HostPort: '6001' }] } },
+        }),
+      })),
+    });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    await expect(p.getVncEndpoint!('container-abc')).rejects.toThrow(/5900/);
+  });
 });
