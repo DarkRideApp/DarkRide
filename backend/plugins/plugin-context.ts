@@ -31,6 +31,7 @@ import type {
   ApkApi,
   PathsApi,
   DispatcherApi,
+  DocStoreApi,
 } from '@darkrideapp/plugin-sdk';
 import { registerEndpoint } from '../api/api-service';
 import { registerPluginScopes, type ScopeMetadata } from '../auth/scopes-registry';
@@ -98,6 +99,7 @@ export class PluginContextImpl implements PluginContext {
   private _cloudStorage: CloudStorageService | null = null;
   private _runner: AutomationRunner | null = null;
   private _fileSync: FileStorageService | null = null;
+  private _documentStore: DocStoreApi | null = null;
   private _rawDb: BetterSQLite3Database<any> | null = null;
   private _settings: SettingsApi | null = null;
   private _cloudFiles: CloudFilesApi | null = null;
@@ -267,6 +269,20 @@ export class PluginContextImpl implements PluginContext {
       );
     }
     return this._fileSync;
+  }
+
+  setDocumentStore(api: DocStoreApi): void {
+    this._documentStore = api;
+  }
+
+  get documentStore(): DocStoreApi {
+    if (this._documentStore === null) {
+      throw new Error(
+        `Plugin "${this.pluginName}": documentStore not available until plugin is fully loaded. ` +
+        `Access from start() or later, not register().`,
+      );
+    }
+    return this._documentStore;
   }
 
   setSettingsApi(api: SettingsApi): void {

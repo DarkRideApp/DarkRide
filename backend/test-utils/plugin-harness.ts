@@ -9,6 +9,7 @@ import { computeLoadOrder } from '../plugins/load-order';
 import { AiToolRegistry } from '../services/ai-tools';
 import * as schema from '../db/schema';
 import type { NamespacedStorage } from '@darkrideapp/plugin-sdk';
+import { createInMemoryDocStore } from '@darkrideapp/plugin-sdk/test-utils';
 
 export interface PluginTestHarness {
   /** Express app with plugin routes registered */
@@ -60,6 +61,7 @@ export interface CreateHarnessOptions {
     apks: unknown;
     paths: unknown;
     dispatcher: unknown;
+    documentStore: import('@darkrideapp/plugin-sdk').DocStoreApi;
   }>;
 }
 
@@ -316,6 +318,7 @@ export async function createPluginTestHarness(
       apks: (opts.coreServices?.apks ?? stubApks) as any,
       paths: (opts.coreServices?.paths ?? stubPaths) as any,
       dispatcher: (opts.coreServices?.dispatcher ?? stubDispatcher) as any,
+      documentStore: (opts.coreServices?.documentStore ?? createInMemoryDocStore()) as any,
     });
     await pluginManager.startAll();
   }

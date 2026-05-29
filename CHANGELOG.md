@@ -4,6 +4,10 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- **Plugin SDK 1.5.0** — `ctx.documentStore` (`DocStoreApi`: `putDoc`/`getDoc`) is now available to plugins as a typed handle over the host Document Store. Accessible from `start()` — throws if accessed during `register()`. Includes an in-memory test fixture `createInMemoryDocStore` exported from `@darkrideapp/plugin-sdk/test-utils`. Non-breaking minor bump (1.4.0 → 1.5.0).
+
 ## [1.0.0] — 2026-05-17
 
 Initial public release.

@@ -9,5 +9,6 @@ export * from './hooks';
 export * from './agent';
 export * from './storage';
 export * from './services';
+export * from './doc-store';
 export * from './host-tables';
 export * from './ctx-extensions';
