@@ -27,7 +27,10 @@ export function registerVideoTransportEndpoint(
   registry: ProviderRegistry,
 ): void {
   registerEndpoint('GET', '/v1/devices/:serial/video-transport', async (req, res) => {
-    const serial = decodeURIComponent(req.params.serial);
+    // Express already URL-decodes path params, so req.params.serial is the
+    // raw serial (e.g., "localhost:32770"). A second decodeURIComponent would
+    // throw URIError on any serial containing a literal '%' character.
+    const serial = req.params.serial;
     res.json({ success: true, data: resolveVideoTransport(serial, repo, registry) });
   }, { requires: ['core.devices:read'] });
 }

@@ -31,4 +31,11 @@ describe('resolveVideoTransport', () => {
     expect(resolveVideoTransport('localhost:32770', repo, registry))
       .toEqual({ transport: 'vnc', wsPath: '/ws/vnc?serial=localhost%3A32770' });
   });
+
+  it('returns transport=scrcpy when the provider declares videoTransport=scrcpy explicitly', () => {
+    (repo.getBySerial as any).mockReturnValue({ providerId: 'adb-device', runtimeId: 'r' });
+    (registry.get as any).mockReturnValue({ id: 'adb-device', videoTransport: 'scrcpy' });
+    expect(resolveVideoTransport('usb-pixel-001', repo, registry))
+      .toEqual({ transport: 'scrcpy' });
+  });
 });
