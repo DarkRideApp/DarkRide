@@ -49,3 +49,14 @@ describe('DeviceProvider type surface', () => {
     expectTypeOf<State>().toEqualTypeOf<'created' | 'starting' | 'running' | 'stopping' | 'stopped' | 'error'>();
   });
 });
+
+describe('DeviceProvider — Phase 1 VNC additions', () => {
+  it('declares optional videoTransport with the vnc | scrcpy union', () => {
+    expectTypeOf<DeviceProvider['videoTransport']>().toEqualTypeOf<'vnc' | 'scrcpy' | undefined>();
+  });
+
+  it('declares optional getVncEndpoint returning host+port', () => {
+    type Endpoint = NonNullable<DeviceProvider['getVncEndpoint']>;
+    expectTypeOf<Awaited<ReturnType<Endpoint>>>().toEqualTypeOf<{ host: string; port: number }>();
+  });
+});

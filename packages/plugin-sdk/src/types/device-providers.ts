@@ -145,6 +145,22 @@ export interface DeviceProvider {
 
   /** Form schema for the wizard, if this provider supports createInstance. */
   getCreateFormSchema?(): Promise<CreateFormSchema>;
+
+  /**
+   * Declares how the device-detail page should render this provider's screen.
+   * - 'vnc': frontend uses <VncViewer> and connects via /ws/vnc?serial=...
+   * - 'scrcpy' (or absent): frontend uses the existing <DeviceViewer>.
+   *
+   * Providers declaring 'vnc' MUST also implement getVncEndpoint().
+   */
+  videoTransport?: 'vnc' | 'scrcpy';
+
+  /**
+   * Returns the loopback host+port the VNC proxy should connect to for this
+   * running instance. Only meaningful when videoTransport === 'vnc'.
+   * Throws if the instance is not currently running or the port isn't bound.
+   */
+  getVncEndpoint?(runtimeId: string): Promise<{ host: string; port: number }>;
 }
 
 /**
