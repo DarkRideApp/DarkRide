@@ -230,6 +230,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   return {
     id: 'docker-android',
     displayName: 'Docker Android',
+    videoTransport: 'vnc',
 
     async isAvailable(): Promise<ProviderAvailability> {
       const r = await detectDockerDaemon(d);
@@ -326,9 +327,16 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             // before it touches the adapter probe.
             'NVIDIA_VISIBLE_DEVICES=void',
           ],
-          ExposedPorts: { '5555/tcp': {} },
+          ExposedPorts: { '5555/tcp': {}, '5900/tcp': {} },
           HostConfig: {
-            PortBindings: { '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }] },
+            PortBindings: {
+              '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }],
+              // 5900: budtmo's raw VNC. Bound to loopback so only the
+              // DarkRide process can reach it; the browser talks to the
+              // /ws/vnc proxy which bridges to this port. See spec
+              // 2026-05-29-emulator-vnc-streaming-design.md §Architecture.
+              '5900/tcp': [{ HostIp: '127.0.0.1', HostPort: '0' }],
+            },
             Devices: devices,
             DeviceRequests: deviceRequests.length > 0 ? deviceRequests : undefined,
             // Force the default OCI runtime explicitly. Without this, daemons

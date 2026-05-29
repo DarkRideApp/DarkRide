@@ -48,7 +48,7 @@ describe('docker-android provider', () => {
     expect(d.createContainer).toHaveBeenCalledWith(expect.objectContaining({
       Image: 'budtmo/docker-android:emulator_14.0',
       Labels: expect.objectContaining({ 'darkride.emulator': 'true' }),
-      ExposedPorts: { '5555/tcp': {} },
+      ExposedPorts: expect.objectContaining({ '5555/tcp': {} }),
     }));
   });
 
@@ -87,6 +87,29 @@ describe('docker-android provider', () => {
       displayName: 'kvm-missing',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
     })).rejects.toThrow(/hardware virtualization/i);
+  });
+
+  it('exposes 5900/tcp bound to loopback for the VNC proxy to reach', async () => {
+    // Phase 1 emulator VNC streaming — the proxy connects to budtmo's RFB on
+    // 5900 over loopback. The browser never reaches this port directly; the
+    // host binding must be 127.0.0.1 to keep that boundary enforced.
+    const d = makeDockerMock();
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    await p.createInstance!({
+      displayName: 'vnc-port',
+      config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
+    });
+    const call = (d.createContainer as any).mock.calls[0][0];
+    expect(call.ExposedPorts).toMatchObject({ '5900/tcp': {} });
+    expect(call.HostConfig.PortBindings['5900/tcp']).toEqual([
+      { HostIp: '127.0.0.1', HostPort: '0' },
+    ]);
+  });
+
+  it('declares videoTransport: vnc', async () => {
+    const d = makeDockerMock();
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    expect(p.videoTransport).toBe('vnc');
   });
 
   it('rethrows unrelated createContainer errors unchanged', async () => {
