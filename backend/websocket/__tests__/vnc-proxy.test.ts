@@ -64,8 +64,18 @@ describe('VNC bridge', () => {
     tcp.destroy = vi.fn();
     const deps = makeDeps({ connectTcp: () => tcp });
     await createVncBridge(ws as any, 'localhost:32770', deps);
-    ws.emit('message', Buffer.from([0x52, 0x46, 0x42])); // "RFB" — RFB protocol greeting bytes
+    ws.emit('message', Buffer.from([0x52, 0x46, 0x42]), true); // "RFB" — RFB protocol greeting bytes
     expect(tcp.write).toHaveBeenCalledWith(Buffer.from([0x52, 0x46, 0x42]));
+  });
+
+  it('ignores text frames from WS (does not forward to TCP)', async () => {
+    const tcp = new EventEmitter() as any;
+    tcp.write = vi.fn();
+    tcp.destroy = vi.fn();
+    const deps = makeDeps({ connectTcp: () => tcp });
+    await createVncBridge(ws as any, 'localhost:32770', deps);
+    ws.emit('message', Buffer.from('hello'), false); // text frame (isBinary=false)
+    expect(tcp.write).not.toHaveBeenCalled();
   });
 
   it('forwards bytes from TCP to WS', async () => {
@@ -96,5 +106,16 @@ describe('VNC bridge', () => {
     await createVncBridge(ws as any, 'localhost:32770', deps);
     tcp.emit('close');
     expect(ws.closed?.code).toBe(1001);
+  });
+
+  it('closes the WS when the TCP socket errors mid-stream', async () => {
+    const tcp = new EventEmitter() as any;
+    tcp.write = vi.fn();
+    tcp.destroy = vi.fn();
+    const deps = makeDeps({ connectTcp: () => tcp });
+    await createVncBridge(ws as any, 'localhost:32770', deps);
+    tcp.emit('error', new Error('ECONNRESET'));
+    expect(ws.closed?.code).toBe(1011);
+    expect(ws.closed?.reason).toMatch(/ECONNRESET/);
   });
 });

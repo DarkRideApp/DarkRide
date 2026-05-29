@@ -4,6 +4,8 @@ import { createLoggers } from '../logs';
 
 const { log, error: logError } = createLoggers('vnc-proxy');
 
+type RawData = Buffer | ArrayBuffer | Buffer[];
+
 export interface VncEndpoint {
   host: string;
   port: number;
@@ -57,20 +59,39 @@ export async function createVncBridge(
     if (torndown) return;
     torndown = true;
     log(`vnc bridge ${serial}: torn down by ${origin} (${code} ${reason})`);
+    ws.off('message', onWsMessage);
+    tcp.off('data', onTcpData);
     try { tcp.destroy(); } catch { /* best effort */ }
     try { ws.close(code, reason); } catch { /* best effort */ }
   };
 
-  ws.on('message', (data: Buffer) => {
-    // ws library always delivers messages as Buffer for binary frames.
-    try { tcp.write(data); } catch (e: any) { logError(`vnc bridge ${serial}: tcp.write failed: ${e.message}`); }
-  });
+  const onWsMessage = (data: RawData, isBinary: boolean) => {
+    if (!isBinary) {
+      logError(`vnc bridge ${serial}: unexpected text frame; ignoring`);
+      return;
+    }
+    try {
+      tcp.write(data as Buffer);
+    } catch (e: any) {
+      logError(`vnc bridge ${serial}: tcp.write failed: ${e.message}`);
+      teardown('ws', 1011, `tcp.write failed: ${e.message}`);
+    }
+  };
+
+  const onTcpData = (chunk: Buffer) => {
+    try {
+      ws.send(chunk);
+    } catch (e: any) {
+      logError(`vnc bridge ${serial}: ws.send failed: ${e.message}`);
+      teardown('tcp', 1011, `ws.send failed: ${e.message}`);
+    }
+  };
+
+  ws.on('message', onWsMessage);
   ws.on('close', () => teardown('ws', 1000, 'ws closed'));
   ws.on('error', (e: any) => teardown('ws', 1011, `ws error: ${e.message}`));
 
-  tcp.on('data', (chunk: Buffer) => {
-    try { ws.send(chunk); } catch (e: any) { logError(`vnc bridge ${serial}: ws.send failed: ${e.message}`); }
-  });
+  tcp.on('data', onTcpData);
   tcp.on('close', () => teardown('tcp', 1001, 'tcp closed'));
   tcp.on('error', (e: any) => teardown('tcp', 1011, `tcp error: ${e.message}`));
 }
