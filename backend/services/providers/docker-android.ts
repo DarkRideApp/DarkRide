@@ -1,4 +1,5 @@
 import { existsSync } from 'fs';
+import { resolve } from 'path';
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import type {
@@ -49,6 +50,13 @@ const LABEL_KEY = 'darkride.emulator';
 // DarkRide grpc-web bridge (session cookie + core.devices:read scope); the raw
 // port is reachable only by host-local processes, same threat model as VNC.
 const GRPC_PORT = 8554;
+
+// WebRTC media can't traverse Docker NAT on its own — the emulator's media
+// track reaches `connected` then drops. A TURN relay (DarkRide's coturn) fixes
+// it: we mount a turncfg script and point the emulator at it with `-turncfg`.
+// The script emits iceServers at `host.docker.internal:3478`, which resolves to
+// the host from BOTH the browser and the container, so both peers reach coturn.
+const TURN_CFG_CONTAINER_PATH = '/opt/turncfg.sh';
 
 /** Aggregated pull progress broadcast to the UI. One number, one phrase, no per-layer noise. */
 export interface PullProgress {
@@ -187,6 +195,13 @@ export interface DockerAndroidOptions {
   bootCompleted?: (serial: string) => Promise<boolean>;
   bootTimeoutMs?: number;
   bootRetryIntervalMs?: number;
+  /**
+   * Host path to the WebRTC TURN-config script bind-mounted into each emulator
+   * (see TURN_CFG_CONTAINER_PATH). When present, the emulator launches with
+   * `-turncfg`; when absent (script missing), TURN is skipped and WebRTC media
+   * may not traverse Docker NAT. Defaults to `<cwd>/data/turncfg.sh`.
+   */
+  turnCfgHostPath?: string;
 }
 
 /**
@@ -242,6 +257,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   // boot_completed typically takes another 30-60s. 240s leaves headroom.
   const bootTimeoutMs = opts.bootTimeoutMs ?? 240_000;
   const bootRetryIntervalMs = opts.bootRetryIntervalMs ?? 5_000;
+  const turnCfgHostPath = opts.turnCfgHostPath ?? resolve(process.cwd(), 'data', 'turncfg.sh');
 
   return {
     id: 'docker-android',
@@ -314,6 +330,21 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       // would otherwise see "No such image" from the daemon. ~8GB download.
       await ensureImageLocal(d, image, opts?.onPullProgress);
 
+      // `-no-skin` (drop the phone bezel) + `-grpc` (EmulatorController + Rtc/
+      // JSEP for the WebRTC video/input path) + optionally `-turncfg` (TURN
+      // relay for WebRTC media over Docker NAT). EMULATOR_ADDITIONAL_ARGS is
+      // space-split by budtmo, so each token must be space-free — hence the
+      // turncfg value is a mounted script path, not an inline command.
+      const emulatorArgs = ['-no-skin', `-grpc ${GRPC_PORT}`];
+      const binds: string[] = [];
+      if (existsSync(turnCfgHostPath)) {
+        emulatorArgs.push(`-turncfg ${TURN_CFG_CONTAINER_PATH}`);
+        binds.push(`${turnCfgHostPath}:${TURN_CFG_CONTAINER_PATH}:ro`);
+        log(`docker-android: WebRTC TURN enabled (mounting ${turnCfgHostPath})`);
+      } else {
+        log(`docker-android: no turncfg at ${turnCfgHostPath} — WebRTC media may not traverse Docker NAT (png fallback still works)`);
+      }
+
       log(`Creating docker-android container "${spec.displayName}" image=${image} ram=${ramMb}MB arch=${arch}`);
       let container: any;
       try {
@@ -352,8 +383,9 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             // `-grpc <port>` starts the emulator's gRPC bridge (EmulatorController
             // + Rtc/JSEP) — the WebRTC video + input path — unauthenticated,
             // bound to all interfaces (see GRPC_PORT note). Published to host
-            // loopback below.
-            `EMULATOR_ADDITIONAL_ARGS=-no-skin -grpc ${GRPC_PORT}`,
+            // loopback below. `-turncfg` (when the script is mounted) supplies
+            // the WebRTC TURN relay. Built above.
+            `EMULATOR_ADDITIONAL_ARGS=${emulatorArgs.join(' ')}`,
             // Disable nvidia-container-cli's legacy mode entirely. When the
             // nvidia-container-toolkit is installed in the host environment
             // (e.g. Docker Desktop with GPU support enabled on Windows/WSL),
@@ -382,6 +414,9 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
               // sole reader. See the GRPC_PORT note for the no-auth rationale.
               [`${GRPC_PORT}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: '0' }],
             },
+            // Bind-mount the TURN-config script (when present) so `-turncfg`
+            // can read it. Read-only; one shared script for all emulators.
+            ...(binds.length ? { Binds: binds } : {}),
             Devices: devices,
             DeviceRequests: deviceRequests.length > 0 ? deviceRequests : undefined,
             // Force the default OCI runtime explicitly. Without this, daemons

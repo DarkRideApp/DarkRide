@@ -132,6 +132,29 @@ describe('docker-android provider', () => {
     ]);
   });
 
+  it('mounts the TURN-config script + adds -turncfg when the script exists', async () => {
+    // WebRTC media needs a TURN relay on Docker NAT; the emulator reads it from
+    // a mounted script via -turncfg (a single space-free token).
+    const d = makeDockerMock();
+    // Use a path known to exist (this test file) to satisfy existsSync.
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false, turnCfgHostPath: __filename });
+    await p.createInstance!({ displayName: 'turn', config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 } });
+    const call = (d.createContainer as any).mock.calls[0][0];
+    const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
+    expect(addArgs).toContain('-turncfg /opt/turncfg.sh');
+    expect(call.HostConfig.Binds).toEqual([`${__filename}:/opt/turncfg.sh:ro`]);
+  });
+
+  it('skips -turncfg (and Binds) when no TURN-config script is present', async () => {
+    const d = makeDockerMock();
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false, turnCfgHostPath: '/no/such/turncfg.sh' });
+    await p.createInstance!({ displayName: 'noturn', config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 } });
+    const call = (d.createContainer as any).mock.calls[0][0];
+    const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
+    expect(addArgs).not.toContain('-turncfg');
+    expect(call.HostConfig.Binds).toBeUndefined();
+  });
+
   it('getGrpcEndpoint returns the bound host loopback port (no token) for a running container', async () => {
     const d = makeDockerMock({
       getContainer: vi.fn().mockImplementation((id: string) => ({

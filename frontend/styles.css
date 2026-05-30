@@ -1894,11 +1894,23 @@ body.live-log-open .main-content {
  * fit the width, cap the height so a tall portrait device stays in-viewport,
  * and center. android-emulator-webrtc's inner wrappers are size:auto, so the
  * media element drives layout. */
+/* Nav bar under the emulator stream — matches the scrcpy DeviceViewer's nav
+ * container so the shared DeviceNavButtons (.btn .btn-sm) render identically.
+ * Deliberately no button-level overrides here; styling comes from .btn .btn-sm. */
+.emulator-controls {
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  justify-content: center;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
 .emulator-view video,
 .emulator-view img {
   display: block;
   max-width: 100%;
-  max-height: calc(100vh - 220px);
+  max-height: calc(100vh - 260px);
   margin: 0 auto;
   /* The png engine renders an <img>; without this, click-dragging to interact
    * with the device triggers the browser's native image drag/selection ghost.

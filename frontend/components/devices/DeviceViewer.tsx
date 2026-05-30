@@ -1,13 +1,14 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  ArrowLeft, Home, Square, Power, Move, Camera, MoreHorizontal,
+  ArrowLeft, Move, Camera, MoreHorizontal,
   ArrowUp, ArrowDown, ArrowRight, Unlock as UnlockIcon,
 } from 'lucide-react';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import { ButtonList } from '@darkrideapp/plugin-sdk/react';
 import type { ButtonListItem } from '@darkrideapp/plugin-sdk/react';
 import { pluginRegistry } from '@darkrideapp/plugin-sdk/react';
+import { DeviceNavButtons } from './DeviceNavButtons';
 import { decodeFrame, FrameMsgType, WireVersionMismatchError } from '../../lib/video/wire-format';
 import { H264Decoder } from '../../lib/video/h264-decoder';
 import { GapDetector } from '../../lib/video/gap-detector';
@@ -545,10 +546,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
         {reconnecting && <div className="device-viewer-reconnecting">Reconnecting…</div>}
       </div>
       <div style={{ display: 'flex', gap: 6, padding: '6px', justifyContent: 'center', flexWrap: 'wrap', alignItems: 'center' }}>
-        <button className="btn btn-sm" data-testid="dv-nav-back" title="Back" onClick={() => handleNav('back')}><ArrowLeft size={iconSize} /></button>
-        <button className="btn btn-sm" data-testid="dv-nav-home" title="Home" onClick={() => handleNav('home')}><Home size={iconSize} /></button>
-        <button className="btn btn-sm" data-testid="dv-nav-recents" title="Recents" onClick={() => handleNav('recents')}><Square size={iconSize} /></button>
-        {isAndroid && <button className="btn btn-sm" data-testid="dv-nav-power" title="Power" onClick={() => handleNav('power')}><Power size={iconSize} /></button>}
+        <DeviceNavButtons onNav={handleNav} isAndroid={isAndroid} iconSize={iconSize} />
         {isAndroid && <button className="btn btn-sm" data-testid="dv-cmd-unlock" title="Unlock" onClick={() => runCommand('unlock')}><UnlockIcon size={iconSize} /></button>}
         <button ref={swipeTriggerRef} className="btn btn-sm" data-testid="dv-swipe" title="Swipe" onClick={() => setSwipeOpen(o => !o)}><Move size={iconSize} /></button>
         <button className="btn btn-sm" data-testid="dv-screenshot" title="Screenshot" onClick={handleScreenshot}><Camera size={iconSize} /></button>

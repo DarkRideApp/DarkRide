@@ -251,15 +251,26 @@ export function DeviceView() {
   // Key forwarding — page-level, not canvas-related.
   useEffect(() => {
     if (!deviceId) return;
+    // The emulator (webrtc) owns its own keyboard via the gRPC channel
+    // (EmulatorView). Its adb input path fails, so forwarding here would only
+    // spam failures and double-send. Leave keyboard entirely to EmulatorView.
+    if (videoTransport === 'webrtc') return;
     const handler = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if ((e.target as HTMLElement).closest?.('.live-log-wrapper')) return;
+      // Don't hijack browser shortcuts — modifier combos (Ctrl/Cmd/Alt, e.g.
+      // Ctrl+Shift+R, Ctrl+R) and function keys (F5 refresh, F12 devtools).
+      // These would otherwise be swallowed by preventDefault + forwarded to the
+      // device, making it impossible to reload or open devtools while a device
+      // page is open.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (/^F\d{1,2}$/.test(e.key)) return;
       e.preventDefault();
       ws.sendMessage('device-key', { deviceId, key: e.key });
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [ws, deviceId]);
+  }, [ws, deviceId, videoTransport]);
 
   // DOM capture: fetch DOM via ADB, store in sessionStorage, open selector debugger
   const handleCaptureDom = useCallback(async () => {

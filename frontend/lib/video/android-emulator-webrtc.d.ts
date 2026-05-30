@@ -22,5 +22,9 @@ declare module 'android-emulator-webrtc/emulator' {
     onError?: (error: unknown) => void;
   }
 
-  export class Emulator extends React.Component<EmulatorProps> {}
+  export class Emulator extends React.Component<EmulatorProps> {
+    /** Send a hardware key over the live JSEP input channel (webrtc engine).
+     *  e.g. 'GoHome', 'GoBack', 'AppSwitch', 'Power', 'AudioVolumeUp'. */
+    sendKey(key: string): void;
+  }
 }

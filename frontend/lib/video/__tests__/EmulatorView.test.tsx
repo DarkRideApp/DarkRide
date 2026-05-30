@@ -8,10 +8,17 @@ import { render, waitFor, act } from '@testing-library/react';
 // callbacks. `latest()` returns the most recent props (current engine/view).
 const emulatorProps: any[] = [];
 const latest = () => emulatorProps[emulatorProps.length - 1];
+// Class mock so refs resolve to an instance exposing sendKey (for the nav-bar
+// test). lastEmulator tracks the most recent instance.
+let lastEmulator: any = null;
 vi.mock('android-emulator-webrtc/emulator', () => ({
-  Emulator: (props: any) => {
-    emulatorProps.push(props);
-    return React.createElement('div', { 'data-testid': 'mock-emulator', 'data-view': props.view });
+  Emulator: class MockEmulator extends React.Component<any> {
+    sendKey = vi.fn();
+    constructor(props: any) { super(props); lastEmulator = this; }
+    render() {
+      emulatorProps.push(this.props);
+      return React.createElement('div', { 'data-testid': 'mock-emulator', 'data-view': this.props.view });
+    }
   },
 }));
 
@@ -21,17 +28,17 @@ describe('EmulatorView', () => {
   beforeEach(() => { emulatorProps.length = 0; });
   afterEach(() => { vi.useRealTimers(); });
 
-  it('defaults to the png engine with a same-origin uri built from grpcWebPath', () => {
+  it('defaults to the webrtc engine with a same-origin uri built from grpcWebPath', () => {
     render(<EmulatorView serial="localhost:32771" grpcWebPath="/v1/devices/localhost%3A32771/grpc" />);
     const props = latest();
-    expect(props.view).toBe('png');
+    expect(props.view).toBe('webrtc');
     expect(props.muted).toBe(true);
     expect(props.uri).toBe(`${window.location.origin}/v1/devices/localhost%3A32771/grpc`);
   });
 
-  it('uses the webrtc engine when initialEngine="webrtc"', () => {
-    render(<EmulatorView serial="x" grpcWebPath="/v1/devices/x/grpc" initialEngine="webrtc" />);
-    expect(latest().view).toBe('webrtc');
+  it('forces the png engine when initialEngine="png"', () => {
+    render(<EmulatorView serial="x" grpcWebPath="/v1/devices/x/grpc" initialEngine="png" />);
+    expect(latest().view).toBe('png');
   });
 
   it('fires onReady when the session reaches "connected"', async () => {
@@ -41,13 +48,59 @@ describe('EmulatorView', () => {
     await waitFor(() => expect(onReady).toHaveBeenCalled());
   });
 
-  it('fires onDisconnect only after a successful connect (ignores pre-connect churn)', async () => {
+  it('degrades webrtc → png only after the disconnect grace window (not on a blip)', () => {
+    vi.useFakeTimers();
+    render(<EmulatorView serial="x" grpcWebPath="/v1/devices/x/grpc" />);
+    expect(latest().view).toBe('webrtc');
+    act(() => latest().onStateChange('connected'));
+    act(() => latest().onStateChange('disconnected'));
+    // Still webrtc during the grace window…
+    act(() => { vi.advanceTimersByTime(5000); });
+    expect(latest().view).toBe('webrtc');
+    // …degrades once the window elapses while still down.
+    act(() => { vi.advanceTimersByTime(8000); });
+    expect(latest().view).toBe('png');
+  });
+
+  it('a quick disconnect→reconnect blip does NOT degrade to png', () => {
+    vi.useFakeTimers();
+    render(<EmulatorView serial="x" grpcWebPath="/v1/devices/x/grpc" />);
+    act(() => latest().onStateChange('connected'));
+    act(() => latest().onStateChange('disconnected'));
+    act(() => { vi.advanceTimersByTime(3000); });
+    act(() => latest().onStateChange('connected')); // recovered
+    act(() => { vi.advanceTimersByTime(20000); });
+    expect(latest().view).toBe('webrtc');
+  });
+
+  it('the shared nav bar maps buttons to the emulator gRPC sendKey', () => {
+    const { getByTestId } = render(<EmulatorView serial="x" grpcWebPath="/v1/devices/x/grpc" />);
+    act(() => { getByTestId('dv-nav-home').click(); });
+    expect(lastEmulator.sendKey).toHaveBeenCalledWith('GoHome');
+    act(() => { getByTestId('dv-nav-back').click(); });
+    expect(lastEmulator.sendKey).toHaveBeenCalledWith('GoBack');
+    act(() => { getByTestId('dv-nav-recents').click(); });
+    expect(lastEmulator.sendKey).toHaveBeenCalledWith('AppSwitch');
+  });
+
+  it('forwards keystrokes to the emulator over gRPC (webrtc engine)', () => {
+    render(<EmulatorView serial="x" grpcWebPath="/v1/devices/x/grpc" />);
+    act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'p' })); });
+    expect(lastEmulator.sendKey).toHaveBeenCalledWith('p');
+    // Browser shortcuts (Ctrl/F-keys) are NOT forwarded.
+    lastEmulator.sendKey.mockClear();
+    act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', ctrlKey: true })); });
+    act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'F5' })); });
+    expect(lastEmulator.sendKey).not.toHaveBeenCalled();
+  });
+
+  it('fires onDisconnect when the png stream drops after connecting', async () => {
     const onDisconnect = vi.fn();
-    render(<EmulatorView serial="x" grpcWebPath="/v1/devices/x/grpc" onDisconnect={onDisconnect} />);
-    // Pre-connect 'disconnected' (webrtc setup churn) must be ignored.
+    render(<EmulatorView serial="x" grpcWebPath="/v1/devices/x/grpc" initialEngine="png" onDisconnect={onDisconnect} />);
+    // Pre-connect churn ignored.
     act(() => latest().onStateChange('disconnected'));
     expect(onDisconnect).not.toHaveBeenCalled();
-    // After a real connect, a drop is a genuine disconnect.
+    // A drop after a real connect (png engine) is a genuine disconnect.
     act(() => latest().onStateChange('connected'));
     act(() => latest().onStateChange('disconnected'));
     await waitFor(() => expect(onDisconnect).toHaveBeenCalled());

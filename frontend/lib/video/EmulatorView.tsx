@@ -6,6 +6,7 @@ import React, { useEffect, useRef, useMemo, useState, useCallback } from 'react'
 // (same-origin), so the DarkRide session cookie is sent automatically — no
 // explicit auth object needed (auth defaults to a no-op authenticator).
 import { Emulator } from 'android-emulator-webrtc/emulator';
+import { DeviceNavButtons, type NavButton } from '../../components/devices/DeviceNavButtons';
 
 export interface EmulatorViewProps {
   /** Device serial — logging context + remount key. */
@@ -14,12 +15,12 @@ export interface EmulatorViewProps {
    *  The grpc-web client appends `/<Service>/<Method>` to this. */
   grpcWebPath: string;
   /**
-   * Initial streaming engine. Defaults to 'png' (screenshot stream over the
-   * grpc-web bridge) because it works everywhere with no extra infrastructure.
-   * 'webrtc' gives smoother H.264 video BUT its media track needs a reachable
-   * ICE path — on Docker-NAT'd emulators that requires a TURN relay (-turncfg
-   * + coturn), without which the peer connects then drops. Set 'webrtc' once
-   * TURN is configured; the engine still degrades to png on failure.
+   * Initial streaming engine. Defaults to 'webrtc' (smooth H.264 video + live
+   * input), which needs a reachable ICE path — DarkRide supplies a TURN relay
+   * (coturn + the emulator's -turncfg) so the media traverses Docker NAT. If
+   * the media still can't connect/sustain, the engine automatically degrades
+   * to 'png' (screenshot stream over the grpc-web bridge — works everywhere,
+   * just laggier). Pass 'png' to force the fallback.
    */
   initialEngine?: 'webrtc' | 'png';
   /** Fired when the session reaches "connected". */
@@ -35,6 +36,12 @@ export interface EmulatorViewProps {
  *  png streams over the same grpc-web bridge and never does. */
 const WEBRTC_CONNECT_TIMEOUT_MS = 9000;
 
+/** Grace period after a WebRTC `disconnected` before degrading to png. ICE
+ *  routinely blips to `disconnected` and recovers (e.g. when the tab loses
+ *  focus and the browser throttles the connection); degrading immediately
+ *  would strand the user on the laggy png engine after a momentary hiccup. */
+const WEBRTC_RECONNECT_GRACE_MS = 12000;
+
 /**
  * Emulator renderer. Prefers WebRTC video (device-only, native-res), and
  * gracefully degrades to png screenshot streaming — over the SAME grpc-web
@@ -47,7 +54,7 @@ const WEBRTC_CONNECT_TIMEOUT_MS = 9000;
  * every render. Keyed by serial+engine for a clean remount. Reconnect policy
  * is the parent's, as with VncViewer.
  */
-export function EmulatorView({ serial, grpcWebPath, initialEngine = 'png', onReady, onError, onDisconnect }: EmulatorViewProps) {
+export function EmulatorView({ serial, grpcWebPath, initialEngine = 'webrtc', onReady, onError, onDisconnect }: EmulatorViewProps) {
   const onReadyRef = useRef(onReady);
   const onErrorRef = useRef(onError);
   const onDisconnectRef = useRef(onDisconnect);
@@ -62,10 +69,29 @@ export function EmulatorView({ serial, grpcWebPath, initialEngine = 'png', onRea
   const uri = useMemo(() => `${window.location.origin}${grpcWebPath}`, [grpcWebPath]);
   const tag = `[EmulatorView ${serial}]`;
 
+  // Ref to the <Emulator> instance so the on-screen nav bar can drive the
+  // device's hardware keys. The component's sendKey() goes over the live JSEP
+  // input channel (webrtc engine); in the png fallback that channel is dormant,
+  // so the buttons are disabled there.
+  const emulatorRef = useRef<{ sendKey?: (key: string) => void } | null>(null);
+  const sendKey = useCallback((key: string) => {
+    try { emulatorRef.current?.sendKey?.(key); }
+    catch (e) { console.warn(`${tag} sendKey(${key}) failed`, e); }
+  }, [tag]);
+
+  // Map the shared nav buttons to the emulator's hardware keys.
+  const handleNav = useCallback((button: NavButton) => {
+    sendKey(({ back: 'GoBack', home: 'GoHome', recents: 'AppSwitch', power: 'Power' } as const)[button]);
+  }, [sendKey]);
+
   const [engine, setEngine] = useState<'webrtc' | 'png'>(initialEngine);
   const connectedRef = useRef(false);
   const engineRef = useRef(engine);
   engineRef.current = engine;
+  // Pending "degrade to png" timer armed on a webrtc disconnect; cancelled if
+  // the connection recovers within the grace window.
+  const degradeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (degradeTimerRef.current) clearTimeout(degradeTimerRef.current); }, []);
 
   // Degrade to png if WebRTC hasn't connected within the timeout (most likely
   // cause: media can't cross Docker NAT and no TURN relay is configured).
@@ -80,15 +106,50 @@ export function EmulatorView({ serial, grpcWebPath, initialEngine = 'png', onRea
     return () => clearTimeout(timer);
   }, [engine, tag]);
 
+  // Keyboard. The WebRTC component doesn't capture keys, and the emulator's adb
+  // input path fails — so we forward keystrokes over the same gRPC channel as
+  // mouse (sendKey). DeviceView's global adb keydown forwarding is disabled for
+  // this transport (it would double-send + spam failures). Only active on the
+  // webrtc engine; browser shortcuts + form fields are left alone.
+  useEffect(() => {
+    if (engine !== 'webrtc') return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t?.isContentEditable) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;      // browser shortcuts
+      if (/^F\d{1,2}$/.test(e.key)) return;                 // function keys
+      e.preventDefault();
+      sendKey(e.key);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [engine, sendKey]);
+
   const handleStateChange = useCallback((state: string) => {
     console.log(`${tag} [${engineRef.current}] state: ${state}`);
     if (state === 'connected') {
       connectedRef.current = true;
+      // Recovered (or first connect) — cancel any pending degrade.
+      if (degradeTimerRef.current) { clearTimeout(degradeTimerRef.current); degradeTimerRef.current = null; }
       onReadyRef.current?.();
-    } else if (state === 'disconnected' && connectedRef.current) {
-      // Only a drop AFTER a successful connect is a real disconnect; pre-connect
-      // 'disconnected' churn during webrtc setup is just the fallback path.
-      onDisconnectRef.current?.();
+    } else if (state === 'disconnected') {
+      if (engineRef.current === 'webrtc') {
+        // Don't degrade on the first blip — ICE recovers constantly (focus
+        // loss, brief network stalls). Arm a grace timer; if it's still down
+        // when it fires, THEN drop to png. A subsequent 'connected' cancels it.
+        if (!degradeTimerRef.current) {
+          degradeTimerRef.current = setTimeout(() => {
+            degradeTimerRef.current = null;
+            if (engineRef.current === 'webrtc') {
+              console.warn(`${tag} WebRTC stayed disconnected ${WEBRTC_RECONNECT_GRACE_MS}ms — degrading to png`);
+              connectedRef.current = false;
+              setEngine('png');
+            }
+          }, WEBRTC_RECONNECT_GRACE_MS);
+        }
+      } else if (connectedRef.current) {
+        onDisconnectRef.current?.();
+      }
     }
   }, [tag]);
 
@@ -117,6 +178,7 @@ export function EmulatorView({ serial, grpcWebPath, initialEngine = 'png', onRea
       style={{ width: '100%', background: '#000' }}
     >
       <Emulator
+        ref={emulatorRef as any}
         key={`${serial}:${engine}`}
         uri={uri}
         view={engine}
@@ -124,6 +186,12 @@ export function EmulatorView({ serial, grpcWebPath, initialEngine = 'png', onRea
         onStateChange={handleStateChange}
         onError={handleError}
       />
+      {/* Same nav bar as the scrcpy DeviceViewer. The emulator can't use the
+          adb input path, so these map to the emulator's gRPC sendKey; disabled
+          in the png fallback where that channel is dormant. */}
+      <div className="emulator-controls" data-testid={`emulator-controls-${serial}`}>
+        <DeviceNavButtons onNav={handleNav} isAndroid iconSize={16} disabled={engine !== 'webrtc'} />
+      </div>
     </div>
   );
 }
