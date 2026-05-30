@@ -1,6 +1,7 @@
 import type { PluginContext, PluginDefinition } from '../types/plugin';
 import type { HookBus } from '../types/hooks';
 import type { PluginAiApi } from '../types/ai';
+import type { DocStoreApi } from '../types/doc-store';
 
 export interface PluginHarness {
   /** The mocked context the plugin's register/start ran against. */
@@ -86,6 +87,7 @@ function createDefaultMockCtx(pluginName: string): PluginContext {
     apks: createNoopApks(),
     paths: createNoopPaths(),
     dispatcher: () => { throw new Error('dispatcher() not available in default mock — pass via mocks'); },
+    documentStore: createNoopDocStore(),
   } as PluginContext;
 }
 
@@ -151,6 +153,13 @@ function createNoopApks() {
 function createNoopPaths() {
   return {
     fileStorage: (rel: string) => `/tmp/${rel}`,
+  };
+}
+
+function createNoopDocStore(): DocStoreApi {
+  return {
+    putDoc: async () => {},
+    getDoc: async () => null,
   };
 }
 

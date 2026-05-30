@@ -6,7 +6,7 @@ import { PassThrough } from 'stream';
 import * as schema from '../db/schema';
 import { createTestDb } from '../test-utils/create-test-db';
 import { ApiKeyManager } from '../auth/api-key-manager';
-import { ClaudeCliProvider } from './claude-cli-provider';
+import { ClaudeCliProvider, evaluateToolSelfTest } from './claude-cli-provider';
 import type { AgentIdentity } from './ai-agent';
 import { mkdtempSync } from 'fs';
 import { join } from 'path';
@@ -483,5 +483,58 @@ describe('ClaudeCliProvider', () => {
       expect(scopes).toEqual(['core.apk:read']); // identity scopes, NOT the user row's wider scopes
     });
 
+  });
+});
+
+describe('ClaudeCliProvider.getVersion', () => {
+  function childEmitting(stdout: string, code: number): any {
+    const child: any = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = vi.fn();
+    setImmediate(() => {
+      if (stdout) child.stdout.write(stdout);
+      child.stdout.end();
+      setImmediate(() => child.emit('close', code));
+    });
+    return child;
+  }
+
+  it('parses the semver from `claude --version` output', async () => {
+    spawnMock.mockImplementationOnce(() => childEmitting('2.1.158 (Claude Code)\n', 0));
+    expect(await ClaudeCliProvider.getVersion()).toBe('2.1.158');
+  });
+
+  it('returns null when the CLI exits non-zero', async () => {
+    spawnMock.mockImplementationOnce(() => childEmitting('', 1));
+    expect(await ClaudeCliProvider.getVersion()).toBeNull();
+  });
+});
+
+describe('evaluateToolSelfTest', () => {
+  const toolUseLine = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'mcp__selftest__ping', input: {} }] } });
+  const leakLine = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'I will call <invoke name="ping"></invoke>' }] } });
+  const plainTextLine = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'pong, done' }] } });
+
+  it('passes when a real tool_use occurred', () => {
+    expect(evaluateToolSelfTest(toolUseLine + '\n', 0, '')).toEqual({ ok: true });
+  });
+
+  it('fails with a token-degraded reason when tool calls leak as text', () => {
+    const r = evaluateToolSelfTest(leakLine + '\n', 0, '');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/as TEXT/i);
+  });
+
+  it('fails when no tool was called and there was no leak', () => {
+    const r = evaluateToolSelfTest(plainTextLine + '\n', 0, '');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/no tool/i);
+  });
+
+  it('reports a non-zero exit code', () => {
+    const r = evaluateToolSelfTest('', 1, 'boom');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/exited with code 1/);
   });
 });

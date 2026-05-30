@@ -10,6 +10,7 @@ interface TerminalSession {
   type: 'host' | 'device';
   deviceId?: string;
   label: string;
+  initialCommand?: string;
 }
 
 interface LogEntry {
@@ -127,13 +128,14 @@ export function LiveLogPanel() {
   }, []);
 
   // ── Multi-session terminal management ─────────────────────────────────
-  const addSession = useCallback((type: 'host' | 'device', deviceId?: string, label?: string) => {
+  const addSession = useCallback((type: 'host' | 'device', deviceId?: string, label?: string, initialCommand?: string) => {
     const id = `${type}-${deviceId || 'host'}-${Date.now()}`;
     const session: TerminalSession = {
       id,
       type,
       deviceId,
       label: label || (type === 'host' ? 'Host' : deviceId || 'Device'),
+      initialCommand,
     };
     setSessions(prev => {
       if (type === 'device' && deviceId) {
@@ -159,8 +161,18 @@ export function LiveLogPanel() {
         addSession('device', detail.deviceId, detail.deviceName || detail.deviceId);
       }
     };
+    // Open a HOST shell session, optionally auto-running a command once the
+    // shell is ready (e.g. Settings → AI "Re-authenticate Claude" runs `claude login`).
+    const hostHandler = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {};
+      addSession('host', undefined, detail.label || 'Host', detail.initialCommand);
+    };
     window.addEventListener('terminal:open', handler);
-    return () => window.removeEventListener('terminal:open', handler);
+    window.addEventListener('terminal:open-host', hostHandler);
+    return () => {
+      window.removeEventListener('terminal:open', handler);
+      window.removeEventListener('terminal:open-host', hostHandler);
+    };
   }, [addSession]);
 
   // Auto-select device from session-status when a manual automation starts
@@ -618,6 +630,7 @@ export function LiveLogPanel() {
                     sessionId={s.id}
                     type={s.type}
                     deviceId={s.deviceId}
+                    initialCommand={s.initialCommand}
                     visible={s.id === activeSessionId}
                     onExit={() => removeSession(s.id)}
                   />

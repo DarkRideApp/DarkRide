@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import * as schema from '../db/schema';
-import { DocumentStore } from './document-store';
+import { DocumentStore, DocumentStoreHttpError } from './document-store';
 import { gunzipSync } from 'zlib';
 import { createTestDb } from '../test-utils/create-test-db';
 
@@ -175,6 +175,27 @@ describe('DocumentStore', () => {
 
       await store.getDoc('doc1');
       expect(capturedHeaders).toEqual({ 'Content-Type': 'application/json' });
+    });
+
+    it('getDoc throws a DocumentStoreHttpError carrying the status', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404 }));
+      // Assert the concrete class too — the ctx adapter's 404->null mapping
+      // relies on `err instanceof DocumentStoreHttpError`.
+      await expect(store.getDoc('missing')).rejects.toBeInstanceOf(DocumentStoreHttpError);
+      await expect(store.getDoc('missing')).rejects.toMatchObject({
+        name: 'DocumentStoreHttpError',
+        status: 404,
+        message: 'Document store GET failed: 404',
+      });
+    });
+
+    it('URL-encodes the key in the path', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }));
+      await store.getDoc('a b/c');
+      expect(fetch).toHaveBeenCalledWith(
+        'https://docs.example.com/api/id/a%20b%2Fc',
+        expect.objectContaining({ method: 'GET' }),
+      );
     });
 
     it('strips trailing slash from URL', async () => {

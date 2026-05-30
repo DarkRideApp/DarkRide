@@ -7,6 +7,7 @@ import { clearEndpoints, getApiRouter } from './api-service';
 import { registerAiModelEndpoints } from './ai-models';
 import { RateLimitCache, AiModelRouter } from '../services/ai-model-router';
 import { createTestDb } from '../test-utils/create-test-db';
+import { ClaudeCliProvider } from '../services/claude-cli-provider';
 
 const { aiModels, aiProviders, aiTiers } = schema;
 
@@ -468,6 +469,49 @@ describe('AI Models API Endpoints', () => {
       const res = await request(app).post(`/v1/ai/models/${models[0].id}/test`);
       expect(res.body.success).toBe(false);
       expect(res.body.error).toContain('Invalid API key');
+    });
+
+    it('passes a claude-cli model test when version + tool round-trip succeed', async () => {
+      const cliProvider = insertProvider(db, { name: 'Claude CLI', type: 'claude-cli', apiKey: 'oauth-tok' });
+      insertModel(db, cliProvider, { provider: 'claude-cli', model: 'sonnet' });
+      const model = db.select().from(aiModels).all().find(m => m.providerId === cliProvider)!;
+
+      vi.spyOn(ClaudeCliProvider, 'getVersion').mockResolvedValue('2.1.158');
+      const toolSpy = vi.spyOn(ClaudeCliProvider, 'testToolUse').mockResolvedValue({ ok: true });
+
+      const res = await request(app).post(`/v1/ai/models/${model.id}/test`);
+
+      expect(toolSpy).toHaveBeenCalledWith('oauth-tok', 'sonnet');
+      expect(res.body.success).toBe(true);
+    });
+
+    it('fails a claude-cli model test when the CLI cannot drive tools (token degraded)', async () => {
+      const cliProvider = insertProvider(db, { name: 'Claude CLI', type: 'claude-cli', apiKey: 'oauth-tok' });
+      insertModel(db, cliProvider, { provider: 'claude-cli', model: 'sonnet' });
+      const model = db.select().from(aiModels).all().find(m => m.providerId === cliProvider)!;
+
+      vi.spyOn(ClaudeCliProvider, 'getVersion').mockResolvedValue('2.1.158');
+      vi.spyOn(ClaudeCliProvider, 'testToolUse').mockResolvedValue({
+        ok: false, reason: 'emitted tool calls as TEXT instead of running them',
+      });
+
+      const res = await request(app).post(`/v1/ai/models/${model.id}/test`);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toContain('TEXT');
+    });
+
+    it('fails a claude-cli model test when the CLI binary is missing', async () => {
+      const cliProvider = insertProvider(db, { name: 'Claude CLI', type: 'claude-cli', apiKey: null });
+      insertModel(db, cliProvider, { provider: 'claude-cli', model: 'sonnet' });
+      const model = db.select().from(aiModels).all().find(m => m.providerId === cliProvider)!;
+
+      vi.spyOn(ClaudeCliProvider, 'getVersion').mockResolvedValue(null);
+
+      const res = await request(app).post(`/v1/ai/models/${model.id}/test`);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toContain('not found');
     });
   });
 
