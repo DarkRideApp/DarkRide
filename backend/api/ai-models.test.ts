@@ -1,12 +1,16 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import request from 'supertest';
 import express from 'express';
+import { EventEmitter } from 'events';
 import { drizzle, BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
 import { clearEndpoints, getApiRouter } from './api-service';
 import { registerAiModelEndpoints } from './ai-models';
 import { RateLimitCache, AiModelRouter } from '../services/ai-model-router';
 import { createTestDb } from '../test-utils/create-test-db';
+import { spawn } from 'child_process';
+
+vi.mock('child_process', () => ({ spawn: vi.fn() }));
 
 const { aiModels, aiProviders, aiTiers } = schema;
 
@@ -468,6 +472,44 @@ describe('AI Models API Endpoints', () => {
       const res = await request(app).post(`/v1/ai/models/${models[0].id}/test`);
       expect(res.body.success).toBe(false);
       expect(res.body.error).toContain('Invalid API key');
+    });
+
+    it('tests a claude-cli model by spawning the CLI (success on exit 0)', async () => {
+      const cliProvider = insertProvider(db, { name: 'Claude CLI', type: 'claude-cli', apiKey: 'oauth-tok' });
+      insertModel(db, cliProvider, { provider: 'claude-cli', model: 'sonnet' });
+      const model = db.select().from(aiModels).all().find(m => m.providerId === cliProvider)!;
+
+      // Emit 'close' from inside the mock — after the handler has synchronously
+      // attached its listeners on the returned child (avoids an emit/listen race).
+      vi.mocked(spawn).mockImplementation(((): any => {
+        const child = new EventEmitter() as any;
+        child.kill = vi.fn();
+        setImmediate(() => child.emit('close', 0));
+        return child;
+      }));
+
+      const res = await request(app).post(`/v1/ai/models/${model.id}/test`);
+
+      expect(vi.mocked(spawn)).toHaveBeenCalledWith('claude', ['--version'], expect.anything());
+      expect(res.body.success).toBe(true);
+    });
+
+    it('fails a claude-cli model test when the CLI exits non-zero', async () => {
+      const cliProvider = insertProvider(db, { name: 'Claude CLI', type: 'claude-cli', apiKey: 'oauth-tok' });
+      insertModel(db, cliProvider, { provider: 'claude-cli', model: 'sonnet' });
+      const model = db.select().from(aiModels).all().find(m => m.providerId === cliProvider)!;
+
+      vi.mocked(spawn).mockImplementation(((): any => {
+        const child = new EventEmitter() as any;
+        child.kill = vi.fn();
+        setImmediate(() => child.emit('close', 1));
+        return child;
+      }));
+
+      const res = await request(app).post(`/v1/ai/models/${model.id}/test`);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toContain('Claude CLI');
     });
   });
 

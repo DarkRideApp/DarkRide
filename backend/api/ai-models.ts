@@ -1,4 +1,5 @@
 import { asc, eq } from 'drizzle-orm';
+import { spawn } from 'child_process';
 import { registerEndpoint } from './api-service';
 import { aiModels, aiProviders, aiTiers } from '../db/schema';
 import type { AppDatabase } from '../db/index';
@@ -432,6 +433,34 @@ async function testModelConnection(
         }, {
           model: m, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }],
         }, m);
+      }
+
+      case 'claude-cli': {
+        // Claude Code models run via the local `claude` CLI, not an HTTP
+        // endpoint — verify the binary works (mirrors the provider-level test
+        // in ai-providers.ts). apiKey, when set, is a CLAUDE_CODE_OAUTH_TOKEN.
+        return await new Promise((resolve) => {
+          const env = apiKey
+            ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: apiKey }
+            : undefined;
+          const child = spawn('claude', ['--version'], { env });
+          const timer = setTimeout(() => {
+            child.kill();
+            resolve({ success: false, error: 'Claude CLI not found or not working' });
+          }, 15000);
+          child.on('close', (code) => {
+            clearTimeout(timer);
+            if (code === 0) {
+              resolve({ success: true, model: modelName || 'claude-cli' });
+            } else {
+              resolve({ success: false, error: 'Claude CLI not found or not working' });
+            }
+          });
+          child.on('error', () => {
+            clearTimeout(timer);
+            resolve({ success: false, error: 'Claude CLI not found or not working' });
+          });
+        });
       }
 
       default:
