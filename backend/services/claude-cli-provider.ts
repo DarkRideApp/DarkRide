@@ -791,13 +791,23 @@ export class ClaudeCliProvider {
         : undefined;
       const child = spawn('claude', ['--version'], { stdio: ['ignore', 'pipe', 'ignore'], env });
       let out = '';
+      let settled = false;
+      const done = (v: string | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(v);
+      };
+      // Bound the wait — this sits on the Settings status path and before every
+      // claude-cli model test, so a hung `claude --version` must not hang the request.
+      const timer = setTimeout(() => { child.kill('SIGKILL'); done(null); }, 10000);
       child.stdout?.on('data', (c: Buffer) => { out += c.toString(); });
       child.on('close', (code) => {
-        if (code !== 0) { resolve(null); return; }
+        if (code !== 0) { done(null); return; }
         const m = out.match(/(\d+\.\d+\.\d+)/);
-        resolve(m ? m[1] : null);
+        done(m ? m[1] : null);
       });
-      child.on('error', () => resolve(null));
+      child.on('error', () => done(null));
     });
   }
 }

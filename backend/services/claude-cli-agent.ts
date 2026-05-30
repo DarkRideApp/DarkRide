@@ -150,7 +150,9 @@ export class ClaudeCliAgent implements AiAgentInterface {
     ) {
       throw new Error(
         `Claude (model "${this.model}") emitted tool calls as text and ran zero tools, so the result is fabricated. ` +
-        'Update the `claude` CLI on this host (npm i -g @anthropic-ai/claude-code@latest) or select a different model.',
+        'Most often the Claude Code token configured on the provider is wrong/stale — clear it to use the CLI login, ' +
+        'or replace it via `claude setup-token`. Less often, the `claude` CLI is too old for the model ' +
+        '(npm i -g @anthropic-ai/claude-code@latest) or the model itself is the problem.',
       );
     }
 
