@@ -22,7 +22,7 @@ export function AISection() {
   const [showProviderModal, setShowProviderModal] = useState(false);
   const [editingProvider, setEditingProvider] = useState<AiProviderConfig | null>(null);
   const [providerForm, setProviderForm] = useState({
-    name: '', type: 'gemini' as AiProviderType, apiKey: '', baseUrl: '',
+    name: '', type: 'gemini' as AiProviderType, apiKey: '', baseUrl: '', clearApiKey: false,
   });
   const [providerSaving, setProviderSaving] = useState(false);
   const [providerTestResult, setProviderTestResult] = useState<{ success: boolean; message: string } | null>(null);
@@ -49,11 +49,15 @@ export function AISection() {
 
   // Claude CLI status
   const [claudeCliAvailable, setClaudeCliAvailable] = useState<boolean | null>(null);
+  const [claudeCliVersion, setClaudeCliVersion] = useState<string | null>(null);
 
   const fetchClaudeCliStatus = useCallback(async () => {
     try {
       const res = await ws.sendRestApi('GET', '/v1/ai/claude-cli/status');
-      if (res.body?.success) setClaudeCliAvailable(res.body.data?.available ?? false);
+      if (res.body?.success) {
+        setClaudeCliAvailable(res.body.data?.available ?? false);
+        setClaudeCliVersion(res.body.data?.version ?? null);
+      }
     } catch { setClaudeCliAvailable(false); }
   }, [ws]);
 
@@ -99,7 +103,7 @@ export function AISection() {
   // AI Provider handlers
   const handleOpenAddProvider = () => {
     setEditingProvider(null);
-    setProviderForm({ name: '', type: 'gemini', apiKey: '', baseUrl: '' });
+    setProviderForm({ name: '', type: 'gemini', apiKey: '', baseUrl: '', clearApiKey: false });
     setProviderTestResult(null);
     setShowProviderModal(true);
   };
@@ -107,7 +111,7 @@ export function AISection() {
   const handleOpenEditProvider = (p: AiProviderConfig) => {
     setEditingProvider(p);
     setProviderForm({
-      name: p.name, type: p.type, apiKey: '', baseUrl: p.baseUrl || '',
+      name: p.name, type: p.type, apiKey: '', baseUrl: p.baseUrl || '', clearApiKey: false,
     });
     setProviderTestResult(null);
     setShowProviderModal(true);
@@ -121,7 +125,11 @@ export function AISection() {
         type: providerForm.type,
         baseUrl: providerForm.baseUrl || null,
       };
-      if (providerForm.apiKey) payload.apiKey = providerForm.apiKey;
+      // Explicit empty string clears the stored key (backend: '' -> null).
+      // Otherwise only send a key when the user typed a new one — an untouched
+      // empty box must NOT wipe the existing secret.
+      if (providerForm.clearApiKey) payload.apiKey = '';
+      else if (providerForm.apiKey) payload.apiKey = providerForm.apiKey;
 
       if (editingProvider) {
         await ws.sendRestApi('PUT', `/v1/ai/providers/${editingProvider.id}`, payload);
@@ -138,6 +146,29 @@ export function AISection() {
     } finally {
       setProviderSaving(false);
     }
+  };
+
+  // Shown under a secret field when editing a provider that already has one
+  // saved, so the user can explicitly REMOVE it (the field itself always
+  // renders empty — the secret is never sent back to the client).
+  const renderSavedKeyNotice = () => {
+    if (!editingProvider?.hasApiKey) return null;
+    if (providerForm.clearApiKey) {
+      return (
+        <div style={{ fontSize: 12, color: 'var(--status-error, #ef4444)', display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+          Saved key will be removed when you save.
+          <button type="button" className="btn btn-sm" data-testid="provider-key-undo-remove"
+            onClick={() => setProviderForm(f => ({ ...f, clearApiKey: false }))}>Undo</button>
+        </div>
+      );
+    }
+    return (
+      <div style={{ fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+        <span style={{ color: 'var(--status-online, #22c55e)' }}>✓ A key is saved</span>
+        <button type="button" className="btn btn-sm" data-testid="provider-key-remove"
+          onClick={() => setProviderForm(f => ({ ...f, apiKey: '', clearApiKey: true }))}>Remove</button>
+      </div>
+    );
   };
 
   const handleDeleteProvider = async (id: number) => {
@@ -419,11 +450,33 @@ export function AISection() {
                 flexShrink: 0,
               }} />
               <span style={{ fontSize: 13, fontWeight: 500 }}>Claude CLI</span>
+              {claudeCliVersion && (
+                <span style={{
+                  fontSize: 12, fontFamily: 'var(--font-mono, monospace)',
+                  color: 'var(--text-muted)', padding: '1px 6px', borderRadius: 4,
+                  background: 'rgba(128,128,128,0.12)',
+                }}>
+                  v{claudeCliVersion}
+                </span>
+              )}
               <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                 {claudeCliAvailable
-                  ? 'Detected — add as an AI Provider below to use for all AI tasks'
+                  ? 'Detected — keep it updated so newer models can use tools (an outdated CLI silently skips tool calls)'
                   : 'Not found — install claude CLI to enable'}
               </span>
+              {claudeCliAvailable && (
+                <button
+                  className="btn btn-sm"
+                  style={{ marginLeft: 'auto', whiteSpace: 'nowrap' }}
+                  data-testid="reauth-claude-btn"
+                  title="Opens the in-browser Terminal and runs `claude login` as the server user — no SSH needed"
+                  onClick={() => window.dispatchEvent(new CustomEvent('terminal:open-host', {
+                    detail: { label: 'Claude login', initialCommand: 'claude login' },
+                  }))}
+                >
+                  Re-authenticate
+                </button>
+              )}
             </div>
           )}
 
@@ -766,8 +819,12 @@ export function AISection() {
             {providerForm.type === 'claude-cli' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <div style={{ fontSize: 13, color: 'var(--text-muted)', padding: '4px 0' }}>
-                  Uses your local Claude CLI installation. If your login has expired, paste a long-lived
-                  token from <code style={{ fontSize: 12 }}>claude setup-token</code> below.
+                  Uses the server's Claude CLI login. To (re)authenticate without SSH, open the
+                  in-browser <strong>Terminal</strong> (logs panel) — it runs as the same user as the
+                  server — and run <code style={{ fontSize: 12 }}>claude login</code> or{' '}
+                  <code style={{ fontSize: 12 }}>claude setup-token</code>. Leave the token below
+                  empty to use that login, or paste a <code style={{ fontSize: 12 }}>setup-token</code>{' '}
+                  to override it. A wrong/stale token authenticates but can't run tools.
                 </div>
                 <div className="form-group">
                   <label htmlFor="settings-llm-oauth-token">
@@ -778,10 +835,11 @@ export function AISection() {
                     className="form-input"
                     type="password"
                     value={providerForm.apiKey}
-                    onChange={e => setProviderForm(f => ({ ...f, apiKey: e.target.value }))}
+                    onChange={e => setProviderForm(f => ({ ...f, apiKey: e.target.value, clearApiKey: false }))}
                     placeholder={editingProvider?.hasApiKey ? 'Enter new token to replace' : 'CLAUDE_CODE_OAUTH_TOKEN from setup-token'}
                     data-testid="provider-oauth-token-input"
                   />
+                  {renderSavedKeyNotice()}
                 </div>
               </div>
             )}
@@ -794,10 +852,11 @@ export function AISection() {
                   className="form-input"
                   type="password"
                   value={providerForm.apiKey}
-                  onChange={e => setProviderForm(f => ({ ...f, apiKey: e.target.value }))}
+                  onChange={e => setProviderForm(f => ({ ...f, apiKey: e.target.value, clearApiKey: false }))}
                   placeholder={editingProvider?.hasApiKey ? 'Enter new key to replace' : 'Enter API key'}
                   data-testid="provider-api-key-input"
                 />
+                {renderSavedKeyNotice()}
               </div>
             )}
 

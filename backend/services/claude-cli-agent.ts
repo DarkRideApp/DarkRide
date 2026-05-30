@@ -8,6 +8,12 @@ import type { AiMessage, AiAssistantMessage, AiTextBlock, AiToolUseBlock } from 
 
 const { log, error: logError } = createLoggers('claude-cli-agent');
 
+// Markup Claude uses internally for tool calls. If it shows up in the assistant's
+// *text* (rather than as structured tool_use blocks) it means the CLI failed to
+// parse the model's tool calls — they leaked as text. Matches `<invoke …>`,
+// `</invoke>` and `<function_calls>` (with or without an `antml:` prefix).
+const TOOL_CALL_LEAK_RE = /<\/?(?:antml:)?(?:invoke|function_calls)\b/i;
+
 export class ClaudeCliAgent implements AiAgentInterface {
   constructor(
     private db: AppDatabase,
@@ -126,6 +132,28 @@ export class ClaudeCliAgent implements AiAgentInterface {
     } catch (err: any) {
       logError(`ClaudeCliAgent sendMessage error: ${err.message}`);
       cliError = `Error: ${err.message || String(err)}`;
+    }
+
+    // 5b. Detect "text-based tool call" leakage. When the CLI cannot drive tool
+    // use for the configured model, the model writes tool-call markup
+    // (<invoke …>/<function_calls>) as plain *text* and executes zero real
+    // tools — then fabricates the tool results inline. Any narrative it produced
+    // is hallucinated. Fail loudly instead of returning a clean-looking result,
+    // so callers (APK review, diff analysis) surface it rather than silently
+    // saving garbage. Usually means the host's `claude` CLI is too old for the
+    // model — update it or pick a different model.
+    if (
+      !cliError
+      && toolUseCount === 0
+      && assistantToolUses.length === 0
+      && TOOL_CALL_LEAK_RE.test(assistantTextChunks.join(''))
+    ) {
+      throw new Error(
+        `Claude (model "${this.model}") emitted tool calls as text and ran zero tools, so the result is fabricated. ` +
+        'Most often the Claude Code token configured on the provider is wrong/stale — clear it to use the CLI login, ' +
+        'or replace it via `claude setup-token`. Less often, the `claude` CLI is too old for the model ' +
+        '(npm i -g @anthropic-ai/claude-code@latest) or the model itself is the problem.',
+      );
     }
 
     // 6. Build assistant message with content blocks
