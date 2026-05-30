@@ -8,11 +8,12 @@ interface TerminalTabProps {
   sessionId: string;
   type: 'host' | 'device';
   deviceId?: string;         // required for type='device'
+  initialCommand?: string;   // auto-run once after the shell is ready
   visible: boolean;          // false = hidden but kept alive (display:none)
   onExit: () => void;        // called when pty exits
 }
 
-export function TerminalTab({ sessionId, type, deviceId, visible, onExit }: TerminalTabProps) {
+export function TerminalTab({ sessionId, type, deviceId, initialCommand, visible, onExit }: TerminalTabProps) {
   const ws = useWebSocket();
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -21,6 +22,11 @@ export function TerminalTab({ sessionId, type, deviceId, visible, onExit }: Term
   // Wrap onExit in a ref so the effect doesn't re-run when the callback identity changes
   const onExitRef = useRef(onExit);
   onExitRef.current = onExit;
+  // initialCommand via refs so the start effect doesn't re-run (and re-spawn the
+  // pty) if the prop identity changes. Sent once, after the shell's first output.
+  const initialCommandRef = useRef(initialCommand);
+  initialCommandRef.current = initialCommand;
+  const initialSentRef = useRef(false);
 
   const prefix = type === 'host' ? 'host-shell' : 'adb-shell';
 
@@ -72,6 +78,12 @@ export function TerminalTab({ sessionId, type, deviceId, visible, onExit }: Term
       (msg: { sessionId: string; data: string }) => {
         if (msg.sessionId !== sessionId) return;
         terminal.write(msg.data);
+        // Run the requested command once the shell has produced its first
+        // output (its prompt is ready), then never again for this session.
+        if (initialCommandRef.current && !initialSentRef.current) {
+          initialSentRef.current = true;
+          ws.sendMessage(`${prefix}/input`, { sessionId, data: initialCommandRef.current + '\r' });
+        }
       }
     );
 

@@ -464,6 +464,19 @@ export function AISection() {
                   ? 'Detected — keep it updated so newer models can use tools (an outdated CLI silently skips tool calls)'
                   : 'Not found — install claude CLI to enable'}
               </span>
+              {claudeCliAvailable && (
+                <button
+                  className="btn btn-sm"
+                  style={{ marginLeft: 'auto', whiteSpace: 'nowrap' }}
+                  data-testid="reauth-claude-btn"
+                  title="Opens the in-browser Terminal and runs `claude login` as the server user — no SSH needed"
+                  onClick={() => window.dispatchEvent(new CustomEvent('terminal:open-host', {
+                    detail: { label: 'Claude login', initialCommand: 'claude login' },
+                  }))}
+                >
+                  Re-authenticate
+                </button>
+              )}
             </div>
           )}
 
