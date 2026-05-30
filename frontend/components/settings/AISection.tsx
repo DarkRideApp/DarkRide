@@ -49,11 +49,15 @@ export function AISection() {
 
   // Claude CLI status
   const [claudeCliAvailable, setClaudeCliAvailable] = useState<boolean | null>(null);
+  const [claudeCliVersion, setClaudeCliVersion] = useState<string | null>(null);
 
   const fetchClaudeCliStatus = useCallback(async () => {
     try {
       const res = await ws.sendRestApi('GET', '/v1/ai/claude-cli/status');
-      if (res.body?.success) setClaudeCliAvailable(res.body.data?.available ?? false);
+      if (res.body?.success) {
+        setClaudeCliAvailable(res.body.data?.available ?? false);
+        setClaudeCliVersion(res.body.data?.version ?? null);
+      }
     } catch { setClaudeCliAvailable(false); }
   }, [ws]);
 
@@ -419,9 +423,18 @@ export function AISection() {
                 flexShrink: 0,
               }} />
               <span style={{ fontSize: 13, fontWeight: 500 }}>Claude CLI</span>
+              {claudeCliVersion && (
+                <span style={{
+                  fontSize: 12, fontFamily: 'var(--font-mono, monospace)',
+                  color: 'var(--text-muted)', padding: '1px 6px', borderRadius: 4,
+                  background: 'rgba(128,128,128,0.12)',
+                }}>
+                  v{claudeCliVersion}
+                </span>
+              )}
               <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                 {claudeCliAvailable
-                  ? 'Detected — add as an AI Provider below to use for all AI tasks'
+                  ? 'Detected — keep it updated so newer models can use tools (an outdated CLI silently skips tool calls)'
                   : 'Not found — install claude CLI to enable'}
               </span>
             </div>

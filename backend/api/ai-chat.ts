@@ -2,16 +2,20 @@ import { eq, and, desc, gte, lte, sql } from 'drizzle-orm';
 import { registerEndpoint } from './api-service';
 import { aiConversations } from '../db/schema';
 import type { AppDatabase } from '../db/index';
-import type { ClaudeCliProvider } from '../services/claude-cli-provider';
+import { ClaudeCliProvider } from '../services/claude-cli-provider';
 
 export function registerAiChatApiEndpoints(db: AppDatabase, getClaudeCliProvider?: () => ClaudeCliProvider | null): void {
-  // GET /v1/ai/claude-cli/status — check if Claude CLI provider is available
-  registerEndpoint('GET', '/v1/ai/claude-cli/status', (_req, res) => {
+  // GET /v1/ai/claude-cli/status — claude-cli availability + installed CLI version.
+  // The version matters: an outdated CLI can fail to drive tool use for newer
+  // models (tool calls leak as text), which the UI surfaces as a warning.
+  registerEndpoint('GET', '/v1/ai/claude-cli/status', async (_req, res) => {
     const provider = getClaudeCliProvider?.();
+    const version = provider != null ? await ClaudeCliProvider.getVersion() : null;
     res.json({
       success: true,
       data: {
         available: provider != null,
+        version,
       },
     });
   });

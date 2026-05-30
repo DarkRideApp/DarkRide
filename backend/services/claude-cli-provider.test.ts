@@ -485,3 +485,28 @@ describe('ClaudeCliProvider', () => {
 
   });
 });
+
+describe('ClaudeCliProvider.getVersion', () => {
+  function childEmitting(stdout: string, code: number): any {
+    const child: any = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = vi.fn();
+    setImmediate(() => {
+      if (stdout) child.stdout.write(stdout);
+      child.stdout.end();
+      setImmediate(() => child.emit('close', code));
+    });
+    return child;
+  }
+
+  it('parses the semver from `claude --version` output', async () => {
+    spawnMock.mockImplementationOnce(() => childEmitting('2.1.158 (Claude Code)\n', 0));
+    expect(await ClaudeCliProvider.getVersion()).toBe('2.1.158');
+  });
+
+  it('returns null when the CLI exits non-zero', async () => {
+    spawnMock.mockImplementationOnce(() => childEmitting('', 1));
+    expect(await ClaudeCliProvider.getVersion()).toBeNull();
+  });
+});

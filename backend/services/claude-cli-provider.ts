@@ -722,4 +722,26 @@ export class ClaudeCliProvider {
       child.on('error', () => resolve(false));
     });
   }
+
+  /**
+   * Return the installed Claude CLI semver (e.g. "2.1.158"), or null if the
+   * binary is missing or doesn't report a version. Parses `claude --version`
+   * output of the form "2.1.158 (Claude Code)".
+   */
+  static async getVersion(oauthToken?: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      const env = oauthToken
+        ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: oauthToken }
+        : undefined;
+      const child = spawn('claude', ['--version'], { stdio: ['ignore', 'pipe', 'ignore'], env });
+      let out = '';
+      child.stdout?.on('data', (c: Buffer) => { out += c.toString(); });
+      child.on('close', (code) => {
+        if (code !== 0) { resolve(null); return; }
+        const m = out.match(/(\d+\.\d+\.\d+)/);
+        resolve(m ? m[1] : null);
+      });
+      child.on('error', () => resolve(null));
+    });
+  }
 }
