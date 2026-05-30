@@ -15,6 +15,7 @@ import { GapDetector } from '../../lib/video/gap-detector';
 import { KeyframeTrigger } from '../../lib/video/keyframe-trigger';
 import { VideoHealthIndicator, HealthState } from './VideoHealthIndicator';
 import { VideoQualitySelector } from './VideoQualitySelector';
+import { EmulatorVideo, type EmulatorVideoHandle } from '../../lib/video/EmulatorVideo';
 import './DeviceViewer.css';
 
 pluginRegistry.registerUiSlots('core', [
@@ -133,17 +134,26 @@ export interface DeviceViewerProps {
   onStreamReady?: (info: {
     screenWidth: number;
     screenHeight: number;
-    backend: 'scrcpy' | 'minicap' | 'polling' | 'wda-polling';
+    backend: 'scrcpy' | 'minicap' | 'polling' | 'wda-polling' | 'webrtc';
   }) => void;
   onError?: (error: string) => void;
   className?: string;
   extraActions?: DeviceAction[];
   captureSessionId?: number;
+  /**
+   * When set, the viewer runs in "emulator mode": the video surface is an
+   * <EmulatorVideo> (WebRTC, with png fallback) over this grpc-web path, and
+   * controls route to the emulator's gRPC input channel (sendKey) instead of
+   * the adb scrcpy WebSocket. The on-screen control surface is identical.
+   */
+  webrtcGrpcPath?: string;
 }
 
-export function DeviceViewer({ deviceId, onStreamReady, onError, className, extraActions, captureSessionId }: DeviceViewerProps): JSX.Element {
+export function DeviceViewer({ deviceId, onStreamReady, onError, className, extraActions, captureSessionId, webrtcGrpcPath }: DeviceViewerProps): JSX.Element {
   const ws = useWebSocket();
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const emulatorVideoRef = useRef<EmulatorVideoHandle>(null);
+  const isEmulator = !!webrtcGrpcPath;
   const viewerId = useMemo(
     () => crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
     [deviceId],
@@ -206,8 +216,14 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
   }, [ws, deviceId]);
 
   const handleNav = useCallback((button: 'back' | 'home' | 'recents' | 'power') => {
+    if (isEmulator) {
+      // Emulator can't use the adb input path — map to the emulator's hardware
+      // keys over the gRPC input channel.
+      emulatorVideoRef.current?.sendKey(({ back: 'GoBack', home: 'GoHome', recents: 'AppSwitch', power: 'Power' } as const)[button]);
+      return;
+    }
     ws.sendMessage('device-nav', { deviceId, button });
-  }, [ws, deviceId]);
+  }, [ws, deviceId, isEmulator]);
 
   const handleScreenshot = useCallback(async () => {
     if (captureSessionId != null) {
@@ -261,6 +277,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
 
   // Capability detection: check whether the browser supports WebCodecs VideoDecoder.
   useEffect(() => {
+    if (isEmulator) return; // emulator renders via <EmulatorVideo>, no WebCodecs path
     if (typeof (globalThis as any).VideoDecoder === 'undefined') {
       setSupported(false);
       return;
@@ -270,19 +287,21 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
       .then((r: any) => { if (!cancelled) setSupported(!!r.supported); })
       .catch(() => { if (!cancelled) setSupported(false); });
     return () => { cancelled = true; };
-  }, []);
+  }, [isEmulator]);
 
   useEffect(() => {
+    if (isEmulator) return; // emulator stream is driven by <EmulatorVideo> over gRPC
     if (!deviceId || !ws.connected) return;
     ws.sendMessage('device-stream-start', { deviceId, viewerId });
     return () => {
       ws.sendMessage('device-stream-stop', { deviceId, viewerId });
     };
-  }, [ws, deviceId, viewerId]);
+  }, [ws, deviceId, viewerId, isEmulator]);
 
   // Polling/minicap fallback: JSON device-frame messages carry base64 JPEG.
   // Kept alongside the binary WebCodecs path — both backends can coexist.
   useEffect(() => {
+    if (isEmulator) return;
     return ws.subscribe('device-frame', (msg: any) => {
       if (msg.deviceId !== deviceId) return;
       const canvas = canvasRef.current;
@@ -302,7 +321,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
       };
       img.src = `data:image/jpeg;base64,${msg.frame}`;
     });
-  }, [ws, deviceId]);
+  }, [ws, deviceId, isEmulator]);
 
   // scrcpy H.264 path via WebCodecs — only active when browser supports VideoDecoder.
   // Tracks observed frameId gaps for the lifetime of this effect; the detector
@@ -312,6 +331,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
   const lastKeyframeAtRef = useRef<number>(Date.now());
   const gapStatsRef = useRef({ totalGaps: 0, totalMissed: 0, regressions: 0, wraps: 0, keyframeRequests: 0, watchdogFires: 0 });
   useEffect(() => {
+    if (isEmulator) return;
     if (!supported) return;
     // Effect re-runs on deviceId change carry the ref's stale value from
     // the previous device. Reset so the new device gets a fresh 8s window
@@ -410,9 +430,10 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
       gapDetectorRef.current = null;
       triggerRef.current = null;
     };
-  }, [ws, supported, deviceId]);
+  }, [ws, supported, deviceId, isEmulator]);
 
   useEffect(() => {
+    if (isEmulator) return;
     return ws.subscribe('device-stream-started', (msg: any) => {
       if (msg.deviceId !== deviceId) return;
       if (msg.screenWidth && msg.screenHeight) {
@@ -427,17 +448,19 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
         backend: msg.backend,
       });
     });
-  }, [ws, deviceId, onStreamReady]);
+  }, [ws, deviceId, onStreamReady, isEmulator]);
 
   useEffect(() => {
+    if (isEmulator) return;
     if (!onError) return;
     return ws.subscribe('device-stream-error', (msg: any) => {
       if (msg.deviceId !== deviceId) return;
       onError(msg.error ?? 'Stream error');
     });
-  }, [ws, deviceId, onError]);
+  }, [ws, deviceId, onError, isEmulator]);
 
   useEffect(() => {
+    if (isEmulator) return;
     return ws.subscribe('video-reset', (msg: any) => {
       if (msg.deviceId !== deviceId) return;
       setReconnecting(true);
@@ -450,15 +473,16 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
       triggerRef.current?.reset();
       lastKeyframeAtRef.current = Date.now();
     });
-  }, [ws, deviceId]);
+  }, [ws, deviceId, isEmulator]);
 
   useEffect(() => {
+    if (isEmulator) return;
     return ws.subscribe('video-config-change', (msg: any) => {
       if (msg.deviceId !== deviceId) return;
       if (typeof msg.tier === 'number') setVideoTier(msg.tier);
       if (typeof msg.bitrate === 'number') setVideoBitrate(msg.bitrate);
     });
-  }, [ws, deviceId]);
+  }, [ws, deviceId, isEmulator]);
 
   useEffect(() => {
     if (!reconnecting) {
@@ -481,6 +505,24 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
     return () => { cancelled = true; };
   }, [ws, deviceId]);
 
+  // Keyboard forwarding for emulator mode. The WebRTC <Emulator> doesn't
+  // capture keys and the emulator's adb input path fails, so we forward
+  // keystrokes over the same gRPC channel as mouse (sendKey). Browser
+  // shortcuts + form fields are left alone.
+  useEffect(() => {
+    if (!isEmulator) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t?.isContentEditable) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;      // browser shortcuts
+      if (/^F\d{1,2}$/.test(e.key)) return;                 // function keys
+      e.preventDefault();
+      emulatorVideoRef.current?.sendKey(e.key);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isEmulator]);
+
   const isAndroid = platform !== 'ios'; // default = Android-superset until we know otherwise
 
   const healthState: HealthState =
@@ -497,7 +539,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
       icon: 'x-circle',
       onClick: () => runCommand('stopall'),
     }] : []),
-    ...(isAndroid ? [{
+    ...(isAndroid && !isEmulator ? [{
       id: 'core:retry-stream',
       label: 'Retry stream',
       icon: 'refresh-cw',
@@ -526,24 +568,38 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
         ...(reservedDims ? { aspectRatio: `${reservedDims.width} / ${reservedDims.height}` } : {}),
         flexDirection: 'column',
       }}>
-        {supported === false && (
-          <div className="device-viewer-unsupported">
-            Live video requires a modern browser (Chrome 94+, Firefox 130+, Safari 16.4+, Edge 94+).
-            Touch and screenshot still work.
-          </div>
+        {isEmulator ? (
+          // Emulator mode: WebRTC video (with png fallback) over gRPC. The
+          // <Emulator> captures mouse itself; controls route to sendKey.
+          <EmulatorVideo
+            ref={emulatorVideoRef}
+            serial={deviceId}
+            grpcWebPath={webrtcGrpcPath!}
+            onReady={() => onStreamReady?.({ screenWidth: 0, screenHeight: 0, backend: 'webrtc' })}
+            onError={(e) => onError?.(e.message)}
+          />
+        ) : (
+          <>
+            {supported === false && (
+              <div className="device-viewer-unsupported">
+                Live video requires a modern browser (Chrome 94+, Firefox 130+, Safari 16.4+, Edge 94+).
+                Touch and screenshot still work.
+              </div>
+            )}
+            <canvas
+              ref={canvasRef}
+              style={{
+                maxWidth: '100%', maxHeight: 'calc(100vh - 200px)', cursor: 'pointer', display: 'block',
+                ...(supported === false ? { visibility: 'hidden', position: 'absolute', pointerEvents: 'none' } : {}),
+              }}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              onMouseLeave={handleMouseUp}
+            />
+            {reconnecting && <div className="device-viewer-reconnecting">Reconnecting…</div>}
+          </>
         )}
-        <canvas
-          ref={canvasRef}
-          style={{
-            maxWidth: '100%', maxHeight: 'calc(100vh - 200px)', cursor: 'pointer', display: 'block',
-            ...(supported === false ? { visibility: 'hidden', position: 'absolute', pointerEvents: 'none' } : {}),
-          }}
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onMouseLeave={handleMouseUp}
-        />
-        {reconnecting && <div className="device-viewer-reconnecting">Reconnecting…</div>}
       </div>
       <div style={{ display: 'flex', gap: 6, padding: '6px', justifyContent: 'center', flexWrap: 'wrap', alignItems: 'center' }}>
         <DeviceNavButtons onNav={handleNav} isAndroid={isAndroid} iconSize={iconSize} />
@@ -560,8 +616,8 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
             onClick={a.onClick}
           >{a.icon}</button>
         ))}
-        <VideoQualitySelector onChange={handleQualityChange} autoTier={videoTier} />
-        <VideoHealthIndicator state={healthState} tier={videoTier} bitrate={videoBitrate} />
+        {!isEmulator && <VideoQualitySelector onChange={handleQualityChange} autoTier={videoTier} />}
+        {!isEmulator && <VideoHealthIndicator state={healthState} tier={videoTier} bitrate={videoBitrate} />}
         <button ref={overflowTriggerRef} className="btn btn-sm" data-testid="dv-overflow" title="More" onClick={() => setOverflowOpen(o => !o)}><MoreHorizontal size={iconSize} /></button>
       </div>
 

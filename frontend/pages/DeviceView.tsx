@@ -7,7 +7,6 @@ import { AppsTab } from '../components/devices/AppsTab';
 import { WireGuardSetup } from '../components/devices/WireGuardSetup';
 import { DeviceViewer, DeviceAction } from '../components/devices/DeviceViewer';
 import { VncViewer } from '../lib/video/VncViewer';
-import { EmulatorView } from '../lib/video/EmulatorView';
 import { SetupWizardModal } from '../components/devices/SetupWizardModal';
 import { CURRENT_SETUP_VERSION } from '../../shared/types/api';
 import type { Device, Setting } from '../../shared/types/api';
@@ -584,11 +583,13 @@ export function DeviceView() {
   const canvasSection = (
     <div className="device-canvas-container">
       {videoTransport === 'webrtc' && grpcWebPath ? (
-        <EmulatorView
-          serial={deviceId!}
-          grpcWebPath={grpcWebPath}
-          onReady={() => handleStreamReady({ screenWidth: 0, screenHeight: 0, backend: 'webrtc' })}
-          onError={(e) => handleStreamError(e.message)}
+        <DeviceViewer
+          deviceId={deviceId!}
+          webrtcGrpcPath={grpcWebPath}
+          captureSessionId={captureSessionId ?? undefined}
+          extraActions={extraActions}
+          onStreamReady={handleStreamReady}
+          onError={handleStreamError}
         />
       ) : videoTransport === 'vnc' && vncWsPath ? (
         <VncViewer

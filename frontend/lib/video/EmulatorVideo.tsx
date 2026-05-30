@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useMemo, useState, useCallback, useImperativeHandle } from 'react';
 // android-emulator-webrtc ships CJS; the `/emulator` subpath re-exports dist.
 // The <Emulator> component builds EmulatorControllerService + RtcService +
 // JsepProtocol from `uri`/`auth` internally and renders a WebRTC <video> of
@@ -6,9 +6,8 @@ import React, { useEffect, useRef, useMemo, useState, useCallback } from 'react'
 // (same-origin), so the DarkRide session cookie is sent automatically — no
 // explicit auth object needed (auth defaults to a no-op authenticator).
 import { Emulator } from 'android-emulator-webrtc/emulator';
-import { DeviceNavButtons, type NavButton } from '../../components/devices/DeviceNavButtons';
 
-export interface EmulatorViewProps {
+export interface EmulatorVideoProps {
   /** Device serial — logging context + remount key. */
   serial: string;
   /** Base grpc-web path from /video-transport, e.g. /v1/devices/<serial>/grpc.
@@ -27,8 +26,12 @@ export interface EmulatorViewProps {
   onReady?: () => void;
   /** Fired on a low-level gRPC/WebRTC error. */
   onError?: (err: Error) => void;
-  /** Fired when the session transitions to "disconnected". */
-  onDisconnect?: () => void;
+}
+
+/** Imperative handle exposed via ref so the parent (DeviceViewer) can drive the
+ *  device's hardware keys + keystrokes over the emulator's gRPC input channel. */
+export interface EmulatorVideoHandle {
+  sendKey(key: string): void;
 }
 
 /** How long to wait for the WebRTC session to connect before degrading to the
@@ -43,46 +46,43 @@ const WEBRTC_CONNECT_TIMEOUT_MS = 9000;
 const WEBRTC_RECONNECT_GRACE_MS = 12000;
 
 /**
- * Emulator renderer. Prefers WebRTC video (device-only, native-res), and
+ * Emulator VIDEO core. Prefers WebRTC video (device-only, native-res), and
  * gracefully degrades to png screenshot streaming — over the SAME grpc-web
  * bridge, so it works even where WebRTC media can't traverse Docker's network
  * (no TURN). Both engines render only the Android screen.
  *
- * Mirrors VncViewer's callback shape so DeviceView swaps between scrcpy / VNC /
- * emulator with a single conditional, and uses the same callback-ref
- * discipline so an inline-closure parent doesn't tear down the live session on
- * every render. Keyed by serial+engine for a clean remount. Reconnect policy
- * is the parent's, as with VncViewer.
+ * This component renders ONLY the video surface; the control chrome (nav bar,
+ * keyboard forwarding) is owned by DeviceViewer, which drives this component's
+ * gRPC input channel through the imperative `sendKey` handle. Keyed by
+ * serial+engine for a clean remount.
  */
-export function EmulatorView({ serial, grpcWebPath, initialEngine = 'webrtc', onReady, onError, onDisconnect }: EmulatorViewProps) {
+export const EmulatorVideo = React.forwardRef<EmulatorVideoHandle, EmulatorVideoProps>(function EmulatorVideo(
+  { serial, grpcWebPath, initialEngine = 'webrtc', onReady, onError },
+  ref,
+) {
   const onReadyRef = useRef(onReady);
   const onErrorRef = useRef(onError);
-  const onDisconnectRef = useRef(onDisconnect);
   useEffect(() => {
     onReadyRef.current = onReady;
     onErrorRef.current = onError;
-    onDisconnectRef.current = onDisconnect;
   });
 
   // Absolute same-origin URI so the session cookie is sent (and so a stray
   // <base> tag can't repoint the grpc-web calls). Stable across renders.
   const uri = useMemo(() => `${window.location.origin}${grpcWebPath}`, [grpcWebPath]);
-  const tag = `[EmulatorView ${serial}]`;
+  const tag = `[EmulatorVideo ${serial}]`;
 
-  // Ref to the <Emulator> instance so the on-screen nav bar can drive the
-  // device's hardware keys. The component's sendKey() goes over the live JSEP
-  // input channel (webrtc engine); in the png fallback that channel is dormant,
-  // so the buttons are disabled there.
+  // Ref to the <Emulator> instance so the parent's on-screen nav bar +
+  // keyboard can drive the device's input. The component's sendKey() goes over
+  // the live JSEP input channel (webrtc engine); in the png fallback that
+  // channel is dormant.
   const emulatorRef = useRef<{ sendKey?: (key: string) => void } | null>(null);
   const sendKey = useCallback((key: string) => {
     try { emulatorRef.current?.sendKey?.(key); }
     catch (e) { console.warn(`${tag} sendKey(${key}) failed`, e); }
   }, [tag]);
 
-  // Map the shared nav buttons to the emulator's hardware keys.
-  const handleNav = useCallback((button: NavButton) => {
-    sendKey(({ back: 'GoBack', home: 'GoHome', recents: 'AppSwitch', power: 'Power' } as const)[button]);
-  }, [sendKey]);
+  useImperativeHandle(ref, () => ({ sendKey }), [sendKey]);
 
   const [engine, setEngine] = useState<'webrtc' | 'png'>(initialEngine);
   const connectedRef = useRef(false);
@@ -106,25 +106,6 @@ export function EmulatorView({ serial, grpcWebPath, initialEngine = 'webrtc', on
     return () => clearTimeout(timer);
   }, [engine, tag]);
 
-  // Keyboard. The WebRTC component doesn't capture keys, and the emulator's adb
-  // input path fails — so we forward keystrokes over the same gRPC channel as
-  // mouse (sendKey). DeviceView's global adb keydown forwarding is disabled for
-  // this transport (it would double-send + spam failures). Only active on the
-  // webrtc engine; browser shortcuts + form fields are left alone.
-  useEffect(() => {
-    if (engine !== 'webrtc') return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t?.isContentEditable) return;
-      if (e.ctrlKey || e.metaKey || e.altKey) return;      // browser shortcuts
-      if (/^F\d{1,2}$/.test(e.key)) return;                 // function keys
-      e.preventDefault();
-      sendKey(e.key);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [engine, sendKey]);
-
   const handleStateChange = useCallback((state: string) => {
     console.log(`${tag} [${engineRef.current}] state: ${state}`);
     if (state === 'connected') {
@@ -147,8 +128,6 @@ export function EmulatorView({ serial, grpcWebPath, initialEngine = 'webrtc', on
             }
           }, WEBRTC_RECONNECT_GRACE_MS);
         }
-      } else if (connectedRef.current) {
-        onDisconnectRef.current?.();
       }
     }
   }, [tag]);
@@ -169,7 +148,7 @@ export function EmulatorView({ serial, grpcWebPath, initialEngine = 'webrtc', on
   return (
     <div
       className="emulator-view"
-      data-testid={`emulator-view-${serial}`}
+      data-testid={`emulator-video-${serial}`}
       data-engine={engine}
       // Let the inner <video>/<img> drive height; the global
       // `.device-canvas-container canvas/video/img { max-width: 100% }` rule
@@ -186,12 +165,6 @@ export function EmulatorView({ serial, grpcWebPath, initialEngine = 'webrtc', on
         onStateChange={handleStateChange}
         onError={handleError}
       />
-      {/* Same nav bar as the scrcpy DeviceViewer. The emulator can't use the
-          adb input path, so these map to the emulator's gRPC sendKey; disabled
-          in the png fallback where that channel is dormant. */}
-      <div className="emulator-controls" data-testid={`emulator-controls-${serial}`}>
-        <DeviceNavButtons onNav={handleNav} isAndroid iconSize={16} disabled={engine !== 'webrtc'} />
-      </div>
     </div>
   );
-}
+});

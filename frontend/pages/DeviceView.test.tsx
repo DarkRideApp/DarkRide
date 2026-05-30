@@ -471,7 +471,7 @@ describe('DeviceView — video transport gating', () => {
     });
   });
 
-  it('renders <EmulatorView> when video-transport endpoint returns transport=webrtc', async () => {
+  it('renders the DeviceViewer emulator surface when video-transport endpoint returns transport=webrtc', async () => {
     const ws: WebSocketContextValue = {
       connected: true,
       sendMessage: vi.fn(),
@@ -501,7 +501,7 @@ describe('DeviceView — video transport gating', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByTestId('emulator-view-localhost:32771')).toBeInTheDocument();
+      expect(screen.getByTestId('emulator-video-localhost:32771')).toBeInTheDocument();
     });
   });
 
