@@ -80,13 +80,52 @@ Full list: `git log --oneline main..HEAD`.
 
 ---
 
-## Currently debugging
+## Currently debugging — RESOLVED 2026-05-30 (local session, Opus 4.8)
 
-The user reported that after `delete + recreate` of an emulator, the device-detail page falls back to **scrcpy polling** instead of using VNC. Working hypothesis (unverified):
+**Root cause (confirmed):** nothing ran `adb disconnect` on the emulator lifecycle.
+docker-android emulators are reached over TCP (`adb connect localhost:<hostPort>`).
+When the container went away (stop/delete/recreate) the adb server kept the
+endpoint in its device list (as "offline"), and `device-manager.pollAdbDevices`
+upserts **every** entry `adb devices` reports — including offline ones — so it
+re-inserted an orphaned `devices` row with no backing instance. That orphan's
+detail page resolves `resolveVideoTransport` → `scrcpy` (no provider for an
+unknown serial). This is exactly the user's "deleted emulator reappears as an
+ADB-detected device" symptom, and the recreate-→-scrcpy symptom (a recreated
+container binds a *different* random port, leaving the old serial's orphan row
+to shadow it).
 
+**Fix** (`backend/api/devices-providers.ts`): a `dropAdbEndpoint(serial)` helper
+(injectable `adbDisconnect` dep, no-op for non-`:port` serials so USB/iOS are
+untouched) now fires on:
+- **DELETE** — disconnect *before* `forgetDeviceRow` so the poller can't resurrect it.
+- **STOP** — so a stopped emulator leaves `adb devices`.
+- **recreate-on-start** — disconnect old endpoint + `forgetDeviceRow(old serial)`
+  + `updateSerial(id, null)` before rebuilding, so the fresh container's new
+  serial is unambiguous.
+
+Tests: 4 new cases in `backend/api/__tests__/devices-providers.test.ts`
+(disconnect-on-delete, disconnect-on-stop, non-network-serial no-op, recreate
+teardown). `createApp` now injects a no-op `adbDisconnect` so unit tests never
+shell out to a real `adb`. Backend `tsc --noEmit` clean.
+
+**Leftover for the user:** pre-existing orphan `devices` rows from *before* this
+fix won't auto-clean — clear them once via the per-card **Forget** button. New
+ones won't accumulate.
+
+**Secondary observation (not changed):** `pollAdbDevices` inserts a brand-new
+`devices` row even for `offline`/`unauthorized` adb entries (device-manager.ts
+~L446). The disconnect fix makes this moot for emulators, but it's a latent
+sharp edge — left alone to avoid disturbing USB first-plug-in flows.
+
+---
+
+### Original (pre-fix) hypothesis, kept for context
 - URL still has the **old** serial (e.g. `/ui/devices/localhost:32768/details`) because the user navigated to it before delete.
 - New container got a different random host port (`localhost:32770` or whatever), so the URL serial no longer matches any instance row.
 - `resolveVideoTransport` correctly returns `scrcpy` for an unknown serial → DeviceView renders `<DeviceViewer>` → scrcpy can't find the adb serial → falls back to polling.
+
+The URL-staleness angle was a real contributor but not the root cause; the adb
+endpoint never being torn down is what kept resurrecting the orphan.
 
 Diagnostic curl (need session cookie from devtools → Application → Cookies):
 

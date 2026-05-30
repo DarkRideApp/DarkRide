@@ -6,9 +6,16 @@ import type { DeviceInstancesRepo } from '../services/device-instances-repo';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { forgetDeviceRow } from '../services/forget-device';
+import { adbCommand } from '../services/device-manager';
 import { createLoggers } from '../logs';
 
 const { log: dpLog } = createLoggers('devices-providers-api');
+
+/** Injectable side-effects, overridden in tests to avoid touching real adb. */
+export interface DevicesProvidersDeps {
+  /** Drop an `adb connect <host:port>` entry. Defaults to real `adb disconnect`. */
+  adbDisconnect?: (serial: string) => Promise<void>;
+}
 
 /**
  * Register the `/v1/devices/providers/*` REST endpoints. See spec §10.
@@ -20,7 +27,32 @@ export function registerDevicesProvidersEndpoints(
   registry: ProviderRegistry,
   repo: DeviceInstancesRepo,
   db?: AppDatabase,
+  deps: DevicesProvidersDeps = {},
 ): void {
+  const adbDisconnect = deps.adbDisconnect ?? (async (serial: string) => {
+    await adbCommand(['disconnect', serial]);
+  });
+
+  /**
+   * Drop a stale `adb connect <host:port>` entry for a managed emulator that
+   * is being stopped, deleted, or recreated. docker-android emulators are
+   * reached over TCP (serial = `localhost:<hostPort>`); when the container
+   * goes away the adb server keeps the endpoint in its device list (shown as
+   * "offline"), and the device poller then re-inserts an orphaned `devices`
+   * row with no backing instance — whose detail page falls back to scrcpy
+   * because `resolveVideoTransport` can't map the serial to a provider. This
+   * keeps adb's view in sync with the container lifecycle. Non-fatal on
+   * failure; no-op for non-network serials (USB / iOS UDIDs have no `:port`).
+   */
+  async function dropAdbEndpoint(serial: string | null | undefined): Promise<void> {
+    if (!serial || !/:\d+$/.test(serial)) return;
+    try {
+      await adbDisconnect(serial);
+      dpLog(`adb disconnect ${serial} (instance lifecycle)`);
+    } catch (e: any) {
+      dpLog(`adb disconnect ${serial} failed (non-fatal): ${e?.message ?? e}`);
+    }
+  }
   // GET /v1/devices/providers — list providers + availability + capabilities
   registerEndpoint('GET', '/v1/devices/providers', async (_req, res) => {
     const providers = await Promise.all(registry.list().map(async (p) => {
@@ -169,6 +201,20 @@ export function registerDevicesProvidersEndpoints(
       let runtimeId = row.runtimeId;
       if ((row.state === 'error' || row.state === 'stopped') && p.createInstance && p.deleteInstance) {
         const meta = row.spawnMetadata ?? {};
+        // The old container is being replaced by a fresh one that may bind a
+        // different random host port. Tear down the old adb endpoint + its
+        // adb-seeded devices row first, so the new container doesn't compete
+        // with an orphaned `localhost:<oldPort>` serial that no longer maps to
+        // this instance — that orphan's detail page would resolve to scrcpy
+        // instead of VNC. Clear the row's serial too; the new startInstance
+        // repopulates it below once the fresh port is bound.
+        await dropAdbEndpoint(row.serial);
+        if (row.serial && db) {
+          try { forgetDeviceRow(db, row.serial); } catch (e: any) {
+            dpLog(`Failed to clean up devices row ${row.serial} during recreate: ${e?.message ?? e}`);
+          }
+        }
+        repo.updateSerial(row.id, null);
         try { await p.deleteInstance(runtimeId); } catch { /* container may already be gone */ }
         const fresh = await p.createInstance({
           displayName: row.displayName ?? `instance-${row.id}`,
@@ -204,6 +250,9 @@ export function registerDevicesProvidersEndpoints(
       repo.updateState(row.id, 'stopping');
       broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
       await p.stopInstance(row.runtimeId);
+      // The container is down — drop its adb endpoint so the stopped emulator
+      // doesn't linger in `adb devices` (and get re-seeded as an orphan row).
+      await dropAdbEndpoint(row.serial);
       repo.updateState(row.id, 'stopped');
       broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
       res.json({ success: true });
@@ -234,6 +283,11 @@ export function registerDevicesProvidersEndpoints(
       // user doesn't end up with an unactionable "online" device card
       // (lastSeen is still recent for ~2 minutes after the container dies,
       // which suppresses the Forget button on the device card).
+      // Disconnect the adb endpoint BEFORE forgetting the row: the device
+      // poller upserts every entry `adb devices` reports, so a still-connected
+      // (now "offline") endpoint would otherwise be re-inserted as an orphan
+      // moments after we delete it — reappearing as a phantom adb device.
+      await dropAdbEndpoint(row.serial);
       if (row.serial && db) {
         try {
           if (forgetDeviceRow(db, row.serial)) {
