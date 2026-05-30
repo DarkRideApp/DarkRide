@@ -99,6 +99,18 @@ export class DeviceInstancesRepo {
       .where(eq(deviceInstances.serial, serial)).get() as DeviceInstanceRow ?? null;
   }
 
+  /**
+   * All instances sharing a serial. A docker-android emulator is ALSO observed
+   * by the adb-device provider, and host-port reuse can leave a stale
+   * adb-device row pointing at the same serial — so a serial is not unique.
+   * Callers that need the *video-owning* instance (resolver, grpc-web bridge)
+   * must pick among these by provider capability + state, not assume one row.
+   */
+  listBySerial(serial: string): DeviceInstanceRow[] {
+    return this.db.select().from(deviceInstances)
+      .where(eq(deviceInstances.serial, serial)).all() as DeviceInstanceRow[];
+  }
+
   getById(id: number): DeviceInstanceRow | undefined {
     return this.db.select().from(deviceInstances).where(eq(deviceInstances.id, id)).all()[0] as DeviceInstanceRow | undefined;
   }

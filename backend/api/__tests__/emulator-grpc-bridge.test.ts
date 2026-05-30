@@ -86,10 +86,12 @@ function makeApp(repo: any, registry: any, deps: any) {
   return app;
 }
 
-const RUNNING_ROW = { id: 11, providerId: 'docker-android', runtimeId: 'cid', serial: 'localhost:32771' };
-function repoWith(row: any) { return { getBySerial: vi.fn().mockReturnValue(row) }; }
+const RUNNING_ROW = { id: 11, providerId: 'docker-android', runtimeId: 'cid', serial: 'localhost:32771', state: 'running' };
+// The bridge resolves the gRPC instance via resolveGrpcInstance → listBySerial +
+// a provider that declares videoTransport:'webrtc' AND getGrpcEndpoint.
+function repoWith(row: any) { return { listBySerial: vi.fn().mockReturnValue(row ? [row] : []) }; }
 function registryWithEndpoint(ep: any) {
-  return { get: vi.fn().mockReturnValue({ getGrpcEndpoint: vi.fn().mockResolvedValue(ep) }) };
+  return { get: vi.fn().mockReturnValue({ videoTransport: 'webrtc', getGrpcEndpoint: vi.fn().mockResolvedValue(ep) }) };
 }
 
 describe('emulator grpc-web bridge handler', () => {
@@ -107,17 +109,19 @@ describe('emulator grpc-web bridge handler', () => {
     expect((res.body as Buffer).subarray(5).toString('utf8')).toContain('grpc-status:5');
   });
 
-  it('returns a grpc-web FAILED_PRECONDITION trailer when the provider has no gRPC endpoint', async () => {
-    const registry = { get: vi.fn().mockReturnValue({ /* no getGrpcEndpoint */ }) };
+  it('returns a grpc-web NOT_FOUND trailer when no instance for the serial is gRPC-capable', async () => {
+    // A row exists but its provider doesn't declare webrtc/getGrpcEndpoint (e.g.
+    // only a stale adb-device row) → no gRPC-capable instance → NOT_FOUND.
+    const registry = { get: vi.fn().mockReturnValue({ id: 'adb-device' /* no videoTransport */ }) };
     const app = makeApp(repoWith(RUNNING_ROW), registry, scriptedUpstream([]));
     const res = await request(app).post('/v1/devices/localhost%3A32771/grpc/svc/M')
       .set('Content-Type', 'application/grpc-web+proto').send(Buffer.alloc(0)).buffer(true).parse(rawParser);
     expect(res.status).toBe(200);
-    expect((res.body as Buffer).subarray(5).toString('utf8')).toContain('grpc-status:9');
+    expect((res.body as Buffer).subarray(5).toString('utf8')).toContain('grpc-status:5');
   });
 
   it('returns a grpc-web UNAVAILABLE trailer when the endpoint cannot be resolved (e.g. not running)', async () => {
-    const registry = { get: vi.fn().mockReturnValue({ getGrpcEndpoint: vi.fn().mockRejectedValue(new Error('not running')) }) };
+    const registry = { get: vi.fn().mockReturnValue({ videoTransport: 'webrtc', getGrpcEndpoint: vi.fn().mockRejectedValue(new Error('not running')) }) };
     const app = makeApp(repoWith(RUNNING_ROW), registry, scriptedUpstream([]));
     const res = await request(app).post('/v1/devices/localhost%3A32771/grpc/svc/M')
       .set('Content-Type', 'application/grpc-web+proto').send(Buffer.alloc(0)).buffer(true).parse(rawParser);

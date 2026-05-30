@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import * as grpc from '@grpc/grpc-js';
 import { registerEndpoint } from './api-service';
+import { resolveGrpcInstance } from './video-transport';
 import type { ProviderRegistry } from '../services/providers';
 import type { DeviceInstancesRepo } from '../services/device-instances-repo';
 import { createLoggers } from '../logs';
@@ -153,20 +154,19 @@ export function registerEmulatorGrpcBridge(
     const methodPath = '/' + ((req.params as any)[0] ?? '');
     const isText = String(req.headers['content-type'] ?? '').includes('grpc-web-text');
 
-    const row = repo.getBySerial(serial);
+    // Pick the running, gRPC-capable instance for this serial — NOT a stale
+    // adb-device (or stopped docker-android) row that host-port reuse left
+    // sharing the serial (which a plain getBySerial would wrongly return).
+    const row = resolveGrpcInstance(serial, repo, registry);
     if (!row) {
-      sendGrpcWebError(res, isText, grpc.status.NOT_FOUND, `No instance for serial ${serial}`);
+      sendGrpcWebError(res, isText, grpc.status.NOT_FOUND, `No gRPC-capable instance for serial ${serial}`);
       return;
     }
-    const provider = registry.get(row.providerId);
-    if (!provider?.getGrpcEndpoint) {
-      sendGrpcWebError(res, isText, grpc.status.FAILED_PRECONDITION, `Provider ${row.providerId} has no gRPC endpoint`);
-      return;
-    }
+    const provider = registry.get(row.providerId)!; // resolveGrpcInstance guarantees getGrpcEndpoint
 
     let endpoint: { host: string; port: number; token?: string };
     try {
-      endpoint = await provider.getGrpcEndpoint(row.runtimeId);
+      endpoint = await provider.getGrpcEndpoint!(row.runtimeId);
     } catch (err: any) {
       sendGrpcWebError(res, isText, grpc.status.UNAVAILABLE, err?.message ?? 'gRPC endpoint unavailable');
       return;
