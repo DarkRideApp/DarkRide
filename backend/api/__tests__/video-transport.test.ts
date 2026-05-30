@@ -32,6 +32,13 @@ describe('resolveVideoTransport', () => {
       .toEqual({ transport: 'vnc', wsPath: '/ws/vnc?serial=localhost%3A32770' });
   });
 
+  it('returns transport=webrtc with grpcWebPath when the provider declares webrtc', () => {
+    (repo.getBySerial as any).mockReturnValue({ providerId: 'docker-android', runtimeId: 'r' });
+    (registry.get as any).mockReturnValue({ id: 'docker-android', videoTransport: 'webrtc' });
+    expect(resolveVideoTransport('localhost:32771', repo, registry))
+      .toEqual({ transport: 'webrtc', grpcWebPath: '/v1/devices/localhost%3A32771/grpc' });
+  });
+
   it('returns transport=scrcpy when the provider declares videoTransport=scrcpy explicitly', () => {
     (repo.getBySerial as any).mockReturnValue({ providerId: 'adb-device', runtimeId: 'r' });
     (registry.get as any).mockReturnValue({ id: 'adb-device', videoTransport: 'scrcpy' });

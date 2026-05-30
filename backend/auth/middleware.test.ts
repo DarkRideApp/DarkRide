@@ -257,6 +257,27 @@ describe('csrfProtection', () => {
     expect(next).toHaveBeenCalled();
   });
 
+  it('passes grpc-web POSTs without a CSRF token (non-simple content type can\'t be forged cross-site)', () => {
+    // The emulator WebRTC bridge POSTs framed grpc-web bodies; the client can't
+    // reliably attach our session CSRF header to every call. application/grpc-web*
+    // requires a CORS preflight cross-site, which DarkRide doesn't grant — so
+    // these are unforgeable. Auth (session + scope) is still enforced upstream.
+    for (const ct of ['application/grpc-web+proto', 'application/grpc-web-text']) {
+      const req = mockReq({
+        method: 'POST',
+        headers: { 'content-type': ct } as any,
+        authUser: {
+          userId: 1, username: 'alice', via: 'session',
+          effectiveScopes: new Set(['devices:read']), csrfToken: 'secret-token',
+        },
+      });
+      const res = mockRes();
+      const next = vi.fn();
+      csrfProtection(req, res as any, next);
+      expect(next).toHaveBeenCalled();
+    }
+  });
+
   it('skips CSRF check for API key auth (non-browser)', () => {
     const req = mockReq({
       method: 'POST',

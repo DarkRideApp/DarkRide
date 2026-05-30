@@ -34,6 +34,22 @@ function budtmoImageFor(androidVersion: string): string {
 }
 const LABEL_KEY = 'darkride.emulator';
 
+// Emulator gRPC (EmulatorController + Rtc/JSEP) for the WebRTC video path.
+//
+// We launch with `-grpc 8554` WITHOUT auth. Two reasons confirmed empirically:
+//  1. The emulator's token/JWT auth ("-grpc-use-token") is an Android-Studio-
+//     specific scheme (issuer/audience allowlist at lib/emulator_access.json,
+//     signed JWTs) — the raw console token is rejected.
+//  2. With auth enabled the server restricts itself to container-localhost
+//     (needs a forwarder); with `auth: none` it binds [::]:8554 (all
+//     interfaces), so we can publish it straight to a host LOOPBACK port — no
+//     forwarder needed.
+// Security: this mirrors the budtmo VNC port (5900) — unauthenticated but
+// bound to host 127.0.0.1 only. The real access gate for browsers is the
+// DarkRide grpc-web bridge (session cookie + core.devices:read scope); the raw
+// port is reachable only by host-local processes, same threat model as VNC.
+const GRPC_PORT = 8554;
+
 /** Aggregated pull progress broadcast to the UI. One number, one phrase, no per-layer noise. */
 export interface PullProgress {
   /** 0..100; null while we don't yet know the total layer count. */
@@ -230,7 +246,11 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   return {
     id: 'docker-android',
     displayName: 'Docker Android',
-    videoTransport: 'vnc',
+    // Phase 2: emulators stream device-only WebRTC via the emulator's gRPC
+    // (EmulatorController + Rtc) through the DarkRide grpc-web bridge. The VNC
+    // path (getVncEndpoint / budtmo x11vnc) is retained as a dormant fallback —
+    // flip this back to 'vnc' to revert if WebRTC media is unavailable.
+    videoTransport: 'webrtc',
 
     async isAvailable(): Promise<ProviderAvailability> {
       const r = await detectDockerDaemon(d);
@@ -328,7 +348,12 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             // it the VNC stream shows a phone-shaped window-within-the-
             // window — useful when you want to demo on a real device, but
             // pure overhead for our headless-control use case.
-            'EMULATOR_ADDITIONAL_ARGS=-no-skin',
+            //
+            // `-grpc <port>` starts the emulator's gRPC bridge (EmulatorController
+            // + Rtc/JSEP) — the WebRTC video + input path — unauthenticated,
+            // bound to all interfaces (see GRPC_PORT note). Published to host
+            // loopback below.
+            `EMULATOR_ADDITIONAL_ARGS=-no-skin -grpc ${GRPC_PORT}`,
             // Disable nvidia-container-cli's legacy mode entirely. When the
             // nvidia-container-toolkit is installed in the host environment
             // (e.g. Docker Desktop with GPU support enabled on Windows/WSL),
@@ -343,7 +368,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             // before it touches the adapter probe.
             'NVIDIA_VISIBLE_DEVICES=void',
           ],
-          ExposedPorts: { '5555/tcp': {}, '5900/tcp': {} },
+          ExposedPorts: { '5555/tcp': {}, '5900/tcp': {}, [`${GRPC_PORT}/tcp`]: {} },
           HostConfig: {
             PortBindings: {
               '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }],
@@ -352,6 +377,10 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
               // /ws/vnc proxy which bridges to this port. See spec
               // 2026-05-29-emulator-vnc-streaming-design.md §Architecture.
               '5900/tcp': [{ HostIp: '127.0.0.1', HostPort: '0' }],
+              // GRPC_PORT: the emulator's gRPC (EmulatorController + Rtc).
+              // Loopback-only on the host; the DarkRide grpc-web bridge is the
+              // sole reader. See the GRPC_PORT note for the no-auth rationale.
+              [`${GRPC_PORT}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: '0' }],
             },
             Devices: devices,
             DeviceRequests: deviceRequests.length > 0 ? deviceRequests : undefined,
@@ -484,6 +513,21 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       if (!portStr) {
         throw new Error(`Container ${id} has no host binding for 5900/tcp — VNC unavailable`);
       }
+      return { host: '127.0.0.1', port: Number(portStr) };
+    },
+
+    async getGrpcEndpoint(id: string): Promise<{ host: string; port: number; token?: string }> {
+      const container = d.getContainer(id);
+      const info = await container.inspect();
+      if (!info?.State?.Running) {
+        throw new Error(`Container ${id} is not running — cannot resolve gRPC endpoint`);
+      }
+      const portStr = info?.NetworkSettings?.Ports?.[`${GRPC_PORT}/tcp`]?.[0]?.HostPort;
+      if (!portStr) {
+        throw new Error(`Container ${id} has no host binding for ${GRPC_PORT}/tcp — emulator gRPC unavailable`);
+      }
+      // No token: the emulator gRPC runs unauthenticated on host loopback (see
+      // the GRPC_PORT note). The grpc-web bridge is the access gate.
       return { host: '127.0.0.1', port: Number(portStr) };
     },
 

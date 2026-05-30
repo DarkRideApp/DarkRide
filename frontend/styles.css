@@ -1889,6 +1889,25 @@ body.live-log-open .main-content {
   max-height: calc(100vh - 220px);
   margin: 0 auto;
 }
+/* EmulatorView renders a <video> (webrtc engine) or <img> (png fallback)
+ * rather than a canvas, so the canvas rules above don't apply. Mirror them:
+ * fit the width, cap the height so a tall portrait device stays in-viewport,
+ * and center. android-emulator-webrtc's inner wrappers are size:auto, so the
+ * media element drives layout. */
+.emulator-view video,
+.emulator-view img {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100vh - 220px);
+  margin: 0 auto;
+  /* The png engine renders an <img>; without this, click-dragging to interact
+   * with the device triggers the browser's native image drag/selection ghost.
+   * Pointer events still fire (the component maps them to touch), we only
+   * suppress selection + drag. */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+}
 .device-info-sidebar .info-row {
   display: flex;
   justify-content: space-between;

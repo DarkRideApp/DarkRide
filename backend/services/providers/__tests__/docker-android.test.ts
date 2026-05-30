@@ -106,10 +106,73 @@ describe('docker-android provider', () => {
     ]);
   });
 
-  it('declares videoTransport: vnc', async () => {
+  it('declares videoTransport: webrtc (device-only emulator gRPC stream)', async () => {
     const d = makeDockerMock();
     const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
-    expect(p.videoTransport).toBe('vnc');
+    expect(p.videoTransport).toBe('webrtc');
+  });
+
+  it('enables the emulator gRPC (unauthenticated) and publishes it to host loopback', async () => {
+    // WebRTC video path: the emulator's gRPC (EmulatorController + Rtc/JSEP) is
+    // started with `-grpc 8554` (no token — token/JWT auth is Android-Studio-
+    // specific) and published to host 127.0.0.1 only, mirroring the VNC port.
+    const d = makeDockerMock();
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    await p.createInstance!({
+      displayName: 'grpc-port',
+      config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
+    });
+    const call = (d.createContainer as any).mock.calls[0][0];
+    const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
+    expect(addArgs).toContain('-grpc 8554');
+    expect(addArgs).not.toContain('-grpc-use-token');
+    expect(call.ExposedPorts).toMatchObject({ '8554/tcp': {} });
+    expect(call.HostConfig.PortBindings['8554/tcp']).toEqual([
+      { HostIp: '127.0.0.1', HostPort: '0' },
+    ]);
+  });
+
+  it('getGrpcEndpoint returns the bound host loopback port (no token) for a running container', async () => {
+    const d = makeDockerMock({
+      getContainer: vi.fn().mockImplementation((id: string) => ({
+        id,
+        inspect: vi.fn().mockResolvedValue({
+          State: { Running: true },
+          NetworkSettings: { Ports: {
+            '5555/tcp': [{ HostPort: '6001' }],
+            '8554/tcp': [{ HostPort: '34567' }],
+          } },
+        }),
+      })),
+    });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const ep = await p.getGrpcEndpoint!('container-abc');
+    expect(ep).toEqual({ host: '127.0.0.1', port: 34567 });
+  });
+
+  it('getGrpcEndpoint throws when the container is not running', async () => {
+    const d = makeDockerMock({
+      getContainer: vi.fn().mockImplementation((id: string) => ({
+        id,
+        inspect: vi.fn().mockResolvedValue({ State: { Running: false }, NetworkSettings: { Ports: {} } }),
+      })),
+    });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    await expect(p.getGrpcEndpoint!('container-abc')).rejects.toThrow(/not running/i);
+  });
+
+  it('getGrpcEndpoint throws when the gRPC port is not bound', async () => {
+    const d = makeDockerMock({
+      getContainer: vi.fn().mockImplementation((id: string) => ({
+        id,
+        inspect: vi.fn().mockResolvedValue({
+          State: { Running: true },
+          NetworkSettings: { Ports: { '5555/tcp': [{ HostPort: '6001' }] } },
+        }),
+      })),
+    });
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    await expect(p.getGrpcEndpoint!('container-abc')).rejects.toThrow(/8554/);
   });
 
   it('rethrows unrelated createContainer errors unchanged', async () => {

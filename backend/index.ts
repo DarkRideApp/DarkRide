@@ -143,6 +143,7 @@ import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
 import { registerDevicesProvidersEndpoints } from './api/devices-providers';
 import { registerVideoTransportEndpoint } from './api/video-transport';
+import { registerEmulatorGrpcBridge } from './api/emulator-grpc-bridge';
 import { measureDiskUsage } from './services/disk-usage';
 
 const { log, error } = createLoggers('server');
@@ -901,6 +902,8 @@ httpServer.listen(PORT, HOST, () => {
   registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo, db);
   vncWss = setupVncProxy(httpServer, { repo: deviceInstancesRepo, registry: providerRegistry });
   registerVideoTransportEndpoint(deviceInstancesRepo, providerRegistry);
+  // grpc-web ⇄ gRPC bridge for the emulator WebRTC video path (Phase 2).
+  registerEmulatorGrpcBridge(deviceInstancesRepo, providerRegistry);
 
   // Phase 1: Python environment
   setStartupPhase('preparing_python', 'Preparing Python environment...');

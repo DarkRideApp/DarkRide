@@ -11,6 +11,13 @@ vi.mock('@novnc/novnc', () => ({
   },
 }));
 
+// Mock android-emulator-webrtc so EmulatorView renders a plain marker div
+// instead of opening gRPC/WebRTC connections in jsdom.
+vi.mock('android-emulator-webrtc/emulator', () => ({
+  Emulator: (_props: any) =>
+    require('react').createElement('div', { 'data-testid': 'mock-emulator' }),
+}));
+
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, waitFor, fireEvent, screen } from '@testing-library/react';
@@ -461,6 +468,40 @@ describe('DeviceView — video transport gating', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('vnc-viewer-localhost:32770')).toBeInTheDocument();
+    });
+  });
+
+  it('renders <EmulatorView> when video-transport endpoint returns transport=webrtc', async () => {
+    const ws: WebSocketContextValue = {
+      connected: true,
+      sendMessage: vi.fn(),
+      sendRestApi: vi.fn().mockImplementation(async (_m: string, path: string) => {
+        if (path.endsWith('/video-transport')) {
+          return { type: 'restapi', id: '1', status: 200, body: { data: { transport: 'webrtc', grpcWebPath: '/v1/devices/localhost%3A32771/grpc' } } };
+        }
+        if (path.startsWith('/v1/device/view/')) {
+          return { type: 'restapi', id: '2', status: 200, body: { data: { id: 'localhost:32771', name: 'localhost:32771', platform: 'android', isRooted: true, setupVersion: 4, lastSeen: Date.now() } } };
+        }
+        return { type: 'restapi', id: '3', status: 200, body: { data: {} } };
+      }),
+      subscribe: vi.fn().mockReturnValue(() => {}),
+    } as any;
+
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={['/ui/devices/localhost%3A32771/details']}>
+            <Routes>
+              <Route path="/ui/devices/:id" element={<DeviceView />} />
+              <Route path="/ui/devices/:id/:tab" element={<DeviceView />} />
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </WebSocketContext.Provider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('emulator-view-localhost:32771')).toBeInTheDocument();
     });
   });
 

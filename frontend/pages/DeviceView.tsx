@@ -7,6 +7,7 @@ import { AppsTab } from '../components/devices/AppsTab';
 import { WireGuardSetup } from '../components/devices/WireGuardSetup';
 import { DeviceViewer, DeviceAction } from '../components/devices/DeviceViewer';
 import { VncViewer } from '../lib/video/VncViewer';
+import { EmulatorView } from '../lib/video/EmulatorView';
 import { SetupWizardModal } from '../components/devices/SetupWizardModal';
 import { CURRENT_SETUP_VERSION } from '../../shared/types/api';
 import type { Device, Setting } from '../../shared/types/api';
@@ -55,8 +56,9 @@ export function DeviceView() {
   const [reprobing, setReprobing] = useState(false);
   const [pairing, setPairing] = useState(false);
   const [busyWarning, setBusyWarning] = useState<number | null>(null); // remaining seconds
-  const [videoTransport, setVideoTransport] = useState<'vnc' | 'scrcpy' | null>(null);
+  const [videoTransport, setVideoTransport] = useState<'webrtc' | 'vnc' | 'scrcpy' | null>(null);
   const [vncWsPath, setVncWsPath] = useState<string | null>(null);
+  const [grpcWebPath, setGrpcWebPath] = useState<string | null>(null);
   const [showSyslog, setShowSyslog] = useState(false);
   const [syslogRunning, setSyslogRunning] = useState(false);
   const [syslogEntries, setSyslogEntries] = useState<Array<{
@@ -85,8 +87,10 @@ export function DeviceView() {
       .then((r: any) => {
         if (cancelled) return;
         const data = r?.body?.data ?? {};
-        setVideoTransport(data.transport === 'vnc' ? 'vnc' : 'scrcpy');
+        const t = data.transport === 'webrtc' ? 'webrtc' : data.transport === 'vnc' ? 'vnc' : 'scrcpy';
+        setVideoTransport(t);
         setVncWsPath(data.wsPath ?? null);
+        setGrpcWebPath(data.grpcWebPath ?? null);
       })
       .catch(() => {
         // Network/WS errors are non-fatal — fall through to the scrcpy
@@ -568,7 +572,14 @@ export function DeviceView() {
 
   const canvasSection = (
     <div className="device-canvas-container">
-      {videoTransport === 'vnc' && vncWsPath ? (
+      {videoTransport === 'webrtc' && grpcWebPath ? (
+        <EmulatorView
+          serial={deviceId!}
+          grpcWebPath={grpcWebPath}
+          onReady={() => handleStreamReady({ screenWidth: 0, screenHeight: 0, backend: 'webrtc' })}
+          onError={(e) => handleStreamError(e.message)}
+        />
+      ) : videoTransport === 'vnc' && vncWsPath ? (
         <VncViewer
           serial={deviceId!}
           wsPath={vncWsPath}

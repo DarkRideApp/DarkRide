@@ -4,7 +4,8 @@ import { registerEndpoint } from './api-service';
 
 export type VideoTransportResult =
   | { transport: 'scrcpy' }
-  | { transport: 'vnc'; wsPath: string };
+  | { transport: 'vnc'; wsPath: string }
+  | { transport: 'webrtc'; grpcWebPath: string };
 
 /**
  * Pure resolver — easy to unit test without standing up an Express stack.
@@ -18,8 +19,15 @@ export function resolveVideoTransport(
   const row = repo.getBySerial(serial);
   if (!row) return { transport: 'scrcpy' };
   const provider = registry.get(row.providerId);
-  if (provider?.videoTransport !== 'vnc') return { transport: 'scrcpy' };
-  return { transport: 'vnc', wsPath: `/ws/vnc?serial=${encodeURIComponent(serial)}` };
+  // 'webrtc': the browser's android-emulator-webrtc client speaks grpc-web to
+  // this base path; the DarkRide grpc-web bridge forwards to the emulator gRPC.
+  if (provider?.videoTransport === 'webrtc') {
+    return { transport: 'webrtc', grpcWebPath: `/v1/devices/${encodeURIComponent(serial)}/grpc` };
+  }
+  if (provider?.videoTransport === 'vnc') {
+    return { transport: 'vnc', wsPath: `/ws/vnc?serial=${encodeURIComponent(serial)}` };
+  }
+  return { transport: 'scrcpy' };
 }
 
 export function registerVideoTransportEndpoint(
