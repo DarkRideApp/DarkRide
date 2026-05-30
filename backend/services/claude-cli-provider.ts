@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'child_process';
-import { writeFileSync, existsSync, mkdirSync, chmodSync, unlinkSync } from 'fs';
+import { writeFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
+import { tmpdir } from 'os';
 import { eq, isNotNull } from 'drizzle-orm';
 import { createLoggers } from '../logs';
 import type { ApiKeyManager } from '../auth/api-key-manager';
@@ -702,6 +703,61 @@ export class ClaudeCliProvider {
     }
   }
 
+  /**
+   * Self-test that the CLI can actually DRIVE a tool with the given auth, not
+   * just authenticate. Spins up a throwaway stdio MCP server exposing one
+   * `ping` tool and asks the model to call it. Returns `ok:false` when the
+   * model text-leaks the call (the failure mode a wrong/stale token causes —
+   * it authenticates but can't run tools) so the Settings "Test" button can
+   * surface it instead of it only showing up at analysis time.
+   */
+  static async testToolUse(
+    oauthToken: string | undefined,
+    model: string,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-tooltest-'));
+    const serverPath = join(dir, 'ping-mcp.js');
+    const configPath = join(dir, 'mcp.json');
+    try {
+      writeFileSync(serverPath, PING_MCP_SERVER);
+      writeFileSync(configPath, JSON.stringify({
+        mcpServers: { selftest: { command: 'node', args: [serverPath] } },
+      }));
+      const env = oauthToken
+        ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: oauthToken }
+        : { ...process.env };
+      const args = [
+        '--print', '--output-format', 'stream-json', '--verbose',
+        '--mcp-config', configPath, '--strict-mcp-config',
+        '--permission-mode', 'bypassPermissions',
+        '--model', model || 'sonnet', '--tools', '',
+      ];
+      return await new Promise((resolve) => {
+        const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'], env });
+        let out = '';
+        let stderr = '';
+        const timer = setTimeout(() => {
+          child.kill('SIGKILL');
+          resolve({ ok: false, reason: 'Timed out waiting for the Claude CLI tool self-test' });
+        }, 60000);
+        child.stdout?.on('data', (c: Buffer) => { out += c.toString(); });
+        child.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
+        child.on('error', () => {
+          clearTimeout(timer);
+          resolve({ ok: false, reason: 'Claude CLI not found or not executable' });
+        });
+        child.on('close', (code) => {
+          clearTimeout(timer);
+          resolve(evaluateToolSelfTest(out, code, stderr));
+        });
+        child.stdin?.write('Call the ping tool to verify tool access, then reply "done".');
+        child.stdin?.end();
+      });
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+
   /** Kill all active Claude CLI processes (for graceful shutdown) */
   killAll(): void {
     for (const [key, child] of this.activeProcesses) {
@@ -744,4 +800,55 @@ export class ClaudeCliProvider {
       child.on('error', () => resolve(null));
     });
   }
+}
+
+// Throwaway stdio MCP server (one `ping` tool) used by testToolUse(). Plain JS,
+// no deps — written to a temp file and run via `node <file>`.
+const PING_MCP_SERVER = `
+let buf='';process.stdin.on('data',d=>{buf+=d;let i;while((i=buf.indexOf('\\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;let m;try{m=JSON.parse(line)}catch{continue}
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:(m.params&&m.params.protocolVersion)||'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'selftest',version:'1.0.0'}}});
+else if(m.method==='tools/list')send({jsonrpc:'2.0',id:m.id,result:{tools:[{name:'ping',description:'Returns pong. Call to verify tool access.',inputSchema:{type:'object',properties:{}}}]}});
+else if(m.method==='tools/call')send({jsonrpc:'2.0',id:m.id,result:{content:[{type:'text',text:'pong'}]}});
+else if(m.method&&m.method.indexOf('notifications/')===0){}
+else if(m.id!==undefined)send({jsonrpc:'2.0',id:m.id,result:{}});}});
+function send(o){process.stdout.write(JSON.stringify(o)+'\\n')}
+`;
+
+// Same markup detection as ClaudeCliAgent: tool-call XML in the assistant's
+// *text* means the model couldn't really call tools.
+const TOOL_CALL_LEAK_RE = /<\/?(?:antml:)?(?:invoke|function_calls)\b/i;
+
+/** Decide the result of a tool self-test from the CLI's stream-json output. */
+export function evaluateToolSelfTest(
+  out: string,
+  code: number | null,
+  stderr: string,
+): { ok: boolean; reason?: string } {
+  let realToolCall = false;
+  let text = '';
+  for (const line of out.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let e: any;
+    try { e = JSON.parse(t); } catch { continue; }
+    if (e.type === 'assistant' && e.message?.content) {
+      for (const b of e.message.content) {
+        if (b.type === 'tool_use') realToolCall = true;
+        else if (b.type === 'text') text += b.text;
+      }
+    }
+  }
+  if (realToolCall) return { ok: true };
+  if (TOOL_CALL_LEAK_RE.test(text)) {
+    return {
+      ok: false,
+      reason: 'Claude authenticated but emitted tool calls as TEXT instead of running them — '
+        + 'the configured token is not a working Claude Code session. Replace it (claude setup-token) '
+        + 'or remove it to use the CLI login.',
+    };
+  }
+  if (code !== 0 && code !== null) {
+    return { ok: false, reason: `Claude CLI exited with code ${code}${stderr ? `: ${stderr.slice(0, 150)}` : ''}` };
+  }
+  return { ok: false, reason: 'Claude ran but called no tool during the self-test — tool access could not be verified.' };
 }

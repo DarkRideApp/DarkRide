@@ -1,5 +1,5 @@
 import { asc, eq } from 'drizzle-orm';
-import { spawn } from 'child_process';
+import { ClaudeCliProvider } from '../services/claude-cli-provider';
 import { registerEndpoint } from './api-service';
 import { aiModels, aiProviders, aiTiers } from '../db/schema';
 import type { AppDatabase } from '../db/index';
@@ -437,30 +437,15 @@ async function testModelConnection(
 
       case 'claude-cli': {
         // Claude Code models run via the local `claude` CLI, not an HTTP
-        // endpoint — verify the binary works (mirrors the provider-level test
-        // in ai-providers.ts). apiKey, when set, is a CLAUDE_CODE_OAUTH_TOKEN.
-        return await new Promise((resolve) => {
-          const env = apiKey
-            ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: apiKey }
-            : undefined;
-          const child = spawn('claude', ['--version'], { env });
-          const timer = setTimeout(() => {
-            child.kill();
-            resolve({ success: false, error: 'Claude CLI not found or not working' });
-          }, 15000);
-          child.on('close', (code) => {
-            clearTimeout(timer);
-            if (code === 0) {
-              resolve({ success: true, model: modelName || 'claude-cli' });
-            } else {
-              resolve({ success: false, error: 'Claude CLI not found or not working' });
-            }
-          });
-          child.on('error', () => {
-            clearTimeout(timer);
-            resolve({ success: false, error: 'Claude CLI not found or not working' });
-          });
-        });
+        // endpoint. apiKey, when set, is a CLAUDE_CODE_OAUTH_TOKEN. Verify both
+        // that the binary works AND that it can actually drive a tool with this
+        // auth — a wrong/stale token authenticates but text-leaks tool calls,
+        // so a version check alone would falsely pass.
+        const version = await ClaudeCliProvider.getVersion(apiKey);
+        if (!version) return { success: false, error: 'Claude CLI not found or not working' };
+        const tool = await ClaudeCliProvider.testToolUse(apiKey, modelName || 'sonnet');
+        if (!tool.ok) return { success: false, error: tool.reason || 'Claude CLI cannot use tools' };
+        return { success: true, model: modelName || 'claude-cli' };
       }
 
       default:
