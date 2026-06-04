@@ -431,10 +431,20 @@ export class ClaudeCliProvider {
     // delaying init didn't help (even 5s).
     //
     // Leaving built-in tools enabled gives the model something to call
-    // immediately, breaking the race. Each AI flow's system prompt must now
-    // explicitly require the specific MCP tools it expects (e.g. AI Review
-    // must say "ALWAYS call review_apk_findings to record findings; do not
-    // write to disk via the Write tool").
+    // immediately, breaking the race. But because we run with
+    // `--permission-mode bypassPermissions`, leaving every built-in enabled
+    // would expose a prompt-injection escalation: a chat message could drive
+    // Bash/Write/Edit/WebFetch to exfiltrate or mutate state outside the
+    // DarkRide MCP tool boundary. So we hard-block the destructive built-ins
+    // at the CLI layer. Read/Glob/Grep/ToolSearch stay available so the
+    // model has something to do during the MCP handshake window.
+    args.push(
+      '--disallowedTools',
+      'Bash', 'Edit', 'Write', 'NotebookEdit',
+      'Task',
+      'WebFetch', 'WebSearch',
+      'CronCreate', 'CronDelete',
+    );
 
     if (options?.maxBudgetUsd) {
       args.push('--max-budget-usd', String(options.maxBudgetUsd));
@@ -717,9 +727,9 @@ export class ClaudeCliProvider {
 
   /**
    * Self-test that the CLI can actually DRIVE a tool with the given auth, not
-   * just authenticate. We ask the model to call a built-in tool (Bash); a
-   * working Claude Code session will make a real `tool_use` block, a broken
-   * one will text-leak `<invoke>` markup as content.
+   * just authenticate. We ask the model to call a read-only built-in tool
+   * (Glob); a working Claude Code session will make a real `tool_use` block,
+   * a broken one will text-leak `<invoke>` markup as content.
    *
    * Previously this spun up a throwaway stdio MCP server and asked the model
    * to call a `ping` tool there — but verified on 2026-06-04 that the CLI's
@@ -728,6 +738,10 @@ export class ClaudeCliProvider {
    * environmental reasons that had nothing to do with the token. Built-ins
    * are registered synchronously at init, so they sidestep that race
    * entirely and still reveal a text-leaking token.
+   *
+   * Glob is chosen (over Bash) because it's read-only — keeps the security
+   * stance uniform with sendMessage's disallow list, which blocks the
+   * destructive built-ins.
    */
   static async testToolUse(
     oauthToken: string | undefined,
@@ -740,6 +754,14 @@ export class ClaudeCliProvider {
       '--print', '--output-format', 'stream-json', '--verbose',
       '--permission-mode', 'bypassPermissions',
       '--model', model || 'sonnet',
+      // Match sendMessage's blocklist so the test isn't accidentally more
+      // permissive than production. Glob (the tool the test prompt asks for)
+      // is not blocked.
+      '--disallowedTools',
+      'Bash', 'Edit', 'Write', 'NotebookEdit',
+      'Task',
+      'WebFetch', 'WebSearch',
+      'CronCreate', 'CronDelete',
     ];
     return await new Promise((resolve) => {
       const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'], env });
@@ -760,7 +782,7 @@ export class ClaudeCliProvider {
         resolve(evaluateToolSelfTest(out, code, stderr));
       });
       child.stdin?.write(
-        'Use your Bash tool to run the command `echo darkride-selftest`, then reply "done".',
+        'Use your Glob tool to look for files matching `*.json` in the current directory, then reply "done".',
       );
       child.stdin?.end();
     });

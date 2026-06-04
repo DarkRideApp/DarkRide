@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Two variants:
+# Reproducer for the MCP-pending-at-init race (since fixed by removing
+# --tools '' from ClaudeCliProvider on 2026-06-04). Two variants:
 #   E. HTTP MCP — same transport AI Review uses (HTTP to DarkRide's /mcp).
-#      We spin up a throwaway local HTTP MCP server so this test doesn't
-#      depend on DarkRide running or its bearer-token machinery. If HTTP MCP
-#      reaches "connected" while stdio doesn't, AI Review's failure is NOT
-#      the same race as the Test button and we've been chasing the wrong cause.
-#   F. stdio MCP with --mcp-debug — runs the previous stdio test but with
-#      claude's debug logging on, so we can see what the CLI is doing with
-#      the MCP server before/during init.
+#      Spins up a throwaway local HTTP MCP server so this doesn't depend on
+#      DarkRide running. Reproduces the PRE-FIX behavior with --tools ''.
+#   F. stdio MCP with --mcp-debug — runs the stdio variant with claude's
+#      debug logging on, to see what the CLI is doing with the MCP server
+#      before/during init. Also PRE-FIX behavior.
+#
+# These are kept as historical / regression repros — useful if a future CLI
+# change re-introduces the race, or if a new automation path accidentally
+# brings --tools '' back.
 #
 # Usage:  sudo -u darkride -s -- bash /tmp/test-mcp-http-and-debug.sh
 
@@ -160,7 +163,8 @@ cat > "$DIR/mcp-http.json" <<JSON
 {"mcpServers":{"selftest":{"type":"http","url":"http://127.0.0.1:$PORT/mcp"}}}
 JSON
 
-echo "  Self-test with --tools '' (mirrors DarkRide sendMessage):"
+echo "  Self-test with --tools '' (mirrors the PRE-FIX DarkRide sendMessage —"
+echo "  current code no longer passes --tools '', see commit dropping it on 2026-06-04):"
 echo "Call the ping tool, then reply done." \
   | timeout 90 claude --print --output-format stream-json --verbose \
       --mcp-config "$DIR/mcp-http.json" --strict-mcp-config \

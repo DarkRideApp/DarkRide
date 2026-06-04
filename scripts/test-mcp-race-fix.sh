@@ -79,33 +79,41 @@ if result:
     print(" result: is_error=%s num_turns=%s" % (result.get("is_error"), result.get("num_turns")))
 PY
 
+# Extra claude args are passed as "$@" after the fixed args. This matters:
+# the previous version stuffed them into a single string like "--tools ''"
+# which, when expanded unquoted, became `--tools` + the two literal apostrophe
+# characters `''` rather than `--tools` + empty string. Variants still failed
+# the way we expected, but the args weren't actually faithful to what
+# ClaudeCliProvider used to send.
 run_variant() {
-  local label="$1"; local settings="$2"; local extra_args="$3"; local outfile="$4"
+  local label="$1"; local settings="$2"; local outfile="$3"; shift 3
   echo "=================================="
   echo "  $label"
   echo "=================================="
-  echo "    args: --settings $(basename $settings) $extra_args"
+  echo "    args: --settings $(basename "$settings") $*"
   echo "Call the ping tool, then reply done." \
     | timeout 120 claude --print --output-format stream-json --verbose \
         --mcp-config "$DIR/mcp.json" --strict-mcp-config \
         --settings "$settings" \
         --permission-mode bypassPermissions \
-        --model sonnet $extra_args \
+        --model sonnet "$@" \
         > "$outfile" 2>/dev/null
   python3 "$DIR/parse.py" < "$outfile"
   echo "    raw stream: $outfile"
   echo
 }
 
-# Variant matrix:
-# (A) baseline:   --tools ''           no hook       → current DarkRide behavior
-# (B) sleep1:     --tools ''           sleep 1 hook  → previous test
-# (C) sleep5:     --tools ''           sleep 5 hook  → longer delay
-# (D) no-tools-empty: NO --tools flag  no hook       → built-ins enabled, see if MCP still races
-run_variant "A. baseline (no hook, --tools '')"                     "$DIR/settings-no-hook.json"  "--tools ''"  "$OUT_BASE/a.jsonl"
-run_variant "B. sleep 1 hook + --tools ''"                          "$DIR/settings-sleep1.json"   "--tools ''"  "$OUT_BASE/b.jsonl"
-run_variant "C. sleep 5 hook + --tools ''"                          "$DIR/settings-sleep5.json"   "--tools ''"  "$OUT_BASE/c.jsonl"
-run_variant "D. no hook, NO --tools flag (built-ins enabled)"       "$DIR/settings-no-hook.json"  ""            "$OUT_BASE/d.jsonl"
+# Variant matrix (historical — see commit removing --tools '' from
+# ClaudeCliProvider.sendMessage on 2026-06-04; current sendMessage no longer
+# passes --tools '', so variants A/B/C reproduce the OLD broken behavior):
+# (A) baseline:       --tools ''           no hook       → pre-fix DarkRide behavior
+# (B) sleep1:         --tools ''           sleep 1 hook  → does hook delay init?
+# (C) sleep5:         --tools ''           sleep 5 hook  → longer delay
+# (D) no-tools-empty: NO --tools flag      no hook       → fixed behavior, built-ins enabled
+run_variant "A. baseline (no hook, --tools '')"                  "$DIR/settings-no-hook.json" "$OUT_BASE/a.jsonl" --tools ""
+run_variant "B. sleep 1 hook + --tools ''"                       "$DIR/settings-sleep1.json"  "$OUT_BASE/b.jsonl" --tools ""
+run_variant "C. sleep 5 hook + --tools ''"                       "$DIR/settings-sleep5.json"  "$OUT_BASE/c.jsonl" --tools ""
+run_variant "D. no hook, NO --tools flag (built-ins enabled)"    "$DIR/settings-no-hook.json" "$OUT_BASE/d.jsonl"
 
 echo "=================================="
 echo "  WHAT EACH VARIANT TELLS US"

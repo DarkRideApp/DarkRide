@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# Reproduce ClaudeCliProvider.testToolUse() outside of DarkRide, as the
-# darkride service user, and print every signal the eval function looks at.
+# Reproduce the PRE-FIX ClaudeCliProvider.testToolUse() outside of DarkRide
+# (stdio MCP "ping" server + --tools '' + ping prompt) as the darkride
+# service user, and print every signal the eval function looks at.
+#
+# This is a historical reproducer of the broken setup that motivated the
+# 2026-06-04 fix: testToolUse no longer uses an MCP server or --tools ''
+# in current code. Keep this around because the buggy setup is exactly what
+# unblocked the diagnosis — run it to confirm the original race still
+# reproduces if anything in the CLI changes in the future.
 #
 # Read-only: makes a temp dir, runs claude once, persists the raw stream to
 # /tmp/claude-selftest-out.jsonl so it can be re-parsed without re-running.
-# Does not touch /opt/darkride.
+# Does not touch the DarkRide install directory.
 #
 # Usage:  sudo -u darkride -s -- bash /tmp/debug-claude-cli-selftest.sh
 set -u
