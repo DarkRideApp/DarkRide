@@ -864,6 +864,67 @@ export class AutomationRunner implements IAutomationRunner {
       .run();
   }
 
+  /**
+   * Record a "this automation was queued but never got to run" outcome as a
+   * regular failed automation_sessions row + broadcast + notification.
+   *
+   * Called by AutomationScheduler when a queued entry waits past its deadline
+   * (default 5 min) without a matching available device. The operator then
+   * sees it in the normal automation session history with the reason, instead
+   * of having to inspect the live queue tab to notice things are stuck.
+   */
+  recordQueueTimeout(
+    automationId: number,
+    triggerType: TriggerType,
+    errorMsg: string,
+  ): void {
+    const automation = this.db
+      .select({ name: automations.name })
+      .from(automations)
+      .where(eq(automations.id, automationId))
+      .all()[0];
+    const name = automation?.name ?? `Automation #${automationId}`;
+    const now = new Date();
+    // If the automation row was deleted while the entry sat in the queue,
+    // the FK from automation_sessions.automation_id would reject our insert
+    // and the timeout would never get surfaced. Schema marks the column
+    // nullable for exactly this case — fall back to null so the failed
+    // session still shows up in history under its captured name.
+    const automationIdForRow = automation ? automationId : null;
+
+    const insertResult = this.db
+      .insert(automationSessions)
+      .values({
+        automationId: automationIdForRow,
+        deviceId: null,
+        name,
+        status: 'failed',
+        triggerType,
+        startedAt: now,
+        completedAt: now,
+        // The schema doesn't have a dedicated error column — runner uses `logs`
+        // for both successful execution traces and failure reasons (see
+        // updateSession()), so do the same here.
+        logs: errorMsg,
+      })
+      .run();
+    const sessionId = Number(insertResult.lastInsertRowid);
+
+    error(`Automation "${name}" (session ${sessionId}) dropped from queue: ${errorMsg}`);
+
+    // broadcastSessionStatus also fires the notificationService for failed
+    // status, so operators get the same push/desktop notification as a
+    // regular run failure — no separate notification path.
+    this.broadcastSessionStatus(
+      sessionId,
+      'failed',
+      automationIdForRow ?? undefined,
+      undefined,
+      triggerType,
+      errorMsg,
+    );
+  }
+
   private broadcastSessionStatus(
     sessionId: number,
     status: 'running' | 'success' | 'failed' | 'cancelled',

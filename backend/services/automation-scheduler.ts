@@ -10,10 +10,29 @@ import { matchesCrontab } from '@darkrideapp/plugin-sdk/utils';
 
 const { log, error } = createLoggers('automation-scheduler');
 
+const DEFAULT_MAX_QUEUE_WAIT_MS = 5 * 60_000;
+
 interface QueueEntry {
   automationId: number;
   triggerType: TriggerType;
   queuedAt: Date;
+  /**
+   * When this entry should be dropped as "no device became available in time"
+   * if it still can't run. Without this, an automation that requires a device
+   * could sit at queue head forever when all devices are offline, blocking
+   * every later (potentially deviceless) entry behind it. Incident 2026-06-05.
+   */
+  deadlineAt: Date;
+}
+
+export interface AutomationSchedulerOptions {
+  /**
+   * How long a queued entry waits for its preconditions (a matching available
+   * device, etc.) before it's dropped and recorded as a failed automation
+   * session. Default: 5 minutes. Note: the unrelated queueAlertTimer warning
+   * log fires after a separate, hard-coded 5-minute window.
+   */
+  maxQueueWaitMs?: number;
 }
 
 export class AutomationScheduler {
@@ -23,12 +42,16 @@ export class AutomationScheduler {
   private checkInterval: ReturnType<typeof setInterval> | null = null;
   private queueAlertTimer: ReturnType<typeof setTimeout> | null = null;
   private processingQueue = false;
+  private maxQueueWaitMs: number;
 
   constructor(
     private db: AppDatabase,
     private runner: AutomationRunner,
     private deviceManager?: DeviceManager,
-  ) {}
+    options: AutomationSchedulerOptions = {},
+  ) {
+    this.maxQueueWaitMs = options.maxQueueWaitMs ?? DEFAULT_MAX_QUEUE_WAIT_MS;
+  }
 
   start(): void {
     this.loadSchedules();
@@ -129,7 +152,9 @@ export class AutomationScheduler {
       return false;
     }
 
-    this.queue.push({ automationId, triggerType, queuedAt: new Date() });
+    const queuedAt = new Date();
+    const deadlineAt = new Date(queuedAt.getTime() + this.maxQueueWaitMs);
+    this.queue.push({ automationId, triggerType, queuedAt, deadlineAt });
     log(`Automation ${automationId} added to queue (trigger: ${triggerType})`);
 
     // Start queue health alert timer if not already running
@@ -180,25 +205,15 @@ export class AutomationScheduler {
     const queueDetails = this.queue.map((entry) => {
       const auto = this.db.select().from(automations).where(eq(automations.id, entry.automationId)).all()[0];
 
-      // Determine why the entry can't run
+      // Determine why the entry can't run. tryResolveEntry is the same logic
+      // processQueue() uses to pick the next runnable item, so the operator-
+      // visible reason here matches what the scheduler is actually checking.
       let reason: string | null = null;
       if (this.processingQueue) {
         reason = 'waiting for current automation to finish';
       } else {
-        const available = this.findAvailableDevice(entry.automationId);
-        if (!available) {
-          const onlineCount = deviceStatuses.filter((d) => d.online).length;
-          const busyCount = deviceStatuses.filter((d) => d.online && d.busy).length;
-          if (allDevices.length === 0) {
-            reason = 'no devices configured';
-          } else if (onlineCount === 0) {
-            reason = 'all devices offline';
-          } else if (busyCount === onlineCount) {
-            reason = 'all online devices busy';
-          } else {
-            reason = 'no device matches filter';
-          }
-        }
+        const resolved = this.tryResolveEntry(entry);
+        if (!resolved.ok) reason = resolved.reason;
       }
 
       return {
@@ -216,6 +231,15 @@ export class AutomationScheduler {
       processingQueue: this.processingQueue,
       devices: deviceStatuses,
     };
+  }
+
+  /**
+   * Test seam: returns true when a queue-health-alert timer is pending.
+   * Used by tests to verify the timer is cleared when the queue drains via
+   * either successful execution OR deadline-eviction.
+   */
+  hasPendingQueueAlertTimer(): boolean {
+    return this.queueAlertTimer !== null;
   }
 
   clearQueue(): number {
@@ -289,34 +313,115 @@ export class AutomationScheduler {
     return nowMins >= startMins && nowMins <= endMins;
   }
 
+  /**
+   * Decide whether a queued entry can run right now. On success returns
+   * `{ ok: true, deviceForRun }` where `deviceForRun` is the device id to run
+   * against, or `undefined` when the automation is configured as deviceless.
+   * On failure returns `{ ok: false, reason }` with a human-readable reason
+   * (e.g. "all devices offline", "automation no longer exists"). Shared
+   * between processQueue() (which acts on it) and getQueueStatus() (which
+   * surfaces it to the operator) so they always agree.
+   */
+  private tryResolveEntry(
+    entry: QueueEntry,
+  ): { ok: true; deviceForRun: string | undefined } | { ok: false; reason: string } {
+    const automation = this.db
+      .select({ requiresDevice: automations.requiresDevice })
+      .from(automations)
+      .where(eq(automations.id, entry.automationId))
+      .all()[0];
+
+    if (!automation) {
+      return { ok: false, reason: 'automation no longer exists' };
+    }
+    if (automation.requiresDevice === false) {
+      return { ok: true, deviceForRun: undefined };
+    }
+
+    const availableDevice = this.findAvailableDevice(entry.automationId);
+    if (availableDevice) {
+      return { ok: true, deviceForRun: availableDevice };
+    }
+
+    // No device — diagnose why so the operator sees something useful.
+    const allDevices = this.db.select().from(devices).all();
+    if (allDevices.length === 0) return { ok: false, reason: 'no devices configured' };
+    if (this.deviceManager) {
+      const onlineCount = allDevices.filter((d) => this.deviceManager!.isOnline(d.id)).length;
+      const busyCount = allDevices.filter(
+        (d) => this.deviceManager!.isOnline(d.id) && this.deviceManager!.isBusy(d.id),
+      ).length;
+      if (onlineCount === 0) return { ok: false, reason: 'all devices offline' };
+      if (busyCount === onlineCount) return { ok: false, reason: 'all online devices busy' };
+    }
+    return { ok: false, reason: 'no device matches filter' };
+  }
+
   private async processQueue(): Promise<void> {
     if (this.queue.length === 0) return;
     // Guard against concurrent processQueue() calls (async gap between
     // findAvailableDevice check and runAutomation's tryAcquireBusy)
     if (this.processingQueue) return;
     this.processingQueue = true;
+    // Tracks whether this pass actually made forward progress (ran an
+    // automation or evicted a timed-out entry). Only when something
+    // changed do we re-fire processQueue immediately to drain a backlog
+    // — otherwise the 60s checkInterval is the right cadence to retry,
+    // and a setTimeout(..., 0) chain on a fully-blocked queue would just
+    // burn CPU.
+    let madeProgress = false;
 
     try {
-      const entry = this.queue[0];
+      const now = new Date();
 
-      // Look up the automation to find out whether it actually wants a
-      // device. Deviceless automations should run without one — pre-fix
-      // the scheduler grabbed any online idle device, which then showed
-      // up in session history as if the automation was bound to it.
-      const automation = this.db
-        .select({ requiresDevice: automations.requiresDevice })
-        .from(automations)
-        .where(eq(automations.id, entry.automationId))
-        .all()[0];
+      // 1. Drop any entries past their deadline that still can't run, and
+      // record them as failed sessions so the operator sees them in the
+      // normal automation history rather than just buried in a log line.
+      const survivors: QueueEntry[] = [];
+      for (const entry of this.queue) {
+        const resolved = this.tryResolveEntry(entry);
+        if (resolved.ok || now.getTime() < entry.deadlineAt.getTime()) {
+          survivors.push(entry);
+          continue;
+        }
+        const waitedSeconds = Math.round((now.getTime() - entry.queuedAt.getTime()) / 1000);
+        const errorMsg = `Queue timeout after ${waitedSeconds}s: ${resolved.reason}`;
+        log(`Dropping automation ${entry.automationId} from queue — ${errorMsg}`);
+        try {
+          this.runner.recordQueueTimeout(entry.automationId, entry.triggerType, errorMsg);
+        } catch (err: any) {
+          error(`Failed to record queue timeout for automation ${entry.automationId}: ${err.message}`);
+        }
+        madeProgress = true;
+      }
+      this.queue = survivors;
 
-      let deviceForRun: string | undefined;
-      if (automation?.requiresDevice !== false) {
-        const availableDevice = this.findAvailableDevice(entry.automationId);
-        if (!availableDevice) return;
-        deviceForRun = availableDevice;
+      // If the deadline sweep just emptied the queue, clear the alert timer
+      // here so it doesn't fire a false "Queue health alert" minutes later.
+      // The other site for this is after the runnable splice below, which only
+      // covers the "executed something" exit; this covers "evicted everything".
+      if (this.queue.length === 0 && this.queueAlertTimer) {
+        clearTimeout(this.queueAlertTimer);
+        this.queueAlertTimer = null;
       }
 
-      this.queue.shift();
+      // 2. Find the first entry that can run right now. Skip-and-try-next
+      // instead of FIFO blocking, so a head entry waiting for a device
+      // doesn't park every later entry behind it.
+      let runnableIdx = -1;
+      let deviceForRun: string | undefined;
+      for (let i = 0; i < this.queue.length; i++) {
+        const resolved = this.tryResolveEntry(this.queue[i]);
+        if (resolved.ok) {
+          runnableIdx = i;
+          deviceForRun = resolved.deviceForRun;
+          break;
+        }
+      }
+      if (runnableIdx === -1) return;
+
+      const [entry] = this.queue.splice(runnableIdx, 1);
+      madeProgress = true;
 
       // Clear alert timer if queue is empty
       if (this.queue.length === 0 && this.queueAlertTimer) {
@@ -335,8 +440,14 @@ export class AutomationScheduler {
       }
     } finally {
       this.processingQueue = false;
-      // Immediately process next item if queue is not empty
-      if (this.queue.length > 0) {
+      // Immediately drain the next item only if THIS pass actually did
+      // something (executed a runnable entry, or evicted a timed-out
+      // one). If the queue is non-empty but nothing was runnable AND
+      // nothing was past deadline, no state has changed since the call
+      // that just finished — re-firing setTimeout(..., 0) would just
+      // spin. Wait for the 60s checkInterval (or the next enqueue) to
+      // try again.
+      if (madeProgress && this.queue.length > 0) {
         setTimeout(() => this.processQueue(), 0);
       }
     }
