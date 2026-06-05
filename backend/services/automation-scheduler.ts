@@ -29,8 +29,8 @@ export interface AutomationSchedulerOptions {
   /**
    * How long a queued entry waits for its preconditions (a matching available
    * device, etc.) before it's dropped and recorded as a failed automation
-   * session. Default: 5 minutes — matches the existing queueAlertTimer so the
-   * operator gets one warning log just before the failure.
+   * session. Default: 5 minutes. Note: the unrelated queueAlertTimer warning
+   * log fires after a separate, hard-coded 5-minute window.
    */
   maxQueueWaitMs?: number;
 }
@@ -233,6 +233,15 @@ export class AutomationScheduler {
     };
   }
 
+  /**
+   * Test seam: returns true when a queue-health-alert timer is pending.
+   * Used by tests to verify the timer is cleared when the queue drains via
+   * either successful execution OR deadline-eviction.
+   */
+  hasPendingQueueAlertTimer(): boolean {
+    return this.queueAlertTimer !== null;
+  }
+
   clearQueue(): number {
     const count = this.queue.length;
     this.queue.length = 0;
@@ -305,11 +314,13 @@ export class AutomationScheduler {
   }
 
   /**
-   * Decide whether a queued entry can run right now. Returns either the
-   * device id to run it against, "deviceless" for an automation that doesn't
-   * need one, or a human-readable reason why it can't run yet. Shared between
-   * processQueue() (which acts on it) and getQueueStatus() (which surfaces it
-   * to the operator).
+   * Decide whether a queued entry can run right now. On success returns
+   * `{ ok: true, deviceForRun }` where `deviceForRun` is the device id to run
+   * against, or `undefined` when the automation is configured as deviceless.
+   * On failure returns `{ ok: false, reason }` with a human-readable reason
+   * (e.g. "all devices offline", "automation no longer exists"). Shared
+   * between processQueue() (which acts on it) and getQueueStatus() (which
+   * surfaces it to the operator) so they always agree.
    */
   private tryResolveEntry(
     entry: QueueEntry,
@@ -376,6 +387,15 @@ export class AutomationScheduler {
         }
       }
       this.queue = survivors;
+
+      // If the deadline sweep just emptied the queue, clear the alert timer
+      // here so it doesn't fire a false "Queue health alert" minutes later.
+      // The other site for this is after the runnable splice below, which only
+      // covers the "executed something" exit; this covers "evicted everything".
+      if (this.queue.length === 0 && this.queueAlertTimer) {
+        clearTimeout(this.queueAlertTimer);
+        this.queueAlertTimer = null;
+      }
 
       // 2. Find the first entry that can run right now. Skip-and-try-next
       // instead of FIFO blocking, so a head entry waiting for a device

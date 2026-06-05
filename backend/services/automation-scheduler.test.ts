@@ -639,6 +639,34 @@ describe('AutomationScheduler', () => {
       fastScheduler.stop();
     });
 
+    it('clears the queue-health-alert timer after eviction empties the queue', async () => {
+      // Regression test for PR #14 review (Copilot, comment 3360696236):
+      // if every queued entry hits its deadline at once and they all get
+      // dropped, the earlier code path that cleared queueAlertTimer was only
+      // reached after a successful splice. So a queue that drained via
+      // eviction would still fire a stale "Queue health alert" minutes later.
+      vi.useFakeTimers({ now: 1_000_000 });
+      const fastScheduler = new AutomationScheduler(db, runner, undefined, {
+        maxQueueWaitMs: 100,
+      });
+
+      const blockerId = insertDeviceRequiringAutomation('Blocker');
+      vi.spyOn(runner, 'runAutomation').mockResolvedValue({ sessionId: 1, success: true });
+
+      fastScheduler.enqueue(blockerId, 'schedule');
+      // The enqueue arms a 5-minute alert timer. We confirm it's cleared once
+      // the eviction sweep empties the queue, NOT after 5 real minutes.
+      expect(fastScheduler.hasPendingQueueAlertTimer()).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(fastScheduler.getQueue()).toHaveLength(0);
+      expect(fastScheduler.hasPendingQueueAlertTimer()).toBe(false);
+
+      vi.useRealTimers();
+      fastScheduler.stop();
+    });
+
     it('does NOT drop an entry whose deadline has not yet passed', async () => {
       vi.useFakeTimers({ now: 1_000_000 });
       const fastScheduler = new AutomationScheduler(db, runner, undefined, {
