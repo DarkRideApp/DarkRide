@@ -885,11 +885,17 @@ export class AutomationRunner implements IAutomationRunner {
       .all()[0];
     const name = automation?.name ?? `Automation #${automationId}`;
     const now = new Date();
+    // If the automation row was deleted while the entry sat in the queue,
+    // the FK from automation_sessions.automation_id would reject our insert
+    // and the timeout would never get surfaced. Schema marks the column
+    // nullable for exactly this case — fall back to null so the failed
+    // session still shows up in history under its captured name.
+    const automationIdForRow = automation ? automationId : null;
 
     const insertResult = this.db
       .insert(automationSessions)
       .values({
-        automationId,
+        automationId: automationIdForRow,
         deviceId: null,
         name,
         status: 'failed',
@@ -909,7 +915,14 @@ export class AutomationRunner implements IAutomationRunner {
     // broadcastSessionStatus also fires the notificationService for failed
     // status, so operators get the same push/desktop notification as a
     // regular run failure — no separate notification path.
-    this.broadcastSessionStatus(sessionId, 'failed', automationId, undefined, triggerType, errorMsg);
+    this.broadcastSessionStatus(
+      sessionId,
+      'failed',
+      automationIdForRow ?? undefined,
+      undefined,
+      triggerType,
+      errorMsg,
+    );
   }
 
   private broadcastSessionStatus(

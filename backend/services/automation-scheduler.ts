@@ -363,6 +363,13 @@ export class AutomationScheduler {
     // findAvailableDevice check and runAutomation's tryAcquireBusy)
     if (this.processingQueue) return;
     this.processingQueue = true;
+    // Tracks whether this pass actually made forward progress (ran an
+    // automation or evicted a timed-out entry). Only when something
+    // changed do we re-fire processQueue immediately to drain a backlog
+    // — otherwise the 60s checkInterval is the right cadence to retry,
+    // and a setTimeout(..., 0) chain on a fully-blocked queue would just
+    // burn CPU.
+    let madeProgress = false;
 
     try {
       const now = new Date();
@@ -385,6 +392,7 @@ export class AutomationScheduler {
         } catch (err: any) {
           error(`Failed to record queue timeout for automation ${entry.automationId}: ${err.message}`);
         }
+        madeProgress = true;
       }
       this.queue = survivors;
 
@@ -413,6 +421,7 @@ export class AutomationScheduler {
       if (runnableIdx === -1) return;
 
       const [entry] = this.queue.splice(runnableIdx, 1);
+      madeProgress = true;
 
       // Clear alert timer if queue is empty
       if (this.queue.length === 0 && this.queueAlertTimer) {
@@ -431,8 +440,14 @@ export class AutomationScheduler {
       }
     } finally {
       this.processingQueue = false;
-      // Immediately process next item if queue is not empty
-      if (this.queue.length > 0) {
+      // Immediately drain the next item only if THIS pass actually did
+      // something (executed a runnable entry, or evicted a timed-out
+      // one). If the queue is non-empty but nothing was runnable AND
+      // nothing was past deadline, no state has changed since the call
+      // that just finished — re-firing setTimeout(..., 0) would just
+      // spin. Wait for the 60s checkInterval (or the next enqueue) to
+      // try again.
+      if (madeProgress && this.queue.length > 0) {
         setTimeout(() => this.processQueue(), 0);
       }
     }

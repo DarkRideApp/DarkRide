@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { AutomationScheduler } from './automation-scheduler';
 import { AutomationRunner } from './automation-runner';
@@ -615,8 +616,12 @@ describe('AutomationScheduler', () => {
       });
 
       fastScheduler.enqueue(blockerId, 'schedule');
-      // Advance past the 100ms deadline, then tick once so processQueue notices
+      // Advance past the 100ms deadline. In production the 60s checkInterval
+      // re-fires processQueue and triggers the eviction; here we call it
+      // directly since fake timers don't auto-advance setInterval inside
+      // this advanceTimersByTimeAsync window.
       await vi.advanceTimersByTimeAsync(500);
+      await (fastScheduler as any).processQueue();
 
       // runAutomation should never have been called for the blocker — there's no device.
       expect(mockRun).not.toHaveBeenCalled();
@@ -659,9 +664,95 @@ describe('AutomationScheduler', () => {
       expect(fastScheduler.hasPendingQueueAlertTimer()).toBe(true);
 
       await vi.advanceTimersByTimeAsync(500);
+      await (fastScheduler as any).processQueue();
 
       expect(fastScheduler.getQueue()).toHaveLength(0);
       expect(fastScheduler.hasPendingQueueAlertTimer()).toBe(false);
+
+      vi.useRealTimers();
+      fastScheduler.stop();
+    });
+
+    it('does not tight-loop processQueue when nothing is runnable and nothing has timed out', async () => {
+      // Regression test for PR #14 review (Copilot, 3360745376): the finally
+      // block used to schedule setTimeout(processQueue, 0) whenever the
+      // queue was non-empty. With the new iterating processQueue, an
+      // all-blocked queue (e.g. every entry waiting for a device, none yet
+      // past deadline) would re-fire immediately and spin.
+      vi.useFakeTimers({ now: 1_000_000 });
+      const fastScheduler = new AutomationScheduler(db, runner, undefined, {
+        maxQueueWaitMs: 60_000,  // well past anything advanceTimersByTimeAsync hits
+      });
+
+      const blockerId = insertDeviceRequiringAutomation('Blocker');
+
+      // No devices configured → blocker can't ever resolve.
+      const mockRun = vi.spyOn(runner, 'runAutomation').mockResolvedValue({
+        sessionId: 1, success: true,
+      });
+
+      // Spy on global setTimeout so we can count immediate re-fires.
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+      fastScheduler.enqueue(blockerId, 'schedule');
+      // The enqueue call itself triggers one processQueue. Reset the spy
+      // AFTER enqueue so we only measure post-enqueue setTimeout calls.
+      // (enqueue uses setTimeout to arm the queue-health alert, plus the
+      // initial processQueue call might also schedule. We're checking
+      // that further processQueue() calls don't add MORE.)
+      await vi.advanceTimersByTimeAsync(0);
+      setTimeoutSpy.mockClear();
+
+      // Now kick processQueue manually a few times — each should be a
+      // no-op since nothing's runnable and nothing's past deadline.
+      await (fastScheduler as any).processQueue();
+      await (fastScheduler as any).processQueue();
+      await (fastScheduler as any).processQueue();
+
+      // No runner calls, no immediate re-fires queued.
+      expect(mockRun).not.toHaveBeenCalled();
+      // setTimeout from processQueue's finally is the one we care about.
+      // The queue-health-alert timer was already armed before mockClear,
+      // so any new setTimeout here would be the bug.
+      expect(setTimeoutSpy).not.toHaveBeenCalled();
+
+      setTimeoutSpy.mockRestore();
+      vi.useRealTimers();
+      fastScheduler.stop();
+    });
+
+    it('records queue timeout for an automation that was deleted while queued (no FK violation)', async () => {
+      // Regression test for PR #14 review (Copilot, 3360745443):
+      // automation_sessions.automation_id has a FK to automations.id; if
+      // the row gets deleted while the entry sits in the queue, the
+      // insert in recordQueueTimeout would fail with foreign_keys=ON and
+      // the timeout would never get surfaced. Defensive fall back to a
+      // null automationId in that case.
+      vi.useFakeTimers({ now: 1_000_000 });
+      const fastScheduler = new AutomationScheduler(db, runner, undefined, {
+        maxQueueWaitMs: 100,
+      });
+
+      const blockerId = insertDeviceRequiringAutomation('AboutToBeDeleted');
+      fastScheduler.enqueue(blockerId, 'schedule');
+
+      // Delete the automation row while it's still queued.
+      db.delete(schema.automations).where(eq(schema.automations.id, blockerId)).run();
+
+      // Advance past deadline + trigger processQueue (in prod the 60s
+      // checkInterval would do this).
+      await vi.advanceTimersByTimeAsync(500);
+      await (fastScheduler as any).processQueue();
+
+      // The failed session row should have been written, with automationId
+      // = null (because the automation was deleted) but the captured name
+      // preserved.
+      const sessions = db.select().from(schema.automationSessions).all();
+      const failed = sessions.filter((s) => s.status === 'failed');
+      expect(failed).toHaveLength(1);
+      expect(failed[0].automationId).toBeNull();
+      expect(failed[0].name).toMatch(/Automation #\d+/);
+      expect(failed[0].logs ?? '').toMatch(/queue/i);
 
       vi.useRealTimers();
       fastScheduler.stop();
