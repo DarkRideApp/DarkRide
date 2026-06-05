@@ -537,4 +537,131 @@ describe('AutomationScheduler', () => {
       expect(mockRun).toHaveBeenCalledWith(autoId, 'dev1', 'schedule');
     });
   });
+
+  describe('queue resilience: head should not block runnable entries', () => {
+    // Real-world incident 2026-06-05: WDWLL Tipboards (deviceless) was queued
+    // behind a device-requiring automation. All devices were offline overnight,
+    // so the head sat unrunnable at position [0] forever, blocking Tipboards
+    // (and every other deviceless or available-device automation) from running.
+    // The user noticed because their morning tipboard runs never happened.
+    //
+    // Pre-fix: processQueue() returned at the first unrunnable head — single
+    // head-of-line block holds the entire queue. These tests cover the
+    // remediation: skip to the next runnable entry, and time-out entries that
+    // can never become runnable so the operator sees them as failed runs.
+
+    function insertDevicelessAutomation(name: string): number {
+      const now = Date.now();
+      db.insert(schema.automations).values({
+        name,
+        code: 'code',
+        passcode: 'pass',
+        requiresDevice: false,
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      }).run();
+      const rows = db.select().from(schema.automations).all();
+      return rows[rows.length - 1].id;
+    }
+
+    function insertDeviceRequiringAutomation(name: string, deviceFilter?: string): number {
+      const now = Date.now();
+      db.insert(schema.automations).values({
+        name,
+        code: 'code',
+        passcode: 'pass',
+        requiresDevice: true,
+        deviceFilter: deviceFilter ?? null,
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      }).run();
+      const rows = db.select().from(schema.automations).all();
+      return rows[rows.length - 1].id;
+    }
+
+    it('runs a deviceless entry when a device-requiring entry ahead of it has no device available', async () => {
+      // No devices configured at all — so the head entry definitely can't run
+      const blockerId = insertDeviceRequiringAutomation('Blocker');
+      const devicelessId = insertDevicelessAutomation('Tipboards');
+
+      const mockRun = vi.spyOn(runner, 'runAutomation').mockResolvedValue({
+        sessionId: 1, success: true,
+      });
+
+      scheduler.enqueue(blockerId, 'schedule');
+      scheduler.enqueue(devicelessId, 'schedule');
+      await new Promise(r => setTimeout(r, 50));
+
+      // The deviceless entry should run; the blocker stays parked in the queue.
+      expect(mockRun).toHaveBeenCalledWith(devicelessId, undefined, 'schedule');
+      expect(mockRun).not.toHaveBeenCalledWith(blockerId, expect.anything(), expect.anything());
+      const remaining = scheduler.getQueue();
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0].automationId).toBe(blockerId);
+    });
+
+    it('drops a queue entry whose deadline has passed and writes a failed automation_session row', async () => {
+      vi.useFakeTimers({ now: 1_000_000 });
+      // Use a fresh scheduler with a tiny deadline so we can race past it
+      const fastScheduler = new AutomationScheduler(db, runner, undefined, {
+        maxQueueWaitMs: 100,
+      });
+
+      const blockerId = insertDeviceRequiringAutomation('Blocker');
+
+      // Spy so a real runAutomation call would fail loudly — we expect it NOT to be called
+      const mockRun = vi.spyOn(runner, 'runAutomation').mockResolvedValue({
+        sessionId: 999, success: true,
+      });
+
+      fastScheduler.enqueue(blockerId, 'schedule');
+      // Advance past the 100ms deadline, then tick once so processQueue notices
+      await vi.advanceTimersByTimeAsync(500);
+
+      // runAutomation should never have been called for the blocker — there's no device.
+      expect(mockRun).not.toHaveBeenCalled();
+
+      // A failed automation_sessions row should have been written so the
+      // operator sees it in the normal session history list, not just buried
+      // in the scheduler log.
+      const sessions = db.select().from(schema.automationSessions).all();
+      const failed = sessions.filter((s) => s.status === 'failed' && s.automationId === blockerId);
+      expect(failed).toHaveLength(1);
+      expect(failed[0].triggerType).toBe('schedule');
+      // Schema uses `logs` for both success traces and failure reasons.
+      expect(failed[0].logs ?? '').toMatch(/queue/i);
+      expect(failed[0].logs ?? '').toMatch(/no device|all devices/i);
+
+      // The expired entry should be gone from the queue.
+      expect(fastScheduler.getQueue()).toHaveLength(0);
+
+      vi.useRealTimers();
+      fastScheduler.stop();
+    });
+
+    it('does NOT drop an entry whose deadline has not yet passed', async () => {
+      vi.useFakeTimers({ now: 1_000_000 });
+      const fastScheduler = new AutomationScheduler(db, runner, undefined, {
+        maxQueueWaitMs: 60_000,
+      });
+
+      const blockerId = insertDeviceRequiringAutomation('Blocker');
+
+      vi.spyOn(runner, 'runAutomation').mockResolvedValue({
+        sessionId: 1, success: true,
+      });
+
+      fastScheduler.enqueue(blockerId, 'schedule');
+      // Well under the 60s deadline
+      await vi.advanceTimersByTimeAsync(500);
+
+      // Entry stays in queue, no failure recorded
+      expect(fastScheduler.getQueue()).toHaveLength(1);
+      const sessions = db.select().from(schema.automationSessions).all();
+      expect(sessions.filter((s) => s.status === 'failed')).toHaveLength(0);
+
+      vi.useRealTimers();
+      fastScheduler.stop();
+    });
+  });
 });
