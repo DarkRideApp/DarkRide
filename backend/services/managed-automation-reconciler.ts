@@ -49,6 +49,13 @@ export function reconcileManagedAutomations(
 ): void {
   const emitWarn = options.warn ?? defaultWarn;
 
+  // Wrap the whole state machine + session-back-fill sweep in a single
+  // transaction so a mid-reconcile failure (disk full, transient
+  // SQLITE_BUSY, an unexpected FK or constraint hit) can't leave a
+  // plugin half-stamped. better-sqlite3 commits on normal return and
+  // rolls back on throw. Validation runs OUTSIDE the transaction so a
+  // duplicate-key error doesn't open an empty tx unnecessarily.
+
   // Validate uniqueness of keys before touching the DB. The partial unique
   // index on (managed_by, managed_key) would catch this anyway, but the
   // resulting SqliteError loses the structural meaning ("plugin authored a
@@ -67,6 +74,10 @@ export function reconcileManagedAutomations(
     );
   }
 
+  // Cast to `any` mirrors the pattern in oauth-token-manager: drizzle exposes
+  // `transaction(fn)` and runs `fn` inside a real SQLite tx, but the TS types
+  // don't always know about it at the AppDatabase layer.
+  (db as any).transaction(() => {
   // Snapshot existing managed rows for this plugin so we can do the
   // "declared previously, not now" pass at the end. Drizzle's typed select
   // gives us back camelCase column names.
@@ -223,6 +234,7 @@ export function reconcileManagedAutomations(
       `or use a versioned key (e.g. \`${dropped[0]}@v2\`) so the override survives.`,
     );
   }
+  });  // end transaction
 }
 
 /**

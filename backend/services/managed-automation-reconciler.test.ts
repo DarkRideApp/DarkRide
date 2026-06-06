@@ -343,6 +343,79 @@ describe('reconcileManagedAutomations', () => {
     });
   });
 
+  describe('case 11: transactional atomicity', () => {
+    // Regression for PR #16 fifth-pass review: the reconciler's multi-step
+    // state machine (insert / update / orphan / delete + session backfill)
+    // ran without a transaction. A mid-flight failure (disk full, SQLITE_BUSY,
+    // unexpected constraint) could leave a plugin half-stamped — really hard
+    // to reason about. We now wrap the whole body in a transaction so any
+    // throw rolls back to the entry state.
+    it('rolls back inserts when a later statement throws', () => {
+      // Seed an existing orphaned-shape row that will collide with the second
+      // declared key: it has managedBy NULL but a unique constraint on
+      // some other column we can hit. Simulate the failure by stubbing
+      // `db.insert(...).values(...).run()` after the first call to throw.
+      let runCount = 0;
+      const origRun = (db as any).$client.prepare;
+      // Inject a synthetic throw: monkey-patch better-sqlite3's exec to throw
+      // after the FIRST insert into automations. Simulates a transient
+      // SQLITE_BUSY mid-reconcile.
+      const sqlite = (db as any).$client;
+      const origExec = sqlite.exec.bind(sqlite);
+      sqlite.exec = (sql: string) => origExec(sql);  // no change yet
+      // The cleanest way to inject is to wrap the drizzle insert helper —
+      // but that's invasive. Easier: declare two defs, then point one of
+      // them at code that's too long for a CHECK constraint. SQLite has
+      // no CHECK on automations, so simpler still: directly throw from a
+      // wrapper around the second insert by counting calls.
+      void origRun;
+      void runCount;
+
+      // Concrete approach: pre-create a row that uses a synthetic UNIQUE-
+      // violating combination. The partial unique index on
+      // (managed_by, managed_key) WHERE managed_by IS NOT NULL fires if
+      // we try to insert (plugin-x, 'b') when one already exists. Insert it
+      // by hand, then call reconcile with defs that try to insert 'a' AND 'b'.
+      // The 'a' insert succeeds; the 'b' insert throws on the unique index.
+      // Inside the transaction, the 'a' insert should roll back.
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({ key: 'b' })]);
+      // Now plugin-x already has a row for 'b'. Re-reconcile claiming both
+      // 'a' (new) and 'b' (existing — silent adopt). Then forcibly create
+      // a colliding plugin-x/'a' row from a different `plugin-x` invocation
+      // — actually, simplest: just monkey-patch `db.insert` to throw on the
+      // 2nd call.
+      let calls = 0;
+      const origInsert = (db as any).insert.bind(db);
+      (db as any).insert = (...args: any[]) => {
+        const builder = origInsert(...args);
+        const origValues = builder.values.bind(builder);
+        builder.values = (...vargs: any[]) => {
+          const stmt = origValues(...vargs);
+          const origStmtRun = stmt.run.bind(stmt);
+          stmt.run = (...rargs: any[]) => {
+            calls += 1;
+            if (calls === 2) throw new Error('simulated SQLITE_BUSY mid-reconcile');
+            return origStmtRun(...rargs);
+          };
+          return stmt;
+        };
+        return builder;
+      };
+      try {
+        expect(() => reconcileManagedAutomations(db, 'plugin-y', [
+          makeDef({ key: 'first' }),
+          makeDef({ key: 'second' }),
+        ])).toThrow(/simulated/);
+      } finally {
+        (db as any).insert = origInsert;
+      }
+      // First insert for plugin-y MUST have been rolled back.
+      const yRows = db.select().from(automations)
+        .where(eq(automations.managedBy, 'plugin-y')).all();
+      expect(yRows).toHaveLength(0);
+    });
+  });
+
   describe('case 10: duplicate keys in defs', () => {
     // Regression for PR #16 review: the partial unique index on
     // (managed_by, managed_key) would catch this anyway, but the resulting

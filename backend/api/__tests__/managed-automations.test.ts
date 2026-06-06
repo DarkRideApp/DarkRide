@@ -240,5 +240,38 @@ describe('managed-automations REST endpoints', () => {
       const items = res.body.data.items as Array<{ scriptKey: string }>;
       expect(items.map((i) => i.scriptKey).sort()).toEqual(['a', 'b']);
     });
+
+    it('returns a SUMMARY shape, NOT the heavyweight script bodies', async () => {
+      // Regression for PR #16 fifth-pass review: the list endpoint used to
+      // serialise the full ManagedAutomationView for every row including
+      // code / currentDefaultCode / baseDefaultCode / schedule / deviceFilter.
+      // That's wasteful for a discovery list — the IDE fetches the full
+      // body per-row when it actually opens. Keeping the list tight matters
+      // when plugins ship multi-KB scripts.
+      seedManaged(db, {
+        managedBy: 'plugin-x', managedKey: 'a',
+        code: 'x'.repeat(10_000),
+        currentDefaultCode: 'x'.repeat(10_000),
+        baseDefaultCode: 'y'.repeat(10_000),
+        schedule: JSON.stringify({ type: 'interval', intervalMs: 60_000 }),
+      });
+
+      const res = await request(app).get('/v1/managed-automations');
+      const item = res.body.data.items[0];
+
+      // Summary fields present
+      expect(item.pluginKey).toBe('plugin-x');
+      expect(item.scriptKey).toBe('a');
+      expect(item.name).toBeDefined();
+      expect(typeof item.isOverridden).toBe('boolean');
+      expect(typeof item.hasDrift).toBe('boolean');
+
+      // Heavyweight fields ABSENT
+      expect(item.code).toBeUndefined();
+      expect(item.currentDefaultCode).toBeUndefined();
+      expect(item.baseDefaultCode).toBeUndefined();
+      expect(item.schedule).toBeUndefined();
+      expect(item.deviceFilter).toBeUndefined();
+    });
   });
 });

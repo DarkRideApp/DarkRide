@@ -213,15 +213,47 @@ export function registerManagedAutomationEndpoints(db: AppDatabase): void {
    */
   registerEndpoint('GET', '/v1/managed-automations', (req, res) => {
     // Filter in SQL so we don't drag every ordinary automation through node;
-    // also guards buildView's `row.managedKey!` non-null assertion against a
-    // half-stamped row where managedBy is set but managedKey somehow isn't
-    // (shouldn't happen with the reconciler invariants, but cheap insurance).
-    const rows = db.select().from(automations)
+    // also guards the buildView non-null assertion against a half-stamped row.
+    // Project to summary columns only — the list view is for discovery, the
+    // operator only needs name / description / drift state to decide where
+    // to click. The full body (code, currentDefaultCode, baseDefaultCode,
+    // schedule, deviceFilter, etc.) is fetched per-row via GET .../:plugin/:key
+    // when the IDE actually opens, keeping the list payload tight even when
+    // plugins ship multi-KB scripts.
+    const rows = db.select({
+      id: automations.id,
+      managedBy: automations.managedBy,
+      managedKey: automations.managedKey,
+      name: automations.name,
+      description: automations.description,
+      enabled: automations.enabled,
+      requiresDevice: automations.requiresDevice,
+      isOverridden: automations.isOverridden,
+      allowUserOverride: automations.allowUserOverride,
+      currentDefaultCode: automations.currentDefaultCode,
+      baseDefaultCode: automations.baseDefaultCode,
+    }).from(automations)
       .where(and(isNotNull(automations.managedBy), isNotNull(automations.managedKey)))
       .all();
     res.json({
       success: true,
-      data: { items: rows.map(buildView) },
+      data: {
+        items: rows.map((r) => ({
+          pluginKey: r.managedBy!,
+          scriptKey: r.managedKey!,
+          name: r.name,
+          description: r.description ?? undefined,
+          enabled: r.enabled ?? true,
+          requiresDevice: r.requiresDevice,
+          isOverridden: r.isOverridden,
+          allowUserOverride: r.allowUserOverride,
+          hasDrift:
+            r.isOverridden &&
+            r.baseDefaultCode != null &&
+            r.currentDefaultCode != null &&
+            r.baseDefaultCode !== r.currentDefaultCode,
+        })),
+      },
     });
   }, { requires: ['core.automations:read'] });
 }
