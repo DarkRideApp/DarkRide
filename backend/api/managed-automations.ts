@@ -37,9 +37,23 @@ interface ManagedAutomationView {
   hasDrift: boolean;
   requiresDevice: boolean;
   timeoutMs: number;
+  /** Operator-owned (defaults to plugin's enabledByDefault on first insert). */
   enabled: boolean;
+  /** Operator-owned schedule JSON. Mirror of `automations.schedule`. */
   schedule: string | null;
   deviceFilter: string | null;
+  /**
+   * Snapshot of the plugin's currently-shipped `enabledByDefault` —
+   * refreshed every plugin load. The IDE's "Revert to default" button on
+   * the enabled toggle restores `enabled` to this value.
+   */
+  currentDefaultEnabled: boolean | null;
+  /**
+   * Snapshot of the plugin's currently-shipped `defaultSchedule` —
+   * refreshed every plugin load. The IDE's "Revert to default" on the
+   * schedule editor restores `schedule` to this string.
+   */
+  currentDefaultSchedule: string | null;
 }
 
 function loadManaged(db: AppDatabase, pluginKey: string, scriptKey: string) {
@@ -72,6 +86,8 @@ function buildView(row: NonNullable<ReturnType<typeof loadManaged>>): ManagedAut
     enabled: row.enabled ?? true,
     schedule: row.schedule,
     deviceFilter: row.deviceFilter,
+    currentDefaultEnabled: row.currentDefaultEnabled,
+    currentDefaultSchedule: row.currentDefaultSchedule,
   };
 }
 
@@ -204,6 +220,105 @@ export function registerManagedAutomationEndpoints(db: AppDatabase): void {
       },
     });
   }, { requires: ['core.automations:read'] });
+
+  /**
+   * PUT /v1/managed-automations/:pluginKey/:scriptKey/schedule
+   * Update the operator's schedule (JSON string of `ScheduleConfig` or
+   * `null` to disable). Plugin's `current_default_schedule` snapshot is
+   * NOT touched — it's owned by the reconciler. Body: `{ schedule:
+   * string | null }`.
+   */
+  registerEndpoint('PUT', '/v1/managed-automations/:pluginKey/:scriptKey/schedule', (req, res) => {
+    const { pluginKey, scriptKey } = req.params;
+    const { schedule } = req.body as { schedule?: string | null };
+    if (schedule !== null && typeof schedule !== 'string') {
+      res.status(400).json({ success: false, error: 'schedule must be a string (JSON) or null' });
+      return;
+    }
+    const row = loadManaged(db, pluginKey, scriptKey);
+    if (!row) {
+      res.status(404).json({ success: false, error: 'Managed automation not found' });
+      return;
+    }
+    db.update(automations).set({
+      schedule: schedule ?? null,
+      updatedAt: new Date(),
+    }).where(eq(automations.id, row.id)).run();
+    res.json({ success: true, data: buildView(loadManaged(db, pluginKey, scriptKey)!) });
+  }, { requires: ['core.automations:edit'] });
+
+  /**
+   * PUT /v1/managed-automations/:pluginKey/:scriptKey/enabled
+   * Update the operator's enabled flag. Body: `{ enabled: boolean }`.
+   * Scheduler skips disabled rows at runtime regardless of override state.
+   */
+  registerEndpoint('PUT', '/v1/managed-automations/:pluginKey/:scriptKey/enabled', (req, res) => {
+    const { pluginKey, scriptKey } = req.params;
+    const { enabled } = req.body as { enabled?: unknown };
+    if (typeof enabled !== 'boolean') {
+      res.status(400).json({ success: false, error: 'enabled must be a boolean' });
+      return;
+    }
+    const row = loadManaged(db, pluginKey, scriptKey);
+    if (!row) {
+      res.status(404).json({ success: false, error: 'Managed automation not found' });
+      return;
+    }
+    db.update(automations).set({
+      enabled,
+      updatedAt: new Date(),
+    }).where(eq(automations.id, row.id)).run();
+    res.json({ success: true, data: buildView(loadManaged(db, pluginKey, scriptKey)!) });
+  }, { requires: ['core.automations:edit'] });
+
+  /**
+   * POST /v1/managed-automations/:pluginKey/:scriptKey/revert/schedule
+   * Reset the operator's schedule to the plugin's current default
+   * snapshot. 409 when the plugin has no schedule (`current_default_schedule
+   * IS NULL`) — the operator wants to clear it, they can PUT
+   * `{schedule: null}` instead.
+   */
+  registerEndpoint('POST', '/v1/managed-automations/:pluginKey/:scriptKey/revert/schedule', (req, res) => {
+    const { pluginKey, scriptKey } = req.params;
+    const row = loadManaged(db, pluginKey, scriptKey);
+    if (!row) {
+      res.status(404).json({ success: false, error: 'Managed automation not found' });
+      return;
+    }
+    // current_default_schedule may legitimately be null — that means the
+    // plugin shipped no schedule at all. Reverting to "no schedule" is a
+    // valid request; carry the null through.
+    db.update(automations).set({
+      schedule: row.currentDefaultSchedule,
+      updatedAt: new Date(),
+    }).where(eq(automations.id, row.id)).run();
+    res.json({ success: true, data: buildView(loadManaged(db, pluginKey, scriptKey)!) });
+  }, { requires: ['core.automations:edit'] });
+
+  /**
+   * POST /v1/managed-automations/:pluginKey/:scriptKey/revert/enabled
+   * Reset the operator's enabled flag to the plugin's current default.
+   * 409 if the plugin's default is unknown (`current_default_enabled IS
+   * NULL`, which only happens on legacy rows from before migration 0094
+   * — newer inserts always seed the column).
+   */
+  registerEndpoint('POST', '/v1/managed-automations/:pluginKey/:scriptKey/revert/enabled', (req, res) => {
+    const { pluginKey, scriptKey } = req.params;
+    const row = loadManaged(db, pluginKey, scriptKey);
+    if (!row) {
+      res.status(404).json({ success: false, error: 'Managed automation not found' });
+      return;
+    }
+    if (row.currentDefaultEnabled == null) {
+      res.status(409).json({ success: false, error: 'Plugin default enabled state is not known for this row' });
+      return;
+    }
+    db.update(automations).set({
+      enabled: row.currentDefaultEnabled,
+      updatedAt: new Date(),
+    }).where(eq(automations.id, row.id)).run();
+    res.json({ success: true, data: buildView(loadManaged(db, pluginKey, scriptKey)!) });
+  }, { requires: ['core.automations:edit'] });
 
   /**
    * GET /v1/managed-automations
