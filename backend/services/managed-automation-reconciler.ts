@@ -126,6 +126,12 @@ export function reconcileManagedAutomations(
         allowUserOverride: def.allowUserOverride ?? true,
         emitFailureNotification: def.emitFailureNotification ?? false,
         description: def.description ?? null,
+        // Snapshot of the plugin's current defaults for schedule/enabled —
+        // refreshed every load so "revert to default" in the IDE always
+        // targets what the plugin currently ships, not what it shipped
+        // on the row's first insert.
+        currentDefaultSchedule: def.defaultSchedule ?? null,
+        currentDefaultEnabled: def.enabledByDefault ?? true,
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -146,6 +152,8 @@ export function reconcileManagedAutomations(
           allowUserOverride: def.allowUserOverride ?? true,
           emitFailureNotification: def.emitFailureNotification ?? false,
           description: def.description ?? null,
+          currentDefaultSchedule: def.defaultSchedule ?? null,
+          currentDefaultEnabled: def.enabledByDefault ?? true,
           updatedAt: now,
         })
         .where(eq(automations.id, existing.id))
@@ -172,6 +180,8 @@ export function reconcileManagedAutomations(
         allowUserOverride: def.allowUserOverride ?? true,
         emitFailureNotification: def.emitFailureNotification ?? false,
         description: def.description ?? null,
+        currentDefaultSchedule: def.defaultSchedule ?? null,
+        currentDefaultEnabled: def.enabledByDefault ?? true,
         updatedAt: now,
       })
       .where(eq(automations.id, existing.id))
@@ -193,6 +203,8 @@ export function reconcileManagedAutomations(
         managedKey: null,
         currentDefaultCode: null,
         baseDefaultCode: null,
+        currentDefaultSchedule: null,
+        currentDefaultEnabled: null,
         isOverridden: false,
         enabled: false,
         updatedAt: now,

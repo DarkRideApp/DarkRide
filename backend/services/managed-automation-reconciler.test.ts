@@ -164,6 +164,51 @@ describe('reconcileManagedAutomations', () => {
       expect(row.timeoutMs).toBe(120_000);
       expect(row.currentDefaultCode).toBe('v2\n');
     });
+
+    it('keeps current_default_schedule and current_default_enabled in sync with the plugin without touching the operator-owned schedule/enabled', () => {
+      // These two columns are the "revert to default" targets the SDK IDE
+      // offers. They must refresh on every reconcile pass (including the
+      // preserve-override branch) so the revert button always restores to
+      // what the plugin currently ships — not what it shipped at the row's
+      // first insert. The operator-owned `schedule` and `enabled` columns
+      // are NEVER touched here.
+      const sched1 = JSON.stringify({ type: 'interval', intervalMs: 60_000 });
+      const sched2 = JSON.stringify({ type: 'cron', expressions: ['0 9 * * *'] });
+
+      // First load with interval schedule + enabled
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({
+        defaultSchedule: sched1,
+        enabledByDefault: true,
+      })]);
+      let row = getRow(db, 'plugin-x', 'poller');
+      expect(row.schedule).toBe(sched1);            // seed
+      expect(row.enabled).toBe(true);                // seed
+      expect(row.currentDefaultSchedule).toBe(sched1);
+      expect(row.currentDefaultEnabled).toBe(true);
+
+      // Operator overrides BOTH the schedule and the enabled flag.
+      db.update(automations).set({
+        schedule: JSON.stringify({ type: 'cron', expressions: ['0 0 * * 0'] }),
+        enabled: false,
+      }).where(eq(automations.id, row.id)).run();
+
+      // Plugin ships an updated default — schedule changes, enabled now false.
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({
+        defaultSchedule: sched2,
+        enabledByDefault: false,
+      })]);
+      row = getRow(db, 'plugin-x', 'poller');
+
+      // Operator overrides untouched — the scheduler keeps running THEIR
+      // schedule, not the plugin's new default.
+      expect(row.schedule).toBe(JSON.stringify({ type: 'cron', expressions: ['0 0 * * 0'] }));
+      expect(row.enabled).toBe(false);
+
+      // current_default_* tracks the plugin's latest declaration — the
+      // SDK Revert button targets these.
+      expect(row.currentDefaultSchedule).toBe(sched2);
+      expect(row.currentDefaultEnabled).toBe(false);
+    });
   });
 
   describe('case 4: managed row no longer declared (plugin dropped the script)', () => {
