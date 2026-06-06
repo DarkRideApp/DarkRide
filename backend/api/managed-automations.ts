@@ -23,8 +23,12 @@ interface ManagedAutomationView {
   description?: string;
   /** The script that actually runs. */
   code: string;
-  /** The default the plugin currently ships. */
-  currentDefaultCode: string;
+  /**
+   * The default the plugin currently ships. Null when the plugin no longer
+   * declares this script (rare; happens between an uninstall and the
+   * boot-time orphan sweep). Distinct from empty-string default.
+   */
+  currentDefaultCode: string | null;
   /** The default the operator's override was forked from (merge ancestor). */
   baseDefaultCode: string | null;
   isOverridden: boolean;
@@ -58,7 +62,7 @@ function buildView(row: NonNullable<ReturnType<typeof loadManaged>>): ManagedAut
     name: row.name,
     description: row.description ?? undefined,
     code: row.code,
-    currentDefaultCode: row.currentDefaultCode ?? '',
+    currentDefaultCode: row.currentDefaultCode,
     baseDefaultCode: row.baseDefaultCode,
     isOverridden: row.isOverridden,
     allowUserOverride: row.allowUserOverride,

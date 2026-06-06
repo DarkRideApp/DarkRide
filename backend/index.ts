@@ -1197,7 +1197,14 @@ httpServer.listen(PORT, HOST, () => {
   // automations, deleting clean rows). The scheduler's plugin-loaded
   // guard would also skip these at runtime, but we don't want them to
   // hang around indefinitely as zombie rows.
-  const knownPluginNames = new Set(pluginManager.getPluginNames());
+  //
+  // IMPORTANT: compare against INSTALLED plugins (pluginStateManager.getAll),
+  // not currently-LOADED plugins (pluginManager.getPluginNames). A
+  // temporarily-disabled plugin is still installed and its managed rows
+  // must survive the boot — otherwise toggling a plugin off & on would
+  // delete every non-overridden managed automation it owns. Only truly
+  // absent (uninstalled) plugins should be swept here.
+  const installedPluginNames = new Set(pluginStateManager.getAll().map((p) => p.name));
   const managedByValues = db.selectDistinct({ name: schema.automations.managedBy })
     .from(schema.automations)
     .where(isNotNull(schema.automations.managedBy))
@@ -1205,7 +1212,7 @@ httpServer.listen(PORT, HOST, () => {
     .map((r) => r.name)
     .filter((n): n is string => n != null);
   for (const pluginName of managedByValues) {
-    if (knownPluginNames.has(pluginName)) continue;
+    if (installedPluginNames.has(pluginName)) continue;
     try {
       reconcileManagedAutomations(db, pluginName, []);
     } catch (err: any) {

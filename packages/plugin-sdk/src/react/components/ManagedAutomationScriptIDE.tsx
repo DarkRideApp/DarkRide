@@ -27,7 +27,8 @@ interface ManagedAutomationView {
   name: string;
   description?: string;
   code: string;
-  currentDefaultCode: string;
+  /** May be null when the plugin no longer declares this script. */
+  currentDefaultCode: string | null;
   baseDefaultCode: string | null;
   isOverridden: boolean;
   allowUserOverride: boolean;
@@ -203,7 +204,14 @@ export function ManagedAutomationScriptIDE({
         }}>
           The plugin has shipped a new default for this script. Your override is still running.{' '}
           <button type="button" onClick={keepMine} disabled={busy}>Keep mine</button>{' '}
-          <button type="button" onClick={reset} disabled={busy}>Reset to default</button>
+          <button
+            type="button"
+            onClick={reset}
+            disabled={busy || view.currentDefaultCode == null}
+            title={view.currentDefaultCode == null ? 'No default available — plugin no longer declares this script' : undefined}
+          >
+            Reset to default
+          </button>
         </div>
       )}
 
@@ -219,7 +227,12 @@ export function ManagedAutomationScriptIDE({
             {view.isOverridden ? 'Save changes' : 'Save (creates override)'}
           </button>
           {view.isOverridden && (
-            <button type="button" onClick={reset} disabled={busy}>
+            <button
+              type="button"
+              onClick={reset}
+              disabled={busy || view.currentDefaultCode == null}
+              title={view.currentDefaultCode == null ? 'No default available — plugin no longer declares this script' : undefined}
+            >
               Reset to default
             </button>
           )}

@@ -76,6 +76,19 @@ describe('managed-automations REST endpoints', () => {
       expect(res.body.data.hasDrift).toBe(true);
     });
 
+    it('returns currentDefaultCode as null (NOT empty string) when row.currentDefaultCode is NULL', async () => {
+      // Regression for PR #16 fourth-pass review: the view used to coerce
+      // null → '' which conflated "no default available" with "default is
+      // the empty string", and was inconsistent with /diff (which can
+      // legitimately return incoming: null). The SDK Reset button keys
+      // off this nullability to disable itself when no default is
+      // available; coercing to '' would mis-enable the button.
+      seedManaged(db, { currentDefaultCode: null });
+      const res = await request(app).get('/v1/managed-automations/plugin-x/poller');
+      expect(res.body.data.currentDefaultCode).toBeNull();
+      expect(res.body.data.currentDefaultCode).not.toBe('');
+    });
+
     it('404 for unknown plugin/script', async () => {
       const res = await request(app).get('/v1/managed-automations/nope/nope');
       expect(res.status).toBe(404);
