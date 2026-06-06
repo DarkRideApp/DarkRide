@@ -53,6 +53,21 @@ describe('reconcileManagedAutomations', () => {
       expect(row.timeoutMs).toBe(60_000);
       expect(row.name).toBe('Poller');
     });
+
+    it('stamps a non-empty random passcode so managed rows can not be triggered with an empty-passcode URL', () => {
+      // Regression for PR #16 third-pass review: `passcode` is the
+      // credential for the unauthenticated /v1/automation/run/:id/:passcode
+      // external-trigger endpoint, not an IDE field. An empty passcode
+      // could allow accidental external triggering of managed rows under
+      // some URL-routing edge cases.
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({ key: 'a' })]);
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({ key: 'a-and-b' }), makeDef({ key: 'c' })]);
+      const allPasscodes = db.select().from(automations).all().map((r) => r.passcode);
+      // None should be the empty string.
+      expect(allPasscodes.some((p) => p === '')).toBe(false);
+      // And each should differ (random UUID per insert).
+      expect(new Set(allPasscodes).size).toBe(allPasscodes.length);
+    });
   });
 
   describe('case 2: row exists, not overridden → adopt silently', () => {

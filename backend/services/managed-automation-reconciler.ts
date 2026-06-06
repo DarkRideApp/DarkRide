@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { eq } from 'drizzle-orm';
 import { automations, automationSessions } from '../db/schema';
 import type { AppDatabase } from '../db';
@@ -92,7 +93,12 @@ export function reconcileManagedAutomations(
         // pick sane defaults so the row is a valid ordinary automation
         // too (handy for the orphan-on-uninstall path).
         code: declCode,
-        passcode: '',  // managed rows aren't IDE-edited via the legacy passcode flow
+        // `passcode` gates the unauthenticated /v1/automation/run/:id/:passcode
+        // external-trigger endpoint. Managed rows aren't expected to be
+        // externally triggered — plugins should drive their own runs through
+        // the schedule + manual paths — but we generate a random UUID anyway
+        // so an empty-passcode URL can't accidentally fire one of them.
+        passcode: randomUUID(),
         requiresDevice: def.requiresDevice ?? true,
         timeoutMs: def.timeoutMs ?? 300_000,
         enabled: def.enabledByDefault ?? true,

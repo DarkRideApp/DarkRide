@@ -868,6 +868,54 @@ describe('AutomationScheduler', () => {
       gatedScheduler.stop();
     });
 
+    it('rolls queuedAt forward during plugin outage so waitingSeconds does not include outage time', async () => {
+      // Regression for PR #16 third-pass review: the pause originally only
+      // rolled deadlineAt, leaving queuedAt at the original enqueue moment.
+      // getQueueStatus's `waitingSeconds` (and the later queue-timeout log)
+      // would then include the entire plugin-outage period in the
+      // operator-facing "waiting" figure — misleading, because the operator
+      // wasn't really waiting for a device, the plugin was just away.
+      vi.useFakeTimers({ now: 1_000_000 });
+      const now = new Date();
+      db.insert(schema.automations).values({
+        name: 'managed-poller',
+        code: 'noop',
+        passcode: 'p',
+        requiresDevice: false,
+        managedBy: 'plugin-x',
+        managedKey: 'poller',
+        createdAt: now,
+        updatedAt: now,
+      }).run();
+      const autoId = db.select().from(schema.automations).all().pop()!.id;
+
+      vi.spyOn(runner, 'runAutomation').mockResolvedValue({ sessionId: 1, success: true });
+      const loaded = new Set<string>();
+      const gatedScheduler = new AutomationScheduler(db, runner, undefined, {
+        maxQueueWaitMs: 60_000,
+        isPluginLoaded: (name) => loaded.has(name),
+      });
+
+      gatedScheduler.enqueue(autoId, 'schedule');
+
+      // Plugin out for "many minutes" — advance 10 minutes total in
+      // bumps with processQueue calls between (the prod-equivalent of
+      // the checkInterval firing).
+      for (let i = 0; i < 10; i++) {
+        await vi.advanceTimersByTimeAsync(60_000);
+        await (gatedScheduler as any).processQueue();
+      }
+
+      // waitingSeconds should reflect only the *most recent* tick, not the
+      // full outage. Within the last 60s, so under ~120.
+      const status = gatedScheduler.getQueueStatus();
+      expect(status.queue).toHaveLength(1);
+      expect(status.queue[0].waitingSeconds).toBeLessThan(120);
+
+      vi.useRealTimers();
+      gatedScheduler.stop();
+    });
+
     it('does NOT drop an entry whose deadline has not yet passed', async () => {
       vi.useFakeTimers({ now: 1_000_000 });
       const fastScheduler = new AutomationScheduler(db, runner, undefined, {

@@ -433,9 +433,15 @@ export class AutomationScheduler {
         // shouldn't show up as a wave of "Queue timeout" failures for
         // every queued managed automation — the operator didn't ask for
         // those runs to time out, the plugin just happens to be away.
-        // Roll the deadline forward by maxQueueWaitMs from now so the
-        // entry effectively starts fresh whenever the plugin's back.
+        // Roll BOTH the deadline AND `queuedAt` forward so the entry
+        // effectively starts fresh whenever the plugin's back. Rolling
+        // queuedAt too keeps `waitingSeconds` (in getQueueStatus) and the
+        // eventual queue-timeout log message reflecting only the real
+        // waiting period — i.e. time the entry has actually been
+        // resolvable-but-not-runnable, not plugin-outage time the
+        // operator can't act on.
         if (resolved.reason === REASON_MANAGED_PLUGIN_NOT_LOADED) {
+          entry.queuedAt = now;
           entry.deadlineAt = new Date(now.getTime() + this.maxQueueWaitMs);
           survivors.push(entry);
           continue;
