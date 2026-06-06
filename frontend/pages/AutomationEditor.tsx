@@ -9,7 +9,7 @@ import { DEVICE_FILTERABLE_FIELDS } from '../../shared/types/api';
 import { matchesDeviceFilter, getFilterWarnings, migrateDeviceFilter } from '../../shared/lib/device-filter';
 import type { ValidationResult, SessionStatusUpdate } from '../../shared/types/websocket';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
-import { ScheduleEditor, type ScheduleValue } from '../components/ScheduleEditor';
+import { ScheduleEditor, type ScheduleValue } from '@darkrideapp/plugin-sdk/react';
 import type { DeviceAPI } from '../../shared/types/automation';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';

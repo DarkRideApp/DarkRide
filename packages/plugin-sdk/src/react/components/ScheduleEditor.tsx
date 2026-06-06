@@ -14,7 +14,7 @@ export interface ScheduleValue {
   windowIntervalMinutes: number;
 }
 
-interface ScheduleEditorProps {
+export interface ScheduleEditorProps {
   value: string;
   defaultValue?: string;
   /** Called with cron string when user clicks Save (job-style). */

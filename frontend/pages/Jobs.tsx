@@ -4,7 +4,7 @@ import { PageHeader } from '@darkrideapp/plugin-sdk/react';
 import { SkeletonTable } from '@darkrideapp/plugin-sdk/react';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Play, Clock, AlertCircle, CheckCircle, RefreshCw, Settings } from 'lucide-react';
-import { ScheduleEditor } from '../components/ScheduleEditor';
+import { ScheduleEditor } from '@darkrideapp/plugin-sdk/react';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
 
