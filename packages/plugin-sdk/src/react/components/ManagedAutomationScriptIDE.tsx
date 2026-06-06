@@ -25,6 +25,7 @@ interface ManagedAutomationView {
   pluginKey: string;
   scriptKey: string;
   name: string;
+  description?: string;
   code: string;
   currentDefaultCode: string;
   baseDefaultCode: string | null;
@@ -185,6 +186,9 @@ export function ManagedAutomationScriptIDE({
           <span style={{ color: '#888', fontSize: 12 }}>
             {readOnly ? '(read-only — plugin owns this script)' : view.isOverridden ? '(overridden)' : '(plugin default)'}
           </span>
+          {view.description && (
+            <div style={{ color: '#666', fontSize: 12, marginTop: 2 }}>{view.description}</div>
+          )}
         </div>
         {view.hasDrift && (
           <button type="button" onClick={openDiff} disabled={busy}>

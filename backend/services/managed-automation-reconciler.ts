@@ -1,4 +1,4 @@
-import { eq, and } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { automations, automationSessions } from '../db/schema';
 import type { AppDatabase } from '../db';
 import type { ManagedAutomationDef } from '@darkrideapp/plugin-sdk';
@@ -48,6 +48,24 @@ export function reconcileManagedAutomations(
 ): void {
   const emitWarn = options.warn ?? defaultWarn;
 
+  // Validate uniqueness of keys before touching the DB. The partial unique
+  // index on (managed_by, managed_key) would catch this anyway, but the
+  // resulting SqliteError loses the structural meaning ("plugin authored a
+  // bad def list") in favour of a low-level constraint message. Fail fast
+  // with the plugin name + the duplicated keys so it's obvious what to fix.
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const d of defs) {
+    if (seen.has(d.key)) duplicates.add(d.key);
+    seen.add(d.key);
+  }
+  if (duplicates.size > 0) {
+    throw new Error(
+      `Plugin "${pluginName}" declared duplicate managed-automation keys: ` +
+      `${[...duplicates].join(', ')}. Each managed_key must be unique within a plugin.`,
+    );
+  }
+
   // Snapshot existing managed rows for this plugin so we can do the
   // "declared previously, not now" pass at the end. Drizzle's typed select
   // gives us back camelCase column names.
@@ -90,6 +108,7 @@ export function reconcileManagedAutomations(
         isOverridden: false,
         allowUserOverride: def.allowUserOverride ?? true,
         emitFailureNotification: def.emitFailureNotification ?? false,
+        description: def.description ?? null,
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -109,6 +128,7 @@ export function reconcileManagedAutomations(
           timeoutMs: def.timeoutMs ?? 300_000,
           allowUserOverride: def.allowUserOverride ?? true,
           emitFailureNotification: def.emitFailureNotification ?? false,
+          description: def.description ?? null,
           updatedAt: now,
         })
         .where(eq(automations.id, existing.id))

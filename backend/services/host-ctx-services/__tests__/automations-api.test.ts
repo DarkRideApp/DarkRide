@@ -29,6 +29,7 @@ function makeDb() {
       base_default_code TEXT,
       is_overridden INTEGER NOT NULL DEFAULT 0,
       allow_user_override INTEGER NOT NULL DEFAULT 1,
+      description TEXT,
       emit_failure_notification INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL

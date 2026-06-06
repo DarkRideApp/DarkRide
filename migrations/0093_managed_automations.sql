@@ -16,6 +16,11 @@ ALTER TABLE `automations` ADD `is_overridden` integer DEFAULT 0 NOT NULL;
 --> statement-breakpoint
 ALTER TABLE `automations` ADD `allow_user_override` integer DEFAULT 1 NOT NULL;
 --> statement-breakpoint
+-- One-line description the plugin ships for its IDE / list view. Nullable
+-- because ordinary (non-managed) automation rows don't have one; the
+-- reconciler writes plugin-authored values on insert + silent-adopt paths.
+ALTER TABLE `automations` ADD `description` text;
+--> statement-breakpoint
 -- Managed runs do NOT fire the standard automation:failure notification
 -- event by default — the operator didn't author the script and most
 -- plugins surface health in their own UI. Plugins opt in by setting

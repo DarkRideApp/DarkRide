@@ -287,6 +287,32 @@ describe('reconcileManagedAutomations', () => {
     });
   });
 
+  describe('case 10: duplicate keys in defs', () => {
+    // Regression for PR #16 review: the partial unique index on
+    // (managed_by, managed_key) would catch this anyway, but the resulting
+    // SqliteError loses the structural meaning. Fail fast with a plain
+    // error naming the plugin + duplicated keys so the author sees what
+    // to fix.
+    it('throws a clear error with the plugin name + duplicated keys', () => {
+      expect(() => reconcileManagedAutomations(db, 'plugin-x', [
+        makeDef({ key: 'poller' }),
+        makeDef({ key: 'poller' }),
+      ])).toThrow(/plugin-x.*poller.*unique/i);
+    });
+
+    it('does not partially apply when duplicates are present', () => {
+      try {
+        reconcileManagedAutomations(db, 'plugin-x', [
+          makeDef({ key: 'a' }),
+          makeDef({ key: 'a' }),
+        ]);
+      } catch { /* expected */ }
+      // No row should have been inserted — validation happens before any write.
+      const rows = db.select().from(automations).all();
+      expect(rows).toHaveLength(0);
+    });
+  });
+
   describe('case 8: plugin scoping', () => {
     it('does not touch rows owned by other plugins', () => {
       reconcileManagedAutomations(db, 'plugin-x', [makeDef({ key: 'a' })]);

@@ -1,4 +1,4 @@
-import { eq, and } from 'drizzle-orm';
+import { eq, and, isNotNull } from 'drizzle-orm';
 import { registerEndpoint } from './api-service';
 import { automations } from '../db/schema';
 import type { AppDatabase } from '../db/index';
@@ -19,6 +19,7 @@ interface ManagedAutomationView {
   pluginKey: string;
   scriptKey: string;
   name: string;
+  /** Plugin-authored one-liner; undefined when not set. */
   description?: string;
   /** The script that actually runs. */
   code: string;
@@ -55,6 +56,7 @@ function buildView(row: NonNullable<ReturnType<typeof loadManaged>>): ManagedAut
     pluginKey: row.managedBy!,
     scriptKey: row.managedKey!,
     name: row.name,
+    description: row.description ?? undefined,
     code: row.code,
     currentDefaultCode: row.currentDefaultCode ?? '',
     baseDefaultCode: row.baseDefaultCode,
@@ -108,9 +110,18 @@ export function registerManagedAutomationEndpoints(db: AppDatabase): void {
       res.status(409).json({ success: false, error: 'Override not permitted for this script' });
       return;
     }
+    // Snapshot the merge ancestor ONLY when the operator first forks (i.e.
+    // transitions from not-overridden to overridden). On subsequent saves we
+    // must leave base_default_code alone, otherwise drift detection silently
+    // breaks: an operator who edits twice after the plugin shipped a new
+    // default would inadvertently advance the ancestor and clear the drift
+    // banner without ever clicking "Keep mine".
+    const baseUpdate = row.isOverridden
+      ? {}
+      : { baseDefaultCode: row.currentDefaultCode };
     db.update(automations).set({
       code,
-      baseDefaultCode: row.currentDefaultCode,  // fork point
+      ...baseUpdate,
       isOverridden: true,
       updatedAt: new Date(),
     }).where(eq(automations.id, row.id)).run();
@@ -197,7 +208,13 @@ export function registerManagedAutomationEndpoints(db: AppDatabase): void {
    * operator can find the IDE without having to navigate per-plugin.
    */
   registerEndpoint('GET', '/v1/managed-automations', (req, res) => {
-    const rows = db.select().from(automations).all().filter((r) => r.managedBy != null);
+    // Filter in SQL so we don't drag every ordinary automation through node;
+    // also guards buildView's `row.managedKey!` non-null assertion against a
+    // half-stamped row where managedBy is set but managedKey somehow isn't
+    // (shouldn't happen with the reconciler invariants, but cheap insurance).
+    const rows = db.select().from(automations)
+      .where(and(isNotNull(automations.managedBy), isNotNull(automations.managedKey)))
+      .all();
     res.json({
       success: true,
       data: { items: rows.map(buildView) },

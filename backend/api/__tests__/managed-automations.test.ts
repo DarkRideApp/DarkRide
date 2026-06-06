@@ -95,6 +95,37 @@ describe('managed-automations REST endpoints', () => {
       expect(row.isOverridden).toBe(true);
     });
 
+    it('does NOT overwrite base_default_code on a SECOND save (drift detection stays intact)', async () => {
+      // Regression for PR #16 review: the original PUT handler stamped
+      // base_default_code = current_default_code on every save. So if the
+      // operator overrode → plugin shipped a new default → operator saved
+      // again (refining the edit), base would advance to the new current
+      // and the drift banner would silently turn off without an explicit
+      // "Keep mine" click. Fork-point snapshot must happen on the FIRST
+      // override transition only.
+      seedManaged(db);
+      // First save — creates the override; base captured as v1 (the current default at fork time)
+      await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/code')
+        .send({ code: 'operator-v1\n' });
+      let row = db.select().from(automations).all()[0];
+      expect(row.baseDefaultCode).toBe('v1\n');
+
+      // Plugin ships a new default (reconcile would do this).
+      db.update(automations).set({ currentDefaultCode: 'v2\n' })
+        .where(eq(automations.id, row.id)).run();
+
+      // Second save — operator refines their override. base MUST stay at v1.
+      await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/code')
+        .send({ code: 'operator-v1.1\n' });
+      row = db.select().from(automations).all()[0];
+      expect(row.code).toBe('operator-v1.1\n');
+      expect(row.baseDefaultCode).toBe('v1\n');  // unchanged → drift still detectable
+      expect(row.currentDefaultCode).toBe('v2\n');
+      expect(row.isOverridden).toBe(true);
+    });
+
     it('409 when allow_user_override = false', async () => {
       seedManaged(db, { allowUserOverride: false });
       const res = await request(app)

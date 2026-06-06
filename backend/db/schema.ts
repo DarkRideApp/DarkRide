@@ -63,6 +63,13 @@ export const automations = sqliteTable('automations', {
   /** Does the plugin permit forking? Drives the IDE component. */
   allowUserOverride: integer('allow_user_override', { mode: 'boolean' }).notNull().default(true),
   /**
+   * One-line description from the plugin's ManagedAutomationDef. Nullable
+   * because ordinary (non-managed) automations don't carry one. Refreshed
+   * on every plugin load through the reconciler's insert + silent-adopt +
+   * preserve-override paths.
+   */
+  description: text('description'),
+  /**
    * Opt-in: should a failed managed run fire the standard `automation:failure`
    * notification event? Default false — operator didn't author the script,
    * most plugins surface health in their own UI. Ordinary (non-managed) rows
