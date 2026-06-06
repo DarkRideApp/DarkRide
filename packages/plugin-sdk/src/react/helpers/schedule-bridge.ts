@@ -19,6 +19,20 @@ type WindowedIntervalSchedule = {
 type ScheduleConfig = CronSchedule | IntervalSchedule | WindowedIntervalSchedule;
 
 /**
+ * True when the config is a cron schedule with more than one expression.
+ * The bundled ScheduleEditor only round-trips a single expression; saving
+ * such a schedule through the editor would silently drop the extras. The
+ * IDE uses this to render a read-only banner instead of the editor in
+ * that case so the operator has to Revert + recreate instead of losing
+ * data.
+ */
+export function isMultiExpressionCronConfig(
+  config: ScheduleConfig | null | undefined,
+): boolean {
+  return !!config && config.type === 'cron' && config.expressions.length > 1;
+}
+
+/**
  * Convert a stored `ScheduleConfig` (the JSON the host writes into
  * `automations.schedule`) into the working form ScheduleEditor takes —
  * a cron string + a default `ScheduleValue.mode` hint so the editor opens
@@ -26,6 +40,11 @@ type ScheduleConfig = CronSchedule | IntervalSchedule | WindowedIntervalSchedule
  *
  * Returns `null` when the config is null / unparseable / not a recognised
  * shape — the SDK IDE treats that as "no schedule, edit to add one".
+ *
+ * Multi-expression cron schedules are surfaced via `expressions[0]` for
+ * display only; callers MUST use `isMultiExpressionCronConfig` to gate
+ * editing, otherwise serialising back via `editorValueToScheduleConfig`
+ * will silently drop the extra expressions.
  *
  * Mirrors the bridge inside the host's AutomationEditor.tsx so plugins
  * don't have to reinvent it.

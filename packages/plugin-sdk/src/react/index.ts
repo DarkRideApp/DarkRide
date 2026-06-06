@@ -59,6 +59,7 @@ export {
   scheduleConfigToEditor,
   editorValueToScheduleConfig,
   schedulesEqual,
+  isMultiExpressionCronConfig,
 } from './helpers/schedule-bridge';
 export { NavItemList, DefaultNavItemListItem } from './components/NavItemList';
 export type { NavItemListProps, NavItemListItemProps } from './components/NavItemList';

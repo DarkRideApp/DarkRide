@@ -16,7 +16,17 @@
 
 export interface CronSchedule {
   type: 'cron';
-  /** One or more cron expressions; fires on any match. */
+  /**
+   * One or more cron expressions; fires on any match.
+   *
+   * NOTE on the IDE: the bundled `ScheduleEditor` (and the host's
+   * AutomationEditor) only display + round-trip a single expression.
+   * Plugins are free to ship a multi-expression `defaultSchedule`, but
+   * the operator-facing IDE treats it as read-only and refuses to save
+   * over it — the operator has to clear via Revert and re-create. If
+   * you need an operator-editable multi-expression schedule, model it
+   * as multiple managed automations instead.
+   */
   expressions: string[];
 }
 

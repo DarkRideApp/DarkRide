@@ -5,6 +5,7 @@ import {
   scheduleConfigToEditor,
   editorValueToScheduleConfig,
   schedulesEqual,
+  isMultiExpressionCronConfig,
 } from '../helpers/schedule-bridge';
 
 /**
@@ -318,6 +319,12 @@ export function ManagedAutomationScriptIDE({
   const scheduleDiffersFromDefault = !schedulesEqual(scheduleConfigCurrent, scheduleConfigDefault);
   const enabledDiffersFromDefault =
     view.currentDefaultEnabled !== null && view.enabled !== view.currentDefaultEnabled;
+  // Multi-expression cron schedules are not round-trippable through the
+  // bundled ScheduleEditor — it surfaces expressions[0] only. Render a
+  // read-only banner instead of the editor so the operator has to clear
+  // via Revert (or PUT schedule=null) to edit, rather than silently
+  // dropping the extra expressions on Save.
+  const isMultiExpressionCron = isMultiExpressionCronConfig(scheduleConfigCurrent);
 
   return (
     <div className={className} data-testid="managed-automation-ide">
@@ -412,7 +419,7 @@ export function ManagedAutomationScriptIDE({
               {view.schedule ? 'Operator-set' : 'No schedule — automation only runs manually'}
             </span>
             <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
-              {(view.schedule || scheduleEditorOpen) && (
+              {(view.schedule || scheduleEditorOpen) && !isMultiExpressionCron && (
                 <button
                   type="button"
                   className="btn btn-sm btn-primary"
@@ -442,7 +449,21 @@ export function ManagedAutomationScriptIDE({
             </div>
           </div>
 
-          {view.schedule || scheduleEditorOpen ? (
+          {isMultiExpressionCron ? (
+            <div
+              role="note"
+              data-testid="managed-automation-multi-cron-banner"
+              style={{
+                padding: 8, border: '1px dashed #c70', background: '#fff8e8',
+                borderRadius: 4, fontSize: 12, color: '#664',
+              }}
+            >
+              This automation runs on multiple cron expressions, which the
+              inline editor doesn't yet support. The schedule is read-only
+              here — to change it, hit <strong>Revert to default</strong>
+              {scheduleConfigDefault ? '' : ' (clears it)'} and set a new one.
+            </div>
+          ) : view.schedule || scheduleEditorOpen ? (
             <ScheduleEditor
               inline
               value={scheduleParsed?.cronString ?? scheduleDefaultParsed?.cronString ?? '*/5 * * * *'}
