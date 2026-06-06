@@ -68,21 +68,30 @@ export function ManagedAutomationScriptIDE({
   const [view, setView] = useState<ManagedAutomationView | null>(null);
   const [draft, setDraft] = useState<string>('');
   const [diff, setDiff] = useState<ThreeWayDiff | null>(null);
-  const [busy, setBusy] = useState(false);
+  // Start busy=true so the pre-WebSocket-connect state renders "Loading…"
+  // instead of flashing "Not found." between mount and the first refresh.
+  const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const basePath = `/v1/managed-automations/${encodeURIComponent(pluginKey)}/${encodeURIComponent(scriptKey)}`;
 
   /**
    * Wrap ws.sendRestApi into a tiny helper that surfaces server-side errors
-   * as thrown `Error`s. The WebSocket REST envelope is `{ ok, body }` where
-   * the actual API payload sits at `body.success` / `body.data` / `body.error`.
+   * as thrown `Error`s. The WebSocket envelope is
+   * `{ type, id, status, body }`; the JSON API payload sits inside `body`
+   * as `{ success, data, error }`. We treat anything other than an
+   * explicit `success: true` 2xx as a failure so an unexpected envelope
+   * shape produces a useful error instead of silently resolving to undefined.
    */
   const api = useCallback(async <T,>(method: string, path: string, body?: unknown): Promise<T> => {
     const res = await ws.sendRestApi(method, path, body);
+    if (typeof res.status === 'number' && (res.status < 200 || res.status >= 300)) {
+      const payload = res.body as { error?: string } | undefined;
+      throw new Error(payload?.error ?? `${method} ${path} failed (${res.status})`);
+    }
     const payload = res.body as { success?: boolean; data?: T; error?: string } | undefined;
-    if (!payload || payload.success === false) {
-      throw new Error(payload?.error ?? `${method} ${path} failed`);
+    if (!payload || payload.success !== true) {
+      throw new Error(payload?.error ?? `${method} ${path} returned unexpected payload`);
     }
     return payload.data as T;
   }, [ws]);
