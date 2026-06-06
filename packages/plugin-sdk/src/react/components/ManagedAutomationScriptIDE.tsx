@@ -213,7 +213,7 @@ export function ManagedAutomationScriptIDE({
       )}
 
       {error && (
-        <div role="alert" className="error" style={{ marginBottom: 8 }}>Error: {error}</div>
+        <div role="alert" style={{ color: '#a00', marginBottom: 8 }}>Error: {error}</div>
       )}
 
       {editorEl}
@@ -289,15 +289,24 @@ function MonacoEditor({
 }): React.JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<any>(null);
-  // Hold a ref on the latest onChange so the Monaco subscription doesn't have
-  // to re-bind whenever the parent re-renders with a fresh callback identity.
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [monacoReady, setMonacoReady] = useState(false);
+  // Hold latest props in refs so the async-mounting Monaco can read the
+  // freshest values when it finally instantiates. Without this, if the
+  // parent updates `value` (e.g. a Reset/Save resolved) DURING the
+  // dynamic `import('monaco-editor')`, Monaco would create with the
+  // stale captured value and the [value]-sync effect below would bail
+  // out because editorRef hadn't been set yet — leaving the editor
+  // permanently desynced.
+  const valueRef = useRef(value);
+  const readOnlyRef = useRef(readOnly);
   const onChangeRef = useRef(onChange);
+  useEffect(() => { valueRef.current = value; }, [value]);
+  useEffect(() => { readOnlyRef.current = readOnly; }, [readOnly]);
   useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
 
-  // One-shot mount/unmount effect. We deliberately don't depend on `value`
-  // here — Monaco owns the buffer once mounted; pushing every `value` change
-  // into setValue() would fight the editor's cursor + undo stack. The
-  // separate effect below syncs external resets (e.g. Reset to default).
+  // One-shot mount/unmount. Read from the refs at the moment Monaco
+  // is actually ready, not from the closure-captured initial values.
   useEffect(() => {
     let disposed = false;
     let editor: any = null;
@@ -310,10 +319,10 @@ function MonacoEditor({
 
         const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
         editor = monaco.editor.create(containerRef.current, {
-          value,
+          value: valueRef.current,        // freshest props, not the mount-time closure
           language: 'typescript',
           theme: isDark ? 'vs-dark' : 'vs-light',
-          readOnly,
+          readOnly: readOnlyRef.current,
           minimap: { enabled: false },
           fontSize: 14,
           automaticLayout: true,
@@ -323,12 +332,15 @@ function MonacoEditor({
         changeSub = editor.onDidChangeModelContent(() => {
           onChangeRef.current(editor.getValue());
         });
+        setMonacoReady(true);
       } catch (e) {
-        // If Monaco fails to load (rare in production — only happens if the
-        // host doesn't ship it), the loading message stays and the operator
-        // sees a clear "Monaco failed to load" message via console.
+        // If Monaco fails to load (the host doesn't ship it — rare in
+        // production) replace the loading skeleton with a textarea
+        // fallback so the operator can still edit. The actual error
+        // surfaces via console for the plugin author.
         // eslint-disable-next-line no-console
         console.error('[ManagedAutomationScriptIDE] Monaco failed to load:', e);
+        if (!disposed) setLoadFailed(true);
       }
     })();
 
@@ -339,7 +351,8 @@ function MonacoEditor({
       editorRef.current = null;
     };
     // We want to mount once per (container) lifecycle; rebinding on `value`
-    // would dispose-and-recreate the editor on every keystroke.
+    // would dispose-and-recreate the editor on every keystroke. Props that
+    // change during mount are picked up via the refs above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -358,15 +371,50 @@ function MonacoEditor({
     editorRef.current?.updateOptions?.({ readOnly });
   }, [readOnly]);
 
+  // Fallback: <textarea> if Monaco failed to load (e.g. host doesn't ship it).
+  if (loadFailed) {
+    return (
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        readOnly={readOnly}
+        spellCheck={false}
+        rows={20}
+        style={{
+          width: '100%',
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+          fontSize: 13,
+          padding: 8,
+          boxSizing: 'border-box',
+          border: '1px solid #ccc',
+          borderRadius: 4,
+        }}
+      />
+    );
+  }
+
   return (
     <div
-      ref={containerRef}
-      data-testid="managed-automation-monaco"
       style={{
+        position: 'relative',
         height: 400,
         border: '1px solid var(--border-color, #ccc)',
         borderRadius: 4,
       }}
-    />
+    >
+      <div ref={containerRef} data-testid="managed-automation-monaco" style={{ width: '100%', height: '100%' }} />
+      {!monacoReady && (
+        <div
+          aria-live="polite"
+          style={{
+            position: 'absolute', inset: 0, display: 'flex',
+            alignItems: 'center', justifyContent: 'center',
+            color: '#888', fontSize: 13, pointerEvents: 'none',
+          }}
+        >
+          Loading editor…
+        </div>
+      )}
+    </div>
   );
 }
