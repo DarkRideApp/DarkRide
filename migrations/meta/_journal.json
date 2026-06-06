@@ -533,6 +533,13 @@
 			"when": 1779785033963,
 			"tag": "0092_disk_usage_snapshots",
 			"breakpoints": true
+		},
+		{
+			"idx": 93,
+			"version": "7",
+			"when": 1779785033964,
+			"tag": "0093_managed_automations",
+			"breakpoints": true
 		}
 	]
 }
