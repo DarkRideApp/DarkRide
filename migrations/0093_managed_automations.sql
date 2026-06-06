@@ -16,6 +16,12 @@ ALTER TABLE `automations` ADD `is_overridden` integer DEFAULT 0 NOT NULL;
 --> statement-breakpoint
 ALTER TABLE `automations` ADD `allow_user_override` integer DEFAULT 1 NOT NULL;
 --> statement-breakpoint
+-- Managed runs do NOT fire the standard automation:failure notification
+-- event by default — the operator didn't author the script and most
+-- plugins surface health in their own UI. Plugins opt in by setting
+-- emitFailureNotification: true on the declared entry.
+ALTER TABLE `automations` ADD `emit_failure_notification` integer DEFAULT 0 NOT NULL;
+--> statement-breakpoint
 -- Unique per (plugin, script-key). NULL/NULL pairs are distinct in SQLite, so
 -- this only constrains managed rows; ordinary automations stay unaffected.
 CREATE UNIQUE INDEX `automations_managed_by_managed_key_unique`

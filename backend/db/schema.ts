@@ -62,6 +62,14 @@ export const automations = sqliteTable('automations', {
   isOverridden: integer('is_overridden', { mode: 'boolean' }).notNull().default(false),
   /** Does the plugin permit forking? Drives the IDE component. */
   allowUserOverride: integer('allow_user_override', { mode: 'boolean' }).notNull().default(true),
+  /**
+   * Opt-in: should a failed managed run fire the standard `automation:failure`
+   * notification event? Default false — operator didn't author the script,
+   * most plugins surface health in their own UI. Ordinary (non-managed) rows
+   * still fire failure notifications unconditionally (this column is
+   * ignored when managed_by IS NULL).
+   */
+  emitFailureNotification: integer('emit_failure_notification', { mode: 'boolean' }).notNull().default(false),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });

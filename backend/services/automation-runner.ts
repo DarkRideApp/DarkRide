@@ -954,23 +954,40 @@ export class AutomationRunner implements IAutomationRunner {
     };
     broadcastToAll(message);
 
-    // Emit notifications for terminal states
+    // Emit notifications for terminal states. Managed automations are
+    // suppressed by default — the operator didn't author the script and
+    // most plugins surface health in their own UI by reading sessions.
+    // Plugins that want the standard pipeline opt in by setting
+    // emitFailureNotification=true on the declared entry, which the
+    // reconciler writes into the automations row.
     if (this.notificationService && (status === 'success' || status === 'failed')) {
-      const automationName = automationId
-        ? this.db.select({ name: automations.name }).from(automations)
-            .where(eq(automations.id, automationId)).all()[0]?.name || `#${automationId}`
-        : `Session #${sessionId}`;
+      const row = automationId
+        ? this.db
+            .select({
+              name: automations.name,
+              managedBy: automations.managedBy,
+              emitFailureNotification: automations.emitFailureNotification,
+            })
+            .from(automations)
+            .where(eq(automations.id, automationId))
+            .all()[0]
+        : undefined;
+      const automationName = row?.name ?? (automationId ? `#${automationId}` : `Session #${sessionId}`);
 
-      this.notificationService.emit({
-        type: status === 'success' ? 'automation:success' : 'automation:failure',
-        title: status === 'success'
-          ? `Automation "${automationName}" completed`
-          : `Automation "${automationName}" failed`,
-        body: status === 'failed' && errorMsg ? errorMsg : '',
-        sourceType: 'automation',
-        sourceId: String(sessionId),
-        url: `/ui/automations/session/${sessionId}`,
-      });
+      // Suppress for managed rows that didn't opt in.
+      const isManagedSuppressed = row?.managedBy != null && row.emitFailureNotification === false;
+      if (!isManagedSuppressed) {
+        this.notificationService.emit({
+          type: status === 'success' ? 'automation:success' : 'automation:failure',
+          title: status === 'success'
+            ? `Automation "${automationName}" completed`
+            : `Automation "${automationName}" failed`,
+          body: status === 'failed' && errorMsg ? errorMsg : '',
+          sourceType: 'automation',
+          sourceId: String(sessionId),
+          url: `/ui/automations/session/${sessionId}`,
+        });
+      }
     }
   }
 }

@@ -159,6 +159,52 @@ describe('AutomationRunner', () => {
       expect(session.managed).toBe(false);
     });
 
+    it('suppresses automation:failure notification for a managed run that did not opt in', async () => {
+      const emit = vi.fn();
+      runner.setNotificationService({ emit } as any);
+      const auto = createAutomation(
+        `export default async function(d: any) { throw new Error("boom"); }`,
+        { managedBy: 'plugin-x', managedKey: 'poller' },
+      );
+      await runner.runAutomation(auto.id, 'test-device', 'manual');
+      const failureEmits = emit.mock.calls.filter(
+        ([ev]) => ev?.type === 'automation:failure',
+      );
+      expect(failureEmits).toHaveLength(0);
+    });
+
+    it('still fires automation:failure for a managed run that DID opt in', async () => {
+      const emit = vi.fn();
+      runner.setNotificationService({ emit } as any);
+      const auto = createAutomation(
+        `export default async function(d: any) { throw new Error("boom"); }`,
+        { managedBy: 'plugin-x', managedKey: 'poller' },
+      );
+      // Flip the opt-in column directly (mirrors what reconcile would do
+      // when the def's emitFailureNotification is true).
+      db.update(schema.automations).set({ emitFailureNotification: true })
+        .where(eq(schema.automations.id, auto.id)).run();
+
+      await runner.runAutomation(auto.id, 'test-device', 'manual');
+      const failureEmits = emit.mock.calls.filter(
+        ([ev]) => ev?.type === 'automation:failure',
+      );
+      expect(failureEmits).toHaveLength(1);
+    });
+
+    it('always fires automation:failure for ORDINARY (non-managed) runs (regression)', async () => {
+      const emit = vi.fn();
+      runner.setNotificationService({ emit } as any);
+      const auto = createAutomation(
+        `export default async function(d: any) { throw new Error("boom"); }`,
+      );
+      await runner.runAutomation(auto.id, 'test-device', 'manual');
+      const failureEmits = emit.mock.calls.filter(
+        ([ev]) => ev?.type === 'automation:failure',
+      );
+      expect(failureEmits).toHaveLength(1);
+    });
+
     it('handles timeout', async () => {
       const auto = createAutomation(
         `export default async function(device: any) {

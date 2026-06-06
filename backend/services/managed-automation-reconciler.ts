@@ -89,6 +89,7 @@ export function reconcileManagedAutomations(
         baseDefaultCode: null,
         isOverridden: false,
         allowUserOverride: def.allowUserOverride ?? true,
+        emitFailureNotification: def.emitFailureNotification ?? false,
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -107,6 +108,7 @@ export function reconcileManagedAutomations(
           requiresDevice: def.requiresDevice ?? true,
           timeoutMs: def.timeoutMs ?? 300_000,
           allowUserOverride: def.allowUserOverride ?? true,
+          emitFailureNotification: def.emitFailureNotification ?? false,
           updatedAt: now,
         })
         .where(eq(automations.id, existing.id))
