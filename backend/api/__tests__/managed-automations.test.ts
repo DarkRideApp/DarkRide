@@ -372,6 +372,30 @@ describe('managed-automations REST endpoints', () => {
       expect(res.status).toBe(200);
       expect(sched.removeCalls).toEqual([row.id]);
     });
+
+    it('refuses to revert and 500s when the stored default is malformed JSON', async () => {
+      // Reconciler sanitises new writes, but a row from an older host
+      // build could hold an invalid value. Belt-and-braces: refuse to
+      // round-trip it into automations.schedule (which would silently
+      // break scheduling).
+      const opSched = JSON.stringify({ type: 'cron', expressions: ['*/5 * * * *'] });
+      seedManaged(db, { schedule: opSched, currentDefaultSchedule: 'not-json{' });
+      const res = await request(app).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(500);
+      // Operator's schedule must NOT have been overwritten.
+      expect(db.select().from(automations).all()[0].schedule).toBe(opSched);
+    });
+
+    it('refuses to revert and 500s when stored default has bad ScheduleConfig shape', async () => {
+      const opSched = JSON.stringify({ type: 'cron', expressions: ['*/5 * * * *'] });
+      seedManaged(db, {
+        schedule: opSched,
+        currentDefaultSchedule: JSON.stringify({ type: 'cron', expressions: [] }),
+      });
+      const res = await request(app).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(500);
+      expect(db.select().from(automations).all()[0].schedule).toBe(opSched);
+    });
   });
 
   describe('POST .../revert/enabled', () => {

@@ -487,6 +487,55 @@ describe('reconcileManagedAutomations', () => {
     });
   });
 
+  describe('case 12: malformed defaultSchedule sanitised at the boundary', () => {
+    // Regression for PR #19 review: a buggy plugin could ship a non-JSON
+    // or shape-invalid defaultSchedule. Without sanitisation, the
+    // reconciler would persist it and the scheduler would silently skip
+    // the automation. Worse, revert-to-default would write that broken
+    // value back into automations.schedule. Validate at the boundary.
+
+    it('treats non-JSON defaultSchedule as null and logs a warning', () => {
+      const warnings: string[] = [];
+      reconcileManagedAutomations(
+        db,
+        'plugin-x',
+        [makeDef({ defaultSchedule: 'not-json{' })],
+        { warn: (m) => warnings.push(m) },
+      );
+      const row = getRow(db, 'plugin-x', 'poller');
+      expect(row.schedule).toBeNull();
+      expect(row.currentDefaultSchedule).toBeNull();
+      expect(warnings.some(w => /not valid JSON/.test(w))).toBe(true);
+    });
+
+    it('treats shape-invalid defaultSchedule as null and logs a warning', () => {
+      const warnings: string[] = [];
+      // Valid JSON, invalid ScheduleConfig (cron type but no expressions)
+      reconcileManagedAutomations(
+        db,
+        'plugin-x',
+        [makeDef({ defaultSchedule: JSON.stringify({ type: 'cron', expressions: [] }) })],
+        { warn: (m) => warnings.push(m) },
+      );
+      const row = getRow(db, 'plugin-x', 'poller');
+      expect(row.schedule).toBeNull();
+      expect(row.currentDefaultSchedule).toBeNull();
+      expect(warnings.some(w => /invalid/.test(w))).toBe(true);
+    });
+
+    it('still inserts the row + lets the rest of the plugin load', () => {
+      // A buggy schedule shouldn't poison the whole plugin's reconcile —
+      // the row should still exist (just with no schedule), and a sibling
+      // def should land normally.
+      reconcileManagedAutomations(db, 'plugin-x', [
+        makeDef({ key: 'bad', defaultSchedule: 'not-json' }),
+        makeDef({ key: 'good' }),
+      ], { warn: () => {} });
+      expect(getRow(db, 'plugin-x', 'bad')).toBeDefined();
+      expect(getRow(db, 'plugin-x', 'good')).toBeDefined();
+    });
+  });
+
   describe('case 8: plugin scoping', () => {
     it('does not touch rows owned by other plugins', () => {
       reconcileManagedAutomations(db, 'plugin-x', [makeDef({ key: 'a' })]);

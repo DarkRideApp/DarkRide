@@ -243,6 +243,15 @@ export function ManagedAutomationScriptIDE({
       const v = await api<ManagedAutomationView>('PUT', `${basePath}/schedule`, { schedule: next });
       setView(v);
       setScheduleDirty(false);
+      // If the user just saved a cleared schedule, close the editor so
+      // the next render shows the "Set schedule…" affordance again.
+      // Leaving it open would re-mount ScheduleEditor in the next paint
+      // and its initial onChange would re-mark dirty against the now-null
+      // saved value — mirror what revertSchedule does.
+      if (!v.schedule) {
+        setScheduleEditorOpen(false);
+        scheduleDraftRef.current = null;
+      }
     } catch (e: any) {
       setError(e?.message ?? String(e));
     } finally {

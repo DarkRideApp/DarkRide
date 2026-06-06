@@ -320,26 +320,38 @@ export function registerManagedAutomationEndpoints(
       res.status(404).json({ success: false, error: 'Managed automation not found' });
       return;
     }
+    // Defense in depth: the reconciler sanitises defaultSchedule before
+    // writing it, but a row from an older host build might still hold an
+    // unsanitised value. Parse + validate before writing so we never let
+    // a bad schedule round-trip into automations.schedule (which would
+    // make the scheduler silently skip the row).
+    let parsedDefault: ScheduleConfig | null = null;
+    if (row.currentDefaultSchedule) {
+      try {
+        parsedDefault = JSON.parse(row.currentDefaultSchedule) as ScheduleConfig;
+      } catch {
+        res.status(500).json({
+          success: false,
+          error: 'Stored plugin default schedule is not valid JSON — cannot revert',
+        });
+        return;
+      }
+      const validation = validateScheduleConfig(parsedDefault);
+      if (!validation.valid) {
+        res.status(500).json({
+          success: false,
+          error: `Stored plugin default schedule is invalid (${validation.error}) — cannot revert`,
+        });
+        return;
+      }
+    }
     db.update(automations).set({
       schedule: row.currentDefaultSchedule,
       updatedAt: new Date(),
     }).where(eq(automations.id, row.id)).run();
     if (scheduler) {
-      if (row.currentDefaultSchedule) {
-        try {
-          const parsed = JSON.parse(row.currentDefaultSchedule) as ScheduleConfig;
-          scheduler.setSchedule(row.id, parsed);
-        } catch {
-          // current_default_schedule is plugin-authored and validated by
-          // the reconciler before being stored, so a parse failure here
-          // means an old row from a buggy plugin version. Fall through to
-          // removeSchedule so the scheduler doesn't keep firing the old
-          // operator schedule.
-          scheduler.removeSchedule(row.id);
-        }
-      } else {
-        scheduler.removeSchedule(row.id);
-      }
+      if (parsedDefault) scheduler.setSchedule(row.id, parsedDefault);
+      else scheduler.removeSchedule(row.id);
     }
     res.json({ success: true, data: buildView(loadManaged(db, pluginKey, scriptKey)!) });
   }, { requires: ['core.automations:edit'] });

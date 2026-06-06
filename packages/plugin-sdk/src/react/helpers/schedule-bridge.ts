@@ -120,5 +120,11 @@ export function schedulesEqual(
         && a.windowStart === bw.windowStart
         && a.windowEnd === bw.windowEnd;
     }
+    default:
+      // TypeScript treats the switch as exhaustive on the union, but at
+      // runtime a malformed JSON from the DB (or a future ScheduleConfig
+      // variant we don't yet recognise) could land here. Return false so
+      // dirty/revert logic stays a strict boolean instead of undefined.
+      return false;
   }
 }
