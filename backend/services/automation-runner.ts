@@ -144,7 +144,12 @@ export class AutomationRunner implements IAutomationRunner {
     // execution handles its own cleanup; this wrapper only handles the pre-inner path.
     try {
 
-    // 2. Create automation session
+    // 2. Create automation session. `managed` is denormalised at insert
+    // from automation.managedBy IS NOT NULL so the session-history default
+    // filter (hide-managed) is a plain column scan with no join. If the
+    // automation row later gets orphaned from its plugin, the reconciler /
+    // uninstall path back-fills these rows to managed=0 so the now
+    // operator-owned automation's history becomes visible again.
     const insertResult = this.db
       .insert(automationSessions)
       .values({
@@ -154,6 +159,7 @@ export class AutomationRunner implements IAutomationRunner {
         status: 'running',
         triggerType,
         startedAt: new Date(),
+        managed: automation.managedBy != null,
       })
       .run();
 
@@ -879,7 +885,7 @@ export class AutomationRunner implements IAutomationRunner {
     errorMsg: string,
   ): void {
     const automation = this.db
-      .select({ name: automations.name })
+      .select({ name: automations.name, managedBy: automations.managedBy })
       .from(automations)
       .where(eq(automations.id, automationId))
       .all()[0];
@@ -906,6 +912,10 @@ export class AutomationRunner implements IAutomationRunner {
         // for both successful execution traces and failure reasons (see
         // updateSession()), so do the same here.
         logs: errorMsg,
+        // Denormalised from the live row; if the row is gone (FK fall-back
+        // above) treat it as not-managed so the timeout shows up in the
+        // operator's default history view alongside their other failures.
+        managed: automation?.managedBy != null,
       })
       .run();
     const sessionId = Number(insertResult.lastInsertRowid);
@@ -944,23 +954,40 @@ export class AutomationRunner implements IAutomationRunner {
     };
     broadcastToAll(message);
 
-    // Emit notifications for terminal states
+    // Emit notifications for terminal states. Managed automations are
+    // suppressed by default — the operator didn't author the script and
+    // most plugins surface health in their own UI by reading sessions.
+    // Plugins that want the standard pipeline opt in by setting
+    // emitFailureNotification=true on the declared entry, which the
+    // reconciler writes into the automations row.
     if (this.notificationService && (status === 'success' || status === 'failed')) {
-      const automationName = automationId
-        ? this.db.select({ name: automations.name }).from(automations)
-            .where(eq(automations.id, automationId)).all()[0]?.name || `#${automationId}`
-        : `Session #${sessionId}`;
+      const row = automationId
+        ? this.db
+            .select({
+              name: automations.name,
+              managedBy: automations.managedBy,
+              emitFailureNotification: automations.emitFailureNotification,
+            })
+            .from(automations)
+            .where(eq(automations.id, automationId))
+            .all()[0]
+        : undefined;
+      const automationName = row?.name ?? (automationId ? `#${automationId}` : `Session #${sessionId}`);
 
-      this.notificationService.emit({
-        type: status === 'success' ? 'automation:success' : 'automation:failure',
-        title: status === 'success'
-          ? `Automation "${automationName}" completed`
-          : `Automation "${automationName}" failed`,
-        body: status === 'failed' && errorMsg ? errorMsg : '',
-        sourceType: 'automation',
-        sourceId: String(sessionId),
-        url: `/ui/automations/session/${sessionId}`,
-      });
+      // Suppress for managed rows that didn't opt in.
+      const isManagedSuppressed = row?.managedBy != null && row.emitFailureNotification === false;
+      if (!isManagedSuppressed) {
+        this.notificationService.emit({
+          type: status === 'success' ? 'automation:success' : 'automation:failure',
+          title: status === 'success'
+            ? `Automation "${automationName}" completed`
+            : `Automation "${automationName}" failed`,
+          body: status === 'failed' && errorMsg ? errorMsg : '',
+          sourceType: 'automation',
+          sourceId: String(sessionId),
+          url: `/ui/automations/session/${sessionId}`,
+        });
+      }
     }
   }
 }

@@ -27,7 +27,9 @@ function makeDb() {
       logs TEXT,
       is_pinned INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER NOT NULL,
-      completed_at INTEGER NOT NULL
+      completed_at INTEGER NOT NULL,
+      -- Managed-automations denormalisation (migration 0093) — keep in sync with schema.ts
+      managed INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE screenshots (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

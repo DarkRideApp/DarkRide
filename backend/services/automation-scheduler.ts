@@ -33,7 +33,29 @@ export interface AutomationSchedulerOptions {
    * log fires after a separate, hard-coded 5-minute window.
    */
   maxQueueWaitMs?: number;
+  /**
+   * Predicate the scheduler calls to check whether the plugin owning a
+   * managed automation row is currently loaded. When false:
+   *   - the entry is treated as not-runnable this tick (skip-and-try-next
+   *     finds the next runnable entry instead), AND
+   *   - the entry's deadline clock is paused (deadlineAt rolls forward by
+   *     `maxQueueWaitMs` so a long plugin restart doesn't generate spurious
+   *     queue-timeout failures).
+   *
+   * Wired to PluginManager.isPluginLoaded in production. When undefined,
+   * the scheduler treats every plugin as loaded (legacy behaviour).
+   */
+  isPluginLoaded?: (pluginName: string) => boolean;
 }
+
+/**
+ * Internal sentinel for "blocked because owning plugin isn't loaded".
+ * processQueue() pauses the deadline clock for entries with this reason,
+ * so a plugin restart doesn't generate spurious queue-timeout failures.
+ * Exported only for tests that want to assert on the operator-facing
+ * reason string from getQueueStatus().
+ */
+export const REASON_MANAGED_PLUGIN_NOT_LOADED = 'managed plugin not loaded';
 
 export class AutomationScheduler {
   private schedules = new Map<number, ScheduleConfig>();
@@ -43,6 +65,7 @@ export class AutomationScheduler {
   private queueAlertTimer: ReturnType<typeof setTimeout> | null = null;
   private processingQueue = false;
   private maxQueueWaitMs: number;
+  private isPluginLoaded?: (pluginName: string) => boolean;
 
   constructor(
     private db: AppDatabase,
@@ -51,6 +74,17 @@ export class AutomationScheduler {
     options: AutomationSchedulerOptions = {},
   ) {
     this.maxQueueWaitMs = options.maxQueueWaitMs ?? DEFAULT_MAX_QUEUE_WAIT_MS;
+    this.isPluginLoaded = options.isPluginLoaded;
+  }
+
+  /**
+   * Wire the plugin-loaded predicate after construction. Useful because the
+   * scheduler is constructed at module load (before pluginManager exists),
+   * but managed-automation gating needs to consult pluginManager. Boot calls
+   * this once pluginManager is ready, before scheduler.start().
+   */
+  setIsPluginLoaded(check: (pluginName: string) => boolean): void {
+    this.isPluginLoaded = check;
   }
 
   start(): void {
@@ -326,13 +360,23 @@ export class AutomationScheduler {
     entry: QueueEntry,
   ): { ok: true; deviceForRun: string | undefined } | { ok: false; reason: string } {
     const automation = this.db
-      .select({ requiresDevice: automations.requiresDevice })
+      .select({
+        requiresDevice: automations.requiresDevice,
+        managedBy: automations.managedBy,
+      })
       .from(automations)
       .where(eq(automations.id, entry.automationId))
       .all()[0];
 
     if (!automation) {
       return { ok: false, reason: 'automation no longer exists' };
+    }
+    // Managed-automations guard: if the owning plugin isn't currently loaded,
+    // don't fire its rows. processQueue() pauses the deadline clock for this
+    // specific reason so a plugin restart doesn't generate spurious queue-
+    // timeout failures.
+    if (automation.managedBy && this.isPluginLoaded && !this.isPluginLoaded(automation.managedBy)) {
+      return { ok: false, reason: REASON_MANAGED_PLUGIN_NOT_LOADED };
     }
     if (automation.requiresDevice === false) {
       return { ok: true, deviceForRun: undefined };
@@ -381,6 +425,24 @@ export class AutomationScheduler {
       for (const entry of this.queue) {
         const resolved = this.tryResolveEntry(entry);
         if (resolved.ok || now.getTime() < entry.deadlineAt.getTime()) {
+          survivors.push(entry);
+          continue;
+        }
+        // Pause the deadline clock for managed entries whose owning plugin
+        // is currently unloaded. A plugin restart or temporary disable
+        // shouldn't show up as a wave of "Queue timeout" failures for
+        // every queued managed automation — the operator didn't ask for
+        // those runs to time out, the plugin just happens to be away.
+        // Roll BOTH the deadline AND `queuedAt` forward so the entry
+        // effectively starts fresh whenever the plugin's back. Rolling
+        // queuedAt too keeps `waitingSeconds` (in getQueueStatus) and the
+        // eventual queue-timeout log message reflecting only the real
+        // waiting period — i.e. time the entry has actually been
+        // resolvable-but-not-runnable, not plugin-outage time the
+        // operator can't act on.
+        if (resolved.reason === REASON_MANAGED_PLUGIN_NOT_LOADED) {
+          entry.queuedAt = now;
+          entry.deadlineAt = new Date(now.getTime() + this.maxQueueWaitMs);
           survivors.push(entry);
           continue;
         }

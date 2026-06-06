@@ -759,6 +759,163 @@ describe('AutomationScheduler', () => {
       fastScheduler.stop();
     });
 
+    it('skips a managed automation whose owning plugin is not currently loaded', async () => {
+      // Spec §7.1: scheduler must not fire managed automations for plugins
+      // that aren't loaded (disabled / restarting). Without the guard, a
+      // stop()'d plugin's rows would still execute and likely error out.
+      const now = Date.now();
+      db.insert(schema.automations).values({
+        name: 'managed-poller',
+        code: 'noop',
+        passcode: 'p',
+        requiresDevice: false,
+        managedBy: 'plugin-x',
+        managedKey: 'poller',
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      }).run();
+      const autoId = db.select().from(schema.automations).all().pop()!.id;
+
+      const mockRun = vi.spyOn(runner, 'runAutomation').mockResolvedValue({ sessionId: 1, success: true });
+
+      const loaded = new Set<string>();  // empty — plugin not loaded
+      const gatedScheduler = new AutomationScheduler(db, runner, undefined, {
+        isPluginLoaded: (name) => loaded.has(name),
+      });
+
+      gatedScheduler.enqueue(autoId, 'schedule');
+      await (gatedScheduler as any).processQueue();
+
+      expect(mockRun).not.toHaveBeenCalled();
+      expect(gatedScheduler.getQueue()).toHaveLength(1);
+      gatedScheduler.stop();
+    });
+
+    it('runs the managed entry once its plugin loads back', async () => {
+      // Plugin restart scenario: enqueue → plugin unloads → tick → plugin
+      // reloads → tick → runs.
+      const now = Date.now();
+      db.insert(schema.automations).values({
+        name: 'managed-poller',
+        code: 'noop',
+        passcode: 'p',
+        requiresDevice: false,
+        managedBy: 'plugin-x',
+        managedKey: 'poller',
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      }).run();
+      const autoId = db.select().from(schema.automations).all().pop()!.id;
+
+      const mockRun = vi.spyOn(runner, 'runAutomation').mockResolvedValue({ sessionId: 1, success: true });
+      const loaded = new Set<string>();
+      const gatedScheduler = new AutomationScheduler(db, runner, undefined, {
+        isPluginLoaded: (name) => loaded.has(name),
+      });
+
+      gatedScheduler.enqueue(autoId, 'schedule');
+      await (gatedScheduler as any).processQueue();
+      expect(mockRun).not.toHaveBeenCalled();
+
+      // Plugin loads.
+      loaded.add('plugin-x');
+      await (gatedScheduler as any).processQueue();
+      expect(mockRun).toHaveBeenCalledWith(autoId, undefined, 'schedule');
+      gatedScheduler.stop();
+    });
+
+    it('does NOT count plugin-unloaded time toward the deadline', async () => {
+      // Plugin-unloaded entries should not be evicted as queue timeouts;
+      // their clock effectively pauses while the plugin is unloaded.
+      // Without this, a 6-minute plugin restart would generate spurious
+      // "Queue timeout: managed plugin not loaded" failures for every
+      // managed automation that was queued at the time.
+      vi.useFakeTimers({ now: 1_000_000 });
+      const now = new Date();
+      db.insert(schema.automations).values({
+        name: 'managed-poller',
+        code: 'noop',
+        passcode: 'p',
+        requiresDevice: false,
+        managedBy: 'plugin-x',
+        managedKey: 'poller',
+        createdAt: now,
+        updatedAt: now,
+      }).run();
+      const autoId = db.select().from(schema.automations).all().pop()!.id;
+
+      vi.spyOn(runner, 'runAutomation').mockResolvedValue({ sessionId: 1, success: true });
+      const loaded = new Set<string>();   // plugin stays unloaded
+      const gatedScheduler = new AutomationScheduler(db, runner, undefined, {
+        maxQueueWaitMs: 100,
+        isPluginLoaded: (name) => loaded.has(name),
+      });
+
+      gatedScheduler.enqueue(autoId, 'schedule');
+      // Advance WAY past the 100ms deadline + kick processQueue several
+      // times, mimicking a many-minute plugin outage.
+      for (let i = 0; i < 5; i++) {
+        await vi.advanceTimersByTimeAsync(500);
+        await (gatedScheduler as any).processQueue();
+      }
+
+      // Entry should still be queued — no queue-timeout failure logged.
+      expect(gatedScheduler.getQueue()).toHaveLength(1);
+      const sessions = db.select().from(schema.automationSessions).all();
+      expect(sessions.filter((s) => s.status === 'failed')).toHaveLength(0);
+
+      vi.useRealTimers();
+      gatedScheduler.stop();
+    });
+
+    it('rolls queuedAt forward during plugin outage so waitingSeconds does not include outage time', async () => {
+      // Regression for PR #16 third-pass review: the pause originally only
+      // rolled deadlineAt, leaving queuedAt at the original enqueue moment.
+      // getQueueStatus's `waitingSeconds` (and the later queue-timeout log)
+      // would then include the entire plugin-outage period in the
+      // operator-facing "waiting" figure — misleading, because the operator
+      // wasn't really waiting for a device, the plugin was just away.
+      vi.useFakeTimers({ now: 1_000_000 });
+      const now = new Date();
+      db.insert(schema.automations).values({
+        name: 'managed-poller',
+        code: 'noop',
+        passcode: 'p',
+        requiresDevice: false,
+        managedBy: 'plugin-x',
+        managedKey: 'poller',
+        createdAt: now,
+        updatedAt: now,
+      }).run();
+      const autoId = db.select().from(schema.automations).all().pop()!.id;
+
+      vi.spyOn(runner, 'runAutomation').mockResolvedValue({ sessionId: 1, success: true });
+      const loaded = new Set<string>();
+      const gatedScheduler = new AutomationScheduler(db, runner, undefined, {
+        maxQueueWaitMs: 60_000,
+        isPluginLoaded: (name) => loaded.has(name),
+      });
+
+      gatedScheduler.enqueue(autoId, 'schedule');
+
+      // Plugin out for "many minutes" — advance 10 minutes total in
+      // bumps with processQueue calls between (the prod-equivalent of
+      // the checkInterval firing).
+      for (let i = 0; i < 10; i++) {
+        await vi.advanceTimersByTimeAsync(60_000);
+        await (gatedScheduler as any).processQueue();
+      }
+
+      // waitingSeconds should reflect only the *most recent* tick, not the
+      // full outage. Within the last 60s, so under ~120.
+      const status = gatedScheduler.getQueueStatus();
+      expect(status.queue).toHaveLength(1);
+      expect(status.queue[0].waitingSeconds).toBeLessThan(120);
+
+      vi.useRealTimers();
+      gatedScheduler.stop();
+    });
+
     it('does NOT drop an entry whose deadline has not yet passed', async () => {
       vi.useFakeTimers({ now: 1_000_000 });
       const fastScheduler = new AutomationScheduler(db, runner, undefined, {

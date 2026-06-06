@@ -11,6 +11,7 @@ import type {
   PluginTool,
   PluginToolContext,
   PluginJob,
+  ManagedAutomationDef,
   PluginSetting,
   PluginNotificationEvent,
 } from '@darkrideapp/plugin-sdk';
@@ -178,6 +179,22 @@ export class PluginManager {
     const result: PluginJob[] = [];
     for (const { contributions } of this.plugins.values()) {
       result.push(...contributions.jobs);
+    }
+    return result;
+  }
+
+  /**
+   * Iterate every loaded plugin's managed-automation declarations together
+   * with the owning plugin name. Used by the host's reconcile pass between
+   * register() and startAll(); the host is responsible for running
+   * reconcileManagedAutomations() on each (name, defs) pair.
+   */
+  getAllManagedAutomations(): Array<{ pluginName: string; defs: ManagedAutomationDef[] }> {
+    const result: Array<{ pluginName: string; defs: ManagedAutomationDef[] }> = [];
+    for (const [name, { contributions }] of this.plugins.entries()) {
+      if (contributions.managedAutomations.length > 0) {
+        result.push({ pluginName: name, defs: contributions.managedAutomations });
+      }
     }
     return result;
   }
