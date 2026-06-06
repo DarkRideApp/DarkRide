@@ -22,6 +22,14 @@ function makeDb() {
       enabled INTEGER DEFAULT 1,
       schedule TEXT,
       device_filter TEXT,
+      -- Managed-automations columns (migration 0093) — keep in sync with schema.ts
+      managed_by TEXT,
+      managed_key TEXT,
+      current_default_code TEXT,
+      base_default_code TEXT,
+      is_overridden INTEGER NOT NULL DEFAULT 0,
+      allow_user_override INTEGER NOT NULL DEFAULT 1,
+      emit_failure_notification INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );

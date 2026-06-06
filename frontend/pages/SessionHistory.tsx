@@ -35,6 +35,10 @@ export function SessionHistory() {
   const [triggerFilter, setTriggerFilter] = useState('');
   const [pinnedFilter, setPinnedFilter] = useState('');
   const [deviceFilter, setDeviceFilter] = useState('');
+  // Hide plugin-driven (managed) sessions by default — they'd otherwise
+  // drown an operator's own automations in the feed. Operator can flip it.
+  const [showManaged, setShowManaged] = useState(false);
+  const [managedTotal, setManagedTotal] = useState(0);
   const [searchText, setSearchText] = useState('');
   const [searchQuery, setSearchQuery] = useState(''); // debounced value sent to API
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -67,22 +71,25 @@ export function SessionHistory() {
       if (pinnedFilter) params.set('pinned', pinnedFilter);
       if (deviceFilter) params.set('deviceId', deviceFilter);
       if (searchQuery) params.set('search', searchQuery);
+      if (showManaged) params.set('showManaged', 'true');
 
       const res = await ws.sendRestApi('GET', `/v1/automation/sessions?${params}`);
       const data = res.body?.data;
       if (data?.items) {
         setSessions(data.items);
         setTotal(data.total || 0);
+        setManagedTotal(typeof data.managedTotal === 'number' ? data.managedTotal : 0);
       } else {
         setSessions(data || []);
         setTotal(Array.isArray(data) ? data.length : 0);
+        setManagedTotal(0);
       }
     } catch {
       // ignore
     } finally {
       setLoading(false);
     }
-  }, [ws, page, statusFilter, triggerFilter, pinnedFilter, deviceFilter, searchQuery]);
+  }, [ws, page, statusFilter, triggerFilter, pinnedFilter, deviceFilter, searchQuery, showManaged]);
 
   const hasScope = auth?.hasScope ?? (() => true);
 
@@ -260,6 +267,22 @@ export function SessionHistory() {
             <option value="false">Unpinned Only</option>
           </select>
         </FilterField>
+        {(managedTotal > 0 || showManaged) && (
+          <FilterField label="Managed">
+            <label
+              data-testid="show-managed-toggle"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer', whiteSpace: 'nowrap' }}
+              title="Show sessions from plugin-managed automations"
+            >
+              <input
+                type="checkbox"
+                checked={showManaged}
+                onChange={(e) => { setShowManaged(e.target.checked); setPage(0); }}
+              />
+              Show managed{managedTotal > 0 ? ` (${managedTotal})` : ''}
+            </label>
+          </FilterField>
+        )}
       </FilterBar>
 
       {sessions.length === 0 ? (

@@ -51,6 +51,8 @@ export { InspectorWrapper } from './components/InspectorWrapper';
 export type { InspectorWrapperProps } from './components/InspectorWrapper';
 export { ButtonList, DefaultButtonListItem } from './components/ButtonList';
 export type { ButtonListProps, ButtonListItemProps } from './components/ButtonList';
+export { ManagedAutomationScriptIDE } from './components/ManagedAutomationScriptIDE';
+export type { ManagedAutomationScriptIDEProps } from './components/ManagedAutomationScriptIDE';
 export { NavItemList, DefaultNavItemListItem } from './components/NavItemList';
 export type { NavItemListProps, NavItemListItemProps } from './components/NavItemList';
 export { ExtensionSlot } from './components/ExtensionSlot';

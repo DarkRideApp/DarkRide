@@ -561,6 +561,7 @@ export function registerAutomationEndpoints(
     const pinned = req.query.pinned as string | undefined;
     const deviceId = req.query.deviceId as string | undefined;
     const search = req.query.search as string | undefined;
+    const showManaged = req.query.showManaged === 'true';
     const offset = parseInt(req.query.offset as string, 10) || 0;
     const limit = parseInt(req.query.limit as string, 10);
 
@@ -582,6 +583,12 @@ export function registerAutomationEndpoints(
     if (search) {
       conditions.push(like(automationSessions.name, `%${search}%`));
     }
+    // Hide managed sessions by default — plugin-driven runs would otherwise
+    // drown the operator's own automations in the history feed. The
+    // session-history UI surfaces them behind a "Show managed (N)" toggle.
+    if (!showManaged) {
+      conditions.push(eq(automationSessions.managed, false));
+    }
 
     const whereClause = conditions.length > 0
       ? conditions.length === 1 ? conditions[0] : and(...conditions)
@@ -589,6 +596,23 @@ export function registerAutomationEndpoints(
 
     const countQuery = db.select({ count: sql<number>`count(*)` }).from(automationSessions);
     const total = (whereClause ? countQuery.where(whereClause) : countQuery).all()[0].count;
+
+    // Also surface the count of managed sessions matching the OTHER filters
+    // (status / triggerType / etc, but NOT the managed clause) so the UI
+    // can render an accurate "Show managed (N)" toggle without a second
+    // request. Rebuild conditions without the managed clause to be safe.
+    const otherConditions: any[] = [];
+    if (status) otherConditions.push(eq(automationSessions.status, status as any));
+    if (triggerType) otherConditions.push(eq(automationSessions.triggerType, triggerType as any));
+    if (pinned === 'true') otherConditions.push(eq(automationSessions.isPinned, true));
+    else if (pinned === 'false') otherConditions.push(eq(automationSessions.isPinned, false));
+    if (deviceId) otherConditions.push(eq(automationSessions.deviceId, deviceId));
+    if (search) otherConditions.push(like(automationSessions.name, `%${search}%`));
+    otherConditions.push(eq(automationSessions.managed, true));
+    const managedTotal = db.select({ count: sql<number>`count(*)` })
+      .from(automationSessions)
+      .where(otherConditions.length === 1 ? otherConditions[0] : and(...otherConditions))
+      .all()[0].count;
 
     let query = db.select().from(automationSessions);
     if (whereClause) query = query.where(whereClause) as any;
@@ -600,7 +624,7 @@ export function registerAutomationEndpoints(
     }
 
     const results = query.all();
-    res.json({ success: true, data: { items: results, total, limit: limit || results.length, offset } });
+    res.json({ success: true, data: { items: results, total, managedTotal, limit: limit || results.length, offset } });
   }, { requires: ['core.automations:read'] });
 
   // GET /v1/automation/sessions/:id — session history for a specific automation
