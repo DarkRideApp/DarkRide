@@ -91,6 +91,14 @@ export function ManagedAutomationScriptIDE({
   // serialise it back to a ScheduleConfig and PUT.
   const scheduleDraftRef = useRef<{ value: ScheduleValue; cron: string } | null>(null);
   const [scheduleDirty, setScheduleDirty] = useState(false);
+  // When the operator has no saved schedule (view.schedule === null), we
+  // hide the editor behind a "Set schedule" button. Otherwise the editor
+  // would seed itself with a placeholder cron and fire an initial onChange
+  // — making "Save schedule" light up on first paint and contradicting the
+  // "No schedule" hint right above it. Clicking the button flips this to
+  // true, the editor mounts, and from that point the onChange genuinely
+  // reflects operator intent.
+  const [scheduleEditorOpen, setScheduleEditorOpen] = useState(false);
 
   const basePath = `/v1/managed-automations/${encodeURIComponent(pluginKey)}/${encodeURIComponent(scriptKey)}`;
 
@@ -251,6 +259,9 @@ export function ManagedAutomationScriptIDE({
       setView(v);
       setScheduleDirty(false);
       scheduleDraftRef.current = null;
+      // If the plugin default is null, revert lands the operator back in
+      // "no schedule" territory — close the editor again so the UI matches.
+      if (!v.schedule) setScheduleEditorOpen(false);
     } catch (e: any) {
       setError(e?.message ?? String(e));
     } finally {
@@ -392,15 +403,17 @@ export function ManagedAutomationScriptIDE({
               {view.schedule ? 'Operator-set' : 'No schedule — automation only runs manually'}
             </span>
             <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
-              <button
-                type="button"
-                className="btn btn-sm btn-primary"
-                onClick={saveSchedule}
-                disabled={busy || !scheduleDirty}
-                data-testid="managed-automation-save-schedule"
-              >
-                Save schedule
-              </button>
+              {(view.schedule || scheduleEditorOpen) && (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-primary"
+                  onClick={saveSchedule}
+                  disabled={busy || !scheduleDirty}
+                  data-testid="managed-automation-save-schedule"
+                >
+                  Save schedule
+                </button>
+              )}
               <button
                 type="button"
                 className="btn btn-sm"
@@ -420,19 +433,31 @@ export function ManagedAutomationScriptIDE({
             </div>
           </div>
 
-          <ScheduleEditor
-            inline
-            value={scheduleParsed?.cronString ?? '*/5 * * * *'}
-            defaultValue={scheduleDefaultParsed?.cronString ?? '*/5 * * * *'}
-            onChange={(value, cron) => {
-              scheduleDraftRef.current = { value, cron };
-              // Mark dirty whenever the editor produces a value that differs
-              // from the server-saved one. We compare the serialised
-              // ScheduleConfig to dodge formatting noise inside the editor.
-              const next = editorValueToScheduleConfig(value, cron);
-              setScheduleDirty(!schedulesEqual(next, scheduleConfigCurrent));
-            }}
-          />
+          {view.schedule || scheduleEditorOpen ? (
+            <ScheduleEditor
+              inline
+              value={scheduleParsed?.cronString ?? scheduleDefaultParsed?.cronString ?? '*/5 * * * *'}
+              defaultValue={scheduleDefaultParsed?.cronString ?? '*/5 * * * *'}
+              onChange={(value, cron) => {
+                scheduleDraftRef.current = { value, cron };
+                // Mark dirty whenever the editor produces a value that differs
+                // from the server-saved one. We compare the serialised
+                // ScheduleConfig to dodge formatting noise inside the editor.
+                const next = editorValueToScheduleConfig(value, cron);
+                setScheduleDirty(!schedulesEqual(next, scheduleConfigCurrent));
+              }}
+            />
+          ) : (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => setScheduleEditorOpen(true)}
+              disabled={busy}
+              data-testid="managed-automation-set-schedule"
+            >
+              Set schedule…
+            </button>
+          )}
         </div>
       </fieldset>
 

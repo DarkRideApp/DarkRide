@@ -2,6 +2,9 @@ import { eq, and, isNotNull } from 'drizzle-orm';
 import { registerEndpoint } from './api-service';
 import { automations } from '../db/schema';
 import type { AppDatabase } from '../db/index';
+import type { AutomationScheduler } from '../services/automation-scheduler';
+import { validateScheduleConfig } from '../services/schedule-validator';
+import type { ScheduleConfig } from '../../shared/types/api';
 
 /**
  * Host REST endpoints for the managed-automations IDE. All endpoints are
@@ -91,7 +94,10 @@ function buildView(row: NonNullable<ReturnType<typeof loadManaged>>): ManagedAut
   };
 }
 
-export function registerManagedAutomationEndpoints(db: AppDatabase): void {
+export function registerManagedAutomationEndpoints(
+  db: AppDatabase,
+  scheduler?: AutomationScheduler,
+): void {
   /**
    * GET /v1/managed-automations/:pluginKey/:scriptKey
    * Returns the effective view: code, drift state, IDE-relevant flags.
@@ -227,6 +233,12 @@ export function registerManagedAutomationEndpoints(db: AppDatabase): void {
    * `null` to disable). Plugin's `current_default_schedule` snapshot is
    * NOT touched — it's owned by the reconciler. Body: `{ schedule:
    * string | null }`.
+   *
+   * Validates the JSON shape up-front: the scheduler treats an
+   * unparseable schedule as "skip this row" silently, so without the
+   * pre-check a bad body would persist and the automation would simply
+   * stop firing. Also notifies the running scheduler so the change takes
+   * effect immediately, not at next host restart.
    */
   registerEndpoint('PUT', '/v1/managed-automations/:pluginKey/:scriptKey/schedule', (req, res) => {
     const { pluginKey, scriptKey } = req.params;
@@ -234,6 +246,20 @@ export function registerManagedAutomationEndpoints(db: AppDatabase): void {
     if (schedule !== null && typeof schedule !== 'string') {
       res.status(400).json({ success: false, error: 'schedule must be a string (JSON) or null' });
       return;
+    }
+    let parsed: ScheduleConfig | null = null;
+    if (schedule !== null) {
+      try {
+        parsed = JSON.parse(schedule) as ScheduleConfig;
+      } catch {
+        res.status(400).json({ success: false, error: 'schedule must be valid JSON' });
+        return;
+      }
+      const validation = validateScheduleConfig(parsed);
+      if (!validation.valid) {
+        res.status(400).json({ success: false, error: validation.error ?? 'invalid schedule' });
+        return;
+      }
     }
     const row = loadManaged(db, pluginKey, scriptKey);
     if (!row) {
@@ -244,6 +270,13 @@ export function registerManagedAutomationEndpoints(db: AppDatabase): void {
       schedule: schedule ?? null,
       updatedAt: new Date(),
     }).where(eq(automations.id, row.id)).run();
+    // Keep the scheduler's in-memory map in sync — without this the change
+    // wouldn't take effect until host restart (the scheduler only loads
+    // schedules at boot via loadSchedules()).
+    if (scheduler) {
+      if (parsed) scheduler.setSchedule(row.id, parsed);
+      else scheduler.removeSchedule(row.id);
+    }
     res.json({ success: true, data: buildView(loadManaged(db, pluginKey, scriptKey)!) });
   }, { requires: ['core.automations:edit'] });
 
@@ -274,9 +307,11 @@ export function registerManagedAutomationEndpoints(db: AppDatabase): void {
   /**
    * POST /v1/managed-automations/:pluginKey/:scriptKey/revert/schedule
    * Reset the operator's schedule to the plugin's current default
-   * snapshot. 409 when the plugin has no schedule (`current_default_schedule
-   * IS NULL`) — the operator wants to clear it, they can PUT
-   * `{schedule: null}` instead.
+   * snapshot. `current_default_schedule IS NULL` is a legitimate revert
+   * target — it means the plugin ships no schedule, and reverting clears
+   * the operator's schedule too. Returns 200 in that case (not 409).
+   *
+   * Notifies the running scheduler so the change takes effect immediately.
    */
   registerEndpoint('POST', '/v1/managed-automations/:pluginKey/:scriptKey/revert/schedule', (req, res) => {
     const { pluginKey, scriptKey } = req.params;
@@ -285,13 +320,27 @@ export function registerManagedAutomationEndpoints(db: AppDatabase): void {
       res.status(404).json({ success: false, error: 'Managed automation not found' });
       return;
     }
-    // current_default_schedule may legitimately be null — that means the
-    // plugin shipped no schedule at all. Reverting to "no schedule" is a
-    // valid request; carry the null through.
     db.update(automations).set({
       schedule: row.currentDefaultSchedule,
       updatedAt: new Date(),
     }).where(eq(automations.id, row.id)).run();
+    if (scheduler) {
+      if (row.currentDefaultSchedule) {
+        try {
+          const parsed = JSON.parse(row.currentDefaultSchedule) as ScheduleConfig;
+          scheduler.setSchedule(row.id, parsed);
+        } catch {
+          // current_default_schedule is plugin-authored and validated by
+          // the reconciler before being stored, so a parse failure here
+          // means an old row from a buggy plugin version. Fall through to
+          // removeSchedule so the scheduler doesn't keep firing the old
+          // operator schedule.
+          scheduler.removeSchedule(row.id);
+        }
+      } else {
+        scheduler.removeSchedule(row.id);
+      }
+    }
     res.json({ success: true, data: buildView(loadManaged(db, pluginKey, scriptKey)!) });
   }, { requires: ['core.automations:edit'] });
 

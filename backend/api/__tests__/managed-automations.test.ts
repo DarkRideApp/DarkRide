@@ -8,13 +8,26 @@ import { clearEndpoints, getApiRouter } from '../api-service';
 import { registerManagedAutomationEndpoints } from '../managed-automations';
 import type { AppDatabase } from '../../db/index';
 
-function makeApp(db: AppDatabase) {
+function makeApp(db: AppDatabase, scheduler?: any) {
   clearEndpoints();
-  registerManagedAutomationEndpoints(db);
+  registerManagedAutomationEndpoints(db, scheduler);
   const app = express();
   app.use(express.json());
   app.use(getApiRouter());
   return app;
+}
+
+/**
+ * Test seam for the AutomationScheduler dependency. The real class has a
+ * lot more surface; we only care about the two methods the API calls.
+ */
+function fakeScheduler() {
+  return {
+    setCalls: [] as Array<{ id: number; config: any }>,
+    removeCalls: [] as number[],
+    setSchedule(id: number, config: any) { this.setCalls.push({ id, config }); },
+    removeSchedule(id: number) { this.removeCalls.push(id); },
+  };
 }
 
 function seedManaged(db: AppDatabase, overrides: Partial<typeof automations.$inferInsert> = {}) {
@@ -251,6 +264,49 @@ describe('managed-automations REST endpoints', () => {
         .send({ schedule: { rogue: 'object' } });
       expect(res.status).toBe(400);
     });
+
+    it('400 for malformed JSON', async () => {
+      seedManaged(db);
+      const res = await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: '{not json' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/valid JSON/);
+    });
+
+    it('400 for valid JSON with bad ScheduleConfig shape', async () => {
+      seedManaged(db);
+      const res = await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: JSON.stringify({ type: 'cron', expressions: ['nope'] }) });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/invalid cron expression/);
+    });
+
+    it('notifies the scheduler so changes take effect without a restart', async () => {
+      const sched = fakeScheduler();
+      const localApp = makeApp(db, sched);
+      const row = seedManaged(db);
+      const newSched = JSON.stringify({ type: 'cron', expressions: ['0 9 * * *'] });
+      const res = await request(localApp)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: newSched });
+      expect(res.status).toBe(200);
+      expect(sched.setCalls).toEqual([{ id: row.id, config: { type: 'cron', expressions: ['0 9 * * *'] } }]);
+      expect(sched.removeCalls).toEqual([]);
+    });
+
+    it('calls scheduler.removeSchedule when schedule is cleared', async () => {
+      const sched = fakeScheduler();
+      const localApp = makeApp(db, sched);
+      const row = seedManaged(db, { schedule: JSON.stringify({ type: 'interval', intervalMs: 60_000 }) });
+      const res = await request(localApp)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: null });
+      expect(res.status).toBe(200);
+      expect(sched.removeCalls).toEqual([row.id]);
+      expect(sched.setCalls).toEqual([]);
+    });
   });
 
   describe('PUT .../enabled (operator toggles)', () => {
@@ -290,6 +346,31 @@ describe('managed-automations REST endpoints', () => {
       const res = await request(app).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
       expect(res.status).toBe(200);
       expect(db.select().from(automations).all()[0].schedule).toBeNull();
+    });
+
+    it('notifies scheduler with setSchedule when reverting to a defined default', async () => {
+      const sched = fakeScheduler();
+      const localApp = makeApp(db, sched);
+      const defSched = JSON.stringify({ type: 'interval', intervalMs: 60_000 });
+      const row = seedManaged(db, {
+        schedule: JSON.stringify({ type: 'cron', expressions: ['*/5 * * * *'] }),
+        currentDefaultSchedule: defSched,
+      });
+      const res = await request(localApp).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(200);
+      expect(sched.setCalls).toEqual([{ id: row.id, config: { type: 'interval', intervalMs: 60_000 } }]);
+    });
+
+    it('notifies scheduler with removeSchedule when reverting to null default', async () => {
+      const sched = fakeScheduler();
+      const localApp = makeApp(db, sched);
+      const row = seedManaged(db, {
+        schedule: JSON.stringify({ type: 'interval', intervalMs: 60_000 }),
+        currentDefaultSchedule: null,
+      });
+      const res = await request(localApp).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(200);
+      expect(sched.removeCalls).toEqual([row.id]);
     });
   });
 
