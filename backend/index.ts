@@ -1187,6 +1187,30 @@ httpServer.listen(PORT, HOST, () => {
     }
   }
 
+  // Uninstall sweep: any managed_by value in the automations table that
+  // doesn't correspond to a currently-loaded plugin means the plugin was
+  // uninstalled since last boot. Reconcile with an empty def list, which
+  // routes each row through the orphan-or-delete branch in the state
+  // machine (preserving operator overrides as ordinary disabled
+  // automations, deleting clean rows). The scheduler's plugin-loaded
+  // guard would also skip these at runtime, but we don't want them to
+  // hang around indefinitely as zombie rows.
+  const knownPluginNames = new Set(pluginManager.getPluginNames());
+  const managedByValues = db.selectDistinct({ name: schema.automations.managedBy })
+    .from(schema.automations)
+    .where(isNotNull(schema.automations.managedBy))
+    .all()
+    .map((r) => r.name)
+    .filter((n): n is string => n != null);
+  for (const pluginName of managedByValues) {
+    if (knownPluginNames.has(pluginName)) continue;
+    try {
+      reconcileManagedAutomations(db, pluginName, []);
+    } catch (err: any) {
+      error(`Failed to clean up orphaned managed automations for missing plugin "${pluginName}": ${err?.message ?? err}`);
+    }
+  }
+
   // Run all migrated plugins' start() in topological order. Required-peer
   // failures (and timeouts) abort boot.
   await pluginManager.startAll();

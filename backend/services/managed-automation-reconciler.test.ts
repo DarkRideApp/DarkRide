@@ -249,6 +249,44 @@ describe('reconcileManagedAutomations', () => {
     });
   });
 
+  describe('case 9: uninstall sweep equivalence', () => {
+    // The boot-time uninstall sweep just calls reconcileManagedAutomations
+    // with an empty def list for every managed_by value whose plugin isn't
+    // loaded. This test pins down that contract — empty defs across a
+    // mixed set of overridden + non-overridden rows yields the right
+    // orphan/delete outcomes per row, identical to the "no longer
+    // declared" tail pass for an active plugin.
+    it('on empty defs: orphans overridden rows, deletes non-overridden rows', () => {
+      // Seed two rows
+      reconcileManagedAutomations(db, 'plugin-gone', [
+        makeDef({ key: 'overridden-one' }),
+        makeDef({ key: 'plain-one' }),
+      ]);
+      // Operator overrode one of them
+      db.update(automations).set({
+        code: 'edited\n',
+        baseDefaultCode: 'v1\n',
+        isOverridden: true,
+      }).where(eq(automations.managedKey, 'overridden-one')).run();
+
+      // Plugin uninstalled → sweep calls with no defs
+      reconcileManagedAutomations(db, 'plugin-gone', []);
+
+      // Overridden row preserved as orphan (managedBy null, code intact)
+      const orphan = db.select().from(automations)
+        .where(eq(automations.code, 'edited\n')).all()[0];
+      expect(orphan).toBeDefined();
+      expect(orphan.managedBy).toBeNull();
+      expect(orphan.managedKey).toBeNull();
+      expect(orphan.enabled).toBe(false);
+
+      // Non-overridden row deleted
+      const stillThere = db.select().from(automations)
+        .where(eq(automations.code, 'console.log("v1");\n')).all();
+      expect(stillThere).toHaveLength(0);
+    });
+  });
+
   describe('case 8: plugin scoping', () => {
     it('does not touch rows owned by other plugins', () => {
       reconcileManagedAutomations(db, 'plugin-x', [makeDef({ key: 'a' })]);
