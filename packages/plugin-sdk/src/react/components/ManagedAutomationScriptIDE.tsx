@@ -322,10 +322,31 @@ function MonacoEditor({
     let changeSub: any = null;
 
     (async () => {
-      try {
-        const monaco = await import('monaco-editor');
-        if (disposed || !containerRef.current) return;
+      // Monaco web-worker setup lives in the host's frontend entry point
+      // (frontend/main.tsx) — that way every page that ever mounts a
+      // Monaco editor, INCLUDING plugin pages that embed this IDE
+      // without ever visiting AutomationEditor, gets the workers
+      // configured. If a hypothetical embedder forgets to set it up,
+      // monaco.editor.create still works but silently loses TypeScript
+      // language features. We can't paper over it here because
+      // `new URL(specifier, import.meta.url)` (the canonical Vite/
+      // Webpack-5 worker bundling pattern) requires ESM, but the SDK is
+      // published as CommonJS for compatibility.
 
+      // ── Dynamic import ──────────────────────────────────────────────
+      let monaco: typeof import('monaco-editor');
+      try {
+        monaco = await import('monaco-editor');
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error('[ManagedAutomationScriptIDE] monaco-editor module failed to load (is the host shipping the peer dependency?):', e);
+        if (!disposed) setLoadFailed(true);
+        return;
+      }
+      if (disposed || !containerRef.current) return;
+
+      // ── Editor creation ─────────────────────────────────────────────
+      try {
         const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
         editor = monaco.editor.create(containerRef.current, {
           value: valueRef.current,        // freshest props, not the mount-time closure
@@ -343,12 +364,11 @@ function MonacoEditor({
         });
         setMonacoReady(true);
       } catch (e) {
-        // If Monaco fails to load (the host doesn't ship it — rare in
-        // production) replace the loading skeleton with a textarea
-        // fallback so the operator can still edit. The actual error
-        // surfaces via console for the plugin author.
+        // Initialization fault distinct from load fault — name it so
+        // plugin authors aren't sent hunting for a peer-dep issue when
+        // it's actually a worker / container / theme problem.
         // eslint-disable-next-line no-console
-        console.error('[ManagedAutomationScriptIDE] Monaco failed to load:', e);
+        console.error('[ManagedAutomationScriptIDE] Monaco editor.create failed:', e);
         if (!disposed) setLoadFailed(true);
       }
     })();

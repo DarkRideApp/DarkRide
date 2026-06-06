@@ -1,19 +1,4 @@
-// Monaco worker config — must be before any monaco import
-(self as any).MonacoEnvironment = {
-  getWorker(_workerId: string, label: string) {
-    if (label === 'typescript' || label === 'javascript') {
-      return new Worker(
-        new URL('monaco-editor/esm/vs/language/typescript/ts.worker.js', import.meta.url),
-        { type: 'module' },
-      );
-    }
-    return new Worker(
-      new URL('monaco-editor/esm/vs/editor/editor.worker.js', import.meta.url),
-      { type: 'module' },
-    );
-  },
-};
-
+// Monaco worker config lives in frontend/main.tsx — set there once for every page.
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
