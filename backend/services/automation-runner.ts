@@ -144,7 +144,12 @@ export class AutomationRunner implements IAutomationRunner {
     // execution handles its own cleanup; this wrapper only handles the pre-inner path.
     try {
 
-    // 2. Create automation session
+    // 2. Create automation session. `managed` is denormalised at insert
+    // from automation.managedBy IS NOT NULL so the session-history default
+    // filter (hide-managed) is a plain column scan with no join. If the
+    // automation row later gets orphaned from its plugin, the reconciler /
+    // uninstall path back-fills these rows to managed=0 so the now
+    // operator-owned automation's history becomes visible again.
     const insertResult = this.db
       .insert(automationSessions)
       .values({
@@ -154,6 +159,7 @@ export class AutomationRunner implements IAutomationRunner {
         status: 'running',
         triggerType,
         startedAt: new Date(),
+        managed: automation.managedBy != null,
       })
       .run();
 
@@ -879,7 +885,7 @@ export class AutomationRunner implements IAutomationRunner {
     errorMsg: string,
   ): void {
     const automation = this.db
-      .select({ name: automations.name })
+      .select({ name: automations.name, managedBy: automations.managedBy })
       .from(automations)
       .where(eq(automations.id, automationId))
       .all()[0];
@@ -906,6 +912,10 @@ export class AutomationRunner implements IAutomationRunner {
         // for both successful execution traces and failure reasons (see
         // updateSession()), so do the same here.
         logs: errorMsg,
+        // Denormalised from the live row; if the row is gone (FK fall-back
+        // above) treat it as not-managed so the timeout shows up in the
+        // operator's default history view alongside their other failures.
+        managed: automation?.managedBy != null,
       })
       .run();
     const sessionId = Number(insertResult.lastInsertRowid);

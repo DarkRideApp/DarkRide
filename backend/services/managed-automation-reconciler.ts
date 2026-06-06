@@ -156,6 +156,14 @@ export function reconcileManagedAutomations(
         enabled: false,
         updatedAt: now,
       }).where(eq(automations.id, row.id)).run();
+      // Back-fill historical sessions: the automation is now operator-owned,
+      // so its history should be visible in the default "hide managed" view.
+      // Without this, the operator sees the orphan in their automations list
+      // but its sessions remain hidden — confusing.
+      db.update(automationSessions)
+        .set({ managed: false })
+        .where(eq(automationSessions.automationId, row.id))
+        .run();
       log(`Orphaned managed automation ${pluginName}/${row.managedKey} (operator override preserved)`);
     } else {
       // FK on automation_sessions.automation_id has no ON DELETE clause —

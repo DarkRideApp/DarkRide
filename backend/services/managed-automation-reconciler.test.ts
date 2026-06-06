@@ -214,6 +214,41 @@ describe('reconcileManagedAutomations', () => {
     });
   });
 
+  describe('case 8b: orphan also back-fills sessions.managed = 0', () => {
+    // Without this back-fill, an orphaned automation that the operator now
+    // owns would have its history hidden behind the default "hide managed"
+    // session-history filter — confusing UX.
+    it('flips automation_sessions.managed to 0 for the orphaned automation', async () => {
+      const { automationSessions } = await import('../db/schema');
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({ key: 'poller' })]);
+      const autoId = getRow(db, 'plugin-x', 'poller').id;
+
+      // Mark as overridden so the orphan path fires (not delete).
+      db.update(automations).set({
+        code: 'operator-edits\n',
+        baseDefaultCode: 'v1\n',
+        isOverridden: true,
+      }).where(eq(automations.id, autoId)).run();
+
+      // Insert a historical session row stamped managed = true
+      db.insert(automationSessions).values({
+        automationId: autoId,
+        name: 'Poller',
+        status: 'success',
+        triggerType: 'schedule',
+        startedAt: new Date(),
+        managed: true,
+      } as any).run();
+
+      // Re-reconcile with the key absent → orphan path
+      reconcileManagedAutomations(db, 'plugin-x', []);
+
+      const sess = db.select().from(automationSessions).where(eq(automationSessions.automationId, autoId)).all();
+      expect(sess).toHaveLength(1);
+      expect(sess[0].managed).toBe(false);
+    });
+  });
+
   describe('case 8: plugin scoping', () => {
     it('does not touch rows owned by other plugins', () => {
       reconcileManagedAutomations(db, 'plugin-x', [makeDef({ key: 'a' })]);
