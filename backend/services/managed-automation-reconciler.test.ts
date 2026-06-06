@@ -108,6 +108,47 @@ describe('reconcileManagedAutomations', () => {
       expect(row.baseDefaultCode).toBe('v1\n');              // ancestor unchanged
       expect(row.isOverridden).toBe(true);                   // still overridden
     });
+
+    it('also refreshes the OTHER plugin-owned fields (description, emitFailureNotification, name, etc.) on an overridden row', () => {
+      // Regression for PR #16 second-pass review: the preserve-override
+      // branch was originally missing emitFailureNotification + description
+      // from its update set. The operator only owns `code`; every other
+      // plugin-authored field should refresh on every reconcile regardless
+      // of override state, otherwise a plugin update can't fix typos in its
+      // own metadata for any user who's ever forked the script.
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({
+        code: 'v1\n',
+        name: 'Old name',
+        description: 'Old description',
+        emitFailureNotification: false,
+        timeoutMs: 60_000,
+      })]);
+      // operator forks
+      db.update(automations).set({
+        code: 'operator\n',
+        baseDefaultCode: 'v1\n',
+        isOverridden: true,
+      }).where(eq(automations.managedKey, 'poller')).run();
+
+      // plugin ships an update touching everything EXCEPT seed fields
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({
+        code: 'v2\n',
+        name: 'New name',
+        description: 'New description',
+        emitFailureNotification: true,
+        timeoutMs: 120_000,
+      })]);
+
+      const row = getRow(db, 'plugin-x', 'poller');
+      // operator code untouched
+      expect(row.code).toBe('operator\n');
+      // every plugin-owned field refreshes
+      expect(row.name).toBe('New name');
+      expect(row.description).toBe('New description');
+      expect(row.emitFailureNotification).toBe(true);
+      expect(row.timeoutMs).toBe(120_000);
+      expect(row.currentDefaultCode).toBe('v2\n');
+    });
   });
 
   describe('case 4: managed row no longer declared (plugin dropped the script)', () => {

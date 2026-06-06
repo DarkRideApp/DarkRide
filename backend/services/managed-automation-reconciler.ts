@@ -153,6 +153,8 @@ export function reconcileManagedAutomations(
         requiresDevice: def.requiresDevice ?? true,
         timeoutMs: def.timeoutMs ?? 300_000,
         allowUserOverride: def.allowUserOverride ?? true,
+        emitFailureNotification: def.emitFailureNotification ?? false,
+        description: def.description ?? null,
         updatedAt: now,
       })
       .where(eq(automations.id, existing.id))
