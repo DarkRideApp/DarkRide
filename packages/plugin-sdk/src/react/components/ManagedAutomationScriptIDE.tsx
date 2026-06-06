@@ -1,4 +1,5 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { useWebSocket } from '../hooks/useWebSocket';
 
 /**
  * Drop-in IDE component a plugin embeds on its own page to expose a managed
@@ -10,15 +11,19 @@ import React, { useEffect, useState, useCallback } from 'react';
  *   - GETs the managed-automation view (effective code + drift state).
  *   - When `allow_user_override` is false, renders a read-only viewer
  *     (or the plugin can simply omit the component on those scripts).
- *   - When override is permitted, shows an editor with Save + Reset
- *     buttons, plus a Drift banner with **Keep mine** and a 3-way diff
+ *   - When override is permitted, shows a Monaco editor + Save/Reset
+ *     actions, plus a Drift banner with **Keep mine** and a 3-way diff
  *     when the plugin has shipped a new default that conflicts with
  *     the operator's local edits.
  *
- * The editor is a plain `<textarea>` to keep the SDK lean; plugins that
- * want Monaco / CodeMirror can wrap a custom render via the `editor`
- * prop. For most managed scripts the textarea is enough — the operator's
- * job here is small tweaks, not greenfield authoring.
+ * Communicates with the host via `useWebSocket().sendRestApi(...)` (same
+ * helper SessionHistory and friends use), so the request is authenticated
+ * by the WebSocket session — no CSRF token to thread, no fetch wiring.
+ *
+ * Plugins that want a different editor surface can pass a custom
+ * `editor` render prop. For most managed scripts Monaco is appropriate
+ * — same editor the host's ordinary AutomationEditor uses, with
+ * TypeScript syntax + theme matching.
  */
 
 interface ManagedAutomationView {
@@ -44,24 +49,13 @@ interface ThreeWayDiff {
 export interface ManagedAutomationScriptIDEProps {
   pluginKey: string;
   scriptKey: string;
-  /** Optional custom editor render. Receives current code + change handler. */
+  /**
+   * Optional custom editor render. Receives current code + change handler.
+   * Default is Monaco with TypeScript syntax.
+   */
   editor?: (props: { code: string; onChange: (next: string) => void; readOnly: boolean }) => React.ReactNode;
   /** Optional className applied to the outer container. */
   className?: string;
-}
-
-/** Fetch helper that throws on non-2xx with the server's error message. */
-async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(path, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || json.success === false) {
-    throw new Error(json.error ?? `${method} ${path} failed (${res.status})`);
-  }
-  return json.data as T;
 }
 
 export function ManagedAutomationScriptIDE({
@@ -70,13 +64,37 @@ export function ManagedAutomationScriptIDE({
   editor,
   className,
 }: ManagedAutomationScriptIDEProps): React.JSX.Element {
+  const ws = useWebSocket();
   const [view, setView] = useState<ManagedAutomationView | null>(null);
-  const [draft, setDraft] = useState<string>('');     // edits not yet saved
+  const [draft, setDraft] = useState<string>('');
   const [diff, setDiff] = useState<ThreeWayDiff | null>(null);
-  const [busy, setBusy] = useState(false);
+  // Start busy=true so the pre-WebSocket-connect state renders "Loading…"
+  // instead of flashing "Not found." between mount and the first refresh.
+  const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const basePath = `/v1/managed-automations/${encodeURIComponent(pluginKey)}/${encodeURIComponent(scriptKey)}`;
+
+  /**
+   * Wrap ws.sendRestApi into a tiny helper that surfaces server-side errors
+   * as thrown `Error`s. The WebSocket envelope is
+   * `{ type, id, status, body }`; the JSON API payload sits inside `body`
+   * as `{ success, data, error }`. We treat anything other than an
+   * explicit `success: true` 2xx as a failure so an unexpected envelope
+   * shape produces a useful error instead of silently resolving to undefined.
+   */
+  const api = useCallback(async <T,>(method: string, path: string, body?: unknown): Promise<T> => {
+    const res = await ws.sendRestApi(method, path, body);
+    if (typeof res.status === 'number' && (res.status < 200 || res.status >= 300)) {
+      const payload = res.body as { error?: string } | undefined;
+      throw new Error(payload?.error ?? `${method} ${path} failed (${res.status})`);
+    }
+    const payload = res.body as { success?: boolean; data?: T; error?: string } | undefined;
+    if (!payload || payload.success !== true) {
+      throw new Error(payload?.error ?? `${method} ${path} returned unexpected payload`);
+    }
+    return payload.data as T;
+  }, [ws]);
 
   const refresh = useCallback(async () => {
     setBusy(true);
@@ -90,9 +108,11 @@ export function ManagedAutomationScriptIDE({
     } finally {
       setBusy(false);
     }
-  }, [basePath]);
+  }, [api, basePath]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    if (ws.connected) void refresh();
+  }, [ws.connected, refresh]);
 
   const save = async () => {
     if (!view) return;
@@ -162,22 +182,7 @@ export function ManagedAutomationScriptIDE({
   const readOnly = !view.allowUserOverride;
   const editorEl = editor
     ? editor({ code: draft, onChange: setDraft, readOnly })
-    : (
-      <textarea
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        readOnly={readOnly}
-        spellCheck={false}
-        rows={20}
-        style={{
-          width: '100%',
-          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-          fontSize: 13,
-          padding: 8,
-          boxSizing: 'border-box',
-        }}
-      />
-    );
+    : <MonacoEditor value={draft} onChange={setDraft} readOnly={readOnly} />;
 
   return (
     <div className={className} data-testid="managed-automation-ide">
@@ -192,7 +197,7 @@ export function ManagedAutomationScriptIDE({
           )}
         </div>
         {view.hasDrift && (
-          <button type="button" onClick={openDiff} disabled={busy}>
+          <button type="button" className="btn btn-sm" onClick={openDiff} disabled={busy}>
             View 3-way diff
           </button>
         )}
@@ -203,9 +208,10 @@ export function ManagedAutomationScriptIDE({
           marginBottom: 8, padding: 8, border: '1px solid #d99', background: '#fee', borderRadius: 4,
         }}>
           The plugin has shipped a new default for this script. Your override is still running.{' '}
-          <button type="button" onClick={keepMine} disabled={busy}>Keep mine</button>{' '}
+          <button type="button" className="btn btn-sm" onClick={keepMine} disabled={busy}>Keep mine</button>{' '}
           <button
             type="button"
+            className="btn btn-sm"
             onClick={reset}
             disabled={busy || view.currentDefaultCode == null}
             title={view.currentDefaultCode == null ? 'No default available — plugin no longer declares this script' : undefined}
@@ -223,12 +229,18 @@ export function ManagedAutomationScriptIDE({
 
       {!readOnly && (
         <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
-          <button type="button" onClick={save} disabled={busy || !isDirty}>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={save}
+            disabled={busy || !isDirty}
+          >
             {view.isOverridden ? 'Save changes' : 'Save (creates override)'}
           </button>
           {view.isOverridden && (
             <button
               type="button"
+              className="btn"
               onClick={reset}
               disabled={busy || view.currentDefaultCode == null}
               title={view.currentDefaultCode == null ? 'No default available — plugin no longer declares this script' : undefined}
@@ -240,8 +252,8 @@ export function ManagedAutomationScriptIDE({
       )}
 
       {diff && (
-        <div style={{ marginTop: 16, border: '1px solid #ccc', padding: 8 }}>
-          <h4>3-way diff</h4>
+        <div style={{ marginTop: 16, border: '1px solid #ccc', padding: 8, borderRadius: 4 }}>
+          <h4 style={{ marginTop: 0 }}>3-way diff</h4>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, fontFamily: 'monospace', fontSize: 12 }}>
             <div>
               <div><strong>Ancestor</strong> (forked from)</div>
@@ -256,7 +268,180 @@ export function ManagedAutomationScriptIDE({
               <pre style={{ whiteSpace: 'pre-wrap' }}>{diff.yours}</pre>
             </div>
           </div>
-          <button type="button" onClick={() => setDiff(null)} style={{ marginTop: 8 }}>Close diff</button>
+          <button type="button" className="btn btn-sm" onClick={() => setDiff(null)} style={{ marginTop: 8 }}>
+            Close diff
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Monaco editor wrapper used as the default `editor` for
+ * <ManagedAutomationScriptIDE>. Mirrors the AutomationEditor page:
+ * dynamic-imports `monaco-editor` so the ~2MB chunk only loads when the IDE
+ * actually mounts, TypeScript syntax, theme follows the OS preference.
+ *
+ * Kept in the same file (private export) because no other SDK component
+ * needs it. If a plugin wants something other than Monaco it passes a
+ * custom `editor` render prop and never touches this.
+ */
+function MonacoEditor({
+  value,
+  onChange,
+  readOnly,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  readOnly: boolean;
+}): React.JSX.Element {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<any>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [monacoReady, setMonacoReady] = useState(false);
+  // Hold latest props in refs so the async-mounting Monaco can read the
+  // freshest values when it finally instantiates. Without this, if the
+  // parent updates `value` (e.g. a Reset/Save resolved) DURING the
+  // dynamic `import('monaco-editor')`, Monaco would create with the
+  // stale captured value and the [value]-sync effect below would bail
+  // out because editorRef hadn't been set yet — leaving the editor
+  // permanently desynced.
+  const valueRef = useRef(value);
+  const readOnlyRef = useRef(readOnly);
+  const onChangeRef = useRef(onChange);
+  useEffect(() => { valueRef.current = value; }, [value]);
+  useEffect(() => { readOnlyRef.current = readOnly; }, [readOnly]);
+  useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
+
+  // One-shot mount/unmount. Read from the refs at the moment Monaco
+  // is actually ready, not from the closure-captured initial values.
+  useEffect(() => {
+    let disposed = false;
+    let editor: any = null;
+    let changeSub: any = null;
+
+    (async () => {
+      // Monaco web-worker setup lives in the host's frontend entry point
+      // (frontend/main.tsx) — that way every page that ever mounts a
+      // Monaco editor, INCLUDING plugin pages that embed this IDE
+      // without ever visiting AutomationEditor, gets the workers
+      // configured. If a hypothetical embedder forgets to set it up,
+      // monaco.editor.create still works but silently loses TypeScript
+      // language features. We can't paper over it here because
+      // `new URL(specifier, import.meta.url)` (the canonical Vite/
+      // Webpack-5 worker bundling pattern) requires ESM, but the SDK is
+      // published as CommonJS for compatibility.
+
+      // ── Dynamic import ──────────────────────────────────────────────
+      let monaco: typeof import('monaco-editor');
+      try {
+        monaco = await import('monaco-editor');
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error('[ManagedAutomationScriptIDE] monaco-editor module failed to load (is the host shipping the peer dependency?):', e);
+        if (!disposed) setLoadFailed(true);
+        return;
+      }
+      if (disposed || !containerRef.current) return;
+
+      // ── Editor creation ─────────────────────────────────────────────
+      try {
+        const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        editor = monaco.editor.create(containerRef.current, {
+          value: valueRef.current,        // freshest props, not the mount-time closure
+          language: 'typescript',
+          theme: isDark ? 'vs-dark' : 'vs-light',
+          readOnly: readOnlyRef.current,
+          minimap: { enabled: false },
+          fontSize: 14,
+          automaticLayout: true,
+          scrollBeyondLastLine: false,
+        });
+        editorRef.current = editor;
+        changeSub = editor.onDidChangeModelContent(() => {
+          onChangeRef.current(editor.getValue());
+        });
+        setMonacoReady(true);
+      } catch (e) {
+        // Initialization fault distinct from load fault — name it so
+        // plugin authors aren't sent hunting for a peer-dep issue when
+        // it's actually a worker / container / theme problem.
+        // eslint-disable-next-line no-console
+        console.error('[ManagedAutomationScriptIDE] Monaco editor.create failed:', e);
+        if (!disposed) setLoadFailed(true);
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      try { changeSub?.dispose(); } catch { /* best effort */ }
+      try { editor?.dispose(); } catch { /* best effort */ }
+      editorRef.current = null;
+    };
+    // We want to mount once per (container) lifecycle; rebinding on `value`
+    // would dispose-and-recreate the editor on every keystroke. Props that
+    // change during mount are picked up via the refs above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Sync external value resets (e.g. operator hits Reset, server returns
+  // the fresh code) without nuking the editor.
+  useEffect(() => {
+    const ed = editorRef.current;
+    if (!ed) return;
+    if (ed.getValue() !== value) {
+      ed.setValue(value);
+    }
+  }, [value]);
+
+  // Sync readOnly toggles
+  useEffect(() => {
+    editorRef.current?.updateOptions?.({ readOnly });
+  }, [readOnly]);
+
+  // Fallback: <textarea> if Monaco failed to load (e.g. host doesn't ship it).
+  if (loadFailed) {
+    return (
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        readOnly={readOnly}
+        spellCheck={false}
+        rows={20}
+        style={{
+          width: '100%',
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+          fontSize: 13,
+          padding: 8,
+          boxSizing: 'border-box',
+          border: '1px solid #ccc',
+          borderRadius: 4,
+        }}
+      />
+    );
+  }
+
+  return (
+    <div
+      style={{
+        position: 'relative',
+        height: 400,
+        border: '1px solid var(--border-color, #ccc)',
+        borderRadius: 4,
+      }}
+    >
+      <div ref={containerRef} data-testid="managed-automation-monaco" style={{ width: '100%', height: '100%' }} />
+      {!monacoReady && (
+        <div
+          aria-live="polite"
+          style={{
+            position: 'absolute', inset: 0, display: 'flex',
+            alignItems: 'center', justifyContent: 'center',
+            color: '#888', fontSize: 13, pointerEvents: 'none',
+          }}
+        >
+          Loading editor…
         </div>
       )}
     </div>

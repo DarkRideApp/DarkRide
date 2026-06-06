@@ -1,6 +1,6 @@
 {
   "name": "@darkrideapp/plugin-sdk",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Plugin authoring SDK for DarkRide. Re-exports definePlugin and all plugin types.",
   "license": "AGPL-3.0",
   "repository": {
@@ -45,13 +45,15 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.0.0",
-    "lucide-react": "^0.564.0"
+    "lucide-react": "^0.564.0",
+    "monaco-editor": "^0.52.0"
   },
   "peerDependenciesMeta": {
     "react":            { "optional": true },
     "react-dom":        { "optional": true },
     "react-router-dom": { "optional": true },
-    "lucide-react":     { "optional": true }
+    "lucide-react":     { "optional": true },
+    "monaco-editor":    { "optional": true }
   },
   "devDependencies": {
     "@types/react": "^19.0.0",
