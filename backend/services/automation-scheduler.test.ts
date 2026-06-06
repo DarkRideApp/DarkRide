@@ -540,11 +540,12 @@ describe('AutomationScheduler', () => {
   });
 
   describe('queue resilience: head should not block runnable entries', () => {
-    // Real-world incident 2026-06-05: WDWLL Tipboards (deviceless) was queued
-    // behind a device-requiring automation. All devices were offline overnight,
-    // so the head sat unrunnable at position [0] forever, blocking Tipboards
-    // (and every other deviceless or available-device automation) from running.
-    // The user noticed because their morning tipboard runs never happened.
+    // Real-world incident 2026-06-05: a deviceless automation was queued
+    // behind a device-requiring one. All devices were offline overnight, so
+    // the head sat unrunnable at position [0] forever, blocking the
+    // deviceless entry (and every other deviceless or available-device
+    // automation) from running. The user noticed because their morning
+    // scheduled runs never happened.
     //
     // Pre-fix: processQueue() returned at the first unrunnable head — single
     // head-of-line block holds the entire queue. These tests cover the
@@ -583,7 +584,7 @@ describe('AutomationScheduler', () => {
     it('runs a deviceless entry when a device-requiring entry ahead of it has no device available', async () => {
       // No devices configured at all — so the head entry definitely can't run
       const blockerId = insertDeviceRequiringAutomation('Blocker');
-      const devicelessId = insertDevicelessAutomation('Tipboards');
+      const devicelessId = insertDevicelessAutomation('DevicelessAutomation');
 
       const mockRun = vi.spyOn(runner, 'runAutomation').mockResolvedValue({
         sessionId: 1, success: true,
