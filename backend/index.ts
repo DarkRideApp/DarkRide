@@ -1165,6 +1165,12 @@ httpServer.listen(PORT, HOST, () => {
   );
   const preStartRouteSetups = new Set(pluginManager.getAllRouteSetups());
 
+  // Wire the scheduler's managed-automations guard so its tryResolveEntry
+  // can ask pluginManager whether the owning plugin is currently loaded.
+  // Pre-fix the scheduler treated every plugin as loaded and would fire
+  // managed rows even for stopped/uninstalled plugins.
+  scheduler.setIsPluginLoaded((name) => pluginManager!.hasPlugin(name));
+
   // Reconcile managed automations BEFORE startAll(). Plugins register their
   // managed scripts in register(); the host stamps them onto the automations
   // table here so by the time start() (and the scheduler tick that follows
