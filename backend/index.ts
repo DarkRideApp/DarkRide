@@ -10,6 +10,7 @@ import { ProxyRotator } from './services/proxy-rotator';
 import { PythonBridgeManager, ensureVenvAsync } from './services/python-bridge';
 import { AutomationCompiler } from './services/automation-compiler';
 import { AutomationRunner } from './services/automation-runner';
+import { reconcileManagedAutomations } from './services/managed-automation-reconciler';
 import { AutomationScheduler } from './services/automation-scheduler';
 import { MitmproxyManager } from './services/mitmproxy-manager';
 import { registerProxyEndpoints } from './api/proxies';
@@ -1163,6 +1164,22 @@ httpServer.listen(PORT, HOST, () => {
     pluginManager.getAllAiTools().map((t) => t.name),
   );
   const preStartRouteSetups = new Set(pluginManager.getAllRouteSetups());
+
+  // Reconcile managed automations BEFORE startAll(). Plugins register their
+  // managed scripts in register(); the host stamps them onto the automations
+  // table here so by the time start() (and the scheduler tick that follows
+  // it) reads the table, every declared script has a row and any
+  // previously-declared row that's gone has been orphaned or deleted.
+  for (const { pluginName, defs } of pluginManager.getAllManagedAutomations()) {
+    try {
+      reconcileManagedAutomations(db, pluginName, defs);
+    } catch (err: any) {
+      // Reconcile failure for one plugin must not block the others or the
+      // boot — surface it loudly and continue. The scheduler's plugin-loaded
+      // guard (next commit) protects us against orphaned runs.
+      error(`Failed to reconcile managed automations for plugin "${pluginName}": ${err?.message ?? err}`);
+    }
+  }
 
   // Run all migrated plugins' start() in topological order. Required-peer
   // failures (and timeouts) abort boot.
