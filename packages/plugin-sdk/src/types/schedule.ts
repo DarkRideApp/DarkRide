@@ -32,7 +32,17 @@ export interface CronSchedule {
 
 export interface IntervalSchedule {
   type: 'interval';
-  /** Fire every N milliseconds, starting at the next tick. */
+  /**
+   * Fire every N milliseconds, starting at the next tick.
+   *
+   * NOTE on the IDE: the bundled `ScheduleEditor` only supports
+   * minute-granularity intervals — it converts to/from `intervalMinutes`
+   * and rounds when reading. A `defaultSchedule` whose `intervalMs` isn't
+   * a whole-minute multiple will display correctly but round on save, so
+   * if the operator opens + re-saves without changing anything the
+   * stored value can drift to the nearest minute. Stick to whole-minute
+   * `intervalMs` (and never below 60_000, which the validator enforces).
+   */
   intervalMs: number;
 }
 

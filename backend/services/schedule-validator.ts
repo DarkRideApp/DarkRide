@@ -31,21 +31,27 @@ export function validateScheduleConfig(config: unknown): { valid: boolean; error
   }
   if (c.type === 'interval') {
     const intervalMs = (c as { intervalMs?: unknown }).intervalMs;
-    if (typeof intervalMs !== 'number' || intervalMs < 60000) {
-      return { valid: false, error: 'interval schedule requires intervalMs >= 60000' };
+    // `typeof NaN === 'number'` and `NaN < 60000` is false, so plain
+    // < / >= comparisons let NaN/Infinity through and produce a schedule
+    // that never fires. `Number.isFinite` rejects both.
+    if (typeof intervalMs !== 'number' || !Number.isFinite(intervalMs) || intervalMs < 60000) {
+      return { valid: false, error: 'interval schedule requires finite intervalMs >= 60000' };
     }
     return { valid: true };
   }
   if (c.type === 'windowed_interval') {
     const w = c as { intervalMinutes?: unknown; windowStart?: unknown; windowEnd?: unknown };
-    if (typeof w.intervalMinutes !== 'number' || w.intervalMinutes < 1) {
-      return { valid: false, error: 'windowed_interval schedule requires intervalMinutes >= 1' };
+    if (typeof w.intervalMinutes !== 'number' || !Number.isFinite(w.intervalMinutes) || w.intervalMinutes < 1) {
+      return { valid: false, error: 'windowed_interval schedule requires finite intervalMinutes >= 1' };
     }
-    if (typeof w.windowStart !== 'string' || !/^\d{2}:\d{2}$/.test(w.windowStart)) {
-      return { valid: false, error: 'windowed_interval schedule requires windowStart in HH:MM format' };
+    // The earlier /^\d{2}:\d{2}$/ accepted strings like "99:99" — match
+    // a real clock time so isInWindow can rely on the values.
+    const hhmm = /^([01]\d|2[0-3]):[0-5]\d$/;
+    if (typeof w.windowStart !== 'string' || !hhmm.test(w.windowStart)) {
+      return { valid: false, error: 'windowed_interval schedule requires windowStart as HH:MM (00:00 – 23:59)' };
     }
-    if (typeof w.windowEnd !== 'string' || !/^\d{2}:\d{2}$/.test(w.windowEnd)) {
-      return { valid: false, error: 'windowed_interval schedule requires windowEnd in HH:MM format' };
+    if (typeof w.windowEnd !== 'string' || !hhmm.test(w.windowEnd)) {
+      return { valid: false, error: 'windowed_interval schedule requires windowEnd as HH:MM (00:00 – 23:59)' };
     }
     return { valid: true };
   }
