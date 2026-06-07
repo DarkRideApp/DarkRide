@@ -3168,6 +3168,25 @@ class AuthManager {
       const result: any = await registry.executeTool('list_tracked_apps', { query: 'nothing-like-this' });
       expect(result).toEqual([]);
     });
+
+    it('only counts versions belonging to the matched apps (regression: scoped query)', async () => {
+      // Pre-fix, the tool loaded every apk_versions row into a Map and
+      // then filtered apps. Now the query scopes to the filtered app ids
+      // via inArray. Add a sibling app + version and confirm a narrow
+      // query still returns the right versionCount for the matched app
+      // (i.e. the inArray filter is correct, not accidentally including
+      // unrelated rows).
+      const { uni } = seedApps();
+      db.insert(schema.apkVersions).values([
+        { trackedAppId: uni.id, versionCode: 60, versionName: '2.1.0', filename: 'uni-60.apk', downloadedAt: new Date(NOW * 1000) },
+        { trackedAppId: uni.id, versionCode: 70, versionName: '2.2.0', filename: 'uni-70.apk', downloadedAt: new Date(NOW * 1000) },
+      ]).run();
+      const result: any = await registry.executeTool('list_tracked_apps', { query: 'universal' });
+      expect(result).toHaveLength(1);
+      expect(result[0].packageName).toBe('com.universal.studios');
+      expect(result[0].versionCount).toBe(3); // 50 + 60 + 70
+      expect(result[0].latestVersionCode).toBe(70);
+    });
   });
 
   describe('get_app_versions', () => {

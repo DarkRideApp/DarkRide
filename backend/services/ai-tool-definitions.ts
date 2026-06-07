@@ -1132,19 +1132,27 @@ export function registerAllTools(
     requiredScope: 'core.apk:read',
     async execute(params: { query?: string }) {
       const apps = db.select().from(schema.trackedApps).all();
-      const versions = db.select().from(schema.apkVersions).all();
+      const q = params.query?.toLowerCase().trim();
+      // Filter apps FIRST, then scope the apk_versions read to just the
+      // matching ids — without the query path scanning the whole
+      // versions table is wasted work when the agent only cares about a
+      // single match (e.g. "disney").
+      const filtered = q
+        ? apps.filter(a =>
+            a.packageName.toLowerCase().includes(q)
+            || (a.appName?.toLowerCase().includes(q) ?? false))
+        : apps;
+      if (filtered.length === 0) return [];
+      const filteredIds = filtered.map(a => a.id);
+      const versions = db.select().from(schema.apkVersions)
+        .where(inArray(schema.apkVersions.trackedAppId, filteredIds))
+        .all();
       const versionsByApp = new Map<number, typeof versions>();
       for (const v of versions) {
         const list = versionsByApp.get(v.trackedAppId) ?? [];
         list.push(v);
         versionsByApp.set(v.trackedAppId, list);
       }
-      const q = params.query?.toLowerCase().trim();
-      const filtered = q
-        ? apps.filter(a =>
-            a.packageName.toLowerCase().includes(q)
-            || (a.appName?.toLowerCase().includes(q) ?? false))
-        : apps;
       return filtered.map(a => {
         const list = versionsByApp.get(a.id) ?? [];
         // Pick the latest by versionCode — the host treats that as the
