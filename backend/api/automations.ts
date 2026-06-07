@@ -10,6 +10,7 @@ import type { AppDatabase } from '../db/index';
 import { AutomationRunner } from '../services/automation-runner';
 import { AutomationCompiler } from '../services/automation-compiler';
 import { AutomationScheduler } from '../services/automation-scheduler';
+import { validateScheduleConfig } from '../services/schedule-validator';
 import { exportSessionHar, exportSessionZip } from '../services/session-export';
 import { importSessionHar, importSessionZip } from '../services/session-import';
 import type { CaptureSessionManager } from '../services/capture-session-manager';
@@ -35,42 +36,6 @@ export function registerAutomationEndpoints(
         runner.runCaptureRules(deviceId, sessionId).catch(() => {});
       }
     }
-  }
-
-  function validateScheduleConfig(config: any): { valid: boolean; error?: string } {
-    if (!config || typeof config !== 'object') {
-      return { valid: false, error: 'schedule must be an object' };
-    }
-    if (config.type === 'cron') {
-      if (!Array.isArray(config.expressions) || config.expressions.length === 0) {
-        return { valid: false, error: 'cron schedule requires non-empty expressions array' };
-      }
-      for (const expr of config.expressions) {
-        if (typeof expr !== 'string' || expr.trim().split(/\s+/).length !== 5) {
-          return { valid: false, error: `invalid cron expression: ${expr}` };
-        }
-      }
-      return { valid: true };
-    }
-    if (config.type === 'interval') {
-      if (typeof config.intervalMs !== 'number' || config.intervalMs < 60000) {
-        return { valid: false, error: 'interval schedule requires intervalMs >= 60000' };
-      }
-      return { valid: true };
-    }
-    if (config.type === 'windowed_interval') {
-      if (typeof config.intervalMinutes !== 'number' || config.intervalMinutes < 1) {
-        return { valid: false, error: 'windowed_interval schedule requires intervalMinutes >= 1' };
-      }
-      if (typeof config.windowStart !== 'string' || !/^\d{2}:\d{2}$/.test(config.windowStart)) {
-        return { valid: false, error: 'windowed_interval schedule requires windowStart in HH:MM format' };
-      }
-      if (typeof config.windowEnd !== 'string' || !/^\d{2}:\d{2}$/.test(config.windowEnd)) {
-        return { valid: false, error: 'windowed_interval schedule requires windowEnd in HH:MM format' };
-      }
-      return { valid: true };
-    }
-    return { valid: false, error: 'schedule type must be "cron", "interval", or "windowed_interval"' };
   }
 
   function waitForCompletion(

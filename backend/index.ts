@@ -337,7 +337,7 @@ registerProxyEndpoints(db);
 registerDeviceEndpoints(deviceManager, db, iosDeviceManager);
 registerTrafficEndpoints(db, trafficHookRegistry);
 registerAutomationEndpoints(db, runner, compiler, scheduler, captureManager, fileSync);
-registerManagedAutomationEndpoints(db);
+registerManagedAutomationEndpoints(db, scheduler);
 registerAutomationTemplateEndpoints();
 registerCaptureEndpoints(captureManager);
 registerBlocklistEndpoints(db);

@@ -63,6 +63,15 @@ export const automations = sqliteTable('automations', {
   /** Does the plugin permit forking? Drives the IDE component. */
   allowUserOverride: integer('allow_user_override', { mode: 'boolean' }).notNull().default(true),
   /**
+   * Snapshot of the schedule the plugin currently ships, refreshed every
+   * plugin load. NOT a tracked override — the operator's actual `schedule`
+   * is what runs; this is only the "revert to default" target the SDK IDE
+   * offers when the operator's value differs.
+   */
+  currentDefaultSchedule: text('current_default_schedule'),
+  /** Same idea for `enabled` — the plugin's current default, separate from the operator-owned `enabled` field. */
+  currentDefaultEnabled: integer('current_default_enabled', { mode: 'boolean' }),
+  /**
    * One-line description from the plugin's ManagedAutomationDef. Nullable
    * because ordinary (non-managed) automations don't carry one. Refreshed
    * on every plugin load through the reconciler's insert + silent-adopt +

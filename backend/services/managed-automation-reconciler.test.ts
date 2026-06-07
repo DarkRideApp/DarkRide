@@ -164,6 +164,51 @@ describe('reconcileManagedAutomations', () => {
       expect(row.timeoutMs).toBe(120_000);
       expect(row.currentDefaultCode).toBe('v2\n');
     });
+
+    it('keeps current_default_schedule and current_default_enabled in sync with the plugin without touching the operator-owned schedule/enabled', () => {
+      // These two columns are the "revert to default" targets the SDK IDE
+      // offers. They must refresh on every reconcile pass (including the
+      // preserve-override branch) so the revert button always restores to
+      // what the plugin currently ships — not what it shipped at the row's
+      // first insert. The operator-owned `schedule` and `enabled` columns
+      // are NEVER touched here.
+      const sched1 = JSON.stringify({ type: 'interval', intervalMs: 60_000 });
+      const sched2 = JSON.stringify({ type: 'cron', expressions: ['0 9 * * *'] });
+
+      // First load with interval schedule + enabled
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({
+        defaultSchedule: sched1,
+        enabledByDefault: true,
+      })]);
+      let row = getRow(db, 'plugin-x', 'poller');
+      expect(row.schedule).toBe(sched1);            // seed
+      expect(row.enabled).toBe(true);                // seed
+      expect(row.currentDefaultSchedule).toBe(sched1);
+      expect(row.currentDefaultEnabled).toBe(true);
+
+      // Operator overrides BOTH the schedule and the enabled flag.
+      db.update(automations).set({
+        schedule: JSON.stringify({ type: 'cron', expressions: ['0 0 * * 0'] }),
+        enabled: false,
+      }).where(eq(automations.id, row.id)).run();
+
+      // Plugin ships an updated default — schedule changes, enabled now false.
+      reconcileManagedAutomations(db, 'plugin-x', [makeDef({
+        defaultSchedule: sched2,
+        enabledByDefault: false,
+      })]);
+      row = getRow(db, 'plugin-x', 'poller');
+
+      // Operator overrides untouched — the scheduler keeps running THEIR
+      // schedule, not the plugin's new default.
+      expect(row.schedule).toBe(JSON.stringify({ type: 'cron', expressions: ['0 0 * * 0'] }));
+      expect(row.enabled).toBe(false);
+
+      // current_default_* tracks the plugin's latest declaration — the
+      // SDK Revert button targets these.
+      expect(row.currentDefaultSchedule).toBe(sched2);
+      expect(row.currentDefaultEnabled).toBe(false);
+    });
   });
 
   describe('case 4: managed row no longer declared (plugin dropped the script)', () => {
@@ -439,6 +484,55 @@ describe('reconcileManagedAutomations', () => {
       // No row should have been inserted — validation happens before any write.
       const rows = db.select().from(automations).all();
       expect(rows).toHaveLength(0);
+    });
+  });
+
+  describe('case 12: malformed defaultSchedule sanitised at the boundary', () => {
+    // Regression for PR #19 review: a buggy plugin could ship a non-JSON
+    // or shape-invalid defaultSchedule. Without sanitisation, the
+    // reconciler would persist it and the scheduler would silently skip
+    // the automation. Worse, revert-to-default would write that broken
+    // value back into automations.schedule. Validate at the boundary.
+
+    it('treats non-JSON defaultSchedule as null and logs a warning', () => {
+      const warnings: string[] = [];
+      reconcileManagedAutomations(
+        db,
+        'plugin-x',
+        [makeDef({ defaultSchedule: 'not-json{' })],
+        { warn: (m) => warnings.push(m) },
+      );
+      const row = getRow(db, 'plugin-x', 'poller');
+      expect(row.schedule).toBeNull();
+      expect(row.currentDefaultSchedule).toBeNull();
+      expect(warnings.some(w => /not valid JSON/.test(w))).toBe(true);
+    });
+
+    it('treats shape-invalid defaultSchedule as null and logs a warning', () => {
+      const warnings: string[] = [];
+      // Valid JSON, invalid ScheduleConfig (cron type but no expressions)
+      reconcileManagedAutomations(
+        db,
+        'plugin-x',
+        [makeDef({ defaultSchedule: JSON.stringify({ type: 'cron', expressions: [] }) })],
+        { warn: (m) => warnings.push(m) },
+      );
+      const row = getRow(db, 'plugin-x', 'poller');
+      expect(row.schedule).toBeNull();
+      expect(row.currentDefaultSchedule).toBeNull();
+      expect(warnings.some(w => /invalid/.test(w))).toBe(true);
+    });
+
+    it('still inserts the row + lets the rest of the plugin load', () => {
+      // A buggy schedule shouldn't poison the whole plugin's reconcile —
+      // the row should still exist (just with no schedule), and a sibling
+      // def should land normally.
+      reconcileManagedAutomations(db, 'plugin-x', [
+        makeDef({ key: 'bad', defaultSchedule: 'not-json' }),
+        makeDef({ key: 'good' }),
+      ], { warn: () => {} });
+      expect(getRow(db, 'plugin-x', 'bad')).toBeDefined();
+      expect(getRow(db, 'plugin-x', 'good')).toBeDefined();
     });
   });
 

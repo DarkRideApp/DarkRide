@@ -1,5 +1,12 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { useWebSocket } from '../hooks/useWebSocket';
+import { ScheduleEditor, type ScheduleValue } from './ScheduleEditor';
+import {
+  scheduleConfigToEditor,
+  editorValueToScheduleConfig,
+  schedulesEqual,
+  isMultiExpressionCronConfig,
+} from '../helpers/schedule-bridge';
 
 /**
  * Drop-in IDE component a plugin embeds on its own page to expose a managed
@@ -38,6 +45,14 @@ interface ManagedAutomationView {
   isOverridden: boolean;
   allowUserOverride: boolean;
   hasDrift: boolean;
+  /** Operator-owned enabled flag. */
+  enabled: boolean;
+  /** Operator-owned schedule JSON (matches `ScheduleConfig` stringified) or null. */
+  schedule: string | null;
+  /** Plugin's currently-shipped enabled default — revert target. */
+  currentDefaultEnabled: boolean | null;
+  /** Plugin's currently-shipped schedule default — revert target. */
+  currentDefaultSchedule: string | null;
 }
 
 interface ThreeWayDiff {
@@ -72,6 +87,19 @@ export function ManagedAutomationScriptIDE({
   // instead of flashing "Not found." between mount and the first refresh.
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // The ScheduleEditor reports its current working value via onChange;
+  // we hold the latest payload so the external "Save schedule" button can
+  // serialise it back to a ScheduleConfig and PUT.
+  const scheduleDraftRef = useRef<{ value: ScheduleValue; cron: string } | null>(null);
+  const [scheduleDirty, setScheduleDirty] = useState(false);
+  // When the operator has no saved schedule (view.schedule === null), we
+  // hide the editor behind a "Set schedule" button. Otherwise the editor
+  // would seed itself with a placeholder cron and fire an initial onChange
+  // — making "Save schedule" light up on first paint and contradicting the
+  // "No schedule" hint right above it. Clicking the button flips this to
+  // true, the editor mounts, and from that point the onChange genuinely
+  // reflects operator intent.
+  const [scheduleEditorOpen, setScheduleEditorOpen] = useState(false);
 
   const basePath = `/v1/managed-automations/${encodeURIComponent(pluginKey)}/${encodeURIComponent(scriptKey)}`;
 
@@ -174,6 +202,105 @@ export function ManagedAutomationScriptIDE({
     }
   };
 
+  // ── Operational controls ──────────────────────────────────────────────
+
+  const toggleEnabled = async (next: boolean) => {
+    if (!view) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const v = await api<ManagedAutomationView>('PUT', `${basePath}/enabled`, { enabled: next });
+      setView(v);
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revertEnabled = async () => {
+    if (!view) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const v = await api<ManagedAutomationView>('POST', `${basePath}/revert/enabled`);
+      setView(v);
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveSchedule = async () => {
+    if (!view) return;
+    const payload = scheduleDraftRef.current;
+    if (!payload) return;
+    const config = editorValueToScheduleConfig(payload.value, payload.cron);
+    const next = config ? JSON.stringify(config) : null;
+    setBusy(true);
+    setError(null);
+    try {
+      const v = await api<ManagedAutomationView>('PUT', `${basePath}/schedule`, { schedule: next });
+      setView(v);
+      setScheduleDirty(false);
+      // If the user just saved a cleared schedule, close the editor so
+      // the next render shows the "Set schedule…" affordance again.
+      // Leaving it open would re-mount ScheduleEditor in the next paint
+      // and its initial onChange would re-mark dirty against the now-null
+      // saved value — mirror what revertSchedule does.
+      if (!v.schedule) {
+        setScheduleEditorOpen(false);
+        scheduleDraftRef.current = null;
+      }
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revertSchedule = async () => {
+    if (!view) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const v = await api<ManagedAutomationView>('POST', `${basePath}/revert/schedule`);
+      setView(v);
+      setScheduleDirty(false);
+      scheduleDraftRef.current = null;
+      // If the plugin default is null, revert lands the operator back in
+      // "no schedule" territory — close the editor again so the UI matches.
+      if (!v.schedule) setScheduleEditorOpen(false);
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Schedule editor working state — derived from view.schedule (current
+  // operator value) so the editor seeds correctly on first render. The
+  // ScheduleEditor takes a cron string; the bridge picks an opening tab.
+  // useMemo MUST sit above the early returns below — react hooks must run
+  // unconditionally on every render. We tolerate `view == null` inline.
+  const scheduleParsed = useMemo(() => {
+    if (!view?.schedule) return null;
+    try { return scheduleConfigToEditor(JSON.parse(view.schedule)); }
+    catch { return null; }
+  }, [view?.schedule]);
+  const scheduleDefaultParsed = useMemo(() => {
+    if (!view?.currentDefaultSchedule) return null;
+    try { return scheduleConfigToEditor(JSON.parse(view.currentDefaultSchedule)); }
+    catch { return null; }
+  }, [view?.currentDefaultSchedule]);
+  const scheduleConfigCurrent = useMemo(() => {
+    try { return view?.schedule ? JSON.parse(view.schedule) : null; } catch { return null; }
+  }, [view?.schedule]);
+  const scheduleConfigDefault = useMemo(() => {
+    try { return view?.currentDefaultSchedule ? JSON.parse(view.currentDefaultSchedule) : null; } catch { return null; }
+  }, [view?.currentDefaultSchedule]);
+
   if (!view && busy) return <div className={className}>Loading…</div>;
   if (!view && error) return <div className={className} role="alert">Error: {error}</div>;
   if (!view) return <div className={className}>Not found.</div>;
@@ -183,6 +310,21 @@ export function ManagedAutomationScriptIDE({
   const editorEl = editor
     ? editor({ code: draft, onChange: setDraft, readOnly })
     : <MonacoEditor value={draft} onChange={setDraft} readOnly={readOnly} />;
+
+  // Revert-button enable logic: scheduleDiffersFromDefault compares the
+  // stored operator value (view.schedule) to the plugin's default
+  // (view.currentDefaultSchedule) so the button is enabled IFF the
+  // operator has a value that doesn't match the plugin's snapshot.
+  // Unsaved draft state doesn't count — revert restores from the server.
+  const scheduleDiffersFromDefault = !schedulesEqual(scheduleConfigCurrent, scheduleConfigDefault);
+  const enabledDiffersFromDefault =
+    view.currentDefaultEnabled !== null && view.enabled !== view.currentDefaultEnabled;
+  // Multi-expression cron schedules are not round-trippable through the
+  // bundled ScheduleEditor — it surfaces expressions[0] only. Render a
+  // read-only banner instead of the editor so the operator has to clear
+  // via Revert (or PUT schedule=null) to edit, rather than silently
+  // dropping the extra expressions on Save.
+  const isMultiExpressionCron = isMultiExpressionCronConfig(scheduleConfigCurrent);
 
   return (
     <div className={className} data-testid="managed-automation-ide">
@@ -224,6 +366,130 @@ export function ManagedAutomationScriptIDE({
       {error && (
         <div role="alert" style={{ color: '#a00', marginBottom: 8 }}>Error: {error}</div>
       )}
+
+      {/* Operational settings — enabled toggle + schedule editor, each with
+          a Revert button that's enabled only when the operator's value
+          differs from the plugin's currently-shipped default. */}
+      <fieldset
+        data-testid="managed-automation-ops"
+        style={{
+          marginBottom: 12, padding: 12, border: '1px solid #ddd', borderRadius: 4,
+        }}
+      >
+        <legend style={{ padding: '0 6px', fontSize: 12, color: '#666' }}>Operational settings</legend>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={view.enabled}
+              disabled={busy}
+              onChange={(e) => void toggleEnabled(e.target.checked)}
+              data-testid="managed-automation-enabled-toggle"
+            />
+            Enabled
+          </label>
+          <span style={{ color: '#888', fontSize: 12 }}>
+            {view.enabled ? 'Scheduler will fire this on its cadence' : 'Disabled — scheduler skips it'}
+          </span>
+          <div style={{ marginLeft: 'auto' }}>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={revertEnabled}
+              disabled={busy || !enabledDiffersFromDefault}
+              title={
+                view.currentDefaultEnabled === null
+                  ? 'No plugin default recorded'
+                  : !enabledDiffersFromDefault
+                    ? 'Already matches the plugin default'
+                    : `Reverts to plugin default (${view.currentDefaultEnabled ? 'enabled' : 'disabled'})`
+              }
+              data-testid="managed-automation-revert-enabled"
+            >
+              Revert to default
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+            <strong style={{ fontSize: 13 }}>Schedule</strong>
+            <span style={{ color: '#888', fontSize: 12 }}>
+              {view.schedule ? 'Operator-set' : 'No schedule — automation only runs manually'}
+            </span>
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+              {(view.schedule || scheduleEditorOpen) && !isMultiExpressionCron && (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-primary"
+                  onClick={saveSchedule}
+                  disabled={busy || !scheduleDirty}
+                  data-testid="managed-automation-save-schedule"
+                >
+                  Save schedule
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={revertSchedule}
+                disabled={busy || !scheduleDiffersFromDefault}
+                title={
+                  scheduleConfigDefault == null
+                    ? 'Plugin ships no default schedule — Revert would clear yours'
+                    : !scheduleDiffersFromDefault
+                      ? 'Already matches the plugin default'
+                      : 'Restores the plugin default schedule'
+                }
+                data-testid="managed-automation-revert-schedule"
+              >
+                Revert to default
+              </button>
+            </div>
+          </div>
+
+          {isMultiExpressionCron ? (
+            <div
+              role="note"
+              data-testid="managed-automation-multi-cron-banner"
+              style={{
+                padding: 8, border: '1px dashed #c70', background: '#fff8e8',
+                borderRadius: 4, fontSize: 12, color: '#664',
+              }}
+            >
+              This automation runs on multiple cron expressions, which the
+              inline editor doesn't yet support. The schedule is read-only
+              here — to change it, hit <strong>Revert to default</strong>
+              {scheduleConfigDefault ? '' : ' (clears it)'} and set a new one.
+            </div>
+          ) : view.schedule || scheduleEditorOpen ? (
+            <ScheduleEditor
+              inline
+              value={scheduleParsed?.cronString ?? scheduleDefaultParsed?.cronString ?? '*/5 * * * *'}
+              defaultValue={scheduleDefaultParsed?.cronString ?? '*/5 * * * *'}
+              onChange={(value, cron) => {
+                scheduleDraftRef.current = { value, cron };
+                // Mark dirty whenever the editor produces a value that differs
+                // from the server-saved one. We compare the serialised
+                // ScheduleConfig to dodge formatting noise inside the editor.
+                const next = editorValueToScheduleConfig(value, cron);
+                setScheduleDirty(!schedulesEqual(next, scheduleConfigCurrent));
+              }}
+            />
+          ) : (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => setScheduleEditorOpen(true)}
+              disabled={busy}
+              data-testid="managed-automation-set-schedule"
+            >
+              Set schedule…
+            </button>
+          )}
+        </div>
+      </fieldset>
 
       {editorEl}
 

@@ -31,6 +31,9 @@ function makeDb() {
       allow_user_override INTEGER NOT NULL DEFAULT 1,
       description TEXT,
       emit_failure_notification INTEGER NOT NULL DEFAULT 0,
+      -- Migration 0094 — revert-to-default snapshots
+      current_default_schedule TEXT,
+      current_default_enabled INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );

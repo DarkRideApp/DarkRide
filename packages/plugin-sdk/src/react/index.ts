@@ -53,6 +53,14 @@ export { ButtonList, DefaultButtonListItem } from './components/ButtonList';
 export type { ButtonListProps, ButtonListItemProps } from './components/ButtonList';
 export { ManagedAutomationScriptIDE } from './components/ManagedAutomationScriptIDE';
 export type { ManagedAutomationScriptIDEProps } from './components/ManagedAutomationScriptIDE';
+export { ScheduleEditor, isCronValid, getNextCronRuns } from './components/ScheduleEditor';
+export type { ScheduleEditorProps, ScheduleValue, ScheduleMode } from './components/ScheduleEditor';
+export {
+  scheduleConfigToEditor,
+  editorValueToScheduleConfig,
+  schedulesEqual,
+  isMultiExpressionCronConfig,
+} from './helpers/schedule-bridge';
 export { NavItemList, DefaultNavItemListItem } from './components/NavItemList';
 export type { NavItemListProps, NavItemListItemProps } from './components/NavItemList';
 export { ExtensionSlot } from './components/ExtensionSlot';

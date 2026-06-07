@@ -13,6 +13,7 @@ import type { DeviceManager } from './device-manager';
 import type { AutomationRunner } from './automation-runner';
 import type { TriggerType } from '../../shared/types/api';
 import type { AutomationScheduler } from './automation-scheduler';
+import { validateScheduleConfig } from './schedule-validator';
 import type { AutomationCompiler } from './automation-compiler';
 import type { CaptureSessionManager } from './capture-session-manager';
 import type { PluginStateManager } from './plugin-state-manager';
@@ -647,21 +648,8 @@ export function registerAllTools(
           scheduler.removeSchedule(params.id);
           scheduleResult = 'cleared';
         } else {
-          // Minimal inline validation — mirrors validateScheduleConfig in
-          // api/automations.ts. Kept here so the tool doesn't depend on
-          // an internal API helper.
-          const s = params.schedule;
-          let valid = false;
-          if (s && typeof s === 'object') {
-            if (s.type === 'cron' && Array.isArray(s.expressions) && s.expressions.length > 0) {
-              valid = s.expressions.every((e: any) => typeof e === 'string' && e.trim().split(/\s+/).length === 5);
-            } else if (s.type === 'interval' && typeof s.intervalMs === 'number' && s.intervalMs > 0) {
-              valid = true;
-            } else if (s.type === 'windowed_interval') {
-              valid = true; // deeper validation lives in the route; accept here
-            }
-          }
-          if (!valid) {
+          const validation = validateScheduleConfig(params.schedule);
+          if (!validation.valid) {
             scheduleResult = 'invalid';
           } else {
             scheduler.setSchedule(params.id, params.schedule);

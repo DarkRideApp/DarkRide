@@ -4,6 +4,7 @@ import { automations, automationSessions } from '../db/schema';
 import type { AppDatabase } from '../db';
 import type { ManagedAutomationDef } from '@darkrideapp/plugin-sdk';
 import { createLoggers } from '../logs';
+import { validateScheduleConfig } from './schedule-validator';
 
 // The Logger interface exposes log + error only — no dedicated `warn`. Treat
 // the rename heuristic as an error-level event so it surfaces in the same
@@ -48,6 +49,32 @@ export function reconcileManagedAutomations(
   options: ReconcileOptions = {},
 ): void {
   const emitWarn = options.warn ?? defaultWarn;
+
+  /**
+   * Plugins author `defaultSchedule` as an opaque JSON string. If it's
+   * malformed (or describes an unknown shape), persisting it would make
+   * the scheduler silently skip the automation AND let revert-to-default
+   * persist that same broken value back into `automations.schedule`.
+   * Catch it at the boundary: log a warning, treat the row as having no
+   * default schedule. The plugin still loads — buggy schedule shouldn't
+   * brick the rest of the plugin's automations.
+   */
+  function sanitiseDefaultSchedule(raw: string | undefined, key: string): string | null {
+    if (raw == null) return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      emitWarn(`Plugin "${pluginName}/${key}" defaultSchedule is not valid JSON; ignoring.`);
+      return null;
+    }
+    const validation = validateScheduleConfig(parsed);
+    if (!validation.valid) {
+      emitWarn(`Plugin "${pluginName}/${key}" defaultSchedule is invalid (${validation.error}); ignoring.`);
+      return null;
+    }
+    return raw;
+  }
 
   // Wrap the whole state machine + session-back-fill sweep in a single
   // transaction so a mid-reconcile failure (disk full, transient
@@ -95,6 +122,7 @@ export function reconcileManagedAutomations(
   for (const def of defs) {
     const declCode = normaliseLineEndings(def.code);
     const existing = existingByKey.get(def.key);
+    const safeDefaultSchedule = sanitiseDefaultSchedule(def.defaultSchedule, def.key);
 
     if (!existing) {
       // ── INSERT ────────────────────────────────────────────────────
@@ -113,7 +141,7 @@ export function reconcileManagedAutomations(
         requiresDevice: def.requiresDevice ?? true,
         timeoutMs: def.timeoutMs ?? 300_000,
         enabled: def.enabledByDefault ?? true,
-        schedule: def.defaultSchedule ?? null,
+        schedule: safeDefaultSchedule,
         deviceFilter: def.defaultDeviceFilter
           ? JSON.stringify(def.defaultDeviceFilter)
           : null,
@@ -126,6 +154,12 @@ export function reconcileManagedAutomations(
         allowUserOverride: def.allowUserOverride ?? true,
         emitFailureNotification: def.emitFailureNotification ?? false,
         description: def.description ?? null,
+        // Snapshot of the plugin's current defaults for schedule/enabled —
+        // refreshed every load so "revert to default" in the IDE always
+        // targets what the plugin currently ships, not what it shipped
+        // on the row's first insert.
+        currentDefaultSchedule: safeDefaultSchedule,
+        currentDefaultEnabled: def.enabledByDefault ?? true,
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -146,6 +180,8 @@ export function reconcileManagedAutomations(
           allowUserOverride: def.allowUserOverride ?? true,
           emitFailureNotification: def.emitFailureNotification ?? false,
           description: def.description ?? null,
+          currentDefaultSchedule: safeDefaultSchedule,
+          currentDefaultEnabled: def.enabledByDefault ?? true,
           updatedAt: now,
         })
         .where(eq(automations.id, existing.id))
@@ -172,6 +208,8 @@ export function reconcileManagedAutomations(
         allowUserOverride: def.allowUserOverride ?? true,
         emitFailureNotification: def.emitFailureNotification ?? false,
         description: def.description ?? null,
+        currentDefaultSchedule: safeDefaultSchedule,
+        currentDefaultEnabled: def.enabledByDefault ?? true,
         updatedAt: now,
       })
       .where(eq(automations.id, existing.id))
@@ -193,6 +231,8 @@ export function reconcileManagedAutomations(
         managedKey: null,
         currentDefaultCode: null,
         baseDefaultCode: null,
+        currentDefaultSchedule: null,
+        currentDefaultEnabled: null,
         isOverridden: false,
         enabled: false,
         updatedAt: now,

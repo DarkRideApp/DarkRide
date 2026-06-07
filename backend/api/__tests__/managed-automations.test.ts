@@ -8,13 +8,26 @@ import { clearEndpoints, getApiRouter } from '../api-service';
 import { registerManagedAutomationEndpoints } from '../managed-automations';
 import type { AppDatabase } from '../../db/index';
 
-function makeApp(db: AppDatabase) {
+function makeApp(db: AppDatabase, scheduler?: any) {
   clearEndpoints();
-  registerManagedAutomationEndpoints(db);
+  registerManagedAutomationEndpoints(db, scheduler);
   const app = express();
   app.use(express.json());
   app.use(getApiRouter());
   return app;
+}
+
+/**
+ * Test seam for the AutomationScheduler dependency. The real class has a
+ * lot more surface; we only care about the two methods the API calls.
+ */
+function fakeScheduler() {
+  return {
+    setCalls: [] as Array<{ id: number; config: any }>,
+    removeCalls: [] as number[],
+    setSchedule(id: number, config: any) { this.setCalls.push({ id, config }); },
+    removeSchedule(id: number) { this.removeCalls.push(id); },
+  };
 }
 
 function seedManaged(db: AppDatabase, overrides: Partial<typeof automations.$inferInsert> = {}) {
@@ -216,6 +229,198 @@ describe('managed-automations REST endpoints', () => {
         incoming: 'v2\n',
         yours: 'operator\n',
       });
+    });
+  });
+
+  describe('PUT .../schedule (operator updates schedule)', () => {
+    it('writes the operator schedule, leaves currentDefaultSchedule untouched', async () => {
+      seedManaged(db, {
+        schedule: JSON.stringify({ type: 'interval', intervalMs: 60_000 }),
+        currentDefaultSchedule: JSON.stringify({ type: 'interval', intervalMs: 60_000 }),
+      });
+      const newSched = JSON.stringify({ type: 'cron', expressions: ['0 9 * * *'] });
+      const res = await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: newSched });
+      expect(res.status).toBe(200);
+      const row = db.select().from(automations).all()[0];
+      expect(row.schedule).toBe(newSched);
+      expect(row.currentDefaultSchedule).toBe(JSON.stringify({ type: 'interval', intervalMs: 60_000 }));
+    });
+
+    it('accepts null to clear the schedule', async () => {
+      seedManaged(db, { schedule: JSON.stringify({ type: 'interval', intervalMs: 60_000 }) });
+      const res = await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: null });
+      expect(res.status).toBe(200);
+      expect(db.select().from(automations).all()[0].schedule).toBeNull();
+    });
+
+    it('400 for non-string non-null schedule', async () => {
+      seedManaged(db);
+      const res = await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: { rogue: 'object' } });
+      expect(res.status).toBe(400);
+    });
+
+    it('400 for malformed JSON', async () => {
+      seedManaged(db);
+      const res = await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: '{not json' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/valid JSON/);
+    });
+
+    it('400 for valid JSON with bad ScheduleConfig shape', async () => {
+      seedManaged(db);
+      const res = await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: JSON.stringify({ type: 'cron', expressions: ['nope'] }) });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/invalid cron expression/);
+    });
+
+    it('notifies the scheduler so changes take effect without a restart', async () => {
+      const sched = fakeScheduler();
+      const localApp = makeApp(db, sched);
+      const row = seedManaged(db);
+      const newSched = JSON.stringify({ type: 'cron', expressions: ['0 9 * * *'] });
+      const res = await request(localApp)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: newSched });
+      expect(res.status).toBe(200);
+      expect(sched.setCalls).toEqual([{ id: row.id, config: { type: 'cron', expressions: ['0 9 * * *'] } }]);
+      expect(sched.removeCalls).toEqual([]);
+    });
+
+    it('calls scheduler.removeSchedule when schedule is cleared', async () => {
+      const sched = fakeScheduler();
+      const localApp = makeApp(db, sched);
+      const row = seedManaged(db, { schedule: JSON.stringify({ type: 'interval', intervalMs: 60_000 }) });
+      const res = await request(localApp)
+        .put('/v1/managed-automations/plugin-x/poller/schedule')
+        .send({ schedule: null });
+      expect(res.status).toBe(200);
+      expect(sched.removeCalls).toEqual([row.id]);
+      expect(sched.setCalls).toEqual([]);
+    });
+  });
+
+  describe('PUT .../enabled (operator toggles)', () => {
+    it('flips enabled', async () => {
+      seedManaged(db, { enabled: true });
+      const res = await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/enabled')
+        .send({ enabled: false });
+      expect(res.status).toBe(200);
+      expect(db.select().from(automations).all()[0].enabled).toBe(false);
+    });
+
+    it('400 for non-boolean', async () => {
+      seedManaged(db);
+      const res = await request(app)
+        .put('/v1/managed-automations/plugin-x/poller/enabled')
+        .send({ enabled: 'yes' });
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('POST .../revert/schedule', () => {
+    it('restores schedule to currentDefaultSchedule', async () => {
+      const opSched = JSON.stringify({ type: 'cron', expressions: ['*/5 * * * *'] });
+      const defSched = JSON.stringify({ type: 'interval', intervalMs: 60_000 });
+      seedManaged(db, { schedule: opSched, currentDefaultSchedule: defSched });
+      const res = await request(app).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(200);
+      expect(db.select().from(automations).all()[0].schedule).toBe(defSched);
+    });
+
+    it('reverting to a null currentDefaultSchedule clears the schedule (legitimate operation)', async () => {
+      seedManaged(db, {
+        schedule: JSON.stringify({ type: 'interval', intervalMs: 60_000 }),
+        currentDefaultSchedule: null,
+      });
+      const res = await request(app).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(200);
+      expect(db.select().from(automations).all()[0].schedule).toBeNull();
+    });
+
+    it('notifies scheduler with setSchedule when reverting to a defined default', async () => {
+      const sched = fakeScheduler();
+      const localApp = makeApp(db, sched);
+      const defSched = JSON.stringify({ type: 'interval', intervalMs: 60_000 });
+      const row = seedManaged(db, {
+        schedule: JSON.stringify({ type: 'cron', expressions: ['*/5 * * * *'] }),
+        currentDefaultSchedule: defSched,
+      });
+      const res = await request(localApp).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(200);
+      expect(sched.setCalls).toEqual([{ id: row.id, config: { type: 'interval', intervalMs: 60_000 } }]);
+    });
+
+    it('notifies scheduler with removeSchedule when reverting to null default', async () => {
+      const sched = fakeScheduler();
+      const localApp = makeApp(db, sched);
+      const row = seedManaged(db, {
+        schedule: JSON.stringify({ type: 'interval', intervalMs: 60_000 }),
+        currentDefaultSchedule: null,
+      });
+      const res = await request(localApp).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(200);
+      expect(sched.removeCalls).toEqual([row.id]);
+    });
+
+    it('refuses to revert and 500s when the stored default is malformed JSON', async () => {
+      // Reconciler sanitises new writes, but a row from an older host
+      // build could hold an invalid value. Belt-and-braces: refuse to
+      // round-trip it into automations.schedule (which would silently
+      // break scheduling).
+      const opSched = JSON.stringify({ type: 'cron', expressions: ['*/5 * * * *'] });
+      seedManaged(db, { schedule: opSched, currentDefaultSchedule: 'not-json{' });
+      const res = await request(app).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(500);
+      // Operator's schedule must NOT have been overwritten.
+      expect(db.select().from(automations).all()[0].schedule).toBe(opSched);
+    });
+
+    it('refuses to revert and 500s when stored default has bad ScheduleConfig shape', async () => {
+      const opSched = JSON.stringify({ type: 'cron', expressions: ['*/5 * * * *'] });
+      seedManaged(db, {
+        schedule: opSched,
+        currentDefaultSchedule: JSON.stringify({ type: 'cron', expressions: [] }),
+      });
+      const res = await request(app).post('/v1/managed-automations/plugin-x/poller/revert/schedule');
+      expect(res.status).toBe(500);
+      expect(db.select().from(automations).all()[0].schedule).toBe(opSched);
+    });
+  });
+
+  describe('POST .../revert/enabled', () => {
+    it('restores enabled to currentDefaultEnabled', async () => {
+      seedManaged(db, { enabled: false, currentDefaultEnabled: true });
+      const res = await request(app).post('/v1/managed-automations/plugin-x/poller/revert/enabled');
+      expect(res.status).toBe(200);
+      expect(db.select().from(automations).all()[0].enabled).toBe(true);
+    });
+
+    it('409 when currentDefaultEnabled is null (legacy row, plugin default unknown)', async () => {
+      seedManaged(db, { currentDefaultEnabled: null });
+      const res = await request(app).post('/v1/managed-automations/plugin-x/poller/revert/enabled');
+      expect(res.status).toBe(409);
+    });
+  });
+
+  describe('GET .../:plugin/:key view fields (regression)', () => {
+    it('surfaces currentDefaultEnabled and currentDefaultSchedule on the view', async () => {
+      const defSched = JSON.stringify({ type: 'interval', intervalMs: 30_000 });
+      seedManaged(db, { currentDefaultEnabled: false, currentDefaultSchedule: defSched });
+      const res = await request(app).get('/v1/managed-automations/plugin-x/poller');
+      expect(res.status).toBe(200);
+      expect(res.body.data.currentDefaultEnabled).toBe(false);
+      expect(res.body.data.currentDefaultSchedule).toBe(defSched);
     });
   });
 
