@@ -583,6 +583,7 @@ registerAllTools(aiToolRegistry, db, {
   captureManager,
   pluginStateManager,
   systemStateService,
+  apkAnalyzer,
 });
 
 // Disk space endpoint
