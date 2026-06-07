@@ -3226,6 +3226,51 @@ class AuthManager {
       expect(v100.analysisStatus).toBe('pending');
       expect(v90.analysisStatus).toBeNull();
     });
+
+    it('uses the latest job per version when multiple jobs exist', async () => {
+      // Regression for an in-memory-map quirk: if the iteration order
+      // changes, picking the "first seen" must still mean the highest
+      // id (= newest). Insert in a deliberately out-of-order sequence.
+      const app = seedAppWithVersions();
+      const versions = db.select().from(schema.apkVersions).all().sort((a, b) => b.versionCode - a.versionCode);
+      db.insert(schema.analysisJobs).values([
+        { apkVersionId: versions[0].id, status: 'failed', createdAt: new Date(NOW * 1000 - 2000) },
+        { apkVersionId: versions[0].id, status: 'pending', createdAt: new Date(NOW * 1000 - 1000) },
+        { apkVersionId: versions[0].id, status: 'completed', createdAt: new Date(NOW * 1000) },
+      ]).run();
+      const result: any = await registry.executeTool('get_app_versions', { trackedAppId: app.id });
+      const v110 = result.versions.find((v: any) => v.versionCode === 110);
+      expect(v110.analysisStatus).toBe('completed');
+    });
+
+    it('does not surface analysis jobs from a different app', async () => {
+      // Regression: pre-fix, get_app_versions read every analysis_jobs
+      // row in the DB and grouped client-side. The query is now scoped
+      // to the app's versionIds via SQL inArray. This test would still
+      // pass on the old impl (because grouping is by apkVersionId), but
+      // codifies the boundary so a future "just join everything" change
+      // can't silently leak unrelated app status.
+      const app = seedAppWithVersions();
+      // Insert a separate app + version + analysis job for it
+      db.insert(schema.trackedApps).values({
+        packageName: 'com.other.app', appName: 'Other', createdAt: new Date(NOW * 1000),
+      }).run();
+      const other = db.select().from(schema.trackedApps).where(eq(schema.trackedApps.packageName, 'com.other.app')).all()[0];
+      db.insert(schema.apkVersions).values({
+        trackedAppId: other.id, versionCode: 1, filename: 'other-1.apk', downloadedAt: new Date(NOW * 1000),
+      }).run();
+      const otherVersion = db.select().from(schema.apkVersions).where(eq(schema.apkVersions.trackedAppId, other.id)).all()[0];
+      db.insert(schema.analysisJobs).values({
+        apkVersionId: otherVersion.id, status: 'completed', createdAt: new Date(NOW * 1000),
+      }).run();
+
+      const result: any = await registry.executeTool('get_app_versions', { trackedAppId: app.id });
+      // None of the WDW versions should have analysisStatus set just
+      // because com.other.app has a completed job somewhere.
+      for (const v of result.versions) {
+        expect(v.analysisStatus).toBeNull();
+      }
+    });
   });
 
   describe('trigger_apk_analysis', () => {

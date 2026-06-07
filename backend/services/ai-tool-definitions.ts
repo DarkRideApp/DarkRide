@@ -1,4 +1,4 @@
-import { eq, like, desc, sql } from 'drizzle-orm';
+import { eq, like, desc, sql, inArray } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -1190,11 +1190,18 @@ export function registerAllTools(
         .where(eq(schema.apkVersions.trackedAppId, app.id))
         .all()
         .sort((a, b) => b.versionCode - a.versionCode);
-      // Latest analysis job per version — sort DESC by id, keep the first
-      // seen per apkVersionId. Matches apps.ts:836 (recent jobs feed) and
-      // gives the agent the freshest signal, not whatever the first run
-      // recorded.
-      const jobs = db.select().from(schema.analysisJobs).all().sort((a, b) => b.id - a.id);
+      // Latest analysis job per version — scope to THIS app's versionIds
+      // at the SQL layer (the analysis_jobs table grows unboundedly with
+      // each rerun, and an agent will poll this tool while watching an
+      // analysis progress). Sorted DESC by id so the first row seen per
+      // apkVersionId is the freshest, matching apps.ts:836.
+      const versionIds = versions.map(v => v.id);
+      const jobs = versionIds.length === 0
+        ? []
+        : db.select().from(schema.analysisJobs)
+            .where(inArray(schema.analysisJobs.apkVersionId, versionIds))
+            .orderBy(desc(schema.analysisJobs.id))
+            .all();
       const latestJobByVersion = new Map<number, typeof jobs[number]>();
       for (const j of jobs) {
         if (!latestJobByVersion.has(j.apkVersionId)) latestJobByVersion.set(j.apkVersionId, j);
