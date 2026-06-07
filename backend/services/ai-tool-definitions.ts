@@ -1148,7 +1148,7 @@ export function registerAllTools(
       return filtered.map(a => {
         const list = versionsByApp.get(a.id) ?? [];
         // Pick the latest by versionCode — the host treats that as the
-        // canonical "newest" elsewhere (apps.ts:788).
+        // canonical "newest" elsewhere (backend/api/apps.ts:788).
         const latest = list.length > 0
           ? list.reduce((acc, v) => (v.versionCode > acc.versionCode ? v : acc))
           : null;
@@ -1194,7 +1194,7 @@ export function registerAllTools(
       // at the SQL layer (the analysis_jobs table grows unboundedly with
       // each rerun, and an agent will poll this tool while watching an
       // analysis progress). Sorted DESC by id so the first row seen per
-      // apkVersionId is the freshest, matching apps.ts:836.
+      // apkVersionId is the freshest, matching backend/api/apps.ts:836.
       const versionIds = versions.map(v => v.id);
       const jobs = versionIds.length === 0
         ? []
