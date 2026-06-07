@@ -3225,6 +3225,18 @@ class AuthManager {
       expect(result.error).toBeTruthy();
     });
 
+    it('returns an error when BOTH trackedAppId and packageName are given', async () => {
+      // Reject "both" rather than silently picking one — LLMs can
+      // over-specify and the lookup must not silently resolve to an
+      // unintended app.
+      const app = seedAppWithVersions();
+      const result: any = await registry.executeTool('get_app_versions', {
+        trackedAppId: app.id,
+        packageName: 'com.disney.wdw',
+      });
+      expect(result.error).toMatch(/not both/i);
+    });
+
     it('returns an error when the app is not found', async () => {
       const result: any = await registry.executeTool('get_app_versions', { packageName: 'com.does.not.exist' });
       expect(result.error).toBeTruthy();

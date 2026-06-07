@@ -1187,11 +1187,20 @@ export function registerAllTools(
     context: ['dashboard', 'apk-analysis'],
     requiredScope: 'core.apk:read',
     async execute(params: { trackedAppId?: number; packageName?: string }) {
-      if (params.trackedAppId == null && !params.packageName) {
+      const hasId = params.trackedAppId != null;
+      const hasPkg = !!params.packageName;
+      if (!hasId && !hasPkg) {
         return { error: 'Provide either trackedAppId or packageName' };
       }
-      const app = params.trackedAppId != null
-        ? db.select().from(schema.trackedApps).where(eq(schema.trackedApps.id, params.trackedAppId)).all()[0]
+      // Reject "both" rather than silently picking trackedAppId — an LLM
+      // can easily over-specify, and we don't want the lookup to resolve
+      // to a different app than the operator/agent thought it was asking
+      // about. Force them to pick one.
+      if (hasId && hasPkg) {
+        return { error: 'Provide either trackedAppId or packageName, not both' };
+      }
+      const app = hasId
+        ? db.select().from(schema.trackedApps).where(eq(schema.trackedApps.id, params.trackedAppId!)).all()[0]
         : db.select().from(schema.trackedApps).where(eq(schema.trackedApps.packageName, params.packageName!)).all()[0];
       if (!app) return { error: 'Tracked app not found' };
       const versions = db.select().from(schema.apkVersions)
@@ -1233,7 +1242,7 @@ export function registerAllTools(
   registry.register({
     name: 'trigger_apk_analysis',
     description:
-      'Queue an APK version for analysis (or re-analysis). Use after get_app_versions reports analysisStatus: null for the version you care about, or to force a fresh run. Returns the new jobId; check it with get_system_status or by re-running get_app_versions to watch analysisStatus transition pending → running → completed.',
+      'Queue an APK version for analysis (or re-analysis). Use after get_app_versions reports analysisStatus: null for the version you care about, or to force a fresh run. Returns the new jobId; re-run get_app_versions to watch analysisStatus transition pending → running → completed.',
     inputSchema: {
       type: 'object',
       properties: {
