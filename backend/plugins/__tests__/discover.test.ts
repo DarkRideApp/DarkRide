@@ -53,6 +53,9 @@ describe('discoverPlugins', () => {
       module.exports = {
         name: 'linked-plugin',
         version: '2.0.0',
+        dependencies: [],
+        optionalDependencies: [],
+        aiScopes: [],
         register: function(ctx) {},
       };
     `);
