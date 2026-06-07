@@ -1,4 +1,4 @@
-import { readdirSync, existsSync, readFileSync } from 'fs';
+import { readdirSync, existsSync, readFileSync, statSync, type Dirent } from 'fs';
 import { join, resolve, delimiter as pathDelimiter } from 'path';
 import { pathToFileURL } from 'url';
 import { createLoggers } from '../logs';
@@ -32,6 +32,26 @@ function getPluginsDirs(): string[] {
   return env.split(pathDelimiter).map(s => s.trim()).filter(Boolean);
 }
 
+/**
+ * Is this directory entry a directory, following symlinks/junctions?
+ *
+ * `Dirent.isDirectory()` returns false for a symlink-to-directory (Linux/macOS)
+ * and for a Windows directory junction — both surface as reparse-point dirents.
+ * That caused a plugin *linked* into plugins/ for local dev (the workflow the
+ * docs recommend) to be silently skipped, even though Vite's frontend glob
+ * follows the link. Resolve such entries with a stat. Real dirs and real files
+ * are decided without the extra syscall; only reparse points pay for it.
+ */
+function isDirEntry(entry: Dirent, fullPath: string): boolean {
+  if (entry.isDirectory()) return true;
+  if (entry.isFile()) return false;
+  try {
+    return statSync(fullPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 export interface DiscoveredPlugin {
   name: string;
   path: string;
@@ -61,9 +81,11 @@ export async function discoverPlugins(pluginsDirs: string[] = getPluginsDirs()):
     const entries = readdirSync(pluginsDir, { withFileTypes: true });
 
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-
       const pluginDir = join(pluginsDir, entry.name);
+      // Follow symlinked / junctioned plugin directories (see isDirEntry) so a
+      // plugin linked into plugins/ for local dev isn't silently skipped.
+      if (!isDirEntry(entry, pluginDir)) continue;
+
       const entryFile = findEntryFile(pluginDir);
 
       if (!entryFile) {
