@@ -796,17 +796,18 @@ export function registerAppEndpoints(
       if (latest) latestVersionIds.push(latest.id);
     }
 
-    // Most-recent analysis job (highest job id) for each latest version only.
+    // Most-recent analysis job for each latest version — exactly one row per
+    // version via a MAX(id) GROUP BY subquery (no per-version historical scan).
     const latestJobByVersion = new Map<number, { status: string; stage: string | null; error: string | null }>();
     if (latestVersionIds.length > 0) {
-      const jobs = db.select().from(analysisJobs)
+      const maxJobIds = db
+        .select({ maxId: sql<number>`max(${analysisJobs.id})`.as('maxId') })
+        .from(analysisJobs)
         .where(inArray(analysisJobs.apkVersionId, latestVersionIds))
-        .orderBy(desc(analysisJobs.id))
-        .all();
+        .groupBy(analysisJobs.apkVersionId);
+      const jobs = db.select().from(analysisJobs).where(inArray(analysisJobs.id, maxJobIds)).all();
       for (const j of jobs) {
-        if (!latestJobByVersion.has(j.apkVersionId)) {
-          latestJobByVersion.set(j.apkVersionId, { status: j.status, stage: j.stage ?? null, error: j.error ?? null });
-        }
+        latestJobByVersion.set(j.apkVersionId, { status: j.status, stage: j.stage ?? null, error: j.error ?? null });
       }
     }
 

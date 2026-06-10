@@ -125,4 +125,18 @@ describe('POST /v1/apps/upload', () => {
     expect(unlinkSpy).toHaveBeenCalled();
     unlinkSpy.mockRestore();
   });
+
+  it('removes the copied APK from disk if the DB insert fails', async () => {
+    const apkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apk-upload-orphan-'));
+    const { app } = makeApp(db, { apkDir });
+    // Make the apkVersions insert throw after the file has been copied.
+    const insertSpy = vi.spyOn(db, 'insert').mockImplementationOnce(() => { throw new Error('disk full'); });
+    const res = await request(app).post('/v1/apps/upload').attach('apk', APK_BYTES, 'x.apk');
+    expect(res.status).toBe(500);
+    // No orphaned file left in the package directory.
+    const pkgDir = path.join(apkDir, 'com.up.app');
+    const leftover = fs.existsSync(pkgDir) ? fs.readdirSync(pkgDir) : [];
+    expect(leftover).toHaveLength(0);
+    insertSpy.mockRestore();
+  });
 });

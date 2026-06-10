@@ -107,20 +107,27 @@ export function registerAppsUploadEndpoint(db: AppDatabase, analyzer: AnalyzerLi
       await fs.promises.copyFile(file.path, dest); // copy+unlink: rename() fails across devices
 
       const stat = fs.statSync(dest);
-      db.insert(apkVersions).values({
-        trackedAppId: tracked.id,
-        versionCode: meta.versionCode,
-        versionName: meta.versionName,
-        filename,
-        fileSize: stat.size,
-        deviceId: null,
-        source: 'upload',
-        downloadedAt: new Date(),
-      }).run();
-      const inserted = db.select().from(apkVersions).where(and(
-        eq(apkVersions.trackedAppId, tracked.id),
-        eq(apkVersions.versionCode, meta.versionCode),
-      )).get()!;
+      let inserted;
+      try {
+        db.insert(apkVersions).values({
+          trackedAppId: tracked.id,
+          versionCode: meta.versionCode,
+          versionName: meta.versionName,
+          filename,
+          fileSize: stat.size,
+          deviceId: null,
+          source: 'upload',
+          downloadedAt: new Date(),
+        }).run();
+        inserted = db.select().from(apkVersions).where(and(
+          eq(apkVersions.trackedAppId, tracked.id),
+          eq(apkVersions.versionCode, meta.versionCode),
+        )).get()!;
+      } catch (insertErr) {
+        // Don't leave an orphaned APK on disk if the row couldn't be written.
+        await fs.promises.unlink(dest).catch(() => {});
+        throw insertErr;
+      }
 
       broadcastToAll({
         type: 'apk:version-pulled',

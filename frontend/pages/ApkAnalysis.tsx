@@ -607,7 +607,16 @@ export function ApkAnalysis() {
               label="More actions"
               items={[
                 ...(canManageApk ? [{ key: 'reanalyze', label: 'Re-analyze', disabled: !!reanalyzing, onSelect: handleReanalyze }] : []),
-                { key: 'download', label: 'Download APK', onSelect: () => { window.location.href = `/v1/apps/download/${versionId}`; } },
+                { key: 'download', label: 'Download APK', onSelect: () => {
+                  // Trigger via a temporary <a> so the SPA isn't navigated away
+                  // (preserves analysis-page state and in-flight WS updates).
+                  const a = document.createElement('a');
+                  a.href = `/v1/apps/download/${versionId}`;
+                  a.download = '';
+                  document.body.appendChild(a);
+                  a.click();
+                  document.body.removeChild(a);
+                } },
                 { key: 'diff', label: 'Diff vs previous', onSelect: () => setActiveTab('diff') },
               ]}
             />
