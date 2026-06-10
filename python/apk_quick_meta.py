@@ -16,9 +16,11 @@ def main() -> int:
     try:
         a = APK(sys.argv[1])
         version_code = a.get_androidversion_code()
+        # Explicit None/empty check so a legitimate versionCode of 0 isn't dropped.
+        has_code = version_code is not None and str(version_code) != ""
         print(json.dumps({
             "packageName": a.get_package() or None,
-            "versionCode": int(version_code) if version_code else None,
+            "versionCode": int(version_code) if has_code else None,
             "versionName": a.get_androidversion_name() or None,
         }))
         return 0

@@ -32,6 +32,7 @@ describe('format utils', () => {
   });
 
   it('formatDate renders a short date', () => {
-    expect(formatDate('2026-03-02T12:00:00.000Z')).toMatch(/Mar/);
+    // Locale-independent: assert the year is present rather than an English month name.
+    expect(formatDate('2026-03-02T12:00:00.000Z')).toContain('2026');
   });
 });

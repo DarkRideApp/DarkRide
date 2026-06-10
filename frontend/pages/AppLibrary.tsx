@@ -78,7 +78,8 @@ export function AppLibrary() {
     }).catch(() => setLoading(false));
   }, [ws]);
 
-  useEffect(() => { fetchApps(); }, [fetchApps]);
+  // ws.connected is explicit so a cold start / reconnect re-runs the initial fetch.
+  useEffect(() => { fetchApps(); }, [fetchApps, ws.connected]);
 
   useEffect(() => {
     const unsubs = [

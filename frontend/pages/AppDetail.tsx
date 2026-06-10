@@ -100,7 +100,8 @@ export function AppDetail() {
     }).catch(() => {});
   }, [ws]);
 
-  useEffect(() => { fetchApp(); fetchVersions(); fetchInjected(); }, [fetchApp, fetchVersions, fetchInjected]);
+  // ws.connected is explicit so a cold start / reconnect re-runs the initial fetch.
+  useEffect(() => { fetchApp(); fetchVersions(); fetchInjected(); }, [fetchApp, fetchVersions, fetchInjected, ws.connected]);
 
   useEffect(() => {
     if (!ws.connected) return;

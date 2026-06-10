@@ -40,7 +40,8 @@ export function useAnalysisActivity() {
     }).catch(() => {});
   }, [ws]);
 
-  useEffect(() => { fetchJobs(); }, [fetchJobs]);
+  // ws.connected is explicit so a cold start / reconnect re-runs the initial fetch.
+  useEffect(() => { fetchJobs(); }, [fetchJobs, ws.connected]);
 
   useEffect(() => {
     const unsubs = ['apk:analysis-update', 'apk:ai-agent-update'].map(evt =>
