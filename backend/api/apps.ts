@@ -1,4 +1,4 @@
-import { eq, desc, sql } from 'drizzle-orm';
+import { eq, desc, sql, inArray } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -782,25 +782,44 @@ export function registerAppEndpoints(
       versionsByApp.set(v.trackedAppId, list);
     }
 
-    // Latest analysis job per version (highest job id = most recent)
-    const allJobs = db.select().from(analysisJobs).orderBy(desc(analysisJobs.id)).all();
-    const latestJobByVersion = new Map<number, typeof allJobs[number]>();
-    for (const j of allJobs) {
-      if (!latestJobByVersion.has(j.apkVersionId)) latestJobByVersion.set(j.apkVersionId, j);
-    }
-
-    const result = tracked.map(app => {
+    // Resolve each app's latest version up front so the jobs query can be
+    // scoped to just those versions (bounded by app count) instead of scanning
+    // the whole analysisJobs table.
+    const latestByApp = new Map<number, typeof allVersions[number] | null>();
+    const latestVersionIds: number[] = [];
+    for (const app of tracked) {
       const versions = versionsByApp.get(app.id) || [];
       const latest = versions.length > 0
         ? versions.reduce((a, b) => (a.versionCode > b.versionCode ? a : b))
         : null;
+      latestByApp.set(app.id, latest);
+      if (latest) latestVersionIds.push(latest.id);
+    }
+
+    // Most-recent analysis job (highest job id) for each latest version only.
+    const latestJobByVersion = new Map<number, { status: string; stage: string | null; error: string | null }>();
+    if (latestVersionIds.length > 0) {
+      const jobs = db.select().from(analysisJobs)
+        .where(inArray(analysisJobs.apkVersionId, latestVersionIds))
+        .orderBy(desc(analysisJobs.id))
+        .all();
+      for (const j of jobs) {
+        if (!latestJobByVersion.has(j.apkVersionId)) {
+          latestJobByVersion.set(j.apkVersionId, { status: j.status, stage: j.stage ?? null, error: j.error ?? null });
+        }
+      }
+    }
+
+    const result = tracked.map(app => {
+      const versions = versionsByApp.get(app.id) || [];
+      const latest = latestByApp.get(app.id) ?? null;
       const job = latest ? latestJobByVersion.get(latest.id) : undefined;
 
       return {
         ...app,
         versionCount: versions.length,
         latestVersion: latest,
-        latestAnalysis: job ? { status: job.status, stage: job.stage ?? null, error: job.error ?? null } : null,
+        latestAnalysis: job ?? null,
       };
     });
 

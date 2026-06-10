@@ -10,6 +10,7 @@ import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { extractApkQuickMeta, type ApkMetaExtractor } from '../services/apk-meta';
 import { getApkDir } from '../utils/apk-paths';
+import { safeJoinInside } from '../utils/safe-path';
 import { isValidPackageName } from '../utils/validators';
 import { scopeMatches } from '../auth/scope-matcher';
 import { createLoggers } from '../logs';
@@ -99,9 +100,10 @@ export function registerAppsUploadEndpoint(db: AppDatabase, analyzer: AnalyzerLi
       const apkRoot = deps.apkDir ?? getApkDir();
       const safeName = (meta.versionName ?? String(meta.versionCode)).replace(/[^a-zA-Z0-9._-]/g, '_');
       const filename = `${meta.versionCode}_${safeName}.apk`;
-      const destDir = path.join(apkRoot, meta.packageName);
-      fs.mkdirSync(destDir, { recursive: true });
-      const dest = path.join(destDir, filename);
+      // safeJoinInside throws if packageName/filename would escape apkRoot — a
+      // belt-and-suspenders guard on top of the isValidPackageName check above.
+      const dest = safeJoinInside(apkRoot, meta.packageName, filename);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
       await fs.promises.copyFile(file.path, dest); // copy+unlink: rename() fails across devices
 
       const stat = fs.statSync(dest);
