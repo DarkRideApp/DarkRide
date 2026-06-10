@@ -9,7 +9,7 @@ import { PageHeader } from '@darkrideapp/plugin-sdk/react';
 import { LoadingSpinner } from '@darkrideapp/plugin-sdk/react';
 import { Breadcrumbs } from '@darkrideapp/plugin-sdk/react';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
-import { ActionMenu, StatusStrip } from '@darkrideapp/plugin-sdk/react';
+import { ActionMenu, StatusStrip, Tabs } from '@darkrideapp/plugin-sdk/react';
 import { formatBytes, formatDuration } from '../utils/format';
 import { CodeBrowser } from '../components/analysis/CodeBrowser';
 import { FindingsTable } from '../components/analysis/FindingsTable';
@@ -501,6 +501,7 @@ export function ApkAnalysis() {
   const services: string[] = Array.isArray(manifest.services) ? manifest.services : [];
   const receivers: string[] = Array.isArray(manifest.receivers) ? manifest.receivers : [];
   const providers: string[] = Array.isArray(manifest.providers) ? manifest.providers : [];
+  const findingsTotal = Object.values(overview.findingCounts).reduce((a, b) => a + b, 0);
 
   return (
     <div data-testid="apk-analysis-page">
@@ -638,37 +639,16 @@ export function ApkAnalysis() {
       )}
 
       {/* Tab bar */}
-      <div style={{ display: 'flex', gap: 0, marginBottom: 20, borderBottom: '2px solid var(--border-color)', alignItems: 'center' }}>
-        {TABS.map(tab => (
-          <button
-            key={tab}
-            data-testid={`tab-${tab}`}
-            data-active={activeTab === tab ? 'true' : 'false'}
-            onClick={() => setActiveTab(tab)}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 6,
-              padding: '8px 16px', border: 'none', background: 'none', cursor: 'pointer',
-              borderBottom: activeTab === tab ? '2px solid var(--accent)' : '2px solid transparent',
-              marginBottom: -2,
-              color: activeTab === tab ? 'var(--text-primary)' : 'var(--text-muted)',
-              fontWeight: activeTab === tab ? 600 : 400,
-              fontSize: 13, transition: 'color 0.15s, border-color 0.15s',
-            }}
-          >
-            {TAB_LABELS[tab]}
-          </button>
-        ))}
-        {(activeTab === 'findings' || activeTab === 'strings') && excludedPaths.length > 0 && (
-          <button
-            data-testid="toggle-library"
-            className={`btn btn-sm${showLibrary ? ' btn-primary' : ''}`}
-            onClick={() => setShowLibrary(prev => !prev)}
-            style={{ marginLeft: 'auto', marginBottom: -2, fontSize: 12 }}
-          >
-            Show Libraries
-          </button>
-        )}
-      </div>
+      <Tabs
+        items={TABS.map(tab => ({
+          key: tab,
+          label: TAB_LABELS[tab],
+          count: tab === 'findings' && findingsTotal > 0 ? findingsTotal : undefined,
+          dot: tab === 'notes' && savedNotes.length > 0,
+        }))}
+        active={activeTab}
+        onChange={key => setActiveTab(key as Tab)}
+      />
 
       {/* Tab content */}
       {activeTab === 'overview' && (
@@ -972,6 +952,7 @@ export function ApkAnalysis() {
               }}
               excludedPaths={excludedPaths}
               showLibrary={showLibrary}
+              onToggleLibrary={excludedPaths.length > 0 ? () => setShowLibrary(p => !p) : undefined}
             />
           ) : (
             <div className="empty-state">
@@ -999,6 +980,7 @@ export function ApkAnalysis() {
               }}
               excludedPaths={excludedPaths}
               showLibrary={showLibrary}
+              onToggleLibrary={excludedPaths.length > 0 ? () => setShowLibrary(p => !p) : undefined}
             />
           ) : (
             <div className="empty-state">

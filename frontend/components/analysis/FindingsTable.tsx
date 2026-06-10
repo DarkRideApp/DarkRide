@@ -37,6 +37,8 @@ interface FindingsTableProps {
   onNavigate: (filePath: string, lineNumber: number, source: string) => void;
   excludedPaths?: string[];
   showLibrary?: boolean;
+  onToggleLibrary?: () => void;
+  initialSeverity?: string | null;
 }
 
 const PAGE_SIZE = 200;
@@ -54,7 +56,7 @@ function tryDecodeBase64Preview(value: string): string {
 
 const EMPTY_PATHS: string[] = [];
 
-export function FindingsTable({ versionId, onNavigate, excludedPaths = EMPTY_PATHS, showLibrary = true }: FindingsTableProps) {
+export function FindingsTable({ versionId, onNavigate, excludedPaths = EMPTY_PATHS, showLibrary = true, onToggleLibrary, initialSeverity }: FindingsTableProps) {
   const ws = useWebSocket();
   // Stabilize excludedPaths reference to prevent infinite re-renders
   const excludeKey = excludedPaths.join(',');
@@ -105,6 +107,11 @@ export function FindingsTable({ versionId, onNavigate, excludedPaths = EMPTY_PAT
   useEffect(() => {
     setPage(0);
   }, [showLibrary]);
+
+  // Apply initial severity deep-link
+  useEffect(() => {
+    if (initialSeverity) { setSeverityFilter(initialSeverity as Severity); setPage(0); }
+  }, [initialSeverity]);
 
   // Reset to first page when filters change
   const handleSeverityChange = useCallback((s: Severity) => {
@@ -204,6 +211,13 @@ export function FindingsTable({ versionId, onNavigate, excludedPaths = EMPTY_PAT
             ))}
           </select>
         </div>
+
+        {onToggleLibrary && (
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' }}>
+            <input type="checkbox" checked={showLibrary} onChange={onToggleLibrary} data-testid="toggle-library" />
+            Show library code
+          </label>
+        )}
 
         <div data-testid="findings-count" style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 'auto' }}>
           {total} finding{total !== 1 ? 's' : ''}
