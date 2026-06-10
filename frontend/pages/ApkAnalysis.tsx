@@ -9,6 +9,8 @@ import { PageHeader } from '@darkrideapp/plugin-sdk/react';
 import { LoadingSpinner } from '@darkrideapp/plugin-sdk/react';
 import { Breadcrumbs } from '@darkrideapp/plugin-sdk/react';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
+import { ActionMenu, StatusStrip } from '@darkrideapp/plugin-sdk/react';
+import { formatBytes, formatDuration } from '../utils/format';
 import { CodeBrowser } from '../components/analysis/CodeBrowser';
 import { FindingsTable } from '../components/analysis/FindingsTable';
 import { StringsView } from '../components/analysis/StringsView';
@@ -101,27 +103,6 @@ const SEVERITY_COLORS: Record<string, string> = {
   info: '#6c757d',
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let i = 0;
-  let val = bytes;
-  while (val >= 1024 && i < units.length - 1) {
-    val /= 1024;
-    i++;
-  }
-  return `${val.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const seconds = Math.floor(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
-}
-
 function formatTokenCount(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
@@ -190,6 +171,7 @@ export function ApkAnalysis() {
   const [availability, setAvailability] = useState<{ state: AvailabilityState } | null>(null);
   const [oldAvail, setOldAvail] = useState<{ state: AvailabilityState } | null>(null);
   const [versionSource, setVersionSource] = useState<'device' | 'playstore' | 'upload'>('device');
+  const [isLatest, setIsLatest] = useState(false);
   const toast = useToast();
 
   const displayName = overview?.appName || overview?.packageName || 'APK Analysis';
@@ -287,6 +269,8 @@ export function ApkAnalysis() {
         const vid = Number(versionId);
         const match = res.body.data.find((v: any) => v.id === vid);
         if (match?.source) setVersionSource(match.source as 'device' | 'playstore' | 'upload');
+        const maxRow = res.body.data.reduce((a: any, b: any) => (a.versionCode > b.versionCode ? a : b), res.body.data[0]);
+        setIsLatest(!!maxRow && maxRow.id === Number(versionId));
       }
     } catch {
       // ignore — source is best-effort; defaults to 'device'
@@ -522,7 +506,7 @@ export function ApkAnalysis() {
     <div data-testid="apk-analysis-page">
       <Breadcrumbs items={[
         { label: 'APKs', to: '/ui/apks' },
-        { label: overview.appName || overview.packageName },
+        { label: overview.appName || overview.packageName, to: `/ui/apps/${trackedAppId}` },
         { label: `v${overview.versionName || overview.versionCode}` },
       ]} />
       <PageHeader
@@ -545,6 +529,9 @@ export function ApkAnalysis() {
                 <span style={{ marginLeft: 10, verticalAlign: 'middle' }} data-testid="availability-badge">
                   <AvailabilityBadge state={availability.state} />
                 </span>
+              )}
+              {isLatest && (
+                <span className="badge badge-running" data-testid="latest-badge" style={{ marginLeft: 8, verticalAlign: 'middle' }}>Latest</span>
               )}
               <button
                 title="Copy package ID"
@@ -580,57 +567,47 @@ export function ApkAnalysis() {
             </span>
           </span>
         }
-        subtitle={`v${overview.versionName || overview.versionCode}`}
+        subtitle={`v${overview.versionName || overview.versionCode} · code ${overview.versionCode} · ${formatBytes(overview.totalSize)}`}
         actions={
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button
-              className="btn btn-primary"
-              data-testid="capture-launch-btn"
-              onClick={handleCaptureLaunch}
-              disabled={captureLaunching}
-            >
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button className="btn btn-primary" data-testid="capture-launch-btn" onClick={handleCaptureLaunch} disabled={captureLaunching}>
               {captureLaunching ? 'Starting...' : 'Capture on Device'}
             </button>
-            <button
-              className="btn"
-              data-testid="ai-review-btn"
-              onClick={handleAiReview}
-              disabled={aiAgentStatus === 'running'}
-            >
-              {aiAgentStatus === 'running'
-                ? `AI Reviewing...${aiContextPercent !== null ? ` (ctx ${aiContextPercent}%)` : ''}`
-                : aiTokenUsage
-                  ? `AI Review (${formatTokenCount(aiTokenUsage.inputTokens)} in / ${formatTokenCount(aiTokenUsage.outputTokens)} out)`
-                  : 'AI Review'}
+            <button className="btn" data-testid="ai-review-btn" onClick={handleAiReview} disabled={aiAgentStatus === 'running'}>
+              AI Review
             </button>
-            {canManageApk && (
-              <button
-                className="btn"
-                data-testid="reanalyze-btn"
-                onClick={handleReanalyze}
-                disabled={!!reanalyzing}
-              >
-                {reanalyzing
-                  ? reanalyzing === 'pending' ? 'Queued...'
-                  : (STAGE_LABELS[reanalyzing] || reanalyzing) + (reanalyzingProgress != null ? ` ${reanalyzingProgress}%` : '')
-                  : 'Re-analyze'}
-              </button>
-            )}
-            <a
-              className="btn"
-              data-testid="download-apk-btn"
-              href={`/v1/apps/download/${versionId}`}
-              download
-              style={{ textDecoration: 'none' }}
-            >
-              Download APK
-            </a>
-            <button className="btn" onClick={() => navigate(`/ui/apks`)}>
-              Back to APKs
-            </button>
+            <ActionMenu
+              label="More actions"
+              items={[
+                ...(canManageApk ? [{ key: 'reanalyze', label: 'Re-analyze', disabled: !!reanalyzing, onSelect: handleReanalyze }] : []),
+                { key: 'download', label: 'Download APK', onSelect: () => { window.location.href = `/v1/apps/download/${versionId}`; } },
+                { key: 'diff', label: 'Diff vs previous', onSelect: () => setActiveTab('diff') },
+              ]}
+            />
           </div>
         }
       />
+
+      {reanalyzing && (
+        <StatusStrip
+          data-testid="reanalyze-strip"
+          label={reanalyzing === 'pending' ? 'Re-analysis queued…' : `${STAGE_LABELS[reanalyzing] || reanalyzing}…`}
+          progress={reanalyzingProgress}
+        />
+      )}
+      {aiAgentStatus === 'running' && (
+        <StatusStrip
+          data-testid="ai-strip"
+          label="AI Review running"
+          progress={aiContextPercent}
+          detail={aiTokenUsage ? `${formatTokenCount(aiTokenUsage.inputTokens)} in / ${formatTokenCount(aiTokenUsage.outputTokens)} out` : undefined}
+        />
+      )}
+      {aiAgentStatus !== 'running' && aiTokenUsage && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }} data-testid="ai-last-run">
+          Last AI review: {formatTokenCount(aiTokenUsage.inputTokens)} in / {formatTokenCount(aiTokenUsage.outputTokens)} out
+        </div>
+      )}
 
       {captureLaunchError && (
         <div
