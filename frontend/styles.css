@@ -7058,3 +7058,20 @@ body.live-log-open .ai-chat-fab {
   color: var(--text-muted); border-radius: 50%;
 }
 .search-input-clear:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* ===== StatusStrip (SDK component) ===== */
+.status-strip {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px; border-radius: var(--radius-lg); margin-bottom: 12px;
+  font-size: 12px;
+}
+.status-strip-info { background: rgba(96, 165, 250, 0.08); border: 1px solid rgba(96, 165, 250, 0.25); }
+.status-strip-success { background: rgba(74, 222, 128, 0.08); border: 1px solid rgba(74, 222, 128, 0.25); }
+.status-strip-error { background: rgba(248, 113, 113, 0.08); border: 1px solid rgba(248, 113, 113, 0.25); }
+.status-strip-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--badge-running); animation: pulse 1.5s ease-in-out infinite; }
+.status-strip-success .status-strip-dot { background: var(--success); animation: none; }
+.status-strip-error .status-strip-dot { background: var(--error); animation: none; }
+.status-strip-label { font-weight: 600; color: var(--text-primary); }
+.status-strip-bar { flex: 1; height: 4px; background: var(--bg-tertiary); border-radius: 2px; overflow: hidden; }
+.status-strip-bar-fill { height: 100%; background: var(--badge-running); transition: width 0.3s ease; }
+.status-strip-detail { color: var(--text-secondary); }
