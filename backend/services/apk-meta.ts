@@ -13,7 +13,14 @@ export interface ApkQuickMeta {
 
 /** Parse + validate apk_quick_meta.py stdout. Throws Error with a user-presentable message. */
 export function parseQuickMetaOutput(stdout: string): ApkQuickMeta {
-  const parsed = JSON.parse(stdout.trim());
+  let parsed: any;
+  try {
+    parsed = JSON.parse(stdout.trim());
+  } catch {
+    // The error reaches users via the upload endpoint — give a clear message
+    // instead of a raw "Unexpected token …" SyntaxError.
+    throw new Error('Could not read APK: analyzer returned unexpected output');
+  }
   if (parsed.error) throw new Error(`Could not read APK: ${parsed.error}`);
   if (!parsed.packageName || parsed.versionCode == null) {
     throw new Error('APK identity (package/versionCode) missing from manifest');

@@ -115,9 +115,14 @@ export function AppDetail() {
         if (msg.trackedAppId === appId) { fetchApp(); fetchVersions(); }
       }),
       ws.subscribe('apk:analysis-update', (msg: any) => {
-        setAnalysisStatus(prev => (prev[msg.apkVersionId] !== undefined
-          ? { ...prev, [msg.apkVersionId]: { status: msg.status, stage: msg.stage ?? null, error: msg.error, aiRunning: prev[msg.apkVersionId]?.aiRunning } }
-          : prev));
+        // Update unconditionally so a version that started unanalysed (e.g.
+        // analysis triggered from the Activity panel) reflects live, not just
+        // versions already in the map. Entries for off-page versions are
+        // harmless — never rendered, cleared on unmount.
+        setAnalysisStatus(prev => ({
+          ...prev,
+          [msg.apkVersionId]: { status: msg.status, stage: msg.stage ?? null, error: msg.error, aiRunning: prev[msg.apkVersionId]?.aiRunning },
+        }));
       }),
       ws.subscribe('apk:ai-agent-update', (msg: { versionId: number; status: string }) => {
         setAnalysisStatus(prev => (prev[msg.versionId]

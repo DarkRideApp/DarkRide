@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { WebSocketContext, ToastProvider } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
@@ -54,6 +54,22 @@ function renderDetail(ws = mockWs()) {
 }
 
 describe('AppDetail', () => {
+  it('applies a live analysis-update to a version that started unanalysed', async () => {
+    // The page has multiple subscribers to each event (AppDetail itself plus the
+    // embedded ActivityChip's hook), so collect them all and broadcast like the
+    // real WS does — otherwise the last subscriber would mask the others.
+    const handlers: Record<string, ((msg: any) => void)[]> = {};
+    const ws = { ...mockWs(), subscribe: vi.fn((evt: string, cb: (msg: any) => void) => { (handlers[evt] ||= []).push(cb); return () => {}; }) } as any;
+    renderDetail(ws);
+    // Version 99 starts with analysis: null → shows the "Analyze" button.
+    await waitFor(() => within(screen.getByTestId('version-row-99')).getByRole('button', { name: 'Analyze' }));
+    // A WS update for v99 (e.g. analysis triggered from the Activity panel) updates the row live.
+    act(() => handlers['apk:analysis-update'].forEach(cb => cb({ apkVersionId: 99, status: 'running', stage: 'decompiling', error: null })));
+    await waitFor(() =>
+      expect(within(screen.getByTestId('version-row-99')).getByRole('button', { name: /Decompiling/ })).toBeDisabled(),
+    );
+  });
+
   it('renders header identity, stats and PS switch', async () => {
     renderDetail();
     // The app name appears in both the breadcrumb and the header card; assert the header one.

@@ -13,7 +13,7 @@ describe('parseQuickMetaOutput', () => {
 
   it('throws on missing identity fields', () => {
     expect(() => parseQuickMetaOutput(JSON.stringify({ packageName: null, versionCode: null, versionName: null }))).toThrow(/identity/i);
-    expect(() => parseQuickMetaOutput('not json')).toThrow();
+    expect(() => parseQuickMetaOutput('not json')).toThrow(/unexpected output/i);
   });
 
   it('preserves a null versionName', () => {
