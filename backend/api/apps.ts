@@ -782,16 +782,25 @@ export function registerAppEndpoints(
       versionsByApp.set(v.trackedAppId, list);
     }
 
+    // Latest analysis job per version (highest job id = most recent)
+    const allJobs = db.select().from(analysisJobs).orderBy(desc(analysisJobs.id)).all();
+    const latestJobByVersion = new Map<number, typeof allJobs[number]>();
+    for (const j of allJobs) {
+      if (!latestJobByVersion.has(j.apkVersionId)) latestJobByVersion.set(j.apkVersionId, j);
+    }
+
     const result = tracked.map(app => {
       const versions = versionsByApp.get(app.id) || [];
       const latest = versions.length > 0
         ? versions.reduce((a, b) => (a.versionCode > b.versionCode ? a : b))
         : null;
+      const job = latest ? latestJobByVersion.get(latest.id) : undefined;
 
       return {
         ...app,
         versionCount: versions.length,
         latestVersion: latest,
+        latestAnalysis: job ? { status: job.status, stage: job.stage ?? null, error: job.error ?? null } : null,
       };
     });
 
