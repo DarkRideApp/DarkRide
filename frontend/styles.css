@@ -7022,3 +7022,28 @@ body.live-log-open .ai-chat-fab {
 .tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; }
 .tabs-trailing { margin-left: auto; margin-bottom: -2px; display: flex; align-items: center; gap: 8px; }
 .settings-page-actions { display: flex; gap: 8px; }
+
+/* ===== ActionMenu (SDK component) ===== */
+.action-menu { position: relative; display: inline-flex; }
+.action-menu-trigger {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; border-radius: var(--radius);
+  border: none; background: none; cursor: pointer; color: var(--text-muted);
+}
+.action-menu-trigger:hover { background: var(--bg-hover); color: var(--text-primary); }
+.action-menu-list {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 50;
+  min-width: 200px; padding: 4px;
+  background: var(--bg-card); border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+}
+.action-menu-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 12px; border: none; background: none; cursor: pointer;
+  color: var(--text-primary); font-size: 12px; text-align: left;
+  border-radius: var(--radius);
+}
+.action-menu-item:hover:not(:disabled) { background: var(--bg-hover); }
+.action-menu-item:disabled { opacity: 0.45; cursor: default; }
+.action-menu-item-danger { color: var(--danger); }
+.action-menu-divider { border-top: 1px solid var(--border-color); margin: 4px 0; }
