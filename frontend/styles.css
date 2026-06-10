@@ -6998,4 +6998,27 @@ body.live-log-open .ai-chat-fab {
   margin-bottom: 24px;
 }
 .settings-page-header h1 { margin: 0; font-size: 24px; }
+
+/* ===== Tabs (SDK component) ===== */
+.tabs {
+  display: flex; gap: 0; align-items: center;
+  border-bottom: 2px solid var(--border-color);
+  margin-bottom: 20px;
+}
+.tab {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 16px; border: none; background: none; cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -2px;
+  color: var(--text-muted); font-weight: 400; font-size: 13px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.tab:hover { color: var(--text-secondary); }
+.tab-active { border-bottom-color: var(--accent); color: var(--text-primary); font-weight: 600; }
+.tab-count {
+  font-size: 11px; padding: 1px 7px; border-radius: 10px; font-weight: 600;
+  background: var(--bg-tertiary); color: var(--text-muted);
+}
+.tab-active .tab-count { background: var(--accent-soft); color: var(--accent); }
+.tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; }
+.tabs-trailing { margin-left: auto; margin-bottom: -2px; display: flex; align-items: center; gap: 8px; }
 .settings-page-actions { display: flex; gap: 8px; }
