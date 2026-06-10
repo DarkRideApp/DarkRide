@@ -12,8 +12,8 @@ const app = {
   latestAnalysis: { status: 'completed', stage: 'done', error: null },
 };
 const versions = [
-  { id: 100, trackedAppId: 1, versionCode: 114002, versionName: '11.4.0', filename: 'a.apk', fileSize: 1000, deviceId: null, source: 'playstore', downloadedAt: '2026-06-10T08:00:00Z', availability: 'local' },
-  { id: 99, trackedAppId: 1, versionCode: 113008, versionName: '11.3.0', filename: 'b.apk', fileSize: 900, deviceId: 'pixel7', source: 'device', downloadedAt: '2026-03-02T08:00:00Z', availability: 'local' },
+  { id: 100, trackedAppId: 1, versionCode: 114002, versionName: '11.4.0', filename: 'a.apk', fileSize: 1000, deviceId: null, source: 'playstore', downloadedAt: '2026-06-10T08:00:00Z', availability: 'local', analysis: { status: 'completed', stage: 'done', error: null, aiRunning: false } },
+  { id: 99, trackedAppId: 1, versionCode: 113008, versionName: '11.3.0', filename: 'b.apk', fileSize: 900, deviceId: 'pixel7', source: 'device', downloadedAt: '2026-03-02T08:00:00Z', availability: 'local', analysis: null },
 ];
 const injected = [
   { id: 7, packageName: 'com.disney.shanghai', versionCode: 113008, fridaVersion: '17.2.1', createdAt: '2026-03-03T08:00:00Z' },
@@ -28,8 +28,6 @@ function mockWs(): WebSocketContextValue {
       if (path === '/v1/apps/tracked') return Promise.resolve({ type: 'restapi', id: '1', status: 200, body: { success: true, data: [app] } });
       if (path === '/v1/apps/versions/1') return Promise.resolve({ type: 'restapi', id: '2', status: 200, body: { success: true, data: versions } });
       if (path === '/v1/frida/gadget/injected') return Promise.resolve({ type: 'restapi', id: '3', status: 200, body: { success: true, data: injected } });
-      if (path === '/v1/apps/analysis-status/100') return Promise.resolve({ type: 'restapi', id: '4', status: 200, body: { success: true, data: { status: 'completed', stage: 'done', error: null, aiRunning: false } } });
-      if (path === '/v1/apps/analysis-status/99') return Promise.resolve({ type: 'restapi', id: '5', status: 200, body: { success: true, data: null } });
       if (path === '/v1/device/list') return Promise.resolve({ type: 'restapi', id: '6', status: 200, body: { success: true, data: [] } });
       if (path === '/v1/apps/analysis-jobs/recent') return Promise.resolve({ type: 'restapi', id: '7', status: 200, body: { success: true, data: [] } });
       return Promise.resolve({ type: 'restapi', id: '9', status: 200, body: { success: true, data: [] } });

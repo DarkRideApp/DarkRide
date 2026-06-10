@@ -278,6 +278,26 @@ describe('Apps API', () => {
       // valid state value", which was the original intent of this test.
       expect(res.body.data[0].availability).toBe('local');
     });
+
+    it('embeds each version\'s latest analysis (status/stage/error/aiRunning)', async () => {
+      await request(app).post('/v1/apps/track').send({ packageName: 'com.example.app' });
+      const appId = db.select().from(trackedApps).all()[0].id;
+      db.insert(apkVersions).values({ trackedAppId: appId, versionCode: 10, versionName: '1.0', filename: '10.apk', downloadedAt: new Date() }).run();
+      db.insert(apkVersions).values({ trackedAppId: appId, versionCode: 20, versionName: '2.0', filename: '20.apk', downloadedAt: new Date() }).run();
+      const versions = db.select().from(apkVersions).all();
+      const v10 = versions.find(v => v.versionCode === 10)!;
+      const v20 = versions.find(v => v.versionCode === 20)!;
+      // v10 has two jobs (newest wins); v20 has none → analysis null.
+      db.insert(analysisJobs).values({ apkVersionId: v10.id, status: 'failed', stage: null, error: 'old', createdAt: new Date(1000) }).run();
+      db.insert(analysisJobs).values({ apkVersionId: v10.id, status: 'completed', stage: 'done', createdAt: new Date(2000) }).run();
+
+      const res = await request(app).get(`/v1/apps/versions/${appId}`);
+      expect(res.status).toBe(200);
+      const got10 = res.body.data.find((v: any) => v.versionCode === 10);
+      const got20 = res.body.data.find((v: any) => v.versionCode === 20);
+      expect(got10.analysis).toEqual({ status: 'completed', stage: 'done', error: null, aiRunning: false });
+      expect(got20.analysis).toBeNull();
+    });
   });
 
   describe('GET /v1/apps/download/:versionId', () => {

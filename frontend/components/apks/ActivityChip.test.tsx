@@ -49,6 +49,15 @@ describe('ActivityChip', () => {
     await waitFor(() => expect(screen.getByTestId('activity-chip')).toHaveTextContent('Activity'));
   });
 
+  it('clears the failed state when another hook instance marks viewed', async () => {
+    // The panel and chip are separate useAnalysisActivity() instances; opening
+    // the panel dispatches the viewed event, which the chip must honour live.
+    renderChip([job({ status: 'failed', error: 'boom', completedAt: '2026-06-10T10:05:00Z' })]);
+    await waitFor(() => expect(screen.getByTestId('activity-chip')).toHaveTextContent('1 failed'));
+    fireEvent(window, new CustomEvent('apk-activity-viewed', { detail: Date.parse('2026-06-10T11:00:00Z') }));
+    await waitFor(() => expect(screen.getByTestId('activity-chip')).toHaveTextContent('Activity'));
+  });
+
   it('uses the singular noun for a single running job', async () => {
     renderChip([job()]);
     await waitFor(() => expect(screen.getByTestId('activity-chip')).toHaveTextContent('1 job'));

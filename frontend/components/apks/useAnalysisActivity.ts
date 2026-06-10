@@ -19,6 +19,9 @@ export interface AnalysisJobItem {
 }
 
 const VIEWED_KEY = 'apk-activity-viewed';
+// Broadcast so every live hook instance (chip + panel) stays in sync — opening
+// the panel must clear the chip's "unseen failed" state without a remount.
+const VIEWED_EVENT = 'apk-activity-viewed';
 
 /**
  * Live analysis-job feed for the APK section. Fetches recent jobs and
@@ -50,6 +53,14 @@ export function useAnalysisActivity() {
     const now = Date.now();
     localStorage.setItem(VIEWED_KEY, String(now));
     setLastViewed(now);
+    window.dispatchEvent(new CustomEvent(VIEWED_EVENT, { detail: now }));
+  }, []);
+
+  // Sync lastViewed across hook instances when any of them marks viewed.
+  useEffect(() => {
+    const onViewed = (e: Event) => setLastViewed((e as CustomEvent<number>).detail);
+    window.addEventListener(VIEWED_EVENT, onViewed);
+    return () => window.removeEventListener(VIEWED_EVENT, onViewed);
   }, []);
 
   const active = jobs.filter(j => j.status === 'running' || j.status === 'pending');

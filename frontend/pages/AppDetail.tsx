@@ -19,6 +19,7 @@ interface ApkVersionRow {
   id: number; trackedAppId: number; versionCode: number; versionName: string | null;
   filename: string; fileSize: number | null; deviceId: string | null; source?: string | null;
   downloadedAt: string | number; availability?: AvailabilityState;
+  analysis?: { status: string; stage: string | null; error: string | null; aiRunning?: boolean } | null;
 }
 interface TrackedApp {
   id: number; packageName: string; appName: string | null; autoFetchPlayStore?: boolean | null;
@@ -76,14 +77,19 @@ export function AppDetail() {
     if (!ws.connected) return;
     ws.sendRestApi('GET', `/v1/apps/versions/${appId}`).then(res => {
       if (!res.body?.success) return;
-      setVersions(res.body.data);
-      for (const v of res.body.data as ApkVersionRow[]) {
-        ws.sendRestApi('GET', `/v1/apps/analysis-status/${v.id}`).then(s => {
-          if (s.body?.success && s.body.data) {
-            setAnalysisStatus(prev => ({ ...prev, [v.id]: { status: s.body.data.status, stage: s.body.data.stage ?? null, error: s.body.data.error, aiRunning: !!s.body.data.aiRunning } }));
+      const rows = res.body.data as ApkVersionRow[];
+      setVersions(rows);
+      // The versions endpoint now embeds each version's latest analysis, so we
+      // seed the status map directly instead of an N+1 of analysis-status calls.
+      setAnalysisStatus(prev => {
+        const next = { ...prev };
+        for (const v of rows) {
+          if (v.analysis) {
+            next[v.id] = { status: v.analysis.status, stage: v.analysis.stage ?? null, error: v.analysis.error, aiRunning: !!v.analysis.aiRunning };
           }
-        }).catch(() => {});
-      }
+        }
+        return next;
+      });
     }).catch(() => {});
   }, [ws, appId]);
 

@@ -128,15 +128,22 @@ describe('POST /v1/apps/upload', () => {
 
   it('removes the copied APK from disk if the DB insert fails', async () => {
     const apkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apk-upload-orphan-'));
+    // Pre-create the tracked app so the handler skips the trackedApps insert and
+    // the FIRST (mocked) db.insert is the apkVersions insert — which runs AFTER
+    // the file copy, so we genuinely exercise the orphan-cleanup path.
+    db.insert(trackedApps).values({ packageName: 'com.up.app', appName: null, createdAt: new Date() }).run();
     const { app } = makeApp(db, { apkDir });
-    // Make the apkVersions insert throw after the file has been copied.
+    const copySpy = vi.spyOn(fs.promises, 'copyFile');
     const insertSpy = vi.spyOn(db, 'insert').mockImplementationOnce(() => { throw new Error('disk full'); });
     const res = await request(app).post('/v1/apps/upload').attach('apk', APK_BYTES, 'x.apk');
     expect(res.status).toBe(500);
-    // No orphaned file left in the package directory.
+    // The file was actually copied (so we reached the insert) …
+    expect(copySpy).toHaveBeenCalled();
+    // … and then cleaned up — no orphan left in the package directory.
     const pkgDir = path.join(apkDir, 'com.up.app');
     const leftover = fs.existsSync(pkgDir) ? fs.readdirSync(pkgDir) : [];
     expect(leftover).toHaveLength(0);
     insertSpy.mockRestore();
+    copySpy.mockRestore();
   });
 });
