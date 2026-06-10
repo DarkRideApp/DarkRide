@@ -7096,3 +7096,11 @@ body.live-log-open .ai-chat-fab {
 .activity-panel-section { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin: 14px 0 8px; }
 .activity-job { background: var(--bg-card); border-radius: var(--radius-lg); padding: 10px 12px; margin-bottom: 8px; cursor: pointer; }
 .activity-job:hover { background: var(--bg-hover); }
+
+/* ===== App library rows ===== */
+.app-row {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 16px; cursor: pointer;
+}
+.app-row:hover { background: var(--bg-hover); }
+.app-row:focus-visible { outline: 2px solid var(--border-focus); outline-offset: -2px; }
