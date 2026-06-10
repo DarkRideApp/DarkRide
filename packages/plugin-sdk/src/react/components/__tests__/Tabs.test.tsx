@@ -64,4 +64,15 @@ describe('Tabs', () => {
     render(<Tabs items={items} active="overview" onChange={() => {}} trailing={<button>Extra</button>} />);
     expect(screen.getByRole('button', { name: 'Extra' })).toBeInTheDocument();
   });
+
+  it('renders an empty tablist without crashing when items is empty', () => {
+    render(<Tabs items={[]} active="" onChange={() => {}} />);
+    expect(screen.getByRole('tablist')).toBeInTheDocument();
+    expect(screen.queryAllByRole('tab')).toHaveLength(0);
+  });
+
+  it('gives tab buttons type="button" so they never submit a surrounding form', () => {
+    render(<Tabs items={items} active="overview" onChange={() => {}} />);
+    for (const tab of screen.getAllByRole('tab')) expect(tab).toHaveAttribute('type', 'button');
+  });
 });

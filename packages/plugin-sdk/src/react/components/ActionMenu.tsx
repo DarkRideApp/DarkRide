@@ -82,6 +82,7 @@ export function ActionMenu({ items, label, 'data-testid': testId }: ActionMenuPr
     <div className="action-menu" ref={rootRef} data-testid={testId}>
       <button
         ref={triggerRef}
+        type="button"
         className="action-menu-trigger"
         aria-haspopup="menu"
         aria-expanded={open || undefined}
@@ -103,6 +104,7 @@ export function ActionMenu({ items, label, 'data-testid': testId }: ActionMenuPr
             ) : (
               <button
                 key={item.key}
+                type="button"
                 ref={el => { itemRefs.current[idx] = el; }}
                 role="menuitem"
                 tabIndex={idx === enabledIndices[0] ? 0 : -1}

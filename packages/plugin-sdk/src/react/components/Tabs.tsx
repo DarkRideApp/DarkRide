@@ -42,6 +42,11 @@ export function Tabs({ items, active, onChange, trailing, 'data-testid': testId 
     else if (e.key === 'End') { e.preventDefault(); select(items.length - 1); }
   };
 
+  // Defensive no-op for an empty item list (avoids modulo-by-zero in select()).
+  if (items.length === 0) {
+    return <div className="tabs" role="tablist" data-testid={testId}>{trailing && <div className="tabs-trailing">{trailing}</div>}</div>;
+  }
+
   return (
     <div className="tabs" role="tablist" data-testid={testId}>
       {items.map((item, idx) => {
@@ -49,6 +54,7 @@ export function Tabs({ items, active, onChange, trailing, 'data-testid': testId 
         return (
           <button
             key={item.key}
+            type="button"
             ref={el => { refs.current[idx] = el; }}
             role="tab"
             aria-selected={isActive}
