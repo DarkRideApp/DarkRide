@@ -9,7 +9,7 @@ import { PageHeader } from '@darkrideapp/plugin-sdk/react';
 import { LoadingSpinner } from '@darkrideapp/plugin-sdk/react';
 import { Breadcrumbs } from '@darkrideapp/plugin-sdk/react';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
-import { ActionMenu, StatusStrip, Tabs } from '@darkrideapp/plugin-sdk/react';
+import { ActionMenu, StatusStrip, Tabs, SearchInput } from '@darkrideapp/plugin-sdk/react';
 import { formatBytes, formatDuration } from '../utils/format';
 import { CodeBrowser } from '../components/analysis/CodeBrowser';
 import { FindingsTable } from '../components/analysis/FindingsTable';
@@ -109,6 +109,24 @@ function formatTokenCount(n: number): string {
   return String(n);
 }
 
+const DANGEROUS_PERMISSIONS = new Set([
+  'android.permission.CAMERA', 'android.permission.RECORD_AUDIO',
+  'android.permission.ACCESS_FINE_LOCATION', 'android.permission.ACCESS_COARSE_LOCATION',
+  'android.permission.ACCESS_BACKGROUND_LOCATION', 'android.permission.READ_CONTACTS',
+  'android.permission.WRITE_CONTACTS', 'android.permission.READ_CALENDAR', 'android.permission.WRITE_CALENDAR',
+  'android.permission.READ_EXTERNAL_STORAGE', 'android.permission.WRITE_EXTERNAL_STORAGE',
+  'android.permission.READ_MEDIA_IMAGES', 'android.permission.READ_MEDIA_VIDEO', 'android.permission.READ_MEDIA_AUDIO',
+  'android.permission.READ_PHONE_STATE', 'android.permission.CALL_PHONE', 'android.permission.READ_CALL_LOG',
+  'android.permission.READ_SMS', 'android.permission.SEND_SMS', 'android.permission.RECEIVE_SMS',
+  'android.permission.BODY_SENSORS', 'android.permission.ACTIVITY_RECOGNITION',
+  'android.permission.BLUETOOTH_SCAN', 'android.permission.BLUETOOTH_CONNECT', 'android.permission.POST_NOTIFICATIONS',
+]);
+function permissionGroup(perm: string): 'dangerous' | 'normal' | 'other' {
+  if (DANGEROUS_PERMISSIONS.has(perm)) return 'dangerous';
+  if (perm.startsWith('android.permission.')) return 'normal';
+  return 'other';
+}
+
 const STAGE_LABELS: Record<string, string> = {
   metadata: 'Metadata',
   flutter: 'Flutter Decompile',
@@ -172,7 +190,15 @@ export function ApkAnalysis() {
   const [oldAvail, setOldAvail] = useState<{ state: AvailabilityState } | null>(null);
   const [versionSource, setVersionSource] = useState<'device' | 'playstore' | 'upload'>('device');
   const [isLatest, setIsLatest] = useState(false);
+  const [severityDeepLink, setSeverityDeepLink] = useState<string | null>(null);
+  const [permFilter, setPermFilter] = useState('');
   const toast = useToast();
+
+  // A severity pill deep-link is a one-shot: once the user leaves the Findings
+  // tab, forget it so returning to Findings doesn't clobber a manual filter change.
+  useEffect(() => {
+    if (activeTab !== 'findings') setSeverityDeepLink(null);
+  }, [activeTab]);
 
   const displayName = overview?.appName || overview?.packageName || 'APK Analysis';
   useDocumentTitle(overview ? `Analysis - ${displayName}` : 'APK Analysis');
@@ -656,10 +682,6 @@ export function ApkAnalysis() {
           {/* App info & stats cards */}
           <div className="card-grid" style={{ marginBottom: 16 }}>
             <div className="card stat-card" data-testid="stat-card">
-              <div className="stat-value">{manifest.package || '—'}</div>
-              <div className="stat-label">Package</div>
-            </div>
-            <div className="card stat-card" data-testid="stat-card">
               <div className="stat-value">{overview.fileCount}</div>
               <div className="stat-label">Files</div>
               <div className="stat-detail">
@@ -829,14 +851,17 @@ export function ApkAnalysis() {
               {SEVERITY_ORDER.map(severity => {
                 const count = overview.findingCounts[severity] || 0;
                 return (
-                  <div
+                  <button
                     key={severity}
                     data-testid={`severity-${severity}`}
+                    onClick={() => { if (count > 0) { setSeverityDeepLink(severity); setActiveTab('findings'); } }}
+                    disabled={count === 0}
                     style={{
                       display: 'flex', alignItems: 'center', gap: 8,
                       padding: '6px 12px', borderRadius: 6,
                       background: count > 0 ? `${SEVERITY_COLORS[severity]}15` : 'var(--bg-tertiary)',
                       border: `1px solid ${count > 0 ? `${SEVERITY_COLORS[severity]}40` : 'var(--border-color)'}`,
+                      cursor: count > 0 ? 'pointer' : 'default',
                     }}
                   >
                     <span style={{
@@ -853,7 +878,8 @@ export function ApkAnalysis() {
                     }}>
                       {severity}
                     </span>
-                  </div>
+                    {count > 0 && <span aria-hidden="true" style={{ color: SEVERITY_COLORS[severity] }}>→</span>}
+                  </button>
                 );
               })}
             </div>
@@ -876,21 +902,35 @@ export function ApkAnalysis() {
             <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>
               Permissions ({permissions.length})
             </h3>
-            {permissions.length === 0 ? (
-              <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>No permissions declared</div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {permissions.map(perm => (
-                  <div key={perm} style={{
-                    fontSize: 12, fontFamily: 'var(--font-mono)',
-                    padding: '4px 8px', borderRadius: 4,
-                    background: 'var(--bg-tertiary)',
-                  }}>
-                    {perm}
-                  </div>
-                ))}
-              </div>
-            )}
+            {(() => {
+              const groups: Record<'dangerous' | 'normal' | 'other', string[]> = { dangerous: [], normal: [], other: [] };
+              for (const p of permissions) groups[permissionGroup(p)].push(p);
+              const q = permFilter.toLowerCase();
+              const labelFor = { dangerous: 'Dangerous', normal: 'Normal', other: 'Other' } as const;
+              return (
+                <>
+                  <SearchInput value={permFilter} onChange={setPermFilter} placeholder="Filter permissions…" data-testid="permission-filter" />
+                  {(['dangerous', 'normal', 'other'] as const).map(g => {
+                    const all = groups[g];
+                    const matching = q ? all.filter(p => p.toLowerCase().includes(q)) : all;
+                    if (all.length === 0 || matching.length === 0) return null;
+                    return (
+                      <div key={g} style={{ marginTop: 12 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6, color: g === 'dangerous' ? 'var(--danger)' : 'var(--text-secondary)' }}>
+                          {labelFor[g]} ({all.length})
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          {matching.map(perm => (
+                            <div key={perm} style={{ fontSize: 12, fontFamily: 'var(--font-mono)', padding: '4px 8px', borderRadius: 4, background: 'var(--bg-tertiary)' }}>{perm}</div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {permissions.length === 0 && <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>No permissions declared</div>}
+                </>
+              );
+            })()}
           </div>
 
           {/* Manifest components */}
@@ -953,6 +993,7 @@ export function ApkAnalysis() {
               excludedPaths={excludedPaths}
               showLibrary={showLibrary}
               onToggleLibrary={excludedPaths.length > 0 ? () => setShowLibrary(p => !p) : undefined}
+              initialSeverity={severityDeepLink}
             />
           ) : (
             <div className="empty-state">

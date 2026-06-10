@@ -20,6 +20,10 @@ vi.mock('../components/analysis/ReactNativeTab', () => ({
 }));
 
 const mockOverview = {
+  appName: null,
+  packageName: 'com.example.app',
+  versionName: '1.0.0',
+  versionCode: 100,
   manifest: {
     package: 'com.example.app',
     permissions: [
@@ -148,7 +152,7 @@ describe('ApkAnalysis', () => {
     it('displays package name', async () => {
       renderApkAnalysis();
       await waitFor(() => {
-        // Package name appears in both the page header and the stat card
+        // Package name appears in the page header title (and possibly elsewhere)
         const matches = screen.getAllByText('com.example.app');
         expect(matches.length).toBeGreaterThanOrEqual(1);
       });
