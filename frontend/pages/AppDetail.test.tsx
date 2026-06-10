@@ -5,6 +5,9 @@ import { WebSocketContext, ToastProvider } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
 import { AppDetail } from './AppDetail';
 
+vi.mock('../utils/upload', () => ({ uploadApk: vi.fn() }));
+import { uploadApk } from '../utils/upload';
+
 const app = {
   id: 1, packageName: 'com.disney.shanghai', appName: 'Shanghai Disney', autoFetchPlayStore: true,
   createdAt: '2026-01-01T00:00:00Z', versionCount: 2,
@@ -68,6 +71,20 @@ describe('AppDetail', () => {
     await waitFor(() =>
       expect(within(screen.getByTestId('version-row-99')).getByRole('button', { name: /Decompiling/ })).toBeDisabled(),
     );
+  });
+
+  it('navigates to the filed-under app when an uploaded APK is a different package', async () => {
+    // Upload returns a different trackedAppId (the APK was a different package).
+    vi.mocked(uploadApk).mockResolvedValue({ success: true, status: 200, data: { id: 5, trackedAppId: 99, packageName: 'com.other', versionCode: 1, versionName: null } });
+    renderDetail(); // current app id is 1
+    await waitFor(() => screen.getByTestId('upload-version-btn'));
+    fireEvent.click(screen.getByTestId('upload-version-btn'));
+    fireEvent.change(screen.getByTestId('upload-file-input'), {
+      target: { files: [new File(['PK'], 'other.apk', { type: 'application/octet-stream' })] },
+    });
+    fireEvent.click(screen.getByTestId('upload-submit-btn'));
+    // Navigated to /ui/apps/99, which isn't in the mock → renders "App not found".
+    await waitFor(() => expect(screen.getByText(/app not found/i)).toBeInTheDocument());
   });
 
   it('renders header identity, stats and PS switch', async () => {

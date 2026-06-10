@@ -47,10 +47,14 @@ export function Tabs({ items, active, onChange, trailing, 'data-testid': testId 
     return <div className="tabs" role="tablist" data-testid={testId}>{trailing && <div className="tabs-trailing">{trailing}</div>}</div>;
   }
 
+  // Fall back to the first tab when `active` matches nothing (e.g. state restored
+  // from a stale key), so the tablist always has one focusable, selected tab.
+  const effectiveActive = items.some(i => i.key === active) ? active : items[0].key;
+
   return (
     <div className="tabs" role="tablist" data-testid={testId}>
       {items.map((item, idx) => {
-        const isActive = item.key === active;
+        const isActive = item.key === effectiveActive;
         return (
           <button
             key={item.key}

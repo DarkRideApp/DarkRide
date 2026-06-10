@@ -75,4 +75,12 @@ describe('Tabs', () => {
     render(<Tabs items={items} active="overview" onChange={() => {}} />);
     for (const tab of screen.getAllByRole('tab')) expect(tab).toHaveAttribute('type', 'button');
   });
+
+  it('falls back to the first tab when active matches no item', () => {
+    render(<Tabs items={items} active="does-not-exist" onChange={() => {}} />);
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs[0]).toHaveAttribute('aria-selected', 'true'); // first tab is focusable/selected
+    expect(tabs[0]).toHaveAttribute('tabindex', '0');
+    expect(tabs.filter(t => t.getAttribute('aria-selected') === 'true')).toHaveLength(1);
+  });
 });

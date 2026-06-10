@@ -410,7 +410,17 @@ export function AppDetail() {
         <UploadApkModal
           expectedPackage={app.packageName}
           onClose={() => setUploadOpen(false)}
-          onUploaded={() => { setUploadOpen(false); fetchApp(); fetchVersions(); toast.success('APK uploaded — analysis started'); }}
+          onUploaded={data => {
+            setUploadOpen(false);
+            if (data.trackedAppId !== app.id) {
+              // The APK was a different package — it was filed under its own app.
+              toast.success(`Uploaded ${data.packageName} — filed under its own app`);
+              navigate(`/ui/apps/${data.trackedAppId}`);
+            } else {
+              fetchApp(); fetchVersions();
+              toast.success('APK uploaded — analysis started');
+            }
+          }}
         />
       )}
       {installFor && (
