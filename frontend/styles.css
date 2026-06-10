@@ -7075,3 +7075,24 @@ body.live-log-open .ai-chat-fab {
 .status-strip-bar { flex: 1; height: 4px; background: var(--bg-tertiary); border-radius: 2px; overflow: hidden; }
 .status-strip-bar-fill { height: 100%; background: var(--badge-running); transition: width 0.3s ease; }
 .status-strip-detail { color: var(--text-secondary); }
+
+/* ===== Activity chip + panel ===== */
+.activity-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px; border-radius: 14px; font-size: 12px; font-weight: 600;
+  background: transparent; border: 1px solid var(--border-color);
+  color: var(--text-muted); cursor: pointer; white-space: nowrap;
+}
+.activity-chip-running { background: rgba(96, 165, 250, 0.12); border-color: rgba(96, 165, 250, 0.3); color: var(--badge-running); }
+.activity-chip-failed { background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.3); color: var(--badge-failed); }
+.activity-chip-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.activity-chip-running .activity-chip-dot { animation: pulse 1.5s ease-in-out infinite; }
+.activity-panel-overlay { position: fixed; inset: 0; background: var(--bg-modal-overlay); z-index: 90; }
+.activity-panel {
+  position: fixed; top: 0; right: 0; bottom: 0; width: 380px; max-width: 90vw; z-index: 91;
+  background: var(--bg-secondary); border-left: 1px solid var(--border-color);
+  box-shadow: var(--shadow-lg); padding: 16px; overflow-y: auto;
+}
+.activity-panel-section { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin: 14px 0 8px; }
+.activity-job { background: var(--bg-card); border-radius: var(--radius-lg); padding: 10px 12px; margin-bottom: 8px; cursor: pointer; }
+.activity-job:hover { background: var(--bg-hover); }
