@@ -227,7 +227,7 @@ export function AppDetail() {
       return <button className="btn btn-sm btn-primary" onClick={() => navigate(`/ui/apps/${app.id}/analysis/${v.id}`)} data-testid={`open-analysis-${v.id}`}>Open Analysis</button>;
     }
     if (s?.status === 'pending' || s?.status === 'running') {
-      const label = s.status === 'pending' ? 'Queued…' : `${STAGE_LABELS[s.stage || ''] || 'Analyzing'}…`;
+      const label = s.status === 'pending' ? 'Queued…' : `${STAGE_LABELS[s.stage || ''] || 'Analysing'}…`;
       return <button className="btn btn-sm" disabled>{label}</button>;
     }
     return (

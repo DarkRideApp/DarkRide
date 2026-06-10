@@ -4,7 +4,7 @@ import { formatBytes, formatDate, formatDateRelative, formatDuration, toMs } fro
 describe('format utils', () => {
   it('formatBytes handles null, zero, and scales', () => {
     expect(formatBytes(null)).toBe('—');
-    expect(formatBytes(0)).toBe('—');
+    expect(formatBytes(0)).toBe('0 B');
     expect(formatBytes(512)).toBe('512 B');
     expect(formatBytes(1024)).toBe('1.0 KB');
     expect(formatBytes(148897792)).toBe('142.0 MB');

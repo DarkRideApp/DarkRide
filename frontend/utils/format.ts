@@ -1,7 +1,8 @@
 /** Shared display formatters for the APKs section (and beyond). */
 
 export function formatBytes(bytes: number | null): string {
-  if (bytes === null || bytes === 0) return '—';
+  if (bytes === null) return '—'; // unknown — distinct from a genuine 0 bytes
+  if (bytes === 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
   let i = 0;
   let val = bytes;
