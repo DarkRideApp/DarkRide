@@ -7047,3 +7047,14 @@ body.live-log-open .ai-chat-fab {
 .action-menu-item:disabled { opacity: 0.45; cursor: default; }
 .action-menu-item-danger { color: var(--danger); }
 .action-menu-divider { border-top: 1px solid var(--border-color); margin: 4px 0; }
+
+/* ===== SearchInput (SDK component) ===== */
+.search-input { position: relative; display: flex; align-items: center; flex: 1; }
+.search-input-icon { position: absolute; left: 10px; color: var(--text-muted); pointer-events: none; }
+.search-input-field { width: 100%; padding-left: 32px !important; padding-right: 28px; box-sizing: border-box; }
+.search-input-clear {
+  position: absolute; right: 6px; display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border: none; background: none; cursor: pointer;
+  color: var(--text-muted); border-radius: 50%;
+}
+.search-input-clear:hover { background: var(--bg-hover); color: var(--text-primary); }
