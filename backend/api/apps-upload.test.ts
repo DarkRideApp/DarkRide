@@ -112,18 +112,17 @@ describe('POST /v1/apps/upload', () => {
     expect(res.status).toBe(200);
   });
 
-  it('403s and cleans up the temp file when the user lacks core.apk:manage', async () => {
-    const unlinkSpy = vi.spyOn(fs.promises, 'unlink');
+  it('403s before streaming the upload when the user lacks core.apk:manage', async () => {
+    const writeSpy = vi.spyOn(fs.promises, 'copyFile');
     const { app, extractor } = makeApp(db, { authScopes: ['core.apk:read'] });
     const res = await request(app).post('/v1/apps/upload').attach('apk', APK_BYTES, 'x.apk');
     expect(res.status).toBe(403);
     expect(res.body.error).toMatch(/scope/i);
-    // No work performed past the gate…
+    // The scope gate runs before multer, so nothing is parsed/stored or analysed.
     expect(extractor).not.toHaveBeenCalled();
+    expect(writeSpy).not.toHaveBeenCalled();
     expect(db.select().from(apkVersions).all()).toHaveLength(0);
-    // …and multer's temp file was removed.
-    expect(unlinkSpy).toHaveBeenCalled();
-    unlinkSpy.mockRestore();
+    writeSpy.mockRestore();
   });
 
   it('removes the copied APK from disk if the DB insert fails', async () => {

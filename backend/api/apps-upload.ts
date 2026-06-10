@@ -50,18 +50,22 @@ export function registerAppsUploadEndpoint(db: AppDatabase, analyzer: AnalyzerLi
     });
   };
 
-  getApiRouter().post('/v1/apps/upload', handleMulter, async (req: Request, res: Response) => {
-    const file = req.file;
-    // Always remove multer's temp file, whatever path we exit by (including the
-    // early scope/validation returns below — multer has already written it).
-    const cleanup = () => file ? fs.promises.unlink(file.path).catch(() => {}) : Promise.resolve();
-
+  // Enforce the scope BEFORE multer streams the (up to 2 GB) body to disk, so an
+  // under-scoped caller can't waste disk/bandwidth before being rejected.
+  const requireApkManage = (req: Request, res: Response, next: NextFunction) => {
     const authUser = (req as any).authUser;
     if (authUser && !scopeMatches(authUser.effectiveScopes, 'core.apk:manage')) {
-      await cleanup();
       res.status(403).json({ success: false, error: 'Insufficient scope', required: ['core.apk:manage'] });
       return;
     }
+    next();
+  };
+
+  getApiRouter().post('/v1/apps/upload', requireApkManage, handleMulter, async (req: Request, res: Response) => {
+    const file = req.file;
+    // Always remove multer's temp file, whatever path we exit by.
+    const cleanup = () => file ? fs.promises.unlink(file.path).catch(() => {}) : Promise.resolve();
+
 
     if (!file) {
       res.status(400).json({ success: false, error: 'No file uploaded (expected multipart field "apk")' });

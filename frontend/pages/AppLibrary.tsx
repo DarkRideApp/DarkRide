@@ -197,9 +197,11 @@ export function AppLibrary() {
           <div className="empty-description">
             Track an app by package name, upload an APK, or pull one from a connected device.
           </div>
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 12 }}>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'center', alignItems: 'center', marginTop: 12 }}>
             <button className="btn btn-primary" data-testid="add-app-empty-btn" onClick={() => { setAddAppOpen(true); setAddAppPackage(''); setAddAppError(null); }}>+ Add App</button>
             {canManage && <button className="btn" data-testid="upload-empty-btn" onClick={() => { setDropFile(null); setUploadOpen(true); }}><Upload size={13} /> Upload APK</button>}
+            {/* Activity stays reachable even with no tracked apps (a job may still be running/failed). */}
+            <ActivityChip onClick={() => setPanelOpen(true)} />
           </div>
         </div>
       ) : (

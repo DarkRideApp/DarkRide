@@ -124,4 +124,12 @@ describe('AppLibrary', () => {
     expect(screen.getByTestId('add-app-empty-btn')).toBeInTheDocument();
     expect(screen.getByTestId('upload-empty-btn')).toBeInTheDocument();
   });
+
+  it('keeps the activity chip reachable in the empty state', async () => {
+    renderLibrary(mockWs([]));
+    await waitFor(() => expect(screen.getByText('No tracked apps')).toBeInTheDocument());
+    expect(screen.getByTestId('activity-chip')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('activity-chip'));
+    await waitFor(() => expect(screen.getByTestId('activity-panel')).toBeInTheDocument());
+  });
 });
