@@ -9,6 +9,8 @@ import { PageHeader } from '@darkrideapp/plugin-sdk/react';
 import { LoadingSpinner } from '@darkrideapp/plugin-sdk/react';
 import { Breadcrumbs } from '@darkrideapp/plugin-sdk/react';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
+import { ActionMenu, StatusStrip, Tabs, SearchInput } from '@darkrideapp/plugin-sdk/react';
+import { formatBytes, formatDuration } from '../utils/format';
 import { CodeBrowser } from '../components/analysis/CodeBrowser';
 import { FindingsTable } from '../components/analysis/FindingsTable';
 import { StringsView } from '../components/analysis/StringsView';
@@ -101,31 +103,28 @@ const SEVERITY_COLORS: Record<string, string> = {
   info: '#6c757d',
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let i = 0;
-  let val = bytes;
-  while (val >= 1024 && i < units.length - 1) {
-    val /= 1024;
-    i++;
-  }
-  return `${val.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const seconds = Math.floor(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
-}
-
 function formatTokenCount(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
+}
+
+const DANGEROUS_PERMISSIONS = new Set([
+  'android.permission.CAMERA', 'android.permission.RECORD_AUDIO',
+  'android.permission.ACCESS_FINE_LOCATION', 'android.permission.ACCESS_COARSE_LOCATION',
+  'android.permission.ACCESS_BACKGROUND_LOCATION', 'android.permission.READ_CONTACTS',
+  'android.permission.WRITE_CONTACTS', 'android.permission.READ_CALENDAR', 'android.permission.WRITE_CALENDAR',
+  'android.permission.READ_EXTERNAL_STORAGE', 'android.permission.WRITE_EXTERNAL_STORAGE',
+  'android.permission.READ_MEDIA_IMAGES', 'android.permission.READ_MEDIA_VIDEO', 'android.permission.READ_MEDIA_AUDIO',
+  'android.permission.READ_PHONE_STATE', 'android.permission.CALL_PHONE', 'android.permission.READ_CALL_LOG',
+  'android.permission.READ_SMS', 'android.permission.SEND_SMS', 'android.permission.RECEIVE_SMS',
+  'android.permission.BODY_SENSORS', 'android.permission.ACTIVITY_RECOGNITION',
+  'android.permission.BLUETOOTH_SCAN', 'android.permission.BLUETOOTH_CONNECT', 'android.permission.POST_NOTIFICATIONS',
+]);
+function permissionGroup(perm: string): 'dangerous' | 'normal' | 'other' {
+  if (DANGEROUS_PERMISSIONS.has(perm)) return 'dangerous';
+  if (perm.startsWith('android.permission.')) return 'normal';
+  return 'other';
 }
 
 const STAGE_LABELS: Record<string, string> = {
@@ -190,7 +189,16 @@ export function ApkAnalysis() {
   const [availability, setAvailability] = useState<{ state: AvailabilityState } | null>(null);
   const [oldAvail, setOldAvail] = useState<{ state: AvailabilityState } | null>(null);
   const [versionSource, setVersionSource] = useState<'device' | 'playstore' | 'upload'>('device');
+  const [isLatest, setIsLatest] = useState(false);
+  const [severityDeepLink, setSeverityDeepLink] = useState<string | null>(null);
+  const [permFilter, setPermFilter] = useState('');
   const toast = useToast();
+
+  // A severity pill deep-link is a one-shot: once the user leaves the Findings
+  // tab, forget it so returning to Findings doesn't clobber a manual filter change.
+  useEffect(() => {
+    if (activeTab !== 'findings') setSeverityDeepLink(null);
+  }, [activeTab]);
 
   const displayName = overview?.appName || overview?.packageName || 'APK Analysis';
   useDocumentTitle(overview ? `Analysis - ${displayName}` : 'APK Analysis');
@@ -287,6 +295,8 @@ export function ApkAnalysis() {
         const vid = Number(versionId);
         const match = res.body.data.find((v: any) => v.id === vid);
         if (match?.source) setVersionSource(match.source as 'device' | 'playstore' | 'upload');
+        const maxRow = res.body.data.reduce((a: any, b: any) => (a.versionCode > b.versionCode ? a : b), res.body.data[0]);
+        setIsLatest(!!maxRow && maxRow.id === Number(versionId));
       }
     } catch {
       // ignore — source is best-effort; defaults to 'device'
@@ -517,12 +527,13 @@ export function ApkAnalysis() {
   const services: string[] = Array.isArray(manifest.services) ? manifest.services : [];
   const receivers: string[] = Array.isArray(manifest.receivers) ? manifest.receivers : [];
   const providers: string[] = Array.isArray(manifest.providers) ? manifest.providers : [];
+  const findingsTotal = Object.values(overview.findingCounts).reduce((a, b) => a + b, 0);
 
   return (
     <div data-testid="apk-analysis-page">
       <Breadcrumbs items={[
         { label: 'APKs', to: '/ui/apks' },
-        { label: overview.appName || overview.packageName },
+        { label: overview.appName || overview.packageName, to: `/ui/apps/${trackedAppId}` },
         { label: `v${overview.versionName || overview.versionCode}` },
       ]} />
       <PageHeader
@@ -545,6 +556,9 @@ export function ApkAnalysis() {
                 <span style={{ marginLeft: 10, verticalAlign: 'middle' }} data-testid="availability-badge">
                   <AvailabilityBadge state={availability.state} />
                 </span>
+              )}
+              {isLatest && (
+                <span className="badge badge-running" data-testid="latest-badge" style={{ marginLeft: 8, verticalAlign: 'middle' }}>Latest</span>
               )}
               <button
                 title="Copy package ID"
@@ -580,57 +594,56 @@ export function ApkAnalysis() {
             </span>
           </span>
         }
-        subtitle={`v${overview.versionName || overview.versionCode}`}
+        subtitle={`v${overview.versionName || overview.versionCode} · code ${overview.versionCode} · ${formatBytes(overview.totalSize)}`}
         actions={
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button
-              className="btn btn-primary"
-              data-testid="capture-launch-btn"
-              onClick={handleCaptureLaunch}
-              disabled={captureLaunching}
-            >
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button className="btn btn-primary" data-testid="capture-launch-btn" onClick={handleCaptureLaunch} disabled={captureLaunching}>
               {captureLaunching ? 'Starting...' : 'Capture on Device'}
             </button>
-            <button
-              className="btn"
-              data-testid="ai-review-btn"
-              onClick={handleAiReview}
-              disabled={aiAgentStatus === 'running'}
-            >
-              {aiAgentStatus === 'running'
-                ? `AI Reviewing...${aiContextPercent !== null ? ` (ctx ${aiContextPercent}%)` : ''}`
-                : aiTokenUsage
-                  ? `AI Review (${formatTokenCount(aiTokenUsage.inputTokens)} in / ${formatTokenCount(aiTokenUsage.outputTokens)} out)`
-                  : 'AI Review'}
+            <button className="btn" data-testid="ai-review-btn" onClick={handleAiReview} disabled={aiAgentStatus === 'running'}>
+              AI Review
             </button>
-            {canManageApk && (
-              <button
-                className="btn"
-                data-testid="reanalyze-btn"
-                onClick={handleReanalyze}
-                disabled={!!reanalyzing}
-              >
-                {reanalyzing
-                  ? reanalyzing === 'pending' ? 'Queued...'
-                  : (STAGE_LABELS[reanalyzing] || reanalyzing) + (reanalyzingProgress != null ? ` ${reanalyzingProgress}%` : '')
-                  : 'Re-analyze'}
-              </button>
-            )}
-            <a
-              className="btn"
-              data-testid="download-apk-btn"
-              href={`/v1/apps/download/${versionId}`}
-              download
-              style={{ textDecoration: 'none' }}
-            >
-              Download APK
-            </a>
-            <button className="btn" onClick={() => navigate(`/ui/apks`)}>
-              Back to APKs
-            </button>
+            <ActionMenu
+              label="More actions"
+              items={[
+                ...(canManageApk ? [{ key: 'reanalyze', label: 'Re-analyze', disabled: !!reanalyzing, onSelect: handleReanalyze }] : []),
+                { key: 'download', label: 'Download APK', onSelect: () => {
+                  // Trigger via a temporary <a> so the SPA isn't navigated away
+                  // (preserves analysis-page state and in-flight WS updates).
+                  const a = document.createElement('a');
+                  a.href = `/v1/apps/download/${versionId}`;
+                  a.download = '';
+                  document.body.appendChild(a);
+                  a.click();
+                  document.body.removeChild(a);
+                } },
+                { key: 'diff', label: 'Diff vs previous', onSelect: () => setActiveTab('diff') },
+              ]}
+            />
           </div>
         }
       />
+
+      {reanalyzing && (
+        <StatusStrip
+          data-testid="reanalyze-strip"
+          label={reanalyzing === 'pending' ? 'Re-analysis queued…' : `${STAGE_LABELS[reanalyzing] || reanalyzing}…`}
+          progress={reanalyzingProgress}
+        />
+      )}
+      {aiAgentStatus === 'running' && (
+        <StatusStrip
+          data-testid="ai-strip"
+          label="AI Review running"
+          progress={aiContextPercent}
+          detail={aiTokenUsage ? `${formatTokenCount(aiTokenUsage.inputTokens)} in / ${formatTokenCount(aiTokenUsage.outputTokens)} out` : undefined}
+        />
+      )}
+      {aiAgentStatus !== 'running' && aiTokenUsage && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }} data-testid="ai-last-run">
+          Last AI review: {formatTokenCount(aiTokenUsage.inputTokens)} in / {formatTokenCount(aiTokenUsage.outputTokens)} out
+        </div>
+      )}
 
       {captureLaunchError && (
         <div
@@ -661,47 +674,22 @@ export function ApkAnalysis() {
       )}
 
       {/* Tab bar */}
-      <div style={{ display: 'flex', gap: 0, marginBottom: 20, borderBottom: '2px solid var(--border-color)', alignItems: 'center' }}>
-        {TABS.map(tab => (
-          <button
-            key={tab}
-            data-testid={`tab-${tab}`}
-            data-active={activeTab === tab ? 'true' : 'false'}
-            onClick={() => setActiveTab(tab)}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 6,
-              padding: '8px 16px', border: 'none', background: 'none', cursor: 'pointer',
-              borderBottom: activeTab === tab ? '2px solid var(--accent)' : '2px solid transparent',
-              marginBottom: -2,
-              color: activeTab === tab ? 'var(--text-primary)' : 'var(--text-muted)',
-              fontWeight: activeTab === tab ? 600 : 400,
-              fontSize: 13, transition: 'color 0.15s, border-color 0.15s',
-            }}
-          >
-            {TAB_LABELS[tab]}
-          </button>
-        ))}
-        {(activeTab === 'findings' || activeTab === 'strings') && excludedPaths.length > 0 && (
-          <button
-            data-testid="toggle-library"
-            className={`btn btn-sm${showLibrary ? ' btn-primary' : ''}`}
-            onClick={() => setShowLibrary(prev => !prev)}
-            style={{ marginLeft: 'auto', marginBottom: -2, fontSize: 12 }}
-          >
-            Show Libraries
-          </button>
-        )}
-      </div>
+      <Tabs
+        items={TABS.map(tab => ({
+          key: tab,
+          label: TAB_LABELS[tab],
+          count: tab === 'findings' && findingsTotal > 0 ? findingsTotal : undefined,
+          dot: tab === 'notes' && savedNotes.length > 0,
+        }))}
+        active={activeTab}
+        onChange={key => setActiveTab(key as Tab)}
+      />
 
       {/* Tab content */}
       {activeTab === 'overview' && (
         <div data-testid="tab-content-overview">
           {/* App info & stats cards */}
           <div className="card-grid" style={{ marginBottom: 16 }}>
-            <div className="card stat-card" data-testid="stat-card">
-              <div className="stat-value">{manifest.package || '—'}</div>
-              <div className="stat-label">Package</div>
-            </div>
             <div className="card stat-card" data-testid="stat-card">
               <div className="stat-value">{overview.fileCount}</div>
               <div className="stat-label">Files</div>
@@ -872,14 +860,17 @@ export function ApkAnalysis() {
               {SEVERITY_ORDER.map(severity => {
                 const count = overview.findingCounts[severity] || 0;
                 return (
-                  <div
+                  <button
                     key={severity}
                     data-testid={`severity-${severity}`}
+                    onClick={() => { if (count > 0) { setSeverityDeepLink(severity); setActiveTab('findings'); } }}
+                    disabled={count === 0}
                     style={{
                       display: 'flex', alignItems: 'center', gap: 8,
                       padding: '6px 12px', borderRadius: 6,
                       background: count > 0 ? `${SEVERITY_COLORS[severity]}15` : 'var(--bg-tertiary)',
                       border: `1px solid ${count > 0 ? `${SEVERITY_COLORS[severity]}40` : 'var(--border-color)'}`,
+                      cursor: count > 0 ? 'pointer' : 'default',
                     }}
                   >
                     <span style={{
@@ -896,7 +887,8 @@ export function ApkAnalysis() {
                     }}>
                       {severity}
                     </span>
-                  </div>
+                    {count > 0 && <span aria-hidden="true" style={{ color: SEVERITY_COLORS[severity] }}>→</span>}
+                  </button>
                 );
               })}
             </div>
@@ -919,21 +911,35 @@ export function ApkAnalysis() {
             <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>
               Permissions ({permissions.length})
             </h3>
-            {permissions.length === 0 ? (
-              <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>No permissions declared</div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {permissions.map(perm => (
-                  <div key={perm} style={{
-                    fontSize: 12, fontFamily: 'var(--font-mono)',
-                    padding: '4px 8px', borderRadius: 4,
-                    background: 'var(--bg-tertiary)',
-                  }}>
-                    {perm}
-                  </div>
-                ))}
-              </div>
-            )}
+            {(() => {
+              const groups: Record<'dangerous' | 'normal' | 'other', string[]> = { dangerous: [], normal: [], other: [] };
+              for (const p of permissions) groups[permissionGroup(p)].push(p);
+              const q = permFilter.toLowerCase();
+              const labelFor = { dangerous: 'Dangerous', normal: 'Normal', other: 'Other' } as const;
+              return (
+                <>
+                  <SearchInput value={permFilter} onChange={setPermFilter} placeholder="Filter permissions…" data-testid="permission-filter" />
+                  {(['dangerous', 'normal', 'other'] as const).map(g => {
+                    const all = groups[g];
+                    const matching = q ? all.filter(p => p.toLowerCase().includes(q)) : all;
+                    if (all.length === 0 || matching.length === 0) return null;
+                    return (
+                      <div key={g} style={{ marginTop: 12 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6, color: g === 'dangerous' ? 'var(--danger)' : 'var(--text-secondary)' }}>
+                          {labelFor[g]} ({all.length})
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          {matching.map(perm => (
+                            <div key={perm} style={{ fontSize: 12, fontFamily: 'var(--font-mono)', padding: '4px 8px', borderRadius: 4, background: 'var(--bg-tertiary)' }}>{perm}</div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {permissions.length === 0 && <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>No permissions declared</div>}
+                </>
+              );
+            })()}
           </div>
 
           {/* Manifest components */}
@@ -995,6 +1001,8 @@ export function ApkAnalysis() {
               }}
               excludedPaths={excludedPaths}
               showLibrary={showLibrary}
+              onToggleLibrary={excludedPaths.length > 0 ? () => setShowLibrary(p => !p) : undefined}
+              initialSeverity={severityDeepLink}
             />
           ) : (
             <div className="empty-state">
@@ -1022,6 +1030,7 @@ export function ApkAnalysis() {
               }}
               excludedPaths={excludedPaths}
               showLibrary={showLibrary}
+              onToggleLibrary={excludedPaths.length > 0 ? () => setShowLibrary(p => !p) : undefined}
             />
           ) : (
             <div className="empty-state">

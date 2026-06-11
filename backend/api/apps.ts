@@ -1,4 +1,4 @@
-import { eq, desc, sql } from 'drizzle-orm';
+import { eq, desc, sql, inArray } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -782,16 +782,45 @@ export function registerAppEndpoints(
       versionsByApp.set(v.trackedAppId, list);
     }
 
-    const result = tracked.map(app => {
+    // Resolve each app's latest version up front so the jobs query can be
+    // scoped to just those versions (bounded by app count) instead of scanning
+    // the whole analysisJobs table.
+    const latestByApp = new Map<number, typeof allVersions[number] | null>();
+    const latestVersionIds: number[] = [];
+    for (const app of tracked) {
       const versions = versionsByApp.get(app.id) || [];
       const latest = versions.length > 0
         ? versions.reduce((a, b) => (a.versionCode > b.versionCode ? a : b))
         : null;
+      latestByApp.set(app.id, latest);
+      if (latest) latestVersionIds.push(latest.id);
+    }
+
+    // Most-recent analysis job for each latest version — exactly one row per
+    // version via a MAX(id) GROUP BY subquery (no per-version historical scan).
+    const latestJobByVersion = new Map<number, { status: string; stage: string | null; error: string | null }>();
+    if (latestVersionIds.length > 0) {
+      const maxJobIds = db
+        .select({ maxId: sql<number>`max(${analysisJobs.id})`.as('maxId') })
+        .from(analysisJobs)
+        .where(inArray(analysisJobs.apkVersionId, latestVersionIds))
+        .groupBy(analysisJobs.apkVersionId);
+      const jobs = db.select().from(analysisJobs).where(inArray(analysisJobs.id, maxJobIds)).all();
+      for (const j of jobs) {
+        latestJobByVersion.set(j.apkVersionId, { status: j.status, stage: j.stage ?? null, error: j.error ?? null });
+      }
+    }
+
+    const result = tracked.map(app => {
+      const versions = versionsByApp.get(app.id) || [];
+      const latest = latestByApp.get(app.id) ?? null;
+      const job = latest ? latestJobByVersion.get(latest.id) : undefined;
 
       return {
         ...app,
         versionCount: versions.length,
         latestVersion: latest,
+        latestAnalysis: job ?? null,
       };
     });
 
@@ -820,16 +849,38 @@ export function registerAppEndpoints(
       .all()
       .sort((a, b) => b.versionCode - a.versionCode);
 
-    const versionsWithAvailability = versions.map(v => {
-      try {
-        const avail = computeVersionAvailability(db as any, v.id);
-        return { ...v, availability: avail.state };
-      } catch {
-        return { ...v, availability: 'lost' as const };
+    // Latest analysis job per version in a single query (MAX(id) GROUP BY), so
+    // the client can render status without an N+1 of analysis-status calls.
+    const versionIds = versions.map(v => v.id);
+    const latestJobByVersion = new Map<number, { status: string; stage: string | null; error: string | null }>();
+    if (versionIds.length > 0) {
+      const maxJobIds = db
+        .select({ maxId: sql<number>`max(${analysisJobs.id})`.as('maxId') })
+        .from(analysisJobs)
+        .where(inArray(analysisJobs.apkVersionId, versionIds))
+        .groupBy(analysisJobs.apkVersionId);
+      const jobs = db.select().from(analysisJobs).where(inArray(analysisJobs.id, maxJobIds)).all();
+      for (const j of jobs) {
+        latestJobByVersion.set(j.apkVersionId, { status: j.status, stage: j.stage ?? null, error: j.error ?? null });
       }
+    }
+
+    const enriched = versions.map(v => {
+      let availability: string;
+      try {
+        availability = computeVersionAvailability(db as any, v.id).state;
+      } catch {
+        availability = 'lost';
+      }
+      const job = latestJobByVersion.get(v.id);
+      // aiRunning is in-memory analyzer state; only meaningful once a job exists.
+      const analysis = job
+        ? { ...job, aiRunning: apkAnalyzer ? apkAnalyzer.isAiAgentRunning(v.id) : false }
+        : null;
+      return { ...v, availability, analysis };
     });
 
-    res.json({ success: true, data: versionsWithAvailability });
+    res.json({ success: true, data: enriched });
   }, { requires: ['core.apk:read'] });
 
   // GET /v1/apps/analysis-jobs/recent — Recent analysis jobs across all tracked apps

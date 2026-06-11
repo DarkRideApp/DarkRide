@@ -278,6 +278,26 @@ describe('Apps API', () => {
       // valid state value", which was the original intent of this test.
       expect(res.body.data[0].availability).toBe('local');
     });
+
+    it('embeds each version\'s latest analysis (status/stage/error/aiRunning)', async () => {
+      await request(app).post('/v1/apps/track').send({ packageName: 'com.example.app' });
+      const appId = db.select().from(trackedApps).all()[0].id;
+      db.insert(apkVersions).values({ trackedAppId: appId, versionCode: 10, versionName: '1.0', filename: '10.apk', downloadedAt: new Date() }).run();
+      db.insert(apkVersions).values({ trackedAppId: appId, versionCode: 20, versionName: '2.0', filename: '20.apk', downloadedAt: new Date() }).run();
+      const versions = db.select().from(apkVersions).all();
+      const v10 = versions.find(v => v.versionCode === 10)!;
+      const v20 = versions.find(v => v.versionCode === 20)!;
+      // v10 has two jobs (newest wins); v20 has none → analysis null.
+      db.insert(analysisJobs).values({ apkVersionId: v10.id, status: 'failed', stage: null, error: 'old', createdAt: new Date(1000) }).run();
+      db.insert(analysisJobs).values({ apkVersionId: v10.id, status: 'completed', stage: 'done', createdAt: new Date(2000) }).run();
+
+      const res = await request(app).get(`/v1/apps/versions/${appId}`);
+      expect(res.status).toBe(200);
+      const got10 = res.body.data.find((v: any) => v.versionCode === 10);
+      const got20 = res.body.data.find((v: any) => v.versionCode === 20);
+      expect(got10.analysis).toEqual({ status: 'completed', stage: 'done', error: null, aiRunning: false });
+      expect(got20.analysis).toBeNull();
+    });
   });
 
   describe('GET /v1/apps/download/:versionId', () => {
@@ -688,4 +708,76 @@ describe('Apps API', () => {
     });
   });
 
+});
+
+describe('GET /v1/apps/tracked latestAnalysis enrichment', () => {
+  it('includes the latest job for the latest version, null when none', async () => {
+    const db = createTestDb();
+    const { app } = createApp(db);
+
+    db.insert(trackedApps).values({ packageName: 'com.fixture.one', appName: 'One', createdAt: new Date() }).run();
+    const tracked = db.select().from(trackedApps).all()[0];
+    db.insert(apkVersions).values({
+      trackedAppId: tracked.id, versionCode: 1, versionName: '1.0', filename: '1_1.0.apk',
+      fileSize: 100, deviceId: null, source: 'device', downloadedAt: new Date(),
+    }).run();
+    db.insert(apkVersions).values({
+      trackedAppId: tracked.id, versionCode: 2, versionName: '2.0', filename: '2_2.0.apk',
+      fileSize: 100, deviceId: null, source: 'device', downloadedAt: new Date(),
+    }).run();
+    const versions = db.select().from(apkVersions).all();
+    const latest = versions.find(v => v.versionCode === 2)!;
+    const older = versions.find(v => v.versionCode === 1)!;
+    db.insert(analysisJobs).values({ apkVersionId: older.id, status: 'completed', stage: 'done', createdAt: new Date(1000) }).run();
+    db.insert(analysisJobs).values({ apkVersionId: latest.id, status: 'failed', stage: null, error: 'boom', createdAt: new Date(2000) }).run();
+    db.insert(analysisJobs).values({ apkVersionId: latest.id, status: 'running', stage: 'decompiling', createdAt: new Date(3000) }).run();
+
+    const res = await request(app).get('/v1/apps/tracked');
+    expect(res.status).toBe(200);
+    const item = res.body.data.find((a: any) => a.packageName === 'com.fixture.one');
+    expect(item.latestVersion.versionCode).toBe(2);
+    expect(item.latestAnalysis).toEqual({ status: 'running', stage: 'decompiling', error: null });
+  });
+
+  it('does not leak an older version job even when it is the newest job overall', async () => {
+    const db = createTestDb();
+    const { app } = createApp(db);
+    db.insert(trackedApps).values({ packageName: 'com.fixture.iso', appName: 'Iso', createdAt: new Date() }).run();
+    const tracked = db.select().from(trackedApps).all()[0];
+    db.insert(apkVersions).values({
+      trackedAppId: tracked.id, versionCode: 10, versionName: '1.0', filename: '10.apk',
+      fileSize: 1, deviceId: null, source: 'device', downloadedAt: new Date(),
+    }).run();
+    db.insert(apkVersions).values({
+      trackedAppId: tracked.id, versionCode: 20, versionName: '2.0', filename: '20.apk',
+      fileSize: 1, deviceId: null, source: 'device', downloadedAt: new Date(),
+    }).run();
+    const versions = db.select().from(apkVersions).all();
+    const latest = versions.find(v => v.versionCode === 20)!;
+    const older = versions.find(v => v.versionCode === 10)!;
+    // Latest version's only job is inserted FIRST (lower id); the older version's
+    // job is inserted LAST (highest id overall). The latest version must still
+    // report its own job, not the globally-newest one.
+    db.insert(analysisJobs).values({ apkVersionId: latest.id, status: 'completed', stage: 'done', createdAt: new Date(1000) }).run();
+    db.insert(analysisJobs).values({ apkVersionId: older.id, status: 'failed', stage: null, error: 'old boom', createdAt: new Date(2000) }).run();
+
+    const res = await request(app).get('/v1/apps/tracked');
+    const item = res.body.data.find((a: any) => a.packageName === 'com.fixture.iso');
+    expect(item.latestVersion.versionCode).toBe(20);
+    expect(item.latestAnalysis).toEqual({ status: 'completed', stage: 'done', error: null });
+  });
+
+  it('returns latestAnalysis null when latest version has no jobs', async () => {
+    const db = createTestDb();
+    const { app } = createApp(db);
+    db.insert(trackedApps).values({ packageName: 'com.fixture.two', appName: null, createdAt: new Date() }).run();
+    const tracked = db.select().from(trackedApps).all()[0];
+    db.insert(apkVersions).values({
+      trackedAppId: tracked.id, versionCode: 5, versionName: '5.0', filename: '5_5.0.apk',
+      fileSize: 1, deviceId: null, source: 'upload', downloadedAt: new Date(),
+    }).run();
+    const res = await request(app).get('/v1/apps/tracked');
+    const item = res.body.data.find((a: any) => a.packageName === 'com.fixture.two');
+    expect(item.latestAnalysis).toBeNull();
+  });
 });

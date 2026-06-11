@@ -13,6 +13,7 @@ import type { AiAgentFactory } from './ai-agent-factory';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
 import { APK_DIR, apkFilePath, resolveApkLocal, apkCloudKey, ensureApkLocal, analysisDir as getAnalysisDir } from '../utils/apk-paths';
+import { getPythonPath } from '../utils/python-path';
 import { extractIconFromLocalApk } from './apk-tracker';
 import { getNote, setNote } from './apk-notes';
 
@@ -22,15 +23,6 @@ const RESTART_DELAY_MS = 2000;
 const COMMAND_TIMEOUT_MS = 300000; // 5 minutes per command
 const LONG_COMMAND_TIMEOUT_MS = 1800000; // 30 minutes for store/scan
 
-/**
- * Determines the Python executable path for the current platform.
- */
-function getPythonPath(): string {
-  if (process.platform === 'win32') {
-    return path.resolve('.venv/Scripts/python.exe');
-  }
-  return path.resolve('.venv/bin/python');
-}
 
 interface PendingCommand {
   resolve: (result: any) => void;

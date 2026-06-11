@@ -30,6 +30,7 @@ interface StringsViewProps {
   onNavigate: (filePath: string, lineNumber: number, source: string) => void;
   excludedPaths?: string[];
   showLibrary?: boolean;
+  onToggleLibrary?: () => void;
 }
 
 const TYPE_STYLES: Record<string, { background: string; color: string; border: string }> = {
@@ -60,7 +61,7 @@ function tryDecodeBase64Preview(value: string): string {
   }
 }
 
-export function StringsView({ versionId, onNavigate, excludedPaths = [], showLibrary = true }: StringsViewProps) {
+export function StringsView({ versionId, onNavigate, excludedPaths = [], showLibrary = true, onToggleLibrary }: StringsViewProps) {
   const ws = useWebSocket();
   const [data, setData] = useState<StringsData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -186,15 +187,33 @@ export function StringsView({ versionId, onNavigate, excludedPaths = [], showLib
 
   if (!hasUrls && !hasStrings && !hasCerts) {
     return (
-      <div data-testid="strings-empty" className="empty-state">
-        <div className="empty-message">No strings found</div>
-        <div className="empty-description">No URLs, interesting strings, or certificates were found in this analysis.</div>
+      <div>
+        {onToggleLibrary && (
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' }}>
+              <input type="checkbox" checked={showLibrary} onChange={onToggleLibrary} data-testid="toggle-library" />
+              Show library code
+            </label>
+          </div>
+        )}
+        <div data-testid="strings-empty" className="empty-state">
+          <div className="empty-message">No strings found</div>
+          <div className="empty-description">No URLs, interesting strings, or certificates were found in this analysis.</div>
+        </div>
       </div>
     );
   }
 
   return (
     <div data-testid="strings-view">
+      {onToggleLibrary && (
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' }}>
+            <input type="checkbox" checked={showLibrary} onChange={onToggleLibrary} data-testid="toggle-library" />
+            Show library code
+          </label>
+        </div>
+      )}
       {totalHidden > 0 && (
         <div data-testid="strings-hidden-count" style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>
           {totalHidden} library item{totalHidden !== 1 ? 's' : ''} hidden

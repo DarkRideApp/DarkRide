@@ -6998,4 +6998,109 @@ body.live-log-open .ai-chat-fab {
   margin-bottom: 24px;
 }
 .settings-page-header h1 { margin: 0; font-size: 24px; }
+
+/* ===== Tabs (SDK component) ===== */
+.tabs {
+  display: flex; gap: 0; align-items: center;
+  border-bottom: 2px solid var(--border-color);
+  margin-bottom: 20px;
+}
+.tab {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 16px; border: none; background: none; cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -2px;
+  color: var(--text-muted); font-weight: 400; font-size: 13px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.tab:hover { color: var(--text-secondary); }
+.tab-active { border-bottom-color: var(--accent); color: var(--text-primary); font-weight: 600; }
+.tab-count {
+  font-size: 11px; padding: 1px 7px; border-radius: 10px; font-weight: 600;
+  background: var(--bg-tertiary); color: var(--text-muted);
+}
+.tab-active .tab-count { background: var(--accent-soft); color: var(--accent); }
+.tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; }
+.tabs-trailing { margin-left: auto; margin-bottom: -2px; display: flex; align-items: center; gap: 8px; }
 .settings-page-actions { display: flex; gap: 8px; }
+
+/* ===== ActionMenu (SDK component) ===== */
+.action-menu { position: relative; display: inline-flex; }
+.action-menu-trigger {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; border-radius: var(--radius);
+  border: none; background: none; cursor: pointer; color: var(--text-muted);
+}
+.action-menu-trigger:hover { background: var(--bg-hover); color: var(--text-primary); }
+.action-menu-list {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 50;
+  min-width: 200px; padding: 4px;
+  background: var(--bg-card); border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+}
+.action-menu-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 12px; border: none; background: none; cursor: pointer;
+  color: var(--text-primary); font-size: 12px; text-align: left;
+  border-radius: var(--radius);
+}
+.action-menu-item:hover:not(:disabled) { background: var(--bg-hover); }
+.action-menu-item:disabled { opacity: 0.45; cursor: default; }
+.action-menu-item-danger { color: var(--danger); }
+.action-menu-divider { border-top: 1px solid var(--border-color); margin: 4px 0; }
+
+/* ===== SearchInput (SDK component) ===== */
+.search-input { position: relative; display: flex; align-items: center; flex: 1; }
+.search-input-icon { position: absolute; left: 10px; color: var(--text-muted); pointer-events: none; }
+.search-input-field { width: 100%; padding-left: 32px !important; padding-right: 28px; box-sizing: border-box; }
+.search-input-clear {
+  position: absolute; right: 6px; display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border: none; background: none; cursor: pointer;
+  color: var(--text-muted); border-radius: 50%;
+}
+.search-input-clear:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* ===== StatusStrip (SDK component) ===== */
+.status-strip {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px; border-radius: var(--radius-lg); margin-bottom: 12px;
+  font-size: 12px;
+}
+.status-strip-info { background: rgba(96, 165, 250, 0.08); border: 1px solid rgba(96, 165, 250, 0.25); }
+.status-strip-success { background: rgba(74, 222, 128, 0.08); border: 1px solid rgba(74, 222, 128, 0.25); }
+.status-strip-error { background: rgba(248, 113, 113, 0.08); border: 1px solid rgba(248, 113, 113, 0.25); }
+.status-strip-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--badge-running); animation: pulse 1.5s ease-in-out infinite; }
+.status-strip-success .status-strip-dot { background: var(--success); animation: none; }
+.status-strip-error .status-strip-dot { background: var(--error); animation: none; }
+.status-strip-label { font-weight: 600; color: var(--text-primary); }
+.status-strip-bar { flex: 1; height: 4px; background: var(--bg-tertiary); border-radius: 2px; overflow: hidden; }
+.status-strip-bar-fill { height: 100%; background: var(--badge-running); transition: width 0.3s ease; }
+.status-strip-detail { color: var(--text-secondary); }
+
+/* ===== Activity chip + panel ===== */
+.activity-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px; border-radius: 14px; font-size: 12px; font-weight: 600;
+  background: transparent; border: 1px solid var(--border-color);
+  color: var(--text-muted); cursor: pointer; white-space: nowrap;
+}
+.activity-chip-running { background: rgba(96, 165, 250, 0.12); border-color: rgba(96, 165, 250, 0.3); color: var(--badge-running); }
+.activity-chip-failed { background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.3); color: var(--badge-failed); }
+.activity-chip-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.activity-chip-running .activity-chip-dot { animation: pulse 1.5s ease-in-out infinite; }
+.activity-panel-overlay { position: fixed; inset: 0; background: var(--bg-modal-overlay); z-index: 90; }
+.activity-panel {
+  position: fixed; top: 0; right: 0; bottom: 0; width: 380px; max-width: 90vw; z-index: 91;
+  background: var(--bg-secondary); border-left: 1px solid var(--border-color);
+  box-shadow: var(--shadow-lg); padding: 16px; overflow-y: auto;
+}
+.activity-panel-section { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin: 14px 0 8px; }
+.activity-job { background: var(--bg-card); border-radius: var(--radius-lg); padding: 10px 12px; margin-bottom: 8px; cursor: pointer; }
+.activity-job:hover { background: var(--bg-hover); }
+
+/* ===== App library rows ===== */
+.app-row {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 16px; cursor: pointer;
+}
+.app-row:hover { background: var(--bg-hover); }
+.app-row:focus-visible { outline: 2px solid var(--border-focus); outline-offset: -2px; }
