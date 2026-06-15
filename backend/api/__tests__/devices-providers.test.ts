@@ -240,7 +240,7 @@ describe('/v1/devices/providers endpoints', () => {
     // builds a fresh container that may bind a different host port. If the old
     // localhost:<port> endpoint + its devices row survive, the recreated
     // emulator's detail page can resolve to that orphan (→ scrcpy) instead of
-    // the new VNC-capable instance.
+    // the new webrtc-capable docker-android instance.
     const sqlite = new (await import('better-sqlite3')).default(':memory:');
     sqlite.pragma('foreign_keys = ON');
     const { applyMigrations } = await import('../../test-utils/create-test-db');

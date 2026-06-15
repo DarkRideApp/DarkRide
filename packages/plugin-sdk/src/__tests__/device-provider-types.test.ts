@@ -50,13 +50,13 @@ describe('DeviceProvider type surface', () => {
   });
 });
 
-describe('DeviceProvider — Phase 1 VNC additions', () => {
-  it('declares optional videoTransport with the vnc | scrcpy union', () => {
-    expectTypeOf<DeviceProvider['videoTransport']>().toEqualTypeOf<'vnc' | 'scrcpy' | undefined>();
+describe('DeviceProvider — video transport', () => {
+  it('declares optional videoTransport with the webrtc | scrcpy union', () => {
+    expectTypeOf<DeviceProvider['videoTransport']>().toEqualTypeOf<'webrtc' | 'scrcpy' | undefined>();
   });
 
-  it('declares optional getVncEndpoint returning host+port', () => {
-    type Endpoint = NonNullable<DeviceProvider['getVncEndpoint']>;
-    expectTypeOf<Awaited<ReturnType<Endpoint>>>().toEqualTypeOf<{ host: string; port: number }>();
+  it('declares optional getGrpcEndpoint returning host+port+token', () => {
+    type Endpoint = NonNullable<DeviceProvider['getGrpcEndpoint']>;
+    expectTypeOf<Awaited<ReturnType<Endpoint>>>().toEqualTypeOf<{ host: string; port: number; token?: string }>();
   });
 });

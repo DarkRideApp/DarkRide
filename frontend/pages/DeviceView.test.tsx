@@ -457,7 +457,7 @@ describe('DeviceView — video transport gating', () => {
     });
   });
 
-  it('renders the existing DeviceViewer (no VncViewer) when transport=scrcpy', async () => {
+  it('renders the existing DeviceViewer when transport=scrcpy', async () => {
     const ws: WebSocketContextValue = {
       connected: true,
       sendMessage: vi.fn(),
@@ -490,7 +490,7 @@ describe('DeviceView — video transport gating', () => {
     await waitFor(() => {
       expect(ws.sendRestApi).toHaveBeenCalledWith('GET', '/v1/devices/usb-pixel-001/video-transport');
     });
-    // VncViewer must NOT be in the document for a scrcpy-transport device.
-    expect(screen.queryByTestId('vnc-viewer-usb-pixel-001')).not.toBeInTheDocument();
+    // EmulatorView must NOT be in the document for a scrcpy-transport device.
+    expect(screen.queryByTestId('emulator-video-usb-pixel-001')).not.toBeInTheDocument();
   });
 });

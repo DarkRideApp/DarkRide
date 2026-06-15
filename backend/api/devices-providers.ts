@@ -206,7 +206,7 @@ export function registerDevicesProvidersEndpoints(
         // adb-seeded devices row first, so the new container doesn't compete
         // with an orphaned `localhost:<oldPort>` serial that no longer maps to
         // this instance — that orphan's detail page would resolve to scrcpy
-        // instead of VNC. Clear the row's serial too; the new startInstance
+        // instead of webrtc. Clear the row's serial too; the new startInstance
         // repopulates it below once the fresh port is bound.
         await dropAdbEndpoint(row.serial);
         if (row.serial && db) {

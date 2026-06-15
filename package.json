@@ -60,7 +60,6 @@
     "@grpc/grpc-js": "^1.14.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@node-rs/argon2": "^2.0.2",
-    "@novnc/novnc": "^1.7.0",
     "@octokit/rest": "^22.0.1",
     "@types/dockerode": "^4.0.1",
     "@u4/minicap-prebuilt": "^1.1.2",

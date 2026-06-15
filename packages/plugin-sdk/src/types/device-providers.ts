@@ -151,18 +151,9 @@ export interface DeviceProvider {
    * - 'webrtc': frontend uses <EmulatorView> (android-emulator-webrtc) and
    *   connects to the emulator's gRPC via the DarkRide-origin grpc-web bridge.
    *   Providers declaring 'webrtc' MUST also implement getGrpcEndpoint().
-   * - 'vnc': frontend uses <VncViewer> and connects via /ws/vnc?serial=...
-   *   Providers declaring 'vnc' MUST also implement getVncEndpoint().
    * - 'scrcpy' (or absent): frontend uses the existing <DeviceViewer>.
    */
-  videoTransport?: 'webrtc' | 'vnc' | 'scrcpy';
-
-  /**
-   * Returns the loopback host+port the VNC proxy should connect to for this
-   * running instance. Only meaningful when videoTransport === 'vnc'.
-   * Throws if the instance is not currently running or the port isn't bound.
-   */
-  getVncEndpoint?(runtimeId: string): Promise<{ host: string; port: number }>;
+  videoTransport?: 'webrtc' | 'scrcpy';
 
   /**
    * Returns the loopback host+port (and optional auth token) the grpc-web

@@ -4,7 +4,6 @@ import { registerEndpoint } from './api-service';
 
 export type VideoTransportResult =
   | { transport: 'scrcpy' }
-  | { transport: 'vnc'; wsPath: string }
   | { transport: 'webrtc'; grpcWebPath: string };
 
 /**
@@ -20,8 +19,8 @@ function pickVideoInstance(
   serial: string,
   repo: DeviceInstancesRepo,
   registry: ProviderRegistry,
-  transport: 'webrtc' | 'vnc',
-  cap: 'getGrpcEndpoint' | 'getVncEndpoint',
+  transport: 'webrtc',
+  cap: 'getGrpcEndpoint',
 ) {
   return repo.listBySerial(serial)
     .filter((row) => {
@@ -49,9 +48,6 @@ export function resolveVideoTransport(
   // this base path; the DarkRide grpc-web bridge forwards to the emulator gRPC.
   if (pickVideoInstance(serial, repo, registry, 'webrtc', 'getGrpcEndpoint')) {
     return { transport: 'webrtc', grpcWebPath: `/v1/devices/${encodeURIComponent(serial)}/grpc` };
-  }
-  if (pickVideoInstance(serial, repo, registry, 'vnc', 'getVncEndpoint')) {
-    return { transport: 'vnc', wsPath: `/ws/vnc?serial=${encodeURIComponent(serial)}` };
   }
   return { transport: 'scrcpy' };
 }

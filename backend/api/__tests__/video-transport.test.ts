@@ -4,9 +4,8 @@ import type { ProviderRegistry } from '../../services/providers';
 import type { DeviceInstancesRepo } from '../../services/device-instances-repo';
 
 // Provider stubs. The resolver requires both the declared videoTransport AND
-// the matching capability function (getGrpcEndpoint / getVncEndpoint).
+// the matching capability function (getGrpcEndpoint).
 const WEBRTC_PROVIDER = { id: 'docker-android', videoTransport: 'webrtc', getGrpcEndpoint: () => {} };
-const VNC_PROVIDER = { id: 'docker-android', videoTransport: 'vnc', getVncEndpoint: () => {} };
 const ADB_PROVIDER = { id: 'adb-device' /* observe-only, no videoTransport */ };
 
 describe('resolveVideoTransport', () => {
@@ -26,13 +25,6 @@ describe('resolveVideoTransport', () => {
     (repo.listBySerial as any).mockReturnValue([{ providerId: 'adb-device', runtimeId: 'r', state: 'running' }]);
     (registry.get as any).mockReturnValue(ADB_PROVIDER);
     expect(resolveVideoTransport('usb-pixel-001', repo, registry)).toEqual({ transport: 'scrcpy' });
-  });
-
-  it('returns transport=vnc with wsPath when the provider declares vnc + getVncEndpoint', () => {
-    (repo.listBySerial as any).mockReturnValue([{ providerId: 'docker-android', runtimeId: 'r', state: 'running' }]);
-    (registry.get as any).mockReturnValue(VNC_PROVIDER);
-    expect(resolveVideoTransport('localhost:32770', repo, registry))
-      .toEqual({ transport: 'vnc', wsPath: '/ws/vnc?serial=localhost%3A32770' });
   });
 
   it('returns transport=webrtc with grpcWebPath when the provider declares webrtc + getGrpcEndpoint', () => {
