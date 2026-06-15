@@ -89,23 +89,6 @@ describe('docker-android provider', () => {
     })).rejects.toThrow(/hardware virtualization/i);
   });
 
-  it('exposes 5900/tcp bound to loopback for the VNC proxy to reach', async () => {
-    // Phase 1 emulator VNC streaming — the proxy connects to budtmo's RFB on
-    // 5900 over loopback. The browser never reaches this port directly; the
-    // host binding must be 127.0.0.1 to keep that boundary enforced.
-    const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
-    await p.createInstance!({
-      displayName: 'vnc-port',
-      config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
-    });
-    const call = (d.createContainer as any).mock.calls[0][0];
-    expect(call.ExposedPorts).toMatchObject({ '5900/tcp': {} });
-    expect(call.HostConfig.PortBindings['5900/tcp']).toEqual([
-      { HostIp: '127.0.0.1', HostPort: '0' },
-    ]);
-  });
-
   it('declares videoTransport: webrtc (device-only emulator gRPC stream)', async () => {
     const d = makeDockerMock();
     const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
@@ -115,7 +98,8 @@ describe('docker-android provider', () => {
   it('enables the emulator gRPC (unauthenticated) and publishes it to host loopback', async () => {
     // WebRTC video path: the emulator's gRPC (EmulatorController + Rtc/JSEP) is
     // started with `-grpc 8554` (no token — token/JWT auth is Android-Studio-
-    // specific) and published to host 127.0.0.1 only, mirroring the VNC port.
+    // specific) and published to host 127.0.0.1 only (loopback; grpc-web bridge
+    // is the sole reader).
     const d = makeDockerMock();
     const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     await p.createInstance!({
@@ -336,52 +320,4 @@ describe('docker-android provider', () => {
     expect(stop).toHaveBeenCalled();
   });
 
-  it('getVncEndpoint returns the bound loopback host port for a running container', async () => {
-    // After startInstance binds the container's 5900/tcp to a random host
-    // port, getVncEndpoint inspects the container and returns the bound
-    // port so the VNC proxy knows where to connect.
-    const d = makeDockerMock({
-      getContainer: vi.fn().mockImplementation((id: string) => ({
-        id,
-        start: vi.fn().mockResolvedValue(undefined),
-        stop: vi.fn().mockResolvedValue(undefined),
-        remove: vi.fn().mockResolvedValue(undefined),
-        inspect: vi.fn().mockResolvedValue({
-          State: { Running: true },
-          NetworkSettings: { Ports: {
-            '5555/tcp': [{ HostPort: '6001' }],
-            '5900/tcp': [{ HostPort: '7777' }],
-          } },
-        }),
-      })),
-    });
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
-    const endpoint = await p.getVncEndpoint!('container-abc');
-    expect(endpoint).toEqual({ host: '127.0.0.1', port: 7777 });
-  });
-
-  it('getVncEndpoint throws when the container is not running', async () => {
-    const d = makeDockerMock({
-      getContainer: vi.fn().mockImplementation((id: string) => ({
-        id,
-        inspect: vi.fn().mockResolvedValue({ State: { Running: false }, NetworkSettings: { Ports: {} } }),
-      })),
-    });
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
-    await expect(p.getVncEndpoint!('container-abc')).rejects.toThrow(/not running/i);
-  });
-
-  it('getVncEndpoint throws when 5900 is not bound', async () => {
-    const d = makeDockerMock({
-      getContainer: vi.fn().mockImplementation((id: string) => ({
-        id,
-        inspect: vi.fn().mockResolvedValue({
-          State: { Running: true },
-          NetworkSettings: { Ports: { '5555/tcp': [{ HostPort: '6001' }] } },
-        }),
-      })),
-    });
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
-    await expect(p.getVncEndpoint!('container-abc')).rejects.toThrow(/5900/);
-  });
 });

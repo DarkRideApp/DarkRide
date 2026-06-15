@@ -45,10 +45,10 @@ const LABEL_KEY = 'darkride.emulator';
 //     (needs a forwarder); with `auth: none` it binds [::]:8554 (all
 //     interfaces), so we can publish it straight to a host LOOPBACK port — no
 //     forwarder needed.
-// Security: this mirrors the budtmo VNC port (5900) — unauthenticated but
-// bound to host 127.0.0.1 only. The real access gate for browsers is the
-// DarkRide grpc-web bridge (session cookie + core.devices:read scope); the raw
-// port is reachable only by host-local processes, same threat model as VNC.
+// Security: unauthenticated but bound to host 127.0.0.1 only. The real access
+// gate for browsers is the DarkRide grpc-web bridge (session cookie +
+// core.devices:read scope); the raw port is reachable only by host-local
+// processes.
 const GRPC_PORT = 8554;
 
 // WebRTC media can't traverse Docker NAT on its own — the emulator's media
@@ -262,10 +262,6 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   return {
     id: 'docker-android',
     displayName: 'Docker Android',
-    // Phase 2: emulators stream device-only WebRTC via the emulator's gRPC
-    // (EmulatorController + Rtc) through the DarkRide grpc-web bridge. The VNC
-    // path (getVncEndpoint / budtmo x11vnc) is retained as a dormant fallback —
-    // flip this back to 'vnc' to revert if WebRTC media is unavailable.
     videoTransport: 'webrtc',
 
     async isAvailable(): Promise<ProviderAvailability> {
@@ -365,20 +361,16 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             `EMULATOR_DEVICE=Pixel 8`,
             `RAM_MB=${ramMb}`,
             // Match the Xvfb desktop size to the Pixel 8's native portrait
-            // resolution so the VNC stream is just the emulator surface,
-            // not a 1600x900 Linux desktop with the emulator floating in
-            // the middle of it (budtmo's default). 1080x2400 is Pixel 8's
-            // pixel resolution; the emulator window fills the desktop and
-            // the noVNC client renders only the framebuffer we care about.
-            // If we ever support multiple device profiles, this needs to
-            // be looked up from EMULATOR_DEVICE.
+            // resolution so the emulator surface fills the desktop (budtmo's
+            // default is 1600x900 Linux desktop). 1080x2400 is Pixel 8's
+            // pixel resolution. If we ever support multiple device profiles,
+            // this needs to be looked up from EMULATOR_DEVICE.
             'SCREEN_WIDTH=1080',
             'SCREEN_HEIGHT=2400',
             // `-no-skin` drops the Android emulator's phone-bezel "skin"
             // (the device frame rendered around the actual screen). Without
-            // it the VNC stream shows a phone-shaped window-within-the-
-            // window — useful when you want to demo on a real device, but
-            // pure overhead for our headless-control use case.
+            // it a phone-shaped window appears within the desktop — pure
+            // overhead for our headless-control use case.
             //
             // `-grpc <port>` starts the emulator's gRPC bridge (EmulatorController
             // + Rtc/JSEP) — the WebRTC video + input path — unauthenticated,
@@ -400,15 +392,10 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             // before it touches the adapter probe.
             'NVIDIA_VISIBLE_DEVICES=void',
           ],
-          ExposedPorts: { '5555/tcp': {}, '5900/tcp': {}, [`${GRPC_PORT}/tcp`]: {} },
+          ExposedPorts: { '5555/tcp': {}, [`${GRPC_PORT}/tcp`]: {} },
           HostConfig: {
             PortBindings: {
               '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }],
-              // 5900: budtmo's raw VNC. Bound to loopback so only the
-              // DarkRide process can reach it; the browser talks to the
-              // /ws/vnc proxy which bridges to this port. See spec
-              // 2026-05-29-emulator-vnc-streaming-design.md §Architecture.
-              '5900/tcp': [{ HostIp: '127.0.0.1', HostPort: '0' }],
               // GRPC_PORT: the emulator's gRPC (EmulatorController + Rtc).
               // Loopback-only on the host; the DarkRide grpc-web bridge is the
               // sole reader. See the GRPC_PORT note for the no-auth rationale.
@@ -536,19 +523,6 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
         throw new Error(`Container ${id} is running — stop it first`);
       }
       await container.remove();
-    },
-
-    async getVncEndpoint(id: string): Promise<{ host: string; port: number }> {
-      const container = d.getContainer(id);
-      const info = await container.inspect();
-      if (!info?.State?.Running) {
-        throw new Error(`Container ${id} is not running — cannot resolve VNC endpoint`);
-      }
-      const portStr = info?.NetworkSettings?.Ports?.['5900/tcp']?.[0]?.HostPort;
-      if (!portStr) {
-        throw new Error(`Container ${id} has no host binding for 5900/tcp — VNC unavailable`);
-      }
-      return { host: '127.0.0.1', port: Number(portStr) };
     },
 
     async getGrpcEndpoint(id: string): Promise<{ host: string; port: number; token?: string }> {

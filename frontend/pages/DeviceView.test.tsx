@@ -1,16 +1,3 @@
-// Mock noVNC so VncViewer renders a plain div (data-testid=vnc-viewer-*)
-// without trying to open a real WebSocket in jsdom.
-vi.mock('@novnc/novnc', () => ({
-  default: class MockRFB {
-    addEventListener() {}
-    removeEventListener() {}
-    disconnect() {}
-    scaleViewport = false;
-    resizeSession = false;
-    constructor(_target: HTMLElement, _url: string, _opts: any) {}
-  },
-}));
-
 // Mock android-emulator-webrtc so EmulatorView renders a plain marker div
 // instead of opening gRPC/WebRTC connections in jsdom.
 vi.mock('android-emulator-webrtc/emulator', () => ({
@@ -435,41 +422,6 @@ describe('DeviceView — Capture tab session actions', () => {
 
 describe('DeviceView — video transport gating', () => {
   beforeEach(() => vi.clearAllMocks());
-
-  it('renders <VncViewer> when video-transport endpoint returns transport=vnc', async () => {
-    const ws: WebSocketContextValue = {
-      connected: true,
-      sendMessage: vi.fn(),
-      sendRestApi: vi.fn().mockImplementation(async (_m: string, path: string) => {
-        if (path.endsWith('/video-transport')) {
-          return { type: 'restapi', id: '1', status: 200, body: { data: { transport: 'vnc', wsPath: '/ws/vnc?serial=localhost%3A32770' } } };
-        }
-        if (path.startsWith('/v1/device/view/')) {
-          return { type: 'restapi', id: '2', status: 200, body: { data: { id: 'localhost:32770', name: 'localhost:32770', platform: 'android', isRooted: true, setupVersion: 4, lastSeen: Date.now() } } };
-        }
-        // Permissive defaults so other DeviceView fetches don't blow up.
-        return { type: 'restapi', id: '3', status: 200, body: { data: {} } };
-      }),
-      subscribe: vi.fn().mockReturnValue(() => {}),
-    } as any;
-
-    render(
-      <WebSocketContext.Provider value={ws}>
-        <ToastProvider>
-          <MemoryRouter initialEntries={['/ui/devices/localhost%3A32770/details']}>
-            <Routes>
-              <Route path="/ui/devices/:id" element={<DeviceView />} />
-              <Route path="/ui/devices/:id/:tab" element={<DeviceView />} />
-            </Routes>
-          </MemoryRouter>
-        </ToastProvider>
-      </WebSocketContext.Provider>
-    );
-
-    await waitFor(() => {
-      expect(screen.getByTestId('vnc-viewer-localhost:32770')).toBeInTheDocument();
-    });
-  });
 
   it('renders the DeviceViewer emulator surface when video-transport endpoint returns transport=webrtc', async () => {
     const ws: WebSocketContextValue = {

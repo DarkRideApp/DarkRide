@@ -6,7 +6,6 @@ import { LoadingSpinner } from '@darkrideapp/plugin-sdk/react';
 import { AppsTab } from '../components/devices/AppsTab';
 import { WireGuardSetup } from '../components/devices/WireGuardSetup';
 import { DeviceViewer, DeviceAction } from '../components/devices/DeviceViewer';
-import { VncViewer } from '../lib/video/VncViewer';
 import { SetupWizardModal } from '../components/devices/SetupWizardModal';
 import { CURRENT_SETUP_VERSION } from '../../shared/types/api';
 import type { Device, Setting } from '../../shared/types/api';
@@ -55,8 +54,7 @@ export function DeviceView() {
   const [reprobing, setReprobing] = useState(false);
   const [pairing, setPairing] = useState(false);
   const [busyWarning, setBusyWarning] = useState<number | null>(null); // remaining seconds
-  const [videoTransport, setVideoTransport] = useState<'webrtc' | 'vnc' | 'scrcpy' | null>(null);
-  const [vncWsPath, setVncWsPath] = useState<string | null>(null);
+  const [videoTransport, setVideoTransport] = useState<'webrtc' | 'scrcpy' | null>(null);
   const [grpcWebPath, setGrpcWebPath] = useState<string | null>(null);
   const [showSyslog, setShowSyslog] = useState(false);
   const [syslogRunning, setSyslogRunning] = useState(false);
@@ -77,8 +75,8 @@ export function DeviceView() {
     }).catch(() => setLoading(false));
   }, [ws, deviceId]);
 
-  // Fetch video transport type — determines whether to render VncViewer
-  // (docker-android emulators) or the default scrcpy DeviceViewer.
+  // Fetch video transport type — determines whether to render the WebRTC
+  // DeviceViewer (docker-android emulators) or the default scrcpy DeviceViewer.
   useEffect(() => {
     if (!deviceId || !ws.connected) return;
     let cancelled = false;
@@ -86,9 +84,8 @@ export function DeviceView() {
       .then((r: any) => {
         if (cancelled) return;
         const data = r?.body?.data ?? {};
-        const t = data.transport === 'webrtc' ? 'webrtc' : data.transport === 'vnc' ? 'vnc' : 'scrcpy';
+        const t = data.transport === 'webrtc' ? 'webrtc' : 'scrcpy';
         setVideoTransport(t);
-        setVncWsPath(data.wsPath ?? null);
         setGrpcWebPath(data.grpcWebPath ?? null);
       })
       .catch(() => {
@@ -590,13 +587,6 @@ export function DeviceView() {
           extraActions={extraActions}
           onStreamReady={handleStreamReady}
           onError={handleStreamError}
-        />
-      ) : videoTransport === 'vnc' && vncWsPath ? (
-        <VncViewer
-          serial={deviceId!}
-          wsPath={vncWsPath}
-          onReady={() => handleStreamReady({ screenWidth: 0, screenHeight: 0, backend: 'vnc' })}
-          onError={(e) => handleStreamError(e.message)}
         />
       ) : (
         <DeviceViewer
