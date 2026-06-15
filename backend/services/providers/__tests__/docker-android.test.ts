@@ -116,6 +116,21 @@ describe('docker-android provider', () => {
     ]);
   });
 
+  it('binds adb 5555/tcp to loopback only (unauthenticated adb must not be LAN-reachable)', async () => {
+    // M3: the 5555 port binding previously had no HostIp, so Docker bound it on
+    // 0.0.0.0 — any host on the LAN could adb-connect without auth. Pin it to
+    // 127.0.0.1 (same as the gRPC port). The DarkRide backend is the sole adb
+    // client and runs on the same host.
+    const d = makeDockerMock();
+    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    await p.createInstance!({
+      displayName: 'adb-loopback',
+      config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
+    });
+    const call = (d.createContainer as any).mock.calls[0][0];
+    expect(call.HostConfig.PortBindings['5555/tcp']).toEqual([{ HostIp: '127.0.0.1', HostPort: '0' }]);
+  });
+
   it('mounts the TURN-config script + adds -turncfg when the script exists', async () => {
     // WebRTC media needs a TURN relay on Docker NAT; the emulator reads it from
     // a mounted script via -turncfg (a single space-free token).

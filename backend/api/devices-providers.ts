@@ -1,6 +1,4 @@
-import { eq } from 'drizzle-orm';
 import { registerEndpoint } from './api-service';
-import { deviceInstances } from '../db/schema';
 import type { ProviderRegistry } from '../services/providers';
 import type { DeviceInstancesRepo } from '../services/device-instances-repo';
 import type { AppDatabase } from '../db/index';
@@ -144,11 +142,7 @@ export function registerDevicesProvidersEndpoints(
         // Preserve the provider's richer metadata (image, arch, ramMb, …)
         // which the wizard config alone doesn't carry.
         if (inst.metadata) {
-          // No setMetadata helper today — go direct.
-          (repo as any).db.update(deviceInstances)
-            .set({ spawnMetadata: inst.metadata, lastStateAt: new Date() })
-            .where(eq(deviceInstances.id, row.id))
-            .run();
+          repo.updateMetadata(row.id, inst.metadata);
         }
         repo.updateState(row.id, inst.state);
         broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });

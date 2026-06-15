@@ -79,6 +79,18 @@ export class DeviceInstancesRepo {
   }
 
   /**
+   * Persist the provider's richer instance metadata (image, arch, ramMb, …)
+   * after createInstance resolves. Replaces the wizard-config snapshot stored
+   * at insert time with the full spec the provider actually used.
+   */
+  updateMetadata(id: number, metadata: Record<string, unknown>): void {
+    this.db.update(deviceInstances)
+      .set({ spawnMetadata: metadata, lastStateAt: new Date() })
+      .where(eq(deviceInstances.id, id))
+      .run();
+  }
+
+  /**
    * Re-point an existing instance row at a fresh underlying container.
    * docker-android cannot reliably restart its containers (budtmo's
    * image removes /etc/passwd's root entry after first boot, so

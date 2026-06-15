@@ -395,7 +395,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
           ExposedPorts: { '5555/tcp': {}, [`${GRPC_PORT}/tcp`]: {} },
           HostConfig: {
             PortBindings: {
-              '5555/tcp': [{ HostPort: '0' /* docker picks free port */ }],
+              '5555/tcp': [{ HostIp: '127.0.0.1', HostPort: '0' /* docker picks free port */ }],
               // GRPC_PORT: the emulator's gRPC (EmulatorController + Rtc).
               // Loopback-only on the host; the DarkRide grpc-web bridge is the
               // sole reader. See the GRPC_PORT note for the no-auth rationale.

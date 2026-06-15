@@ -65,10 +65,8 @@ describe('/v1/devices/providers endpoints', () => {
       insert: vi.fn().mockReturnValue({ id: 99, providerId: 'docker-android', runtimeId: '', state: 'pulling' }),
       getById: vi.fn().mockReturnValue({ id: 99, providerId: 'docker-android', runtimeId: '', state: 'pulling' }),
       updateRuntimeId: vi.fn(),
+      updateMetadata: vi.fn(),
       updateState: vi.fn(),
-      // The endpoint touches `(repo as any).db` to set spawnMetadata; provide
-      // a chainable stub so the call doesn't crash the background task.
-      db: { update: () => ({ set: () => ({ where: () => ({ run: vi.fn() }) }) }) },
     };
     const app = createApp(reg, repo);
     const res = await request(app)
@@ -88,6 +86,28 @@ describe('/v1/devices/providers endpoints', () => {
     // tracker doesn't fire.
     resolveCreate({ id: 'inst-1', displayName: 'test', state: 'created', spawnedByDarkride: true });
     await new Promise((r) => setImmediate(r));
+  });
+
+  it('POST .../instances calls repo.updateMetadata when createInstance returns metadata', async () => {
+    const createInstance = vi.fn().mockResolvedValue({
+      id: 'inst-1', displayName: 'test', state: 'created', spawnedByDarkride: true,
+      metadata: { image: 'budtmo/docker-android:emulator_14.0', ramMb: 2048 },
+    });
+    const reg = { get: () => ({ createInstance }) };
+    const repo = {
+      insert: vi.fn().mockReturnValue({ id: 99, providerId: 'docker-android', runtimeId: '', state: 'pulling' }),
+      getById: vi.fn().mockReturnValue({ id: 99, providerId: 'docker-android', runtimeId: '', state: 'pulling' }),
+      updateRuntimeId: vi.fn(),
+      updateMetadata: vi.fn(),
+      updateState: vi.fn(),
+    };
+    const app = createApp(reg, repo);
+    await request(app)
+      .post('/v1/devices/providers/docker-android/instances')
+      .send({ displayName: 'test', config: { androidVersion: '14' } });
+    // Give the fire-and-forget background task a tick to run.
+    await new Promise((r) => setImmediate(r));
+    expect(repo.updateMetadata).toHaveBeenCalledWith(99, { image: 'budtmo/docker-android:emulator_14.0', ramMb: 2048 });
   });
 
   it('POST .../start delegates to provider.startInstance + updates state + persists serial', async () => {

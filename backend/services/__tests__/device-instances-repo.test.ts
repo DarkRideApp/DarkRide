@@ -105,4 +105,11 @@ describe('DeviceInstancesRepo', () => {
     repo.delete(inst.id);
     expect(repo.getById(inst.id)).toBeUndefined();
   });
+
+  it('updateMetadata replaces spawnMetadata and bumps lastStateAt', () => {
+    const row = repo.insert({ providerId: 'docker-android', runtimeId: 'c1', state: 'pulling', spawnedByDarkride: true });
+    repo.updateMetadata(row.id, { image: 'budtmo/docker-android:emulator_14.0', ramMb: 2048 });
+    const got = repo.getById(row.id)!;
+    expect(got.spawnMetadata).toMatchObject({ image: 'budtmo/docker-android:emulator_14.0', ramMb: 2048 });
+  });
 });
