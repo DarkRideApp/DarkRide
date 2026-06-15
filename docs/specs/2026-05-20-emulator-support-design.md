@@ -119,7 +119,7 @@ interface DeviceProviderInstance {
 |---|---|---|---|
 | `adb-device` | Observe ANY adb-reachable Android — physical phones, BYOE AVDs, Genymotion, BlueStacks, custom containers | `wireguard` | `listInstances` only (no spawn/kill) |
 | `avd` | Google Android SDK lifecycle. Creates / starts / stops / deletes AVDs | `wireguard` | Full lifecycle |
-| `docker-android` | Spawn emulator in `ghcr.io/darkrideapp/docker-android:<ver>` container (FROM budtmo + our extras) | `wireguard` | Full lifecycle |
+| `docker-android` | Spawn emulator in a `budtmo/docker-android:emulator_<N>.0` container (pulled directly from Docker Hub) | `emu-http-proxy` | Full lifecycle |
 | `ios-device` | Wraps existing `IosDeviceManager` + Python `usbmuxd` bridge. Physical iOS over USB only | `ios-bridge` | `listInstances` only (no spawn/kill) |
 
 Why this split: every device source either *can* be spawned (AVD, Docker) or only observed (physical phones, iOS). The two non-spawning providers (`adb-device`, `ios-device`) keep `createInstance`/`deleteInstance` undefined; the wizard hides their tabs. The two spawning providers implement full lifecycle and appear as wizard options.
@@ -154,11 +154,12 @@ The current 1200-line `device-manager.ts` refactors into:
 
 Every provider declares its `NetworkConfig` from `getNetworkConfig(id)`. DeviceManager's capture wiring looks at the `mode` field and dispatches to a registered `CaptureHandler`:
 
-- `wireguard` — reuses the existing physical-Android pipeline byte-for-byte. Push wg-go binary (or use pre-baked for `docker-android`), generate keypair, configure tunnel, install mitmproxy CA, start tunnel.
+- `wireguard` — reuses the existing physical-Android pipeline byte-for-byte. Push wg-go binary, generate keypair, configure tunnel, install mitmproxy CA, start tunnel. Used by `adb-device` and `avd`.
+- `emu-http-proxy` — used by `docker-android`. mitmproxy runs in HTTP forward-proxy mode on the host; an in-container TCP forwarder relays to the host bridge gateway, and the emulator is pointed at it via `adb reverse` / `settings put global http_proxy`. The budtmo image ships no wg-go and Docker's NAT makes an in-container WireGuard tunnel impractical, so this path replaces WireGuard for docker-android. See the implementation note at the end.
 - `ios-bridge` — reuses the existing iOS pipeline. Today's `IosDeviceManager` capture path runs unchanged; the provider's `getNetworkConfig()` returns `{ mode: 'ios-bridge' }`, and DeviceManager dispatches to the existing iOS handler.
 - *plugin-defined modes* — e.g. `corellium-tunnel` for a future Corellium provider. The plugin registers its `CaptureHandler` alongside the built-ins via `ctx.deviceProviders([...])`.
 
-The `host-proxy` mode is **not** implemented in v1. It's a reserved name available to future plugin providers that need it (e.g. cloud farms where WireGuard isn't viable). v1 ships only the `wireguard` and `ios-bridge` handlers.
+The `host-proxy` mode is **not** implemented in v1. It's a reserved name available to future plugin providers that need it (e.g. cloud farms where WireGuard isn't viable). v1 ships the `wireguard`, `emu-http-proxy`, and `ios-bridge` handlers.
 
 ---
 
@@ -193,8 +194,9 @@ Extracted from the existing `device-manager.ts` polling loop. Most of the curren
 - `startInstance(id)` — `docker start <id>`. Wait for adbd inside the container to bind. `adb connect localhost:<port>`. Device flows through `adb-device`.
 - `stopInstance(id)` — `docker stop` with timeout, falls back to `docker kill`.
 - `deleteInstance(id)` — `docker rm`. Container labels carry enough metadata to reconcile after a DarkRide restart.
+- `getNetworkConfig()` — `{ mode: 'emu-http-proxy' }`.
 
-**Image strategy:** `ghcr.io/darkrideapp/docker-android:<android-version>` is published by a workflow in this repo. The Dockerfile is `FROM budtmo/docker-android:emulator_<version>` + `COPY wg-go /usr/local/bin/`, `COPY frida-server /usr/local/bin/`, plus a thin entrypoint wrapper. We track budtmo as upstream + ship our small diff. Pre-baked wg-go and Frida binaries in the image mean the runtime push step skips for Docker spawns (saves ~10–30s per launch).
+**Image strategy:** the provider pulls `budtmo/docker-android:emulator_<N>.0` directly from Docker Hub — no custom image. (The original plan baked wg-go + Frida into a `ghcr.io/darkrideapp/docker-android:<ver>` image; that was dropped. With `emu-http-proxy` capture there's no in-container WireGuard to pre-bake for, and Frida is pushed at runtime when needed, so a custom image bought nothing over tracking budtmo as a moving upstream.) See the implementation note at the end.
 
 The **mitmproxy CA cert is NOT baked into the image** — it's regenerated per DarkRide install. The runtime CA install path (push via `adb push` + remount `/system` rw + drop into `/system/etc/security/cacerts/`) is the same as today's physical-device flow. The Docker image just needs to be a `userdebug` build with `/system` writable after `adb root` + remount, which budtmo already provides.
 
@@ -439,3 +441,14 @@ Implementation will be sequenced so CI gates each major stage:
 6. **Phase 6 — Plugin SDK extension.** `ctx.deviceProviders([...])` + type exports + tests. Architecture promise (plugin lane) is verifiable from outside core.
 
 Each phase ends with: full test suite green, CI green on the branch, manual smoke test of the new provider's happy path. Branch stays unmerged through all six phases.
+
+---
+
+## Implementation note (2026-06-15)
+
+Two things shipped differently from the original plan above. Recording them here so the doc matches reality.
+
+- **docker-android capture uses `emu-http-proxy`, not WireGuard.** mitmproxy runs in HTTP forward-proxy mode on the host, an in-container TCP forwarder relays traffic to the host bridge gateway, and the emulator is pointed at it via `adb reverse` / `settings put global http_proxy`. Why: the `budtmo/docker-android` image ships no wg-go binary, and Docker's NAT makes an in-container WireGuard tunnel impractical. WireGuard was **not** dropped — `adb-device` (physical Android) and `avd` still use it; iOS still uses `ios-bridge`.
+- **No custom Docker image.** The implementation pulls `budtmo/docker-android:emulator_<N>.0` directly from Docker Hub. The planned `ghcr.io/darkrideapp/docker-android:<ver>` image (with pre-baked wg-go / Frida) was dropped: with `emu-http-proxy` there's no in-container WireGuard to bake in, so a custom image bought nothing over tracking budtmo directly.
+
+Capture is dispatched through `CaptureModeRegistry`, which `CaptureSessionManager.resolveCaptureMode` selects per device from its provider's `getNetworkConfig(serial).mode`. Registered handlers: `wireguard`, `emu-http-proxy`, `ios-bridge` (see `backend/services/capture-handlers.ts`).
