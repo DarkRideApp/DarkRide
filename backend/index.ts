@@ -3,7 +3,7 @@ import { join as pathJoin } from 'path';
 import { app, httpServer, mountApiRouter } from './app';
 import { initDatabase } from './db/index';
 import { pruneOldData, cleanStaleSessions } from './db/prune';
-import { setupWebSocket, getWebSocketServer, setStartupPhase, broadcastToAll, setupVncProxy } from './websocket/index';
+import { setupWebSocket, getWebSocketServer, setStartupPhase, broadcastToAll } from './websocket/index';
 import { createLoggers } from './logs';
 import { DeviceManager } from './services/device-manager';
 import { ProxyRotator } from './services/proxy-rotator';
@@ -311,8 +311,6 @@ runner.setIosDeviceManager(iosDeviceManager);
 let pluginManager: PluginManager | null = null;
 // dispatcherApi likewise: constructed during startup, closed during shutdown.
 let dispatcherApi: ReturnType<typeof createDispatcherApi> | null = null;
-// vncWss is set up during startup and must be closed on shutdown alongside wss.
-let vncWss: import('ws').WebSocketServer | null = null;
 
 // Initialize saved traffic store and wire to hook registry
 const savedTrafficStore = new SavedTrafficStore(db);
@@ -907,7 +905,6 @@ httpServer.listen(PORT, HOST, () => {
   const deviceInstancesRepo = new DeviceInstancesRepo(db);
   await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
   registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo, db);
-  vncWss = setupVncProxy(httpServer, { repo: deviceInstancesRepo, registry: providerRegistry });
   registerVideoTransportEndpoint(deviceInstancesRepo, providerRegistry);
   // grpc-web ⇄ gRPC bridge for the emulator WebRTC video path (Phase 2).
   registerEmulatorGrpcBridge(deviceInstancesRepo, providerRegistry);
@@ -1508,13 +1505,6 @@ async function shutdown() {
       client.close(1001, 'Server shutting down');
     }
     wss.close();
-  }
-  // VNC proxy WSS is separate — close it too so its clients drop cleanly.
-  if (vncWss) {
-    for (const client of vncWss.clients) {
-      client.close(1001, 'Server shutting down');
-    }
-    vncWss.close();
   }
 
   httpServer.close(() => {

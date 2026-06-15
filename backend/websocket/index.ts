@@ -10,9 +10,6 @@ import { users } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { isFilteredChannel, getRequiredScopes } from './channel-registry';
 import { verifyOrigin, buildDefaultAllowedOrigins, parseAllowedOriginsEnv } from './origin-check';
-import { createVncBridge, defaultConnectTcp } from './vnc-proxy';
-import type { ProviderRegistry } from '../services/providers';
-import type { DeviceInstancesRepo } from '../services/device-instances-repo';
 
 const { log, error } = createLoggers('websocket');
 
@@ -96,16 +93,12 @@ export function setupWebSocket(
   );
   const allowedOrigins = opts?.allowedOrigins ?? [...defaultOrigins, ...envOrigins];
 
-  // Use noServer mode so we can share a single 'upgrade' listener on the HTTP
-  // server across multiple WSS instances (/ws and /ws/vnc). Two WSS instances
-  // both wired to the same server via {server, path} each register their own
-  // 'upgrade' listener; when one calls abortHandshake on a path mismatch it
-  // destroys the socket before the other handler can claim it.
+  // Use noServer mode so the upgrade event is handled by our shared router
+  // below, keeping all path dispatch in one place.
   wss = new WebSocketServer({ noServer: true });
 
   // Shared upgrade router: a single 'upgrade' listener dispatches to the
-  // right WSS instance based on the request path. Additional routes are
-  // registered via registerRoute (see _darkrideRegisterRoute below).
+  // right WSS instance based on the request path.
   const routes = new Map<string, WebSocketServer>([['/ws', wss]]);
 
   server.on('upgrade', (req, socket, head) => {
@@ -129,14 +122,6 @@ export function setupWebSocket(
       target.emit('connection', ws, req);
     });
   });
-
-  // Extension hook: other setup* functions (e.g. setupVncProxy) call this to
-  // register additional WSS instances on the shared upgrade router without
-  // touching the HTTP server directly.
-  function registerRoute(path: string, instance: WebSocketServer): void {
-    routes.set(path, instance);
-  }
-  (wss as any)._darkrideRegisterRoute = registerRoute;
 
   wss.on('connection', (socket: WebSocket, req) => {
     // Authenticate the WebSocket connection via session cookie
@@ -282,61 +267,4 @@ export function broadcastToAll(message: Record<string, any>): void {
 
 export function getWebSocketServer(): WebSocketServer | null {
   return wss;
-}
-
-export interface VncProxyDeps {
-  repo: DeviceInstancesRepo;
-  registry: ProviderRegistry;
-}
-
-/**
- * Mount a WebSocketServer at /ws/vnc on the shared upgrade router.
- * The serial is passed via ?serial=<urlencoded>. Per-connection lifecycle
- * lives in createVncBridge; this function only handles the upgrade and
- * resolves serial → provider.getVncEndpoint().
- *
- * Requires setupWebSocket to have been called first — it installs the
- * shared upgrade router (_darkrideRegisterRoute) that this function uses.
- * Using a shared router (instead of two separate WSS({server, path})
- * instances) avoids the ws library v8 bug where each WSS registers its own
- * 'upgrade' listener and the path-mismatch branch calls abortHandshake,
- * destroying the socket before the correct handler can claim it.
- *
- * The `server` parameter is accepted for API stability but is not used
- * internally; routing is handled via the shared router from setupWebSocket.
- */
-export function setupVncProxy(_server: HttpServer, deps: VncProxyDeps): WebSocketServer {
-  const mainWss = getWebSocketServer();
-  if (!mainWss) {
-    throw new Error('setupVncProxy: setupWebSocket must be called first');
-  }
-  const registerRoute = (mainWss as any)._darkrideRegisterRoute as
-    ((path: string, instance: WebSocketServer) => void) | undefined;
-  if (typeof registerRoute !== 'function') {
-    throw new Error('setupVncProxy: shared upgrade router not initialized (setupWebSocket out of date?)');
-  }
-
-  const vncWss = new WebSocketServer({ noServer: true });
-
-  vncWss.on('connection', (socket, req) => {
-    const serial = new URL(req.url ?? '', 'http://localhost').searchParams.get('serial');
-    if (!serial) {
-      socket.close(1008, 'missing ?serial=');
-      return;
-    }
-    void createVncBridge(socket, serial, {
-      resolveEndpoint: async (s) => {
-        const row = deps.repo.getBySerial(s);
-        if (!row) return null;
-        const provider = deps.registry.get(row.providerId);
-        if (!provider?.getVncEndpoint) return null;
-        return provider.getVncEndpoint(row.runtimeId);
-      },
-      connectTcp: defaultConnectTcp,
-    });
-  });
-
-  registerRoute('/ws/vnc', vncWss);
-  log(`VNC proxy mounted at /ws/vnc`);
-  return vncWss;
 }
