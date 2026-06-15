@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createHash } from 'crypto';
+import { EventEmitter } from 'events';
 import request from 'supertest';
 import express from 'express';
 import {
@@ -9,7 +11,10 @@ import {
   Base64StreamEncoder,
   type GrpcUpstream,
 } from '../emulator-grpc-bridge';
-import { clearEndpoints, getApiRouter } from '../api-service';
+import { clearEndpoints, getApiRouter, getRegisteredEndpoints } from '../api-service';
+import { createTestDb } from '../../test-utils/create-test-db';
+import { createAuthMiddleware } from '../../auth/middleware';
+import { users, apiKeys } from '../../db/schema';
 
 // ---- framing helpers (pure) ----
 describe('grpc-web framing', () => {
@@ -199,5 +204,158 @@ describe('emulator grpc-web bridge handler', () => {
     const decoded = Buffer.from((res.body as Buffer).toString('utf8'), 'base64');
     const expected = Buffer.concat([encodeGrpcWebFrame(0x00, Buffer.from('hello')), encodeTrailer(0, '')]);
     expect(decoded.equals(expected)).toBe(true);
+  });
+
+  // Client navigated away / closed the tab mid-stream → the bridge must cancel
+  // the upstream gRPC call (res.on('close') → call.cancel() + upstream.close()),
+  // otherwise the emulator keeps streaming WebRTC frames into a dead socket.
+  //
+  // We drive the registered handler directly with a fake req/res rather than over
+  // HTTP: an upstream that opens the stream but never emits status (stays open
+  // until cancelled), then we fire res 'close' and assert the upstream was
+  // cancelled. This fails if the res.on('close') → call.cancel() wiring is removed.
+  it('cancels the upstream gRPC call when the client disconnects mid-stream', async () => {
+    let statusHandler: ((s: { code: number; details: string }) => void) | undefined;
+    const cancel = vi.fn();
+    const close = vi.fn();
+    const createUpstream = vi.fn((): GrpcUpstream => ({
+      serverStream() {
+        // Never auto-finalizes: no 'status'/'error' is emitted, so the only way
+        // the call ends is the client-disconnect cancel path under test.
+        return {
+          on(ev: any, cb: any) { if (ev === 'status') statusHandler = cb; },
+          cancel,
+        };
+      },
+      close,
+    }));
+
+    clearEndpoints();
+    registerEmulatorGrpcBridge(
+      repoWith(RUNNING_ROW),
+      registryWithEndpoint({ host: '127.0.0.1', port: 5555 }),
+      { createUpstream },
+    );
+    const handler = getRegisteredEndpoints().find(e => e.path === '/v1/devices/:serial/grpc/*')!.handler;
+
+    // Fake req: a Buffer body (readRawBody short-circuits on Buffer.isBuffer).
+    const req: any = {
+      params: { serial: 'localhost:32771', 0: 'svc/M' },
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: encodeGrpcWebFrame(0x00, Buffer.alloc(0)),
+    };
+    // Fake res: an EventEmitter with the handler's res surface.
+    const res: any = new EventEmitter();
+    res.status = vi.fn(() => res);
+    res.setHeader = vi.fn(() => res);
+    res.flushHeaders = vi.fn();
+    res.write = vi.fn();
+    res.end = vi.fn();
+
+    await handler(req, res);
+
+    // Stream is live (upstream opened, no status yet → not finalized).
+    expect(createUpstream).toHaveBeenCalledTimes(1);
+    expect(cancel).not.toHaveBeenCalled();
+    expect(statusHandler).toBeTypeOf('function'); // handler did wire the upstream
+
+    // Client closes the connection mid-stream.
+    res.emit('close');
+
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalled();
+    // It must NOT write a trailer/end the response after a client-side close.
+    expect(res.end).not.toHaveBeenCalled();
+  });
+});
+
+// ---- auth / scope gate (M4) ----
+// The grpc-web bridge handler itself does no auth: it relies on the global auth
+// middleware (sets req.authUser / 401s the unauthenticated) plus the per-endpoint
+// `requires: ['core.devices:read']` scope check in api-service (403s the
+// under-scoped). These bypass-the-real-middleware handler tests above never
+// exercise that gate, so here we wire the REAL createAuthMiddleware + getApiRouter
+// the same way backend/auth/init.ts does, against a seeded test DB.
+//
+// We use the API-key auth path (Bearer darkride_pat_…) because it needs no
+// cookie/CSRF plumbing: a key row whose sha256 == the plaintext, owned by a user,
+// and effectiveScopes = key.scopes ∩ user.scopes. This is a real 401/403 from the
+// production middleware, NOT a registration-layer assertion — so it fails closed
+// if `requires` is dropped from the registration (403 case) or if the route is
+// ever allowlisted / the gate removed (401 case).
+describe('emulator grpc-web bridge auth gate (M4)', () => {
+  const PAT = 'darkride_pat_test_key_abc123';
+  const keyHash = createHash('sha256').update(PAT).digest('hex');
+
+  function appWithAuth(db: any): express.Express {
+    clearEndpoints();
+    // On the happy path the handler runs the upstream; emit an immediate status so
+    // the grpc-web stream finalizes and supertest sees `end`. On the 401/403 paths
+    // the handler is never reached, so this is just a harmless stub.
+    registerEmulatorGrpcBridge(
+      repoWith(RUNNING_ROW),
+      registryWithEndpoint({ host: '127.0.0.1', port: 1 }),
+      scriptedUpstream([{ status: { code: 0, details: '' } }]),
+    );
+    const app = express();
+    app.use(express.json());
+    // Mirror backend/auth/init.ts: the grpc bridge path is NOT allowlisted.
+    app.use(createAuthMiddleware(db, ['/v1/auth', '/health']));
+    app.use(getApiRouter());
+    return app;
+  }
+
+  function seedUser(db: any, userScopes: string[]): void {
+    const now = new Date();
+    // Let SQLite assign the user id (matches the repo's other auth-test seeders)
+    // and thread it into the api key, rather than hardcoding id: 1.
+    const inserted = db.insert(users).values({
+      username: 'alice', providerId: 'local', scopes: userScopes,
+      enabled: true, createdAt: now, updatedAt: now,
+    }).run();
+    const userId = Number(inserted.lastInsertRowid);
+    db.insert(apiKeys).values({
+      userId, name: 'test', keyHash, keyPrefix: 'darkride_pat_test',
+      scopes: userScopes, createdAt: now,
+    }).run();
+  }
+
+  it('rejects an unauthenticated grpc-web request with 401', async () => {
+    const db = createTestDb([users, apiKeys]);
+    const res = await request(appWithAuth(db))
+      .post('/v1/devices/localhost%3A32771/grpc/svc/M')
+      .set('Content-Type', 'application/grpc-web+proto')
+      .send(encodeGrpcWebFrame(0x00, Buffer.alloc(0)));
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects an authenticated request lacking core.devices:read with 403', async () => {
+    const db = createTestDb([users, apiKeys]);
+    // Authenticated, but only holds an unrelated scope → effectiveScopes lacks core.devices:read.
+    seedUser(db, ['core.apps:read']);
+    const res = await request(appWithAuth(db))
+      .post('/v1/devices/localhost%3A32771/grpc/svc/M')
+      .set('Authorization', `Bearer ${PAT}`)
+      .set('Content-Type', 'application/grpc-web+proto')
+      .send(encodeGrpcWebFrame(0x00, Buffer.alloc(0)));
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ missing: ['core.devices:read'] });
+  });
+
+  it('admits an authenticated request that holds core.devices:read', async () => {
+    const db = createTestDb([users, apiKeys]);
+    seedUser(db, ['core.devices:read']);
+    const res = await request(appWithAuth(db))
+      .post('/v1/devices/localhost%3A32771/grpc/svc/M')
+      .set('Authorization', `Bearer ${PAT}`)
+      .set('Content-Type', 'application/grpc-web+proto')
+      .send(encodeGrpcWebFrame(0x00, Buffer.alloc(0)))
+      .buffer(true)
+      .parse(rawParser);
+    // Passes the gate → handler runs → grpc-web 200 with a status trailer (here
+    // the scripted upstream emits no events so the empty stream is fine; the
+    // point is we got past 401/403 into the handler, not the trailer contents).
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('application/grpc-web');
   });
 });
