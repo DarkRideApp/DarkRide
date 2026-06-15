@@ -180,8 +180,9 @@ describe('CaptureSessionManager — emu-http-proxy (docker-android)', () => {
     expect(typeof result.sessionId).toBe('number');
     expect(result.httpProxy).toEqual({ host: '10.0.2.2', port: PROXY_PORT });
 
-    // Mode was resolved via the provider's getNetworkConfig(serial).
-    expect(provider.getNetworkConfig).toHaveBeenCalledWith(DEVICE);
+    // Mode was resolved via the provider's getNetworkConfig, keyed on the
+    // instance runtime id (per the DeviceProvider contract), not the serial.
+    expect(provider.getNetworkConfig).toHaveBeenCalledWith(RUNTIME_ID);
 
     // emu-http-proxy handler ran (not the wireguard one).
     expect(mockMitm.startHttpProxyCapture).toHaveBeenCalledWith(DEVICE, expect.any(Object));

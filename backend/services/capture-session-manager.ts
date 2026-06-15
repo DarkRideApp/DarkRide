@@ -60,10 +60,13 @@ export class CaptureSessionManager {
    *     (android -> 'wireguard', ios -> 'ios-bridge')
    */
   private resolveCaptureMode(deviceId: string, platform: 'android' | 'ios'): string {
-    const providerId = this.getProviderIdForDevice(deviceId);
-    if (providerId) {
-      const provider = this.providerRegistry?.get(providerId);
-      if (provider) return provider.getNetworkConfig(deviceId).mode;
+    const inst = this.getProviderInstanceForDevice(deviceId);
+    if (inst) {
+      const provider = this.providerRegistry?.get(inst.providerId);
+      // getNetworkConfig is keyed on the provider instance id (runtime id) per
+      // the DeviceProvider contract, NOT the adb serial. Built-in providers
+      // ignore the arg, but a plugin provider may key its config off the id.
+      if (provider) return provider.getNetworkConfig(inst.runtimeId).mode;
     }
     return platform === 'ios' ? 'ios-bridge' : 'wireguard';
   }
@@ -93,15 +96,15 @@ export class CaptureSessionManager {
    * so a stale row can't shadow the live emulator and mis-route capture to
    * WireGuard. Mirrors the H3 tiebreak in video-transport's pickVideoInstance.
    */
-  private getProviderIdForDevice(deviceId: string): string | undefined {
+  private getProviderInstanceForDevice(deviceId: string): { providerId: string; runtimeId: string } | undefined {
     const rows = this.db
-      .select({ providerId: deviceInstances.providerId, state: deviceInstances.state })
+      .select({ providerId: deviceInstances.providerId, runtimeId: deviceInstances.runtimeId, state: deviceInstances.state })
       .from(deviceInstances)
       .where(eq(deviceInstances.serial, deviceId))
       .orderBy(desc(deviceInstances.lastStateAt))
       .all();
-    const running = rows.find((r) => r.state === 'running');
-    return (running ?? rows[0])?.providerId;
+    const chosen = rows.find((r) => r.state === 'running') ?? rows[0];
+    return chosen ? { providerId: chosen.providerId, runtimeId: chosen.runtimeId } : undefined;
   }
 
   async startCapture(deviceId: string, proxyOptions?: { mode: 'none' | 'normal' | 'nordvpn'; country?: string }, tlsProfile?: string): Promise<{ sessionId: number; httpProxy?: { host: string; port: number } }> {
