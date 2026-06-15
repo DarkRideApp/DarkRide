@@ -385,12 +385,19 @@ export class DeviceManager {
   }
 
   /**
-   * Start the ADB polling loop and standby management.
+   * Start the device polling loop and standby management.
+   *
+   * When a provider registry is wired, discovery runs through
+   * `pollDevicesFromProviders()` (the live path); otherwise it falls back to
+   * the legacy inline `pollAdbDevices()`. Both paths share the same reconcile
+   * logic (`reconcileDiscovered`), so physical-device discovery behaves
+   * identically regardless of which one runs.
    */
   start(): void {
     log('Starting device manager');
-    this.pollAdbDevices();
-    this.pollTimer = setInterval(() => this.pollAdbDevices(), ADB_POLL_INTERVAL);
+    const poll = () => this.providerRegistry ? this.pollDevicesFromProviders() : this.pollAdbDevices();
+    poll();
+    this.pollTimer = setInterval(poll, ADB_POLL_INTERVAL);
     this.standbyTimer = setInterval(() => this.checkStandby(), 10000);
   }
 
@@ -410,116 +417,42 @@ export class DeviceManager {
   }
 
   /**
-   * Poll `adb devices` and upsert discovered devices into the database.
-   */
-  async pollAdbDevices(): Promise<void> {
-    try {
-      const output = await adbCommand(['devices']);
-      const parsed = parseAdbDevices(output);
-
-      const currentIds = new Set<string>();
-
-      for (const { id, status } of parsed) {
-        currentIds.add(id);
-
-        if (status === 'device') {
-          const wasOnline = this.onlineDevices.has(id);
-          this.onlineDevices.add(id);
-          // On first discovery (or server restart), reset stay_on_while_plugged_in
-          // so devices don't stay awake indefinitely from a previous session
-          if (!wasOnline) {
-            this.setStayAwake(id, false).catch(() => {});
-            this.hookBus?.emit('device:connected', { id, platform: 'android' });
-          }
-        } else {
-          this.onlineDevices.delete(id);
-          this.stayAwakeDevices.delete(id);
-        }
-
-        // Upsert device
-        const existing = this.db
-          .select()
-          .from(devices)
-          .where(eq(devices.id, id))
-          .all();
-
-        if (existing.length === 0) {
-          log(`New device discovered: ${id}`);
-          // Check if rooted
-          const isRooted = await this.checkRooted(id);
-          this.db.insert(devices).values({
-            id,
-            isRooted,
-            lastSeen: new Date(),
-          }).run();
-          // Collect extended properties for new device
-          if (status === 'device') {
-            this.collectDeviceProperties(id).catch(() => {});
-          }
-        } else {
-          // Re-check root status if currently marked as non-rooted
-          // (covers devices rooted after first discovery, or Magisk prompt not approved on first check)
-          const wasRooted = existing[0].isRooted ?? false;
-          if (!wasRooted) {
-            const isNowRooted = await this.checkRooted(id);
-            if (isNowRooted) {
-              log(`Device ${id} is now rooted`);
-            }
-            this.db.update(devices)
-              .set({ lastSeen: new Date(), ...(isNowRooted ? { isRooted: true } : {}) })
-              .where(eq(devices.id, id))
-              .run();
-          } else {
-            this.db.update(devices)
-              .set({ lastSeen: new Date() })
-              .where(eq(devices.id, id))
-              .run();
-          }
-          // Backfill properties if any are missing (one-time per device)
-          if (status === 'device' && existing[0].manufacturer == null) {
-            this.collectDeviceProperties(id).catch(() => {});
-          }
-        }
-      }
-
-      // Mark devices no longer seen as offline
-      for (const onlineId of [...this.onlineDevices]) {
-        if (!currentIds.has(onlineId)) {
-          this.onlineDevices.delete(onlineId);
-          this.kernelWgSupport.delete(onlineId);
-          this.sleepingDevices.delete(onlineId);
-          this.stayAwakeDevices.delete(onlineId);
-          log(`Android device offline: ${onlineId}`);
-          broadcastToAll({ type: 'device-status', deviceId: onlineId, status: 'offline' });
-          this.hookBus?.emit('device:disconnected', { id: onlineId, platform: 'android' });
-          this.notifyOffline(onlineId);
-        }
-      }
-    } catch (err: any) {
-      error(`ADB poll failed: ${err.message}`);
-    }
-  }
-
-  /**
-   * New provider-driven polling path. Asks the registry for all instances
-   * across all registered providers and upserts them into the devices
-   * table. Falls through (returns early) if no registry is wired —
-   * backwards-compat for the refactor period.
+   * Reconcile a snapshot of discovered devices against the DB + in-memory
+   * online state. This is the single source of truth for device discovery:
+   * both `pollAdbDevices` (legacy fallback) and `pollDevicesFromProviders`
+   * (live path) feed their snapshot here, so physical-device behaviour
+   * (online/offline transitions, root checks, property collection, stay-awake
+   * reset, hook emits, websocket broadcasts, set cleanup) is IDENTICAL no
+   * matter which poller ran.
    *
-   * Phase 1 only: inserts new serials / updates lastSeen for existing ones.
-   * Root checks and property collection are ADB-specific and remain in
-   * `pollAdbDevices`; they will be wired in Phase 2 once the provider
-   * contract surfaces those capabilities.
+   * @param discovered every serial seen this poll, with `online === true` for
+   *   serials in adb `device` state (provider `running` state) and `false`
+   *   for any other state (offline/unauthorized/stopped/error). `source` is a
+   *   label for log messages only.
    */
-  async pollDevicesFromProviders(): Promise<void> {
-    if (!this.providerRegistry) {
-      return;
-    }
-    const all = await this.providerRegistry.listInstancesAll();
-    for (const row of all) {
-      if (!row.instance.serial) continue;
-      const id = row.instance.serial;
+  private async reconcileDiscovered(
+    discovered: Array<{ id: string; online: boolean; source?: string }>,
+  ): Promise<void> {
+    const currentIds = new Set<string>();
 
+    for (const { id, online, source } of discovered) {
+      currentIds.add(id);
+
+      if (online) {
+        const wasOnline = this.onlineDevices.has(id);
+        this.onlineDevices.add(id);
+        // On first discovery (or server restart), reset stay_on_while_plugged_in
+        // so devices don't stay awake indefinitely from a previous session
+        if (!wasOnline) {
+          this.setStayAwake(id, false).catch(() => {});
+          this.hookBus?.emit('device:connected', { id, platform: 'android' });
+        }
+      } else {
+        this.onlineDevices.delete(id);
+        this.stayAwakeDevices.delete(id);
+      }
+
+      // Upsert device
       const existing = this.db
         .select()
         .from(devices)
@@ -527,17 +460,117 @@ export class DeviceManager {
         .all();
 
       if (existing.length === 0) {
-        log(`New device discovered via provider ${row.providerId}: ${id}`);
+        log(`New device discovered${source ? ` via ${source}` : ''}: ${id}`);
+        // Check if rooted
+        const isRooted = await this.checkRooted(id);
         this.db.insert(devices).values({
           id,
+          isRooted,
           lastSeen: new Date(),
         }).run();
+        // Collect extended properties for new device
+        if (online) {
+          this.collectDeviceProperties(id).catch(() => {});
+        }
       } else {
-        this.db.update(devices)
-          .set({ lastSeen: new Date() })
-          .where(eq(devices.id, id))
-          .run();
+        // Re-check root status if currently marked as non-rooted
+        // (covers devices rooted after first discovery, or Magisk prompt not approved on first check)
+        const wasRooted = existing[0].isRooted ?? false;
+        if (!wasRooted) {
+          const isNowRooted = await this.checkRooted(id);
+          if (isNowRooted) {
+            log(`Device ${id} is now rooted`);
+          }
+          this.db.update(devices)
+            .set({ lastSeen: new Date(), ...(isNowRooted ? { isRooted: true } : {}) })
+            .where(eq(devices.id, id))
+            .run();
+        } else {
+          this.db.update(devices)
+            .set({ lastSeen: new Date() })
+            .where(eq(devices.id, id))
+            .run();
+        }
+        // Backfill properties if any are missing (one-time per device)
+        if (online && existing[0].manufacturer == null) {
+          this.collectDeviceProperties(id).catch(() => {});
+        }
       }
+    }
+
+    // Mark devices no longer seen as offline
+    for (const onlineId of [...this.onlineDevices]) {
+      if (!currentIds.has(onlineId)) {
+        this.onlineDevices.delete(onlineId);
+        this.kernelWgSupport.delete(onlineId);
+        this.sleepingDevices.delete(onlineId);
+        this.stayAwakeDevices.delete(onlineId);
+        log(`Android device offline: ${onlineId}`);
+        broadcastToAll({ type: 'device-status', deviceId: onlineId, status: 'offline' });
+        this.hookBus?.emit('device:disconnected', { id: onlineId, platform: 'android' });
+        this.notifyOffline(onlineId);
+      }
+    }
+  }
+
+  /**
+   * Legacy polling path: parse `adb devices` directly and reconcile.
+   *
+   * Retained as the no-registry fallback for `start()` (a boot where no
+   * provider registry was wired). When a registry IS wired,
+   * `pollDevicesFromProviders` runs instead — it delegates to the same
+   * `reconcileDiscovered` helper, so this path and the provider path produce
+   * identical physical-device discovery.
+   */
+  async pollAdbDevices(): Promise<void> {
+    try {
+      const output = await adbCommand(['devices']);
+      const parsed = parseAdbDevices(output);
+      await this.reconcileDiscovered(
+        parsed.map(({ id, status }) => ({ id, online: status === 'device' })),
+      );
+    } catch (err: any) {
+      error(`ADB poll failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Provider-driven polling path — the live discovery loop once a provider
+   * registry is wired (see `start()`). Asks the registry for all instances
+   * across every registered provider, then reconciles them through the same
+   * `reconcileDiscovered` helper `pollAdbDevices` uses.
+   *
+   * The built-in `adb-device` provider's `listInstances()` returns the same
+   * serials adb reports, with `state === 'running'` for adb `device` state
+   * and a non-running state otherwise — so this path reproduces
+   * `pollAdbDevices`'s online/offline transitions, root checks, property
+   * collection, stay-awake reset, hook emits and websocket broadcasts exactly.
+   *
+   * Instances without a serial (e.g. a stopped/created emulator that has no
+   * adb serial yet) are skipped here — they are managed by the emulator
+   * orchestrator, not the physical-device discovery reconcile.
+   *
+   * Returns early if no registry is wired (defensive — `start()` only calls
+   * this when a registry exists).
+   */
+  async pollDevicesFromProviders(): Promise<void> {
+    if (!this.providerRegistry) {
+      return;
+    }
+    try {
+      const all = await this.providerRegistry.listInstancesAll();
+      const discovered: Array<{ id: string; online: boolean; source?: string }> = [];
+      for (const row of all) {
+        if (!row.instance.serial) continue;
+        discovered.push({
+          id: row.instance.serial,
+          online: row.instance.state === 'running',
+          source: `provider ${row.providerId}`,
+        });
+      }
+      await this.reconcileDiscovered(discovered);
+    } catch (err: any) {
+      error(`Provider poll failed: ${err.message}`);
     }
   }
 

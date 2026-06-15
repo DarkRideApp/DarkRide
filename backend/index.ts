@@ -270,9 +270,11 @@ registerLicenseEndpoints(licenseService);
 // Initialize services
 const deviceManager = DeviceManager.getInstance(db);
 // Emulator support — provider abstraction (spec docs/specs/2026-05-20-emulator-support-design.md §4).
-// Phase 1 wires the registry + adb-device provider but does not yet drive it
-// from DeviceManager.start() — the legacy pollAdbDevices interval keeps
-// running. Phase 2 swaps the interval to call pollDevicesFromProviders.
+// Discovery is now driven through the provider registry: once
+// setProviderRegistry() is called, DeviceManager.start() schedules
+// pollDevicesFromProviders() as the live poll. The legacy pollAdbDevices()
+// remains only as the no-registry fallback; both paths share the same
+// reconcileDiscovered() logic, so physical-device discovery is unchanged.
 const providerRegistry = createProviderRegistry();
 providerRegistry.register(createAdbDeviceProvider());
 deviceManager.setProviderRegistry(providerRegistry);
