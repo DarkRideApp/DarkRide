@@ -14,10 +14,10 @@ export type VideoTransportResult =
  * video-capable instance rather than `getBySerial`'s lowest-rowid match (which
  * would let a stale adb-device row shadow the live emulator → wrong scrcpy path).
  *
- * The only video transport is webrtc (VNC was removed in Task 3), so the
- * required capability is always getGrpcEndpoint — both are inlined here. The
- * running-first sort relies on listBySerial returning rows most-recently-updated
- * first, so when two running rows tie the newest (live) one wins (H3).
+ * The only video transport is webrtc, so the required capability is always
+ * getGrpcEndpoint — both are inlined here. The running-first sort relies on
+ * listBySerial returning rows most-recently-updated first, so when two running
+ * rows tie the newest (live) one wins.
  */
 function pickVideoInstance(serial: string, repo: DeviceInstancesRepo, registry: ProviderRegistry) {
   return repo.listBySerial(serial)
