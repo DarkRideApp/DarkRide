@@ -93,17 +93,28 @@ function wireRegistry(
   return manager;
 }
 
-/** Minimal providerRegistry stub: a docker-android provider that reports emu-http-proxy. */
+/**
+ * Minimal providerRegistry stub: a docker-android provider that reports
+ * emu-http-proxy, plus an adb-device provider that reports wireguard. The
+ * adb-device provider is what an emulator's serial ALSO resolves to when a
+ * stale adb-device row shares the serial — the collision the running-first
+ * tiebreak guards against.
+ */
 function createDockerAndroidProviderRegistry() {
   const provider = {
     id: 'docker-android',
     getNetworkConfig: vi.fn().mockReturnValue({ mode: 'emu-http-proxy' }),
   };
+  const adbProvider = {
+    id: 'adb-device',
+    getNetworkConfig: vi.fn().mockReturnValue({ mode: 'wireguard' }),
+  };
   return {
     registry: {
       register: vi.fn(),
-      get: vi.fn().mockImplementation((id: string) => (id === 'docker-android' ? provider : undefined)),
-      list: vi.fn().mockReturnValue([provider]),
+      get: vi.fn().mockImplementation((id: string) =>
+        id === 'docker-android' ? provider : id === 'adb-device' ? adbProvider : undefined),
+      list: vi.fn().mockReturnValue([provider, adbProvider]),
       listInstancesAll: vi.fn().mockResolvedValue([]),
     },
     provider,
@@ -194,5 +205,31 @@ describe('CaptureSessionManager — emu-http-proxy (docker-android)', () => {
     expect(sessions).toHaveLength(1);
     expect(sessions[0].deviceId).toBe(DEVICE);
     expect(sessions[0].status).toBe('running');
+  });
+
+  it('prefers the running docker-android row over a stale adb-device row sharing the serial', async () => {
+    // Reproduce the serial collision: a docker-android emulator is also observed
+    // by the adb-device provider, and a recycled host port can leave a stale
+    // adb-device row. Here the stale adb-device row has the LOWER rowid and a
+    // NEWER timestamp; only running-first resolution picks the live emulator. A
+    // bare rowid-order .all()[0] would pick adb-device and mis-route to wireguard
+    // (then result.httpProxy would be undefined and this test would fail).
+    db.delete(schema.deviceInstances).run();
+    db.insert(schema.deviceInstances).values({
+      providerId: 'adb-device', runtimeId: '', serial: DEVICE, state: 'offline',
+      spawnedByDarkride: false, createdAt: new Date(), lastStateAt: new Date(2026, 5, 15, 10, 0, 0),
+    }).run();
+    db.insert(schema.deviceInstances).values({
+      providerId: 'docker-android', runtimeId: RUNTIME_ID, serial: DEVICE, state: 'running',
+      spawnedByDarkride: true, createdAt: new Date(), lastStateAt: new Date(2026, 5, 15, 9, 0, 0),
+    }).run();
+
+    const result = await manager.startCapture(DEVICE);
+
+    // The live docker-android row won → emu-http-proxy, not the stale adb-device → wireguard.
+    expect(result.httpProxy).toEqual({ host: '10.0.2.2', port: PROXY_PORT });
+    expect(mockMitm.startHttpProxyCapture).toHaveBeenCalledWith(DEVICE, expect.any(Object));
+    expect(mockMitm.startCapture).not.toHaveBeenCalled();
+    expect(mockDm.activateWireGuardTunnel).not.toHaveBeenCalled();
   });
 });

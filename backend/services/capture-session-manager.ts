@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { eq, desc } from 'drizzle-orm';
 import { automationSessions, devices as devicesTable, deviceInstances, settings } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
@@ -86,14 +86,22 @@ export class CaptureSessionManager {
    * the HTTP-proxy route (mitmproxy in forward-proxy mode + adb reverse +
    * `settings put global http_proxy`); physical Android devices take the
    * WireGuard + system-CA-injection route.
+   *
+   * A serial is NOT unique: a docker-android emulator is also observed by the
+   * adb-device provider, and host-port reuse can leave a stale adb-device row
+   * sharing the serial. Prefer a running row, then the most-recently-updated,
+   * so a stale row can't shadow the live emulator and mis-route capture to
+   * WireGuard. Mirrors the H3 tiebreak in video-transport's pickVideoInstance.
    */
   private getProviderIdForDevice(deviceId: string): string | undefined {
-    const row = this.db
-      .select({ providerId: deviceInstances.providerId })
+    const rows = this.db
+      .select({ providerId: deviceInstances.providerId, state: deviceInstances.state })
       .from(deviceInstances)
       .where(eq(deviceInstances.serial, deviceId))
-      .all()[0];
-    return row?.providerId;
+      .orderBy(desc(deviceInstances.lastStateAt))
+      .all();
+    const running = rows.find((r) => r.state === 'running');
+    return (running ?? rows[0])?.providerId;
   }
 
   async startCapture(deviceId: string, proxyOptions?: { mode: 'none' | 'normal' | 'nordvpn'; country?: string }, tlsProfile?: string): Promise<{ sessionId: number; httpProxy?: { host: string; port: number } }> {
