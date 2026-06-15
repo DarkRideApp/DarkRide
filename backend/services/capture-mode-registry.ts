@@ -1,19 +1,48 @@
-import type { CaptureHandler, DeviceProviderInstance, NetworkConfig } from '@darkrideapp/plugin-sdk';
+import type { CaptureSubsystemStatus } from '../../shared/types/websocket';
+
+export type SubsystemKey = keyof CaptureSubsystemStatus;
+export type SubsystemState = 'pending' | 'ok' | 'skipped' | 'warning' | 'error';
 
 /**
- * Per-mode dispatcher for capture wiring. Each `DeviceProvider` declares
- * its `NetworkConfig.mode` via `getNetworkConfig(id)`; the orchestrator
- * looks up the registered handler for that mode and invokes it to wire
- * up the capture pipeline for the instance.
+ * Everything a capture-mode handler needs to wire one device's capture.
+ * Built host-side per startCapture call. Handlers must not assume a provider
+ * instance exists — physical devices arrive via the bare ADB tracker with no
+ * managed instance.
+ */
+export interface CaptureModeContext {
+  deviceId: string;
+  sessionId: number;
+  platform: 'android' | 'ios';
+  mode: string;
+  mitmOptions: Record<string, unknown>;
+  /** Report a subsystem status transition. Per-key narrowed: each subsystem
+   *  only accepts the states valid for it (e.g. mitmproxy has no 'warning'). */
+  setSubsystem: <K extends SubsystemKey>(key: K, status: CaptureSubsystemStatus[K]) => void;
+}
+
+export interface CaptureModeResult {
+  tunnelActivated: boolean;
+  emuHttpProxy?: { host: string; port: number };
+}
+
+export type CaptureHandler = (ctx: CaptureModeContext) => Promise<CaptureModeResult>;
+
+/**
+ * Per-mode dispatcher for capture wiring. Built host-side per `startCapture`
+ * call. The orchestrator builds a {@link CaptureModeContext} for the device,
+ * looks up the handler registered for `ctx.mode`, and invokes it to wire up
+ * the capture pipeline. Handlers return a {@link CaptureModeResult} the host
+ * uses to track tunnel state and any emulator HTTP proxy endpoint.
  *
- * Built-in modes (`wireguard`, `ios-bridge`) ship in core. Plugin
- * providers can register their own modes via `ctx.deviceProviders([...])`.
- * See spec §5.
+ * Built-in modes (`wireguard`, `ios-bridge`) ship in core (Task 5/6). The
+ * thin SDK `DeviceProviderContribution.captureHandler` stays a forward
+ * declaration; no plugin contributes a handler today, so this is a host
+ * concern. See spec §5.
  */
 export interface CaptureModeRegistry {
   register(mode: string, handler: CaptureHandler): void;
   has(mode: string): boolean;
-  dispatch(instance: DeviceProviderInstance, config: NetworkConfig): Promise<void>;
+  dispatch(ctx: CaptureModeContext): Promise<CaptureModeResult>;
 }
 
 export function createCaptureModeRegistry(): CaptureModeRegistry {
@@ -28,12 +57,12 @@ export function createCaptureModeRegistry(): CaptureModeRegistry {
     has(mode) {
       return handlers.has(mode);
     },
-    async dispatch(instance, config) {
-      const handler = handlers.get(config.mode);
+    async dispatch(ctx) {
+      const handler = handlers.get(ctx.mode);
       if (!handler) {
-        throw new Error(`No capture handler registered for mode "${config.mode}"`);
+        throw new Error(`No capture handler registered for mode "${ctx.mode}"`);
       }
-      await handler(instance, config);
+      return handler(ctx);
     },
   };
 }

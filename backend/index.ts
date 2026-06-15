@@ -277,12 +277,8 @@ providerRegistry.register(createAdbDeviceProvider());
 deviceManager.setProviderRegistry(providerRegistry);
 
 const captureModeRegistry = createCaptureModeRegistry();
-// The wireguard capture handler is a Phase 1 no-op shim. Phase 2 replaces
-// it with the real per-device capture setup that today lives inline in
-// DeviceManager's setup path.
-captureModeRegistry.register('wireguard', async (_instance, _cfg) => {
-  // Phase 1: no-op. See spec §5.
-});
+// Placeholder — replaced by the real handlers in Task 6 (capture dispatch).
+captureModeRegistry.register('wireguard', async () => ({ tunnelActivated: false }));
 deviceManager.setCaptureModeRegistry(captureModeRegistry);
 
 const proxyRotator = new ProxyRotator(db);
