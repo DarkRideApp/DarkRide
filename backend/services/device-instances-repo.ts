@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import { deviceInstances } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import type { DeviceInstanceState } from '@darkrideapp/plugin-sdk';
@@ -105,10 +105,19 @@ export class DeviceInstancesRepo {
    * adb-device row pointing at the same serial — so a serial is not unique.
    * Callers that need the *video-owning* instance (resolver, grpc-web bridge)
    * must pick among these by provider capability + state, not assume one row.
+   *
+   * Ordered most-recently-updated first (H3): when two video-capable rows share
+   * a serial AND are both running (docker recycles host ports, so adb serials
+   * `localhost:<hostport>` collide), the running-first comparator in
+   * pickVideoInstance ties — and JS .sort is stable, so it keeps this row order.
+   * Without the recency ORDER BY that order is rowid-ascending (the OLDEST,
+   * stale row), surfacing a dead instance. desc(lastStateAt) makes the live one win.
    */
   listBySerial(serial: string): DeviceInstanceRow[] {
     return this.db.select().from(deviceInstances)
-      .where(eq(deviceInstances.serial, serial)).all() as DeviceInstanceRow[];
+      .where(eq(deviceInstances.serial, serial))
+      .orderBy(desc(deviceInstances.lastStateAt))
+      .all() as DeviceInstanceRow[];
   }
 
   getById(id: number): DeviceInstanceRow | undefined {

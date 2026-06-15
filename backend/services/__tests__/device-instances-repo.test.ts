@@ -82,6 +82,24 @@ describe('DeviceInstancesRepo', () => {
     expect(repo.listAll()).toHaveLength(2);
   });
 
+  it('updateSerial(id, null) clears the serial (stop handler clears stale serials — H3)', () => {
+    const inst = repo.insert({ providerId: 'docker-android', runtimeId: 'd1', serial: 'localhost:32770', state: 'running', spawnedByDarkride: true });
+    expect(repo.getById(inst.id)!.serial).toBe('localhost:32770');
+    repo.updateSerial(inst.id, null);
+    expect(repo.getById(inst.id)!.serial).toBeNull();
+  });
+
+  it('listBySerial returns rows most-recently-updated first (recency tiebreak — H3)', () => {
+    // Two running rows sharing a serial; the older (lower rowid) gets the staler
+    // last_state_at. listBySerial must surface the newer one first regardless of rowid.
+    const stale = repo.insert({ providerId: 'docker-android', runtimeId: 'stale', serial: 'localhost:32770', state: 'running', spawnedByDarkride: true });
+    const fresh = repo.insert({ providerId: 'docker-android', runtimeId: 'fresh', serial: 'localhost:32770', state: 'running', spawnedByDarkride: true });
+    const sqlite = (repo as any).db.session.client as import('better-sqlite3').Database;
+    sqlite.prepare('UPDATE device_instances SET last_state_at = ? WHERE id = ?').run(1000, stale.id);
+    sqlite.prepare('UPDATE device_instances SET last_state_at = ? WHERE id = ?').run(2000, fresh.id);
+    expect(repo.listBySerial('localhost:32770').map((r) => r.runtimeId)).toEqual(['fresh', 'stale']);
+  });
+
   it('delete removes the row', () => {
     const inst = repo.insert({ providerId: 'avd', runtimeId: 'a1', state: 'stopped', spawnedByDarkride: true });
     repo.delete(inst.id);

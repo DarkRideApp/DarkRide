@@ -253,10 +253,18 @@ export function registerDevicesProvidersEndpoints(
       // The container is down — drop its adb endpoint so the stopped emulator
       // doesn't linger in `adb devices` (and get re-seeded as an orphan row).
       await dropAdbEndpoint(row.serial);
+      // Clear the serial (H3): adb serials are localhost:<hostport> and Docker
+      // recycles host ports, so a recycled port could resurface this now-dead
+      // row under a new emulator's serial. listBySerial would then see two rows
+      // for one serial; nulling it here removes the collision at the source.
+      repo.updateSerial(row.id, null);
       repo.updateState(row.id, 'stopped');
       broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
       res.json({ success: true });
     } catch (err: any) {
+      // Deliberately do NOT clear the serial here: a failed stop may mean the
+      // container is still up and reachable at that serial, so the row stays
+      // valid. The serial is only cleared on a confirmed stop above.
       repo.updateState(row.id, 'error', err?.message ?? String(err));
       broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
       res.status(500).json({ success: false, error: err?.message ?? String(err) });

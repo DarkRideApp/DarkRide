@@ -209,12 +209,15 @@ describe('/v1/devices/providers endpoints', () => {
         state: 'running', serial: 'localhost:32768',
       }),
       updateState: vi.fn(),
+      updateSerial: vi.fn(),
     };
     const app = createApp(reg, repo, undefined, { adbDisconnect });
     const res = await request(app).post('/v1/devices/providers/docker-android/instances/99/stop');
     expect(res.status).toBe(200);
     expect(stop).toHaveBeenCalledWith('inst-1');
     expect(adbDisconnect).toHaveBeenCalledWith('localhost:32768');
+    // H3: serial cleared so a recycled host port can't resurface this dead row.
+    expect(repo.updateSerial).toHaveBeenCalledWith(99, null);
     expect(repo.updateState).toHaveBeenCalledWith(99, 'stopped');
   });
 
@@ -228,6 +231,7 @@ describe('/v1/devices/providers endpoints', () => {
         state: 'running', serial: '00008110-000A1B2C3D4E801E',
       }),
       updateState: vi.fn(),
+      updateSerial: vi.fn(),
     };
     const app = createApp(reg, repo, undefined, { adbDisconnect });
     const res = await request(app).post('/v1/devices/providers/ios-device/instances/99/stop');
