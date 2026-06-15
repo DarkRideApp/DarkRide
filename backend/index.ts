@@ -146,6 +146,7 @@ import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { makeCaptureHandlers } from './services/capture-handlers';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
+import { stopSpawnedInstances } from './services/stop-spawned-instances';
 import { registerDevicesProvidersEndpoints } from './api/devices-providers';
 import { registerVideoTransportEndpoint } from './api/video-transport';
 import { registerEmulatorGrpcBridge } from './api/emulator-grpc-bridge';
@@ -329,6 +330,9 @@ runner.setIosDeviceManager(iosDeviceManager);
 let pluginManager: PluginManager | null = null;
 // dispatcherApi likewise: constructed during startup, closed during shutdown.
 let dispatcherApi: ReturnType<typeof createDispatcherApi> | null = null;
+// deviceInstancesRepo likewise: constructed during startup, read during shutdown
+// to stop darkride-spawned emulator instances (M1).
+let deviceInstancesRepo: DeviceInstancesRepo | null = null;
 
 // Initialize saved traffic store and wire to hook registry
 const savedTrafficStore = new SavedTrafficStore(db);
@@ -920,7 +924,7 @@ httpServer.listen(PORT, HOST, () => {
 
   // Reconcile DB device_instances against what each provider currently reports.
   // Runs before plugins load so DB state is accurate before any plugin queries it.
-  const deviceInstancesRepo = new DeviceInstancesRepo(db);
+  deviceInstancesRepo = new DeviceInstancesRepo(db);
   await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
   registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo, db);
   registerVideoTransportEndpoint(deviceInstancesRepo, providerRegistry);
@@ -1514,6 +1518,25 @@ async function shutdown() {
       await dispatcherApi.closeAll();
     } catch (err: any) {
       error(`dispatcherApi.closeAll error: ${err?.message ?? String(err)}`);
+    }
+  }
+
+  // Stop darkride-spawned emulator instances (M1) so they don't orphan a
+  // container + KVM slot + in-container forwarder + stale adb-reverse. Only
+  // spawnedByDarkride===true && state==='running' rows are stopped; BYOE/observed
+  // devices are left alone. Bounded by an overall 15s race so a slow/hung
+  // stopInstance can never block process exit (per-instance errors are logged
+  // and swallowed inside stopSpawnedInstances).
+  if (deviceInstancesRepo) {
+    try {
+      await Promise.race([
+        stopSpawnedInstances(providerRegistry, deviceInstancesRepo),
+        // .unref() so a fast resolve doesn't leave this timer holding the loop
+        // open (mirrors the force-exit timer below).
+        new Promise((resolve) => setTimeout(resolve, 15_000).unref()),
+      ]);
+    } catch (err: any) {
+      error(`stopSpawnedInstances error: ${err?.message ?? String(err)}`);
     }
   }
 
