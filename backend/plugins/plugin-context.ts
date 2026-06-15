@@ -10,6 +10,7 @@ import type {
   PluginToolContext,
   PluginJob,
   DeviceProviderContribution,
+  ManagedAutomationDef,
   PluginSetting,
   PluginCommand,
   PluginNotificationEvent,
@@ -51,6 +52,7 @@ export interface CollectedContributions {
   toolContexts: PluginToolContext[];
   jobs: PluginJob[];
   deviceProviders: DeviceProviderContribution[];
+  managedAutomations: ManagedAutomationDef[];
   settings: PluginSetting[];
   commands: PluginCommand[];
   notificationEvents: PluginNotificationEvent[];
@@ -77,6 +79,7 @@ export function createEmptyContributions(): CollectedContributions {
     toolContexts: [],
     jobs: [],
     deviceProviders: [],
+    managedAutomations: [],
     settings: [],
     commands: [],
     notificationEvents: [],
@@ -183,6 +186,12 @@ export class PluginContextImpl implements PluginContext {
 
   deviceProviders(providers: DeviceProviderContribution[]): void {
     this.collected.deviceProviders.push(...providers);
+  }
+
+  managedAutomations(defs: ManagedAutomationDef[]): void {
+    // Collect at register-time; the host runs reconcile against these AFTER
+    // plugin migrations land and BEFORE start() — see PluginManager.
+    this.collected.managedAutomations.push(...defs);
   }
 
   settingsDefs(defs: PluginSetting[]): void {

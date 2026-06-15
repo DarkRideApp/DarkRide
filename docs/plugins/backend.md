@@ -147,6 +147,60 @@ Both are ways to "do something on a schedule," but they're different primitives 
 
 **Use an automation** when the script needs `device.*` / `setProxy` / the automation sandbox's host bindings, OR when the user is expected to edit the script body live in Monaco (the editor is the product). High-frequency automations (per-minute or faster) are an anti-pattern — they're built around user-visible run history with manual triggers, and at that cadence the history becomes noise.
 
+### When to use `ctx.managedAutomations`
+
+Sometimes you want both: the **sandbox + device + sessions** of an automation, but with the **script + schedule shipped by your plugin** instead of hand-pasted by the operator. That's what `ctx.managedAutomations` is for.
+
+```typescript
+import { readFileSync } from 'fs';
+import { join } from 'path';
+
+ctx.managedAutomations([
+  {
+    key: 'example-poller',                     // immutable identity within the plugin
+    name: 'Example poller',
+    description: 'Polls the example API and writes to the document store.',
+    code: readFileSync(join(ctx.pluginDir, 'scripts/poller.js'), 'utf-8'),
+    defaultSchedule: JSON.stringify({ type: 'interval', intervalMs: 5 * 60_000 }),
+    enabledByDefault: true,
+    requiresDevice: false,
+    allowUserOverride: true,
+    emitFailureNotification: false,
+  },
+]);
+```
+
+Lifecycle:
+
+- **First load** — host inserts a row stamped `managed_by = <plugin>` / `managed_key = 'example-poller'`, runs it on the declared schedule, sessions go to history under `managed = 1` (hidden by default; surfaced behind the "Show managed (N)" toggle).
+- **Plugin update with a new `code`** — silently adopted unless the operator has overridden it.
+- **Operator opens `<ManagedAutomationScriptIDE>` and edits** — fork point recorded as `base_default_code`; subsequent plugin updates of `code` no longer overwrite, and if the new default differs from the fork point a drift banner with **Keep mine** / **Reset to default** appears with a 3-way diff.
+- **Plugin uninstalled** — overridden rows are orphaned (`managed_*` nulled, `enabled = 0`) so the operator's edits survive as ordinary disabled automations; never-overridden rows are deleted outright.
+
+Operator vs plugin ownership:
+
+| Field | Owner |
+|---|---|
+| `code` | 3-way: starts as plugin's `code`; operator may fork, host tracks the merge ancestor. |
+| `currentDefaultCode` (refreshed every load) | Plugin |
+| `defaultSchedule` / `enabledByDefault` / `defaultDeviceFilter` | **Seeds only** — operator-owned after insert. The plugin owns the logic; the operator owns the cadence. Renaming these doesn't re-touch existing rows. |
+| `name` / `description` / `requiresDevice` / `timeoutMs` / `allowUserOverride` | Plugin (refreshed every load). |
+| `emitFailureNotification` | Plugin. Default `false` — managed runs DON'T fire the standard `automation:failure` notification (most plugins surface health in their own UI by reading session rows). Set to `true` to opt back into the standard pipeline. |
+
+**`key` is immutable.** Renaming it is a `delete + insert`, which loses the operator's override silently. If you need to evolve, use a versioned key (`example-poller@v2`) so the old row gets cleanly orphaned and the new one starts fresh. The host emits a warn log on every load where keys disappear AND new keys appear in the same plugin, as a heuristic for "did the author mean to rename?" — read it.
+
+Embed the IDE on your plugin page:
+
+```tsx
+import { ManagedAutomationScriptIDE } from '@darkrideapp/plugin-sdk/react';
+
+<ManagedAutomationScriptIDE pluginKey="my-plugin" scriptKey="example-poller" />
+```
+
+The component handles loading, drift detection, the override / reset / keep-mine actions, and the 3-way diff. Use the `editor` render prop if you want Monaco or CodeMirror instead of the bundled textarea — the SDK keeps the default light to avoid pulling Monaco into every plugin's bundle.
+
+Note on the **asset convention**: ship `code` as a string asset read from `ctx.pluginDir`, not inlined into TypeScript. Easier to lint, diff, and review.
+
 ## Settings
 
 Two backend surfaces. A third (the rendered settings page) lives on the frontend — see [`frontend.md`](./frontend.md#settings-backend-vs-frontend).

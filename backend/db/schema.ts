@@ -84,6 +84,47 @@ export const automations = sqliteTable('automations', {
   enabled: integer('enabled', { mode: 'boolean' }).default(true),
   schedule: text('schedule'), // JSON: ScheduleConfig | null
   deviceFilter: text('device_filter'), // JSON: DeviceFilter | null
+  // ── Managed-automations framework (2026-06-06) ─────────────────────────
+  // Plugins can register automations they own via ctx.managedAutomations.
+  // The host stamps provenance + a 3-way merge state machine on the row,
+  // but execution/scheduling/sessions reuse the existing engine unchanged.
+  // "Managed" is just `managed_by IS NOT NULL`.
+  /** Owning plugin name. NULL = ordinary automation. */
+  managedBy: text('managed_by'),
+  /** Plugin-stable script key. Unique with managedBy. */
+  managedKey: text('managed_key'),
+  /** The default the plugin currently ships (refreshed every plugin load). */
+  currentDefaultCode: text('current_default_code'),
+  /** The default the operator's override was forked from (merge ancestor). */
+  baseDefaultCode: text('base_default_code'),
+  /** Has the operator forked the script? */
+  isOverridden: integer('is_overridden', { mode: 'boolean' }).notNull().default(false),
+  /** Does the plugin permit forking? Drives the IDE component. */
+  allowUserOverride: integer('allow_user_override', { mode: 'boolean' }).notNull().default(true),
+  /**
+   * Snapshot of the schedule the plugin currently ships, refreshed every
+   * plugin load. NOT a tracked override — the operator's actual `schedule`
+   * is what runs; this is only the "revert to default" target the SDK IDE
+   * offers when the operator's value differs.
+   */
+  currentDefaultSchedule: text('current_default_schedule'),
+  /** Same idea for `enabled` — the plugin's current default, separate from the operator-owned `enabled` field. */
+  currentDefaultEnabled: integer('current_default_enabled', { mode: 'boolean' }),
+  /**
+   * One-line description from the plugin's ManagedAutomationDef. Nullable
+   * because ordinary (non-managed) automations don't carry one. Refreshed
+   * on every plugin load through the reconciler's insert + silent-adopt +
+   * preserve-override paths.
+   */
+  description: text('description'),
+  /**
+   * Opt-in: should a failed managed run fire the standard `automation:failure`
+   * notification event? Default false — operator didn't author the script,
+   * most plugins surface health in their own UI. Ordinary (non-managed) rows
+   * still fire failure notifications unconditionally (this column is
+   * ignored when managed_by IS NULL).
+   */
+  emitFailureNotification: integer('emit_failure_notification', { mode: 'boolean' }).notNull().default(false),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
@@ -100,6 +141,13 @@ export const automationSessions = sqliteTable('automation_sessions', {
   notes: text('notes'),
   startedAt: integer('started_at', { mode: 'timestamp' }).notNull(),
   completedAt: integer('completed_at', { mode: 'timestamp' }),
+  /**
+   * Denormalised at session creation from automation.managed_by IS NOT NULL.
+   * Lets the session-history default filter ("hide managed") be a plain
+   * column scan with no join. Back-filled to 0 when an automation is
+   * orphaned from its plugin so the operator's now-owned history is visible.
+   */
+  managed: integer('managed', { mode: 'boolean' }).notNull().default(false),
 });
 
 export const screenshots = sqliteTable('screenshots', {

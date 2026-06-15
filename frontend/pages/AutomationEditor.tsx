@@ -9,27 +9,16 @@ import { DEVICE_FILTERABLE_FIELDS } from '../../shared/types/api';
 import { matchesDeviceFilter, getFilterWarnings, migrateDeviceFilter } from '../../shared/lib/device-filter';
 import type { ValidationResult, SessionStatusUpdate } from '../../shared/types/websocket';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
-import { ScheduleEditor, type ScheduleValue } from '../components/ScheduleEditor';
+import { ScheduleEditor, type ScheduleValue } from '@darkrideapp/plugin-sdk/react';
 import type { DeviceAPI } from '../../shared/types/automation';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
 import { useToast } from '@darkrideapp/plugin-sdk/react';
 
-// Configure Monaco web workers for Vite before any monaco import
-self.MonacoEnvironment = {
-  getWorker(_workerId: string, label: string) {
-    if (label === 'typescript' || label === 'javascript') {
-      return new Worker(
-        new URL('monaco-editor/esm/vs/language/typescript/ts.worker.js', import.meta.url),
-        { type: 'module' },
-      );
-    }
-    return new Worker(
-      new URL('monaco-editor/esm/vs/editor/editor.worker.js', import.meta.url),
-      { type: 'module' },
-    );
-  },
-};
+// Monaco web-worker configuration lives in frontend/main.tsx — set there once
+// at module-eval time so every page that mounts a Monaco editor (this one,
+// CodeBrowser, the SDK's ManagedAutomationScriptIDE on plugin pages) picks
+// it up automatically.
 
 const DEFAULT_CAPTURE_RULE_CODE = `export default async function captureRule(device: DeviceAPI) {
   // Capture rules run once when traffic capture starts.

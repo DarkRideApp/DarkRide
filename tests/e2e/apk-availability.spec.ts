@@ -89,7 +89,7 @@ test.describe('APK availability UX', () => {
 
   // ── 2. APK browser — availability badge in version list ──────────────────────
 
-  test('APK browser page loads and shows the Storage column header', async ({ page }) => {
+  test('App library loads and detail page shows the Storage column', async ({ page }) => {
     // 90s: loginAsAdmin waits for the sidebar, which can take longer than the
     // default 60s global timeout when the server is starting cold.
     test.setTimeout(90_000);
@@ -98,18 +98,16 @@ test.describe('APK availability UX', () => {
     await page.goto('/ui/apks');
     await page.waitForLoadState('networkidle');
 
-    // The page must render the APK browser container
-    await expect(page.locator('[data-testid="apk-browser"]')).toBeVisible({ timeout: 15_000 });
+    // The page must render the App Library container
+    await expect(page.locator('[data-testid="app-library"]')).toBeVisible({ timeout: 15_000 });
 
-    // If any tracked apps are present, expand the first one and assert the
-    // AvailabilityBadge renders for at least one version row.
-    const appRows = page.locator('[data-testid^="tracked-app-row-"]');
+    // If any tracked apps are present, open the first one and assert the
+    // AppDetail versions table shows the Storage column + an AvailabilityBadge.
+    const appRows = page.locator('[data-testid^="app-row-"]');
     const count = await appRows.count();
 
     if (count === 0) {
-      // No apps seeded in the E2E harness — nothing to expand.
-      // The Storage column header is inside the version sub-table which only
-      // renders when an app is expanded; we can't assert it without a fixture.
+      // No apps seeded in the E2E harness — nothing to open.
       test.info().annotations.push({
         type: 'info',
         description:
@@ -118,22 +116,15 @@ test.describe('APK availability UX', () => {
       return;
     }
 
-    // Expand the first app row to reveal its version list
+    // Clicking a row navigates to the App Detail page (/ui/apps/:id)
     await appRows.first().click();
+    await expect(page.locator('[data-testid="app-detail"]')).toBeVisible({ timeout: 10_000 });
 
-    // The version sub-table should appear
-    const firstAppId = await appRows.first().getAttribute('data-testid');
-    // data-testid is "tracked-app-row-<id>" → extract numeric suffix
-    const appId = firstAppId?.replace('tracked-app-row-', '');
-    const versionsPanel = page.locator(`[data-testid="versions-${appId}"]`);
-    await expect(versionsPanel).toBeVisible({ timeout: 10_000 });
-
-    // The "Storage" column header must be present in the expanded table
-    await expect(versionsPanel.locator('text=Storage')).toBeVisible();
+    // The "Storage" column header must be present in the versions table
+    await expect(page.locator('.data-table').locator('text=Storage').first()).toBeVisible();
 
     // At least one AvailabilityBadge should be rendered.
-    // The badge renders as a <span> with one of the known label texts.
-    const badge = versionsPanel.locator('text=/^(Local|Cloud|Needs re-analyze|Lost)$/').first();
+    const badge = page.locator('text=/^(Local|Cloud|Needs re-analyze|Lost)$/').first();
     await expect(badge).toBeVisible();
   });
 

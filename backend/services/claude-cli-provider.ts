@@ -1,7 +1,6 @@
 import { spawn, type ChildProcess } from 'child_process';
-import { writeFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, mkdtempSync, rmSync } from 'fs';
+import { writeFileSync, existsSync, mkdirSync, chmodSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import { eq, isNotNull } from 'drizzle-orm';
 import { createLoggers } from '../logs';
 import type { ApiKeyManager } from '../auth/api-key-manager';
@@ -421,8 +420,31 @@ export class ClaudeCliProvider {
     // Default to Sonnet (better at following tool constraints, cheaper)
     args.push('--model', options?.model || 'sonnet');
 
-    // Disable all built-in tools so Claude only uses DarkRide MCP tools
-    args.push('--tools', '');
+    // We previously passed `--tools ''` here to force MCP-only tool use, but
+    // that flag exposes a Claude CLI `--print`-mode race: the CLI fires
+    // session init (and prompts the model) before the MCP handshake has
+    // settled, so the model sees `tools: []` and either says "I don't have
+    // those tools" or text-leaks `<invoke>` markup. Verified end-to-end on
+    // 2026-06-04 (see scripts/test-mcp-http-and-debug.sh): the MCP HTTP
+    // server received initialize → initialized → tools/list, yet the init
+    // event still showed mcp_servers status=pending and tools=[]. Hooks
+    // delaying init didn't help (even 5s).
+    //
+    // Leaving built-in tools enabled gives the model something to call
+    // immediately, breaking the race. But because we run with
+    // `--permission-mode bypassPermissions`, leaving every built-in enabled
+    // would expose a prompt-injection escalation: a chat message could drive
+    // Bash/Write/Edit/WebFetch to exfiltrate or mutate state outside the
+    // DarkRide MCP tool boundary. So we hard-block the destructive built-ins
+    // at the CLI layer. Read/Glob/Grep/ToolSearch stay available so the
+    // model has something to do during the MCP handshake window.
+    args.push(
+      '--disallowedTools',
+      'Bash', 'Edit', 'Write', 'NotebookEdit',
+      'Task',
+      'WebFetch', 'WebSearch',
+      'CronCreate', 'CronDelete',
+    );
 
     if (options?.maxBudgetUsd) {
       args.push('--max-budget-usd', String(options.maxBudgetUsd));
@@ -705,57 +727,65 @@ export class ClaudeCliProvider {
 
   /**
    * Self-test that the CLI can actually DRIVE a tool with the given auth, not
-   * just authenticate. Spins up a throwaway stdio MCP server exposing one
-   * `ping` tool and asks the model to call it. Returns `ok:false` when the
-   * model text-leaks the call (the failure mode a wrong/stale token causes —
-   * it authenticates but can't run tools) so the Settings "Test" button can
-   * surface it instead of it only showing up at analysis time.
+   * just authenticate. We ask the model to call a read-only built-in tool
+   * (Glob); a working Claude Code session will make a real `tool_use` block,
+   * a broken one will text-leak `<invoke>` markup as content.
+   *
+   * Previously this spun up a throwaway stdio MCP server and asked the model
+   * to call a `ping` tool there — but verified on 2026-06-04 that the CLI's
+   * `--print` mode fires session init (and prompts the model) before MCP
+   * handshakes settle, so the model saw `tools: []` and the test failed for
+   * environmental reasons that had nothing to do with the token. Built-ins
+   * are registered synchronously at init, so they sidestep that race
+   * entirely and still reveal a text-leaking token.
+   *
+   * Glob is chosen (over Bash) because it's read-only — keeps the security
+   * stance uniform with sendMessage's disallow list, which blocks the
+   * destructive built-ins.
    */
   static async testToolUse(
     oauthToken: string | undefined,
     model: string,
   ): Promise<{ ok: boolean; reason?: string }> {
-    const dir = mkdtempSync(join(tmpdir(), 'claude-tooltest-'));
-    const serverPath = join(dir, 'ping-mcp.js');
-    const configPath = join(dir, 'mcp.json');
-    try {
-      writeFileSync(serverPath, PING_MCP_SERVER);
-      writeFileSync(configPath, JSON.stringify({
-        mcpServers: { selftest: { command: 'node', args: [serverPath] } },
-      }));
-      const env = oauthToken
-        ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: oauthToken }
-        : { ...process.env };
-      const args = [
-        '--print', '--output-format', 'stream-json', '--verbose',
-        '--mcp-config', configPath, '--strict-mcp-config',
-        '--permission-mode', 'bypassPermissions',
-        '--model', model || 'sonnet', '--tools', '',
-      ];
-      return await new Promise((resolve) => {
-        const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'], env });
-        let out = '';
-        let stderr = '';
-        const timer = setTimeout(() => {
-          child.kill('SIGKILL');
-          resolve({ ok: false, reason: 'Timed out waiting for the Claude CLI tool self-test' });
-        }, 60000);
-        child.stdout?.on('data', (c: Buffer) => { out += c.toString(); });
-        child.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
-        child.on('error', () => {
-          clearTimeout(timer);
-          resolve({ ok: false, reason: 'Claude CLI not found or not executable' });
-        });
-        child.on('close', (code) => {
-          clearTimeout(timer);
-          resolve(evaluateToolSelfTest(out, code, stderr));
-        });
-        child.stdin?.write('Call the ping tool to verify tool access, then reply "done".');
-        child.stdin?.end();
+    const env = oauthToken
+      ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: oauthToken }
+      : { ...process.env };
+    const args = [
+      '--print', '--output-format', 'stream-json', '--verbose',
+      '--permission-mode', 'bypassPermissions',
+      '--model', model || 'sonnet',
+      // Match sendMessage's blocklist so the test isn't accidentally more
+      // permissive than production. Glob (the tool the test prompt asks for)
+      // is not blocked.
+      '--disallowedTools',
+      'Bash', 'Edit', 'Write', 'NotebookEdit',
+      'Task',
+      'WebFetch', 'WebSearch',
+      'CronCreate', 'CronDelete',
+    ];
+    return await new Promise((resolve) => {
+      const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'], env });
+      let out = '';
+      let stderr = '';
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        resolve({ ok: false, reason: 'Timed out waiting for the Claude CLI tool self-test' });
+      }, 60000);
+      child.stdout?.on('data', (c: Buffer) => { out += c.toString(); });
+      child.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
+      child.on('error', () => {
+        clearTimeout(timer);
+        resolve({ ok: false, reason: 'Claude CLI not found or not executable' });
       });
-    } finally {
-      try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    }
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        resolve(evaluateToolSelfTest(out, code, stderr));
+      });
+      child.stdin?.write(
+        'Use your Glob tool to look for files matching `*.json` in the current directory, then reply "done".',
+      );
+      child.stdin?.end();
+    });
   }
 
   /** Kill all active Claude CLI processes (for graceful shutdown) */
@@ -811,18 +841,6 @@ export class ClaudeCliProvider {
     });
   }
 }
-
-// Throwaway stdio MCP server (one `ping` tool) used by testToolUse(). Plain JS,
-// no deps — written to a temp file and run via `node <file>`.
-const PING_MCP_SERVER = `
-let buf='';process.stdin.on('data',d=>{buf+=d;let i;while((i=buf.indexOf('\\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;let m;try{m=JSON.parse(line)}catch{continue}
-if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:(m.params&&m.params.protocolVersion)||'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'selftest',version:'1.0.0'}}});
-else if(m.method==='tools/list')send({jsonrpc:'2.0',id:m.id,result:{tools:[{name:'ping',description:'Returns pong. Call to verify tool access.',inputSchema:{type:'object',properties:{}}}]}});
-else if(m.method==='tools/call')send({jsonrpc:'2.0',id:m.id,result:{content:[{type:'text',text:'pong'}]}});
-else if(m.method&&m.method.indexOf('notifications/')===0){}
-else if(m.id!==undefined)send({jsonrpc:'2.0',id:m.id,result:{}});}});
-function send(o){process.stdout.write(JSON.stringify(o)+'\\n')}
-`;
 
 // Same markup detection as ClaudeCliAgent: tool-call XML in the assistant's
 // *text* means the model couldn't really call tools.

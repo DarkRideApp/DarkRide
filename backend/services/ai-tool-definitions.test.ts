@@ -3099,4 +3099,284 @@ class AuthManager {
       expect(stopIdx).toBeGreaterThan(msgsIdx);
     });
   });
+
+  // ── App discovery tools ────────────────────────────────────────
+  // The MCP-side tool surface was apk-analysis-centric: an agent could
+  // inspect a known versionId 17 ways but had no way to discover one
+  // from an app name. These tools close that loop.
+
+  describe('list_tracked_apps', () => {
+    function seedApps() {
+      db.insert(schema.trackedApps).values([
+        { packageName: 'com.disney.wdw', appName: 'Walt Disney World', createdAt: new Date(NOW * 1000) },
+        { packageName: 'com.disney.dlr', appName: 'Disneyland Resort', createdAt: new Date(NOW * 1000) },
+        { packageName: 'com.universal.studios', appName: 'Universal Studios', createdAt: new Date(NOW * 1000) },
+        { packageName: 'com.empty.app', appName: 'No Versions', createdAt: new Date(NOW * 1000) },
+      ]).run();
+      const apps = db.select().from(schema.trackedApps).all();
+      const wdw = apps.find(a => a.packageName === 'com.disney.wdw')!;
+      const dlr = apps.find(a => a.packageName === 'com.disney.dlr')!;
+      const uni = apps.find(a => a.packageName === 'com.universal.studios')!;
+      db.insert(schema.apkVersions).values([
+        { trackedAppId: wdw.id, versionCode: 100, versionName: '7.50.0', filename: 'wdw-100.apk', downloadedAt: new Date(NOW * 1000) },
+        { trackedAppId: wdw.id, versionCode: 110, versionName: '7.51.0', filename: 'wdw-110.apk', downloadedAt: new Date(NOW * 1000) },
+        { trackedAppId: dlr.id, versionCode: 80, versionName: '6.10.0', filename: 'dlr-80.apk', downloadedAt: new Date(NOW * 1000) },
+        { trackedAppId: uni.id, versionCode: 50, versionName: '2.0.0', filename: 'uni-50.apk', downloadedAt: new Date(NOW * 1000) },
+      ]).run();
+      return { wdw, dlr, uni };
+    }
+
+    it('returns every tracked app with version count + latest version when no query is given', async () => {
+      seedApps();
+      const result: any = await registry.executeTool('list_tracked_apps', {});
+      expect(Array.isArray(result)).toBe(true);
+      expect(result).toHaveLength(4);
+      const wdw = result.find((r: any) => r.packageName === 'com.disney.wdw');
+      expect(wdw.versionCount).toBe(2);
+      expect(wdw.latestVersionId).toBeTypeOf('number');
+      expect(wdw.latestVersionCode).toBe(110);
+      expect(wdw.latestVersionName).toBe('7.51.0');
+      expect(wdw.appName).toBe('Walt Disney World');
+    });
+
+    it('reports 0 versions / null latest for an app with no APKs', async () => {
+      seedApps();
+      const result: any = await registry.executeTool('list_tracked_apps', {});
+      const empty = result.find((r: any) => r.packageName === 'com.empty.app');
+      expect(empty.versionCount).toBe(0);
+      expect(empty.latestVersionId).toBeNull();
+    });
+
+    it('filters by query against appName (case insensitive)', async () => {
+      seedApps();
+      const result: any = await registry.executeTool('list_tracked_apps', { query: 'disney' });
+      expect(result.map((r: any) => r.packageName).sort()).toEqual([
+        'com.disney.dlr',
+        'com.disney.wdw',
+      ]);
+    });
+
+    it('filters by query against packageName', async () => {
+      seedApps();
+      const result: any = await registry.executeTool('list_tracked_apps', { query: 'universal' });
+      expect(result).toHaveLength(1);
+      expect(result[0].packageName).toBe('com.universal.studios');
+    });
+
+    it('returns an empty array when no apps match the query', async () => {
+      seedApps();
+      const result: any = await registry.executeTool('list_tracked_apps', { query: 'nothing-like-this' });
+      expect(result).toEqual([]);
+    });
+
+    it('only counts versions belonging to the matched apps (regression: scoped query)', async () => {
+      // Pre-fix, the tool loaded every apk_versions row into a Map and
+      // then filtered apps. Now the query scopes to the filtered app ids
+      // via inArray. Add a sibling app + version and confirm a narrow
+      // query still returns the right versionCount for the matched app
+      // (i.e. the inArray filter is correct, not accidentally including
+      // unrelated rows).
+      const { uni } = seedApps();
+      db.insert(schema.apkVersions).values([
+        { trackedAppId: uni.id, versionCode: 60, versionName: '2.1.0', filename: 'uni-60.apk', downloadedAt: new Date(NOW * 1000) },
+        { trackedAppId: uni.id, versionCode: 70, versionName: '2.2.0', filename: 'uni-70.apk', downloadedAt: new Date(NOW * 1000) },
+      ]).run();
+      const result: any = await registry.executeTool('list_tracked_apps', { query: 'universal' });
+      expect(result).toHaveLength(1);
+      expect(result[0].packageName).toBe('com.universal.studios');
+      expect(result[0].versionCount).toBe(3); // 50 + 60 + 70
+      expect(result[0].latestVersionCode).toBe(70);
+    });
+  });
+
+  describe('get_app_versions', () => {
+    function seedAppWithVersions() {
+      db.insert(schema.trackedApps).values({
+        packageName: 'com.disney.wdw',
+        appName: 'Walt Disney World',
+        createdAt: new Date(NOW * 1000),
+      }).run();
+      const app = db.select().from(schema.trackedApps).all()[0];
+      db.insert(schema.apkVersions).values([
+        { trackedAppId: app.id, versionCode: 100, versionName: '7.50.0', filename: 'wdw-100.apk', downloadedAt: new Date(NOW * 1000) },
+        { trackedAppId: app.id, versionCode: 110, versionName: '7.51.0', filename: 'wdw-110.apk', downloadedAt: new Date(NOW * 1000) },
+        { trackedAppId: app.id, versionCode: 90, versionName: '7.49.0', filename: 'wdw-90.apk', downloadedAt: new Date(NOW * 1000) },
+      ]).run();
+      return app;
+    }
+
+    it('returns versions for a trackedAppId, newest versionCode first', async () => {
+      const app = seedAppWithVersions();
+      const result: any = await registry.executeTool('get_app_versions', { trackedAppId: app.id });
+      expect(result.versions.map((v: any) => v.versionCode)).toEqual([110, 100, 90]);
+      // The agent needs versionId so it can pass it to other apk tools.
+      expect(result.versions[0].versionId).toBeTypeOf('number');
+    });
+
+    it('looks up by packageName', async () => {
+      seedAppWithVersions();
+      const result: any = await registry.executeTool('get_app_versions', { packageName: 'com.disney.wdw' });
+      expect(result.packageName).toBe('com.disney.wdw');
+      expect(result.versions).toHaveLength(3);
+    });
+
+    it('returns an error when neither trackedAppId nor packageName is given', async () => {
+      const result: any = await registry.executeTool('get_app_versions', {});
+      expect(result.error).toBeTruthy();
+    });
+
+    it('returns an error when BOTH trackedAppId and packageName are given', async () => {
+      // Reject "both" rather than silently picking one — LLMs can
+      // over-specify and the lookup must not silently resolve to an
+      // unintended app.
+      const app = seedAppWithVersions();
+      const result: any = await registry.executeTool('get_app_versions', {
+        trackedAppId: app.id,
+        packageName: 'com.disney.wdw',
+      });
+      expect(result.error).toMatch(/not both/i);
+    });
+
+    it('returns an error when the app is not found', async () => {
+      const result: any = await registry.executeTool('get_app_versions', { packageName: 'com.does.not.exist' });
+      expect(result.error).toBeTruthy();
+    });
+
+    it('reports analysis status per version (none / completed / pending)', async () => {
+      const app = seedAppWithVersions();
+      const versions = db.select().from(schema.apkVersions).all().sort((a, b) => b.versionCode - a.versionCode);
+      db.insert(schema.analysisJobs).values([
+        { apkVersionId: versions[0].id, status: 'completed', createdAt: new Date(NOW * 1000) },
+        { apkVersionId: versions[1].id, status: 'pending', createdAt: new Date(NOW * 1000) },
+      ]).run();
+      const result: any = await registry.executeTool('get_app_versions', { trackedAppId: app.id });
+      const v110 = result.versions.find((v: any) => v.versionCode === 110);
+      const v100 = result.versions.find((v: any) => v.versionCode === 100);
+      const v90 = result.versions.find((v: any) => v.versionCode === 90);
+      expect(v110.analysisStatus).toBe('completed');
+      expect(v100.analysisStatus).toBe('pending');
+      expect(v90.analysisStatus).toBeNull();
+    });
+
+    it('uses the latest job per version when multiple jobs exist', async () => {
+      // Regression for an in-memory-map quirk: if the iteration order
+      // changes, picking the "first seen" must still mean the highest
+      // id (= newest). Insert in a deliberately out-of-order sequence.
+      const app = seedAppWithVersions();
+      const versions = db.select().from(schema.apkVersions).all().sort((a, b) => b.versionCode - a.versionCode);
+      db.insert(schema.analysisJobs).values([
+        { apkVersionId: versions[0].id, status: 'failed', createdAt: new Date(NOW * 1000 - 2000) },
+        { apkVersionId: versions[0].id, status: 'pending', createdAt: new Date(NOW * 1000 - 1000) },
+        { apkVersionId: versions[0].id, status: 'completed', createdAt: new Date(NOW * 1000) },
+      ]).run();
+      const result: any = await registry.executeTool('get_app_versions', { trackedAppId: app.id });
+      const v110 = result.versions.find((v: any) => v.versionCode === 110);
+      expect(v110.analysisStatus).toBe('completed');
+    });
+
+    it('does not surface analysis jobs from a different app', async () => {
+      // Regression: pre-fix, get_app_versions read every analysis_jobs
+      // row in the DB and grouped client-side. The query is now scoped
+      // to the app's versionIds via SQL inArray. This test would still
+      // pass on the old impl (because grouping is by apkVersionId), but
+      // codifies the boundary so a future "just join everything" change
+      // can't silently leak unrelated app status.
+      const app = seedAppWithVersions();
+      // Insert a separate app + version + analysis job for it
+      db.insert(schema.trackedApps).values({
+        packageName: 'com.other.app', appName: 'Other', createdAt: new Date(NOW * 1000),
+      }).run();
+      const other = db.select().from(schema.trackedApps).where(eq(schema.trackedApps.packageName, 'com.other.app')).all()[0];
+      db.insert(schema.apkVersions).values({
+        trackedAppId: other.id, versionCode: 1, filename: 'other-1.apk', downloadedAt: new Date(NOW * 1000),
+      }).run();
+      const otherVersion = db.select().from(schema.apkVersions).where(eq(schema.apkVersions.trackedAppId, other.id)).all()[0];
+      db.insert(schema.analysisJobs).values({
+        apkVersionId: otherVersion.id, status: 'completed', createdAt: new Date(NOW * 1000),
+      }).run();
+
+      const result: any = await registry.executeTool('get_app_versions', { trackedAppId: app.id });
+      // None of the WDW versions should have analysisStatus set just
+      // because com.other.app has a completed job somewhere.
+      for (const v of result.versions) {
+        expect(v.analysisStatus).toBeNull();
+      }
+    });
+  });
+
+  describe('trigger_apk_analysis', () => {
+    let localRegistry: AiToolRegistry;
+    let fakeAnalyzer: { enqueue: ReturnType<typeof vi.fn> };
+
+    beforeEach(() => {
+      localRegistry = new AiToolRegistry();
+      fakeAnalyzer = { enqueue: vi.fn(async (_id: number) => 42) };
+      registerAllTools(localRegistry, db as any, {
+        bridgeManager: {} as any,
+        deviceManager: { markBusy: vi.fn(), markIdle: vi.fn() } as any,
+        apkAnalyzer: fakeAnalyzer as any,
+      });
+    });
+
+    it('enqueues an analysis job for a known versionId and returns the jobId', async () => {
+      db.insert(schema.trackedApps).values({
+        packageName: 'com.disney.wdw', appName: 'Walt Disney World', createdAt: new Date(NOW * 1000),
+      }).run();
+      const app = db.select().from(schema.trackedApps).all()[0];
+      db.insert(schema.apkVersions).values({
+        trackedAppId: app.id, versionCode: 110, versionName: '7.51.0',
+        filename: 'wdw-110.apk', downloadedAt: new Date(NOW * 1000),
+      }).run();
+      const version = db.select().from(schema.apkVersions).all()[0];
+
+      const result: any = await localRegistry.executeTool('trigger_apk_analysis', { versionId: version.id });
+      expect(fakeAnalyzer.enqueue).toHaveBeenCalledWith(version.id);
+      expect(result.jobId).toBe(42);
+    });
+
+    it('returns an error when the version does not exist', async () => {
+      const result: any = await localRegistry.executeTool('trigger_apk_analysis', { versionId: 9999 });
+      expect(result.error).toBeTruthy();
+      expect(fakeAnalyzer.enqueue).not.toHaveBeenCalled();
+    });
+
+    it('returns an error when the apk analyzer service is not wired in', async () => {
+      const unwiredRegistry = new AiToolRegistry();
+      registerAllTools(unwiredRegistry, db as any, {
+        bridgeManager: {} as any,
+        deviceManager: { markBusy: vi.fn(), markIdle: vi.fn() } as any,
+      });
+      db.insert(schema.trackedApps).values({
+        packageName: 'com.x', appName: 'X', createdAt: new Date(NOW * 1000),
+      }).run();
+      const app = db.select().from(schema.trackedApps).all()[0];
+      db.insert(schema.apkVersions).values({
+        trackedAppId: app.id, versionCode: 1, filename: 'x-1.apk', downloadedAt: new Date(NOW * 1000),
+      }).run();
+      const version = db.select().from(schema.apkVersions).all()[0];
+
+      const result: any = await unwiredRegistry.executeTool('trigger_apk_analysis', { versionId: version.id });
+      expect(result.error).toMatch(/analyzer/i);
+    });
+  });
+
+  describe('discovery tool context registration', () => {
+    it('discovery tools are registered on dashboard context', () => {
+      const tools = registry.getToolsForContext('dashboard');
+      const names = tools.map(t => t.name);
+      expect(names).toContain('list_tracked_apps');
+      expect(names).toContain('get_app_versions');
+      expect(names).toContain('trigger_apk_analysis');
+    });
+
+    it('discovery tools are also registered on apk-analysis context', () => {
+      // So an agent already drilled into versionId X can find sibling
+      // versions or trigger a re-analysis without context-switching.
+      const tools = registry.getToolsForContext('apk-analysis');
+      const names = tools.map(t => t.name);
+      expect(names).toContain('list_tracked_apps');
+      expect(names).toContain('get_app_versions');
+      expect(names).toContain('trigger_apk_analysis');
+    });
+  });
 });

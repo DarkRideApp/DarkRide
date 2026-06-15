@@ -10,12 +10,14 @@ import { ProxyRotator } from './services/proxy-rotator';
 import { PythonBridgeManager, ensureVenvAsync } from './services/python-bridge';
 import { AutomationCompiler } from './services/automation-compiler';
 import { AutomationRunner } from './services/automation-runner';
+import { reconcileManagedAutomations } from './services/managed-automation-reconciler';
 import { AutomationScheduler } from './services/automation-scheduler';
 import { MitmproxyManager } from './services/mitmproxy-manager';
 import { registerProxyEndpoints } from './api/proxies';
 import { registerDeviceEndpoints } from './api/devices';
 import { registerTrafficEndpoints } from './api/traffic';
 import { registerAutomationEndpoints } from './api/automations';
+import { registerManagedAutomationEndpoints } from './api/managed-automations';
 import { registerAutomationTemplateEndpoints } from './api/automation-templates';
 import { registerLiveStreamEndpoints, hasActiveViewers } from './websocket/live-stream';
 import { registerAutomationWebsocketEndpoints } from './websocket/automation-handlers';
@@ -32,6 +34,7 @@ import { registerEndpoint, getApiRouter } from './api/api-service';
 import { registerAiCompleteEndpoints } from './api/ai-complete';
 import { registerAiChatApiEndpoints } from './api/ai-chat';
 import { registerAppEndpoints } from './api/apps';
+import { registerAppsUploadEndpoint } from './api/apps-upload';
 import { registerUtilsEndpoints } from './api/utils';
 import { dbSizeSnapshots, diskUsageSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, aiModels, aiProviders, capturedTraffic } from './db/schema';
 import * as schema from './db/schema';
@@ -366,6 +369,7 @@ registerProxyEndpoints(db);
 registerDeviceEndpoints(deviceManager, db, iosDeviceManager);
 registerTrafficEndpoints(db, trafficHookRegistry);
 registerAutomationEndpoints(db, runner, compiler, scheduler, captureManager, fileSync);
+registerManagedAutomationEndpoints(db, scheduler);
 registerAutomationTemplateEndpoints();
 registerCaptureEndpoints(captureManager);
 registerBlocklistEndpoints(db);
@@ -542,6 +546,7 @@ playStoreSource.setDatabase(db);
 apkTracker.setPlayStoreSource(playStoreSource);
 apkTracker.setNotificationService(notificationService);
 registerAppEndpoints(deviceManager, db, apkTracker, apkAnalyzer, fileSync, iosDeviceManager);
+registerAppsUploadEndpoint(db, apkAnalyzer);
 registerAnalysisEndpoints(db, apkAnalyzer, deviceManager, captureManager, fileSync);
 const fridaReleaseManager = new FridaReleaseManager(db);
 deviceManager.setFridaReleaseManager(fridaReleaseManager);
@@ -611,6 +616,7 @@ registerAllTools(aiToolRegistry, db, {
   captureManager,
   pluginStateManager,
   systemStateService,
+  apkAnalyzer,
 });
 
 // Disk space endpoint
@@ -1233,6 +1239,59 @@ httpServer.listen(PORT, HOST, () => {
     pluginManager.getAllAiTools().map((t) => t.name),
   );
   const preStartRouteSetups = new Set(pluginManager.getAllRouteSetups());
+
+  // Wire the scheduler's managed-automations guard so its tryResolveEntry
+  // can ask pluginManager whether the owning plugin is currently loaded.
+  // Pre-fix the scheduler treated every plugin as loaded and would fire
+  // managed rows even for stopped/uninstalled plugins.
+  scheduler.setIsPluginLoaded((name) => pluginManager!.hasPlugin(name));
+
+  // Reconcile managed automations BEFORE startAll(). Plugins register their
+  // managed scripts in register(); the host stamps them onto the automations
+  // table here so by the time start() (and the scheduler tick that follows
+  // it) reads the table, every declared script has a row and any
+  // previously-declared row that's gone has been orphaned or deleted.
+  for (const { pluginName, defs } of pluginManager.getAllManagedAutomations()) {
+    try {
+      reconcileManagedAutomations(db, pluginName, defs);
+    } catch (err: any) {
+      // Reconcile failure for one plugin must not block the others or the
+      // boot — surface it loudly and continue. The scheduler's plugin-loaded
+      // guard (next commit) protects us against orphaned runs.
+      error(`Failed to reconcile managed automations for plugin "${pluginName}": ${err?.message ?? err}`);
+    }
+  }
+
+  // Uninstall sweep: any managed_by value in the automations table that
+  // doesn't correspond to a currently-loaded plugin means the plugin was
+  // uninstalled since last boot. Reconcile with an empty def list, which
+  // routes each row through the orphan-or-delete branch in the state
+  // machine (preserving operator overrides as ordinary disabled
+  // automations, deleting clean rows). The scheduler's plugin-loaded
+  // guard would also skip these at runtime, but we don't want them to
+  // hang around indefinitely as zombie rows.
+  //
+  // IMPORTANT: compare against INSTALLED plugins (pluginStateManager.getAll),
+  // not currently-LOADED plugins (pluginManager.getPluginNames). A
+  // temporarily-disabled plugin is still installed and its managed rows
+  // must survive the boot — otherwise toggling a plugin off & on would
+  // delete every non-overridden managed automation it owns. Only truly
+  // absent (uninstalled) plugins should be swept here.
+  const installedPluginNames = new Set(pluginStateManager.getAll().map((p) => p.name));
+  const managedByValues = db.selectDistinct({ name: schema.automations.managedBy })
+    .from(schema.automations)
+    .where(isNotNull(schema.automations.managedBy))
+    .all()
+    .map((r) => r.name)
+    .filter((n): n is string => n != null);
+  for (const pluginName of managedByValues) {
+    if (installedPluginNames.has(pluginName)) continue;
+    try {
+      reconcileManagedAutomations(db, pluginName, []);
+    } catch (err: any) {
+      error(`Failed to clean up orphaned managed automations for missing plugin "${pluginName}": ${err?.message ?? err}`);
+    }
+  }
 
   // Run all migrated plugins' start() in topological order. Required-peer
   // failures (and timeouts) abort boot.

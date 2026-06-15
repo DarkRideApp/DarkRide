@@ -50,7 +50,7 @@ describe('AutomationRunner', () => {
     vi.restoreAllMocks();
   });
 
-  function createAutomation(code: string, opts?: { isRule?: boolean; isCaptureRule?: boolean; priority?: number; timeoutMs?: number; requiresHttpsCapture?: boolean; enabled?: boolean; name?: string }) {
+  function createAutomation(code: string, opts?: { isRule?: boolean; isCaptureRule?: boolean; priority?: number; timeoutMs?: number; requiresHttpsCapture?: boolean; enabled?: boolean; name?: string; managedBy?: string; managedKey?: string }) {
     const now = new Date();
     db.insert(schema.automations).values({
       name: opts?.name ?? 'Test Automation',
@@ -62,6 +62,8 @@ describe('AutomationRunner', () => {
       timeoutMs: opts?.timeoutMs ?? 300000,
       requiresHttpsCapture: opts?.requiresHttpsCapture ?? false,
       enabled: opts?.enabled ?? true,
+      managedBy: opts?.managedBy ?? null,
+      managedKey: opts?.managedKey ?? null,
       createdAt: now,
       updatedAt: now,
     }).run();
@@ -136,6 +138,71 @@ describe('AutomationRunner', () => {
       await expect(
         runner.runAutomation(9999, 'test-device', 'manual'),
       ).rejects.toThrow('Automation 9999 not found');
+    });
+
+    it('denormalises sessions.managed = true for a managed automation row', async () => {
+      const auto = createAutomation(
+        `export default async function(d: any) { }`,
+        { managedBy: 'plugin-x', managedKey: 'poller' },
+      );
+      const result = await runner.runAutomation(auto.id, 'test-device', 'schedule');
+      const session = db.select().from(schema.automationSessions)
+        .where(eq(schema.automationSessions.id, result.sessionId)).all()[0];
+      expect(session.managed).toBe(true);
+    });
+
+    it('denormalises sessions.managed = false for an ordinary automation row', async () => {
+      const auto = createAutomation(`export default async function(d: any) { }`);
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+      const session = db.select().from(schema.automationSessions)
+        .where(eq(schema.automationSessions.id, result.sessionId)).all()[0];
+      expect(session.managed).toBe(false);
+    });
+
+    it('suppresses automation:failure notification for a managed run that did not opt in', async () => {
+      const emit = vi.fn();
+      runner.setNotificationService({ emit } as any);
+      const auto = createAutomation(
+        `export default async function(d: any) { throw new Error("boom"); }`,
+        { managedBy: 'plugin-x', managedKey: 'poller' },
+      );
+      await runner.runAutomation(auto.id, 'test-device', 'manual');
+      const failureEmits = emit.mock.calls.filter(
+        ([ev]) => ev?.type === 'automation:failure',
+      );
+      expect(failureEmits).toHaveLength(0);
+    });
+
+    it('still fires automation:failure for a managed run that DID opt in', async () => {
+      const emit = vi.fn();
+      runner.setNotificationService({ emit } as any);
+      const auto = createAutomation(
+        `export default async function(d: any) { throw new Error("boom"); }`,
+        { managedBy: 'plugin-x', managedKey: 'poller' },
+      );
+      // Flip the opt-in column directly (mirrors what reconcile would do
+      // when the def's emitFailureNotification is true).
+      db.update(schema.automations).set({ emitFailureNotification: true })
+        .where(eq(schema.automations.id, auto.id)).run();
+
+      await runner.runAutomation(auto.id, 'test-device', 'manual');
+      const failureEmits = emit.mock.calls.filter(
+        ([ev]) => ev?.type === 'automation:failure',
+      );
+      expect(failureEmits).toHaveLength(1);
+    });
+
+    it('always fires automation:failure for ORDINARY (non-managed) runs (regression)', async () => {
+      const emit = vi.fn();
+      runner.setNotificationService({ emit } as any);
+      const auto = createAutomation(
+        `export default async function(d: any) { throw new Error("boom"); }`,
+      );
+      await runner.runAutomation(auto.id, 'test-device', 'manual');
+      const failureEmits = emit.mock.calls.filter(
+        ([ev]) => ev?.type === 'automation:failure',
+      );
+      expect(failureEmits).toHaveLength(1);
     });
 
     it('handles timeout', async () => {

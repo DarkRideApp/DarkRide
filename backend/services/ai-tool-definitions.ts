@@ -1,4 +1,4 @@
-import { eq, like, desc, sql } from 'drizzle-orm';
+import { eq, like, desc, sql, inArray } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -13,6 +13,7 @@ import type { DeviceManager } from './device-manager';
 import type { AutomationRunner } from './automation-runner';
 import type { TriggerType } from '../../shared/types/api';
 import type { AutomationScheduler } from './automation-scheduler';
+import { validateScheduleConfig } from './schedule-validator';
 import type { AutomationCompiler } from './automation-compiler';
 import type { CaptureSessionManager } from './capture-session-manager';
 import type { PluginStateManager } from './plugin-state-manager';
@@ -37,6 +38,13 @@ export interface AiToolServices {
   captureManager?: CaptureSessionManager;
   pluginStateManager?: PluginStateManager;
   systemStateService?: SystemStateService;
+  /**
+   * Optional — only the `trigger_apk_analysis` tool needs it; left absent
+   * in unit tests that don't exercise it. Typed structurally on the
+   * `enqueue` method so the test seam can pass a minimal fake instead of
+   * a full ApkAnalyzerService.
+   */
+  apkAnalyzer?: { enqueue: (versionId: number) => Promise<number> };
 }
 
 /**
@@ -135,6 +143,7 @@ export function registerAllTools(
     captureManager,
     pluginStateManager,
     systemStateService,
+    apkAnalyzer,
   } = services;
   // ── Session Timeline tools ──────────────────────────────────────
 
@@ -647,21 +656,8 @@ export function registerAllTools(
           scheduler.removeSchedule(params.id);
           scheduleResult = 'cleared';
         } else {
-          // Minimal inline validation — mirrors validateScheduleConfig in
-          // api/automations.ts. Kept here so the tool doesn't depend on
-          // an internal API helper.
-          const s = params.schedule;
-          let valid = false;
-          if (s && typeof s === 'object') {
-            if (s.type === 'cron' && Array.isArray(s.expressions) && s.expressions.length > 0) {
-              valid = s.expressions.every((e: any) => typeof e === 'string' && e.trim().split(/\s+/).length === 5);
-            } else if (s.type === 'interval' && typeof s.intervalMs === 'number' && s.intervalMs > 0) {
-              valid = true;
-            } else if (s.type === 'windowed_interval') {
-              valid = true; // deeper validation lives in the route; accept here
-            }
-          }
-          if (!valid) {
+          const validation = validateScheduleConfig(params.schedule);
+          if (!validation.valid) {
             scheduleResult = 'invalid';
           } else {
             scheduler.setSchedule(params.id, params.schedule);
@@ -1113,6 +1109,161 @@ export function registerAllTools(
     }
     return zlib.inflateSync(buf);
   }
+
+  // ── App discovery tools ──────────────────────────────────────────
+  // Without these, the agent could only operate on a versionId handed in
+  // via the system prompt — it had no way to discover "Walt Disney World"
+  // → packageName → versionId on its own. These close that loop:
+  //   list_tracked_apps   — find an app by name / list everything
+  //   get_app_versions    — pick the versionId you need
+  //   trigger_apk_analysis — kick off analysis if the version isn't analysed yet
+
+  registry.register({
+    name: 'list_tracked_apps',
+    description:
+      'List every tracked Android app the host knows about. Each entry includes the trackedAppId, packageName, appName, versionCount, and the latest version (id + code + name). Optional `query` filters apps where the packageName or appName contains it (case-insensitive). Use this first when asked about an app by name to discover the versionId that other apk tools need.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Optional case-insensitive substring filter on packageName or appName' },
+      },
+    },
+    context: ['dashboard', 'apk-analysis'],
+    requiredScope: 'core.apk:read',
+    async execute(params: { query?: string }) {
+      const apps = db.select().from(schema.trackedApps).all();
+      const q = params.query?.toLowerCase().trim();
+      // Filter apps FIRST, then scope the apk_versions read to just the
+      // matching ids — without the query path scanning the whole
+      // versions table is wasted work when the agent only cares about a
+      // single match (e.g. "disney").
+      const filtered = q
+        ? apps.filter(a =>
+            a.packageName.toLowerCase().includes(q)
+            || (a.appName?.toLowerCase().includes(q) ?? false))
+        : apps;
+      if (filtered.length === 0) return [];
+      const filteredIds = filtered.map(a => a.id);
+      const versions = db.select().from(schema.apkVersions)
+        .where(inArray(schema.apkVersions.trackedAppId, filteredIds))
+        .all();
+      const versionsByApp = new Map<number, typeof versions>();
+      for (const v of versions) {
+        const list = versionsByApp.get(v.trackedAppId) ?? [];
+        list.push(v);
+        versionsByApp.set(v.trackedAppId, list);
+      }
+      return filtered.map(a => {
+        const list = versionsByApp.get(a.id) ?? [];
+        // Pick the latest by versionCode — the host treats that as the
+        // canonical "newest" elsewhere (backend/api/apps.ts:788).
+        const latest = list.length > 0
+          ? list.reduce((acc, v) => (v.versionCode > acc.versionCode ? v : acc))
+          : null;
+        return {
+          trackedAppId: a.id,
+          packageName: a.packageName,
+          appName: a.appName,
+          versionCount: list.length,
+          latestVersionId: latest?.id ?? null,
+          latestVersionCode: latest?.versionCode ?? null,
+          latestVersionName: latest?.versionName ?? null,
+        };
+      });
+    },
+  });
+
+  registry.register({
+    name: 'get_app_versions',
+    description:
+      'List every APK version stored for a tracked app, newest versionCode first. Identify the app by either `trackedAppId` (from list_tracked_apps) or `packageName` (e.g. "com.disney.wdw"). Each version includes versionId (use it as the Context ID for the other apk tools), versionCode, versionName, source, downloadedAt, and analysisStatus ("completed" / "running" / "pending" / "failed" / null when no analysis has been triggered).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        trackedAppId: { type: 'number', description: 'Numeric ID from list_tracked_apps' },
+        packageName: { type: 'string', description: 'Reverse-DNS package name (e.g. com.disney.wdw)' },
+      },
+    },
+    context: ['dashboard', 'apk-analysis'],
+    requiredScope: 'core.apk:read',
+    async execute(params: { trackedAppId?: number; packageName?: string }) {
+      const hasId = params.trackedAppId != null;
+      const hasPkg = !!params.packageName;
+      if (!hasId && !hasPkg) {
+        return { error: 'Provide either trackedAppId or packageName' };
+      }
+      // Reject "both" rather than silently picking trackedAppId — an LLM
+      // can easily over-specify, and we don't want the lookup to resolve
+      // to a different app than the operator/agent thought it was asking
+      // about. Force them to pick one.
+      if (hasId && hasPkg) {
+        return { error: 'Provide either trackedAppId or packageName, not both' };
+      }
+      const app = hasId
+        ? db.select().from(schema.trackedApps).where(eq(schema.trackedApps.id, params.trackedAppId!)).all()[0]
+        : db.select().from(schema.trackedApps).where(eq(schema.trackedApps.packageName, params.packageName!)).all()[0];
+      if (!app) return { error: 'Tracked app not found' };
+      const versions = db.select().from(schema.apkVersions)
+        .where(eq(schema.apkVersions.trackedAppId, app.id))
+        .all()
+        .sort((a, b) => b.versionCode - a.versionCode);
+      // Latest analysis job per version — scope to THIS app's versionIds
+      // at the SQL layer (the analysis_jobs table grows unboundedly with
+      // each rerun, and an agent will poll this tool while watching an
+      // analysis progress). Sorted DESC by id so the first row seen per
+      // apkVersionId is the freshest, matching backend/api/apps.ts:836.
+      const versionIds = versions.map(v => v.id);
+      const jobs = versionIds.length === 0
+        ? []
+        : db.select().from(schema.analysisJobs)
+            .where(inArray(schema.analysisJobs.apkVersionId, versionIds))
+            .orderBy(desc(schema.analysisJobs.id))
+            .all();
+      const latestJobByVersion = new Map<number, typeof jobs[number]>();
+      for (const j of jobs) {
+        if (!latestJobByVersion.has(j.apkVersionId)) latestJobByVersion.set(j.apkVersionId, j);
+      }
+      return {
+        trackedAppId: app.id,
+        packageName: app.packageName,
+        appName: app.appName,
+        versions: versions.map(v => ({
+          versionId: v.id,
+          versionCode: v.versionCode,
+          versionName: v.versionName,
+          source: v.source,
+          downloadedAt: v.downloadedAt,
+          analysisStatus: latestJobByVersion.get(v.id)?.status ?? null,
+        })),
+      };
+    },
+  });
+
+  registry.register({
+    name: 'trigger_apk_analysis',
+    description:
+      'Queue an APK version for analysis (or re-analysis). Use after get_app_versions reports analysisStatus: null for the version you care about, or to force a fresh run. Returns the new jobId; re-run get_app_versions to watch analysisStatus transition pending → running → completed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        versionId: { type: 'number', description: 'apkVersions.id — typically obtained from get_app_versions' },
+      },
+      required: ['versionId'],
+    },
+    context: ['dashboard', 'apk-analysis'],
+    requiredScope: 'core.apk:manage',
+    requiresConfirmation: true,
+    allowUnattended: false,
+    async execute(params: { versionId: number }) {
+      const version = db.select().from(schema.apkVersions)
+        .where(eq(schema.apkVersions.id, params.versionId))
+        .all()[0];
+      if (!version) return { error: 'APK version not found' };
+      if (!apkAnalyzer) return { error: 'APK analyzer not wired into AI tools' };
+      const jobId = await apkAnalyzer.enqueue(params.versionId);
+      return { jobId, versionId: params.versionId };
+    },
+  });
 
   registry.register({
     name: 'get_apk_overview',

@@ -6,6 +6,7 @@ import type { PluginTool, PluginToolContext } from './tools';
 import type { PluginNavItem, PluginPageDef, PluginSetting, PluginCommand, UiSlotDefinition, UiContribution } from './ui';
 import type { PluginJob } from './jobs';
 import type { DeviceProviderContribution } from './device-providers';
+import type { ManagedAutomationDef } from './managed-automations';
 import type { PluginNotificationEvent, PluginNotifyEvent } from './notify';
 import type { HookBus } from './hooks';
 import type { NamespacedStorage } from './storage';
@@ -75,6 +76,23 @@ export interface PluginContext {
   jobs(jobs: PluginJob[]): void;
   /** Register one or more managed-device providers (emulator support). */
   deviceProviders(providers: DeviceProviderContribution[]): void;
+  /**
+   * Declare the automations this plugin owns. Each entry is reconciled
+   * against the `automations` table at plugin load (after migrations,
+   * before start()): inserted as a stamped managed row on first sight,
+   * silently adopted on subsequent loads, or — when the operator has
+   * forked the script — preserved with `current_default_code` refreshed
+   * for drift detection. See `ManagedAutomationDef` for field semantics
+   * and the seed-vs-tracked distinction.
+   *
+   * Managed runs are hidden from the operator's session-history feed by
+   * default (a "Show managed (N)" toggle surfaces them) and don't fire
+   * the standard `automation:failure` notification unless the
+   * declaration opts in. They otherwise reuse the existing automation
+   * engine verbatim — runner, scheduler, sessions, device binding, tool
+   * registry — keyed off the row's `managed_by` column.
+   */
+  managedAutomations(defs: ManagedAutomationDef[]): void;
   settingsDefs(defs: PluginSetting[]): void;
   commands(cmds: PluginCommand[]): void;
   notificationEvents(events: PluginNotificationEvent[]): void;

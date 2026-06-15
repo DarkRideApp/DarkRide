@@ -4,6 +4,8 @@ export * from './ai';
 export * from './tools';
 export * from './ui';
 export * from './jobs';
+export * from './managed-automations';
+export * from './schedule';
 export * from './notify';
 export * from './hooks';
 export * from './agent';

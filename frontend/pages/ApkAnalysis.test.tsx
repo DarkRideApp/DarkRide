@@ -20,6 +20,10 @@ vi.mock('../components/analysis/ReactNativeTab', () => ({
 }));
 
 const mockOverview = {
+  appName: null,
+  packageName: 'com.example.app',
+  versionName: '1.0.0',
+  versionCode: 100,
   manifest: {
     package: 'com.example.app',
     permissions: [
@@ -132,7 +136,7 @@ describe('ApkAnalysis', () => {
     renderApkAnalysis();
     await waitFor(() => {
       const overviewTab = screen.getByTestId('tab-overview');
-      expect(overviewTab).toHaveAttribute('data-active', 'true');
+      expect(overviewTab).toHaveAttribute('aria-selected', 'true');
     });
   });
 
@@ -140,15 +144,15 @@ describe('ApkAnalysis', () => {
     renderApkAnalysis();
     await waitFor(() => screen.getByTestId('tab-code'));
     fireEvent.click(screen.getByTestId('tab-code'));
-    expect(screen.getByTestId('tab-code')).toHaveAttribute('data-active', 'true');
-    expect(screen.getByTestId('tab-overview')).toHaveAttribute('data-active', 'false');
+    expect(screen.getByTestId('tab-code')).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByTestId('tab-overview')).toHaveAttribute('aria-selected', 'false');
   });
 
   describe('Overview tab content', () => {
     it('displays package name', async () => {
       renderApkAnalysis();
       await waitFor(() => {
-        // Package name appears in both the page header and the stat card
+        // Package name appears in the page header title (and possibly elsewhere)
         const matches = screen.getAllByText('com.example.app');
         expect(matches.length).toBeGreaterThanOrEqual(1);
       });
@@ -156,10 +160,11 @@ describe('ApkAnalysis', () => {
 
     it('displays SDK versions', async () => {
       renderApkAnalysis();
-      await waitFor(() => {
-        expect(screen.getByText('21')).toBeInTheDocument();
-        expect(screen.getByText('34')).toBeInTheDocument();
-      });
+      await waitFor(() => screen.getByTestId('tab-content-overview'));
+      const statCards = screen.getAllByTestId('stat-card');
+      const sdkText = statCards.map(c => c.textContent).join(' ');
+      expect(sdkText).toMatch('21');
+      expect(sdkText).toMatch('34');
     });
 
     it('displays file count and total size', async () => {
@@ -573,38 +578,36 @@ describe('ApkAnalysis', () => {
     });
   });
 
-  it('renders APK download button in page header', async () => {
+  it('renders APK download button in the More actions menu', async () => {
     renderApkAnalysis();
-    await waitFor(() => {
-      expect(screen.getByTestId('download-apk-btn')).toBeInTheDocument();
-    });
-    const btn = screen.getByTestId('download-apk-btn');
-    expect(btn).toHaveAttribute('href', '/v1/apps/download/42');
+    await waitFor(() => screen.getByRole('button', { name: 'More actions' }));
+    fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    await waitFor(() => expect(screen.getByTestId('menu-item-download')).toBeInTheDocument());
   });
 
   describe('re-analyze button', () => {
-    it('renders re-analyze button in page header', async () => {
+    it('renders re-analyze item in the More actions menu', async () => {
       renderApkAnalysis();
-      await waitFor(() => {
-        expect(screen.getByTestId('reanalyze-btn')).toBeInTheDocument();
-      });
-      expect(screen.getByTestId('reanalyze-btn')).toHaveTextContent('Re-analyze');
-      expect(screen.getByTestId('reanalyze-btn')).not.toBeDisabled();
+      await waitFor(() => screen.getByRole('button', { name: 'More actions' }));
+      fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+      await waitFor(() => expect(screen.getByTestId('menu-item-reanalyze')).toBeInTheDocument());
+      expect(screen.getByTestId('menu-item-reanalyze')).toHaveTextContent('Re-analyze');
+      expect(screen.getByTestId('menu-item-reanalyze')).not.toBeDisabled();
     });
 
     it('calls POST analyze endpoint on click', async () => {
       const mockWs = createMockWs();
       renderApkAnalysis(mockWs);
-      await waitFor(() => {
-        expect(screen.getByTestId('reanalyze-btn')).toBeInTheDocument();
-      });
+      await waitFor(() => screen.getByRole('button', { name: 'More actions' }));
+      fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+      await waitFor(() => screen.getByTestId('menu-item-reanalyze'));
       await act(async () => {
-        fireEvent.click(screen.getByTestId('reanalyze-btn'));
+        fireEvent.click(screen.getByTestId('menu-item-reanalyze'));
       });
       expect(mockWs.sendRestApi).toHaveBeenCalledWith('POST', '/v1/apps/analyze/42');
     });
 
-    it('shows Queued state after clicking', async () => {
+    it('shows reanalyze-strip status strip after clicking', async () => {
       const mockWs = createMockWs();
       // Make the POST hang so we can see the pending state
       mockWs.sendRestApi = vi.fn().mockImplementation((_method: string, path: string) => {
@@ -620,17 +623,16 @@ describe('ApkAnalysis', () => {
         return Promise.resolve({ type: 'restapi', id: '1', status: 200, body: { success: true, data: mockOverview } });
       });
       renderApkAnalysis(mockWs);
-      await waitFor(() => {
-        expect(screen.getByTestId('reanalyze-btn')).toBeInTheDocument();
-      });
+      await waitFor(() => screen.getByRole('button', { name: 'More actions' }));
+      fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+      await waitFor(() => screen.getByTestId('menu-item-reanalyze'));
       await act(async () => {
-        fireEvent.click(screen.getByTestId('reanalyze-btn'));
+        fireEvent.click(screen.getByTestId('menu-item-reanalyze'));
       });
-      expect(screen.getByTestId('reanalyze-btn')).toHaveTextContent('Queued...');
-      expect(screen.getByTestId('reanalyze-btn')).toBeDisabled();
+      expect(screen.getByTestId('reanalyze-strip')).toBeInTheDocument();
     });
 
-    it('shows stage name during analysis and refreshes on completion', async () => {
+    it('shows stage label in status strip during analysis and hides on completion', async () => {
       let analysisCallback: ((msg: any) => void) | null = null;
       const mockWs = createMockWs();
       mockWs.subscribe = vi.fn().mockImplementation((event: string, cb: any) => {
@@ -638,23 +640,20 @@ describe('ApkAnalysis', () => {
         return () => {};
       });
       renderApkAnalysis(mockWs);
-      await waitFor(() => {
-        expect(screen.getByTestId('reanalyze-btn')).toBeInTheDocument();
-      });
+      await waitFor(() => screen.getByTestId('apk-analysis-page'));
 
       // Simulate running stage update
       await act(async () => {
         analysisCallback?.({ apkVersionId: 42, status: 'running', stage: 'metadata' });
       });
-      expect(screen.getByTestId('reanalyze-btn')).toHaveTextContent('Metadata');
-      expect(screen.getByTestId('reanalyze-btn')).toBeDisabled();
+      expect(screen.getByTestId('reanalyze-strip')).toBeInTheDocument();
+      expect(screen.getByTestId('reanalyze-strip')).toHaveTextContent('Metadata');
 
       // Simulate completion
       await act(async () => {
         analysisCallback?.({ apkVersionId: 42, status: 'completed', stage: 'done' });
       });
-      expect(screen.getByTestId('reanalyze-btn')).toHaveTextContent('Re-analyze');
-      expect(screen.getByTestId('reanalyze-btn')).not.toBeDisabled();
+      expect(screen.queryByTestId('reanalyze-strip')).not.toBeInTheDocument();
     });
 
     it('ignores analysis updates for other versions', async () => {
@@ -665,16 +664,13 @@ describe('ApkAnalysis', () => {
         return () => {};
       });
       renderApkAnalysis(mockWs);
-      await waitFor(() => {
-        expect(screen.getByTestId('reanalyze-btn')).toBeInTheDocument();
-      });
+      await waitFor(() => screen.getByTestId('apk-analysis-page'));
 
-      // Update for a different version
+      // Update for a different version — no strip should appear
       await act(async () => {
         analysisCallback?.({ apkVersionId: 999, status: 'running', stage: 'scan' });
       });
-      expect(screen.getByTestId('reanalyze-btn')).toHaveTextContent('Re-analyze');
-      expect(screen.getByTestId('reanalyze-btn')).not.toBeDisabled();
+      expect(screen.queryByTestId('reanalyze-strip')).not.toBeInTheDocument();
     });
   });
 

@@ -32,7 +32,8 @@ import { LicensePage } from './pages/settings/LicensePage';
 import { Credentials } from './pages/Credentials';
 import { SessionHistory } from './pages/SessionHistory';
 import { ProxiedRequests } from './pages/ProxiedRequests';
-import { ApkBrowser } from './pages/ApkBrowser';
+import { AppLibrary } from './pages/AppLibrary';
+import { AppDetail } from './pages/AppDetail';
 import { ApkAnalysis } from './pages/ApkAnalysis';
 import { Frida } from './pages/Frida';
 import { CloudBrowser } from './pages/CloudBrowser';
@@ -269,7 +270,8 @@ function AuthenticatedApp() {
             <Route path="request-builder" element={<RequestBuilder />} />
             <Route path="traffic" element={<Traffic />} />
             <Route path="selector-debugger" element={<SelectorDebugger />} />
-            <Route path="apks" element={<ApkBrowser />} />
+            <Route path="apks" element={<AppLibrary />} />
+            <Route path="apps/:trackedAppId" element={<AppDetail />} />
             <Route path="apps/:trackedAppId/analysis/:versionId" element={<ApkAnalysis />} />
             <Route path="frida" element={<Frida />} />
             <Route path="marketplace" element={<PluginMarketplace />} />

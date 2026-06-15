@@ -538,7 +538,21 @@
 			"idx": 93,
 			"version": "7",
 			"when": 1779785033964,
-			"tag": "0093_device_instances",
+			"tag": "0093_managed_automations",
+			"breakpoints": true
+		},
+		{
+			"idx": 94,
+			"version": "7",
+			"when": 1779785033965,
+			"tag": "0094_managed_automation_default_schedule",
+			"breakpoints": true
+		},
+		{
+			"idx": 95,
+			"version": "7",
+			"when": 1779785033966,
+			"tag": "0095_device_instances",
 			"breakpoints": true
 		}
 	]
