@@ -36,7 +36,7 @@ import { registerAiChatApiEndpoints } from './api/ai-chat';
 import { registerAppEndpoints } from './api/apps';
 import { registerAppsUploadEndpoint } from './api/apps-upload';
 import { registerUtilsEndpoints } from './api/utils';
-import { dbSizeSnapshots, diskUsageSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, aiModels, aiProviders, capturedTraffic } from './db/schema';
+import { dbSizeSnapshots, diskUsageSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, deviceInstances, aiModels, aiProviders, capturedTraffic } from './db/schema';
 import * as schema from './db/schema';
 import { SavedTrafficStore } from './services/saved-traffic-store';
 import { registerSavedTrafficEndpoints } from './api/saved-traffic';
@@ -140,9 +140,10 @@ import { createProviderRegistry } from './services/providers';
 import { createAdbDeviceProvider } from './services/providers/adb-device';
 import { createIosDeviceProvider } from './services/providers/ios-device';
 import { createDockerAndroidProvider } from './services/providers/docker-android';
-import { createDockerClient, setActiveDockerClient } from './services/providers/docker-helpers';
+import { createDockerClient, setActiveDockerClient, getActiveDockerClient, spawnContainerHttpForwarder } from './services/providers/docker-helpers';
 import { createAvdProvider } from './services/providers/avd';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
+import { makeCaptureHandlers } from './services/capture-handlers';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
 import { registerDevicesProvidersEndpoints } from './api/devices-providers';
@@ -277,9 +278,11 @@ providerRegistry.register(createAdbDeviceProvider());
 deviceManager.setProviderRegistry(providerRegistry);
 
 const captureModeRegistry = createCaptureModeRegistry();
-// Placeholder — replaced by the real handlers in Task 6 (capture dispatch).
-captureModeRegistry.register('wireguard', async () => ({ tunnelActivated: false }));
 deviceManager.setCaptureModeRegistry(captureModeRegistry);
+// Real handlers are registered AFTER captureManager is constructed below —
+// makeCaptureHandlers needs captureManager.waitForTunnelReady, and
+// captureManager needs this registry. Registration happens before any capture
+// can start (the API router only handles requests after startup completes).
 
 const proxyRotator = new ProxyRotator(db);
 const bridgeManager = new PythonBridgeManager(db);
@@ -298,6 +301,23 @@ const scheduler = new AutomationScheduler(db, runner, deviceManager);
 const iosDeviceManager = new IosDeviceManager(db);
 const captureManager = new CaptureSessionManager(db, mitmproxyManager, deviceManager, runner, trafficHookRegistry);
 captureManager.setIosDeviceManager(iosDeviceManager);
+captureManager.setCaptureModeRegistry(captureModeRegistry);
+captureManager.setProviderRegistry(providerRegistry);
+
+// Register the three built-in capture-mode handlers. This must run after
+// captureManager exists (waitForTunnelReady dep) and before any capture starts.
+const captureHandlers = makeCaptureHandlers({
+  mitmproxyManager,
+  deviceManager,
+  spawnContainerHttpForwarder,
+  getActiveDockerClient,
+  lookupRuntimeId: (serial) => db.select({ runtimeId: deviceInstances.runtimeId })
+    .from(deviceInstances).where(eq(deviceInstances.serial, serial)).all()[0]?.runtimeId ?? undefined,
+  waitForTunnelReady: (serial) => captureManager.waitForTunnelReady(serial),
+});
+captureModeRegistry.register('wireguard', captureHandlers.wireguard);
+captureModeRegistry.register('emu-http-proxy', captureHandlers['emu-http-proxy']);
+captureModeRegistry.register('ios-bridge', captureHandlers['ios-bridge']);
 runner.setNotificationService(notificationService);
 runner.setIosDeviceManager(iosDeviceManager);
 
