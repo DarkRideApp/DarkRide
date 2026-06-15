@@ -46,6 +46,10 @@ describe('DeviceProvider type surface', () => {
 
   it('DeviceProviderInstance has state union restricted to the documented values', () => {
     type State = DeviceProviderInstance['state'];
+    // NOTE: this is deliberately NARROWER than the DB's DeviceInstanceState,
+    // which also has 'pulling'. 'pulling' is a host-only row state (we created
+    // a row but the image isn't pulled yet); a provider never *reports* a
+    // pulling instance via listInstances, so it's excluded here on purpose.
     expectTypeOf<State>().toEqualTypeOf<'created' | 'starting' | 'running' | 'stopping' | 'stopped' | 'error'>();
   });
 });

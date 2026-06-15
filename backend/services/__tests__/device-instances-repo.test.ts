@@ -28,6 +28,23 @@ describe('DeviceInstancesRepo', () => {
   let repo: DeviceInstancesRepo;
   beforeEach(() => { repo = new DeviceInstancesRepo(makeDb()); });
 
+  describe('findRuntimeIdBySerial', () => {
+    it('prefers the running instance over a stale row sharing the serial', () => {
+      // Stale adb-device row (lower rowid, no runtime id) inserted first; the
+      // live docker-android row second. Running-first must win, else a naive
+      // .all()[0] would return the stale row's empty runtimeId.
+      repo.insert({ providerId: 'adb-device', runtimeId: '', serial: 'localhost:32770', state: 'stopped', spawnedByDarkride: false });
+      repo.insert({ providerId: 'docker-android', runtimeId: 'container-x', serial: 'localhost:32770', state: 'running', spawnedByDarkride: true });
+      expect(repo.findRuntimeIdBySerial('localhost:32770')).toBe('container-x');
+    });
+
+    it('returns undefined for an unknown serial and for an empty runtime id', () => {
+      expect(repo.findRuntimeIdBySerial('nope:1')).toBeUndefined();
+      repo.insert({ providerId: 'adb-device', runtimeId: '', serial: 'localhost:5', state: 'stopped', spawnedByDarkride: false });
+      expect(repo.findRuntimeIdBySerial('localhost:5')).toBeUndefined();
+    });
+  });
+
   it('insert + getById round-trip', () => {
     const created = repo.insert({
       providerId: 'docker-android',

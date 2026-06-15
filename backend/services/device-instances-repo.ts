@@ -132,6 +132,20 @@ export class DeviceInstancesRepo {
       .all() as DeviceInstanceRow[];
   }
 
+  /**
+   * The runtime id (container id / AVD name) of the live instance for a serial.
+   * Prefers a running row, then the most-recently-updated, so a stale
+   * adb-device row sharing the serial (runtimeId='') can't shadow the live
+   * emulator. Returns undefined when there's no row or no usable runtime id.
+   * Used by the emu-http-proxy capture handler to exec the in-container
+   * forwarder into the correct container.
+   */
+  findRuntimeIdBySerial(serial: string): string | undefined {
+    const rows = this.listBySerial(serial); // already desc(lastStateAt)
+    const chosen = rows.find((r) => r.state === 'running') ?? rows[0];
+    return chosen?.runtimeId || undefined;
+  }
+
   getById(id: number): DeviceInstanceRow | undefined {
     return this.db.select().from(deviceInstances).where(eq(deviceInstances.id, id)).all()[0] as DeviceInstanceRow | undefined;
   }

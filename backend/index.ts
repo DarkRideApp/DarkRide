@@ -314,8 +314,9 @@ const captureHandlers = makeCaptureHandlers({
   deviceManager,
   spawnContainerHttpForwarder,
   getActiveDockerClient,
-  lookupRuntimeId: (serial) => db.select({ runtimeId: deviceInstances.runtimeId })
-    .from(deviceInstances).where(eq(deviceInstances.serial, serial)).all()[0]?.runtimeId ?? undefined,
+  // Running-first + recency selection so a stale adb-device row sharing the
+  // serial can't shadow the live emulator (mirrors resolveCaptureMode's H3 fix).
+  lookupRuntimeId: (serial) => deviceInstancesRepo?.findRuntimeIdBySerial(serial),
   waitForTunnelReady: (serial) => captureManager.waitForTunnelReady(serial),
 });
 captureModeRegistry.register('wireguard', captureHandlers.wireguard);
