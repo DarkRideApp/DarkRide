@@ -160,7 +160,7 @@ describe('CaptureSessionManager — emu-http-proxy (docker-android)', () => {
         providerId: 'docker-android',
         runtimeId: RUNTIME_ID,
         serial: DEVICE,
-        state: 'ready',
+        state: 'running',
         spawnedByDarkride: true,
         createdAt: new Date(),
         lastStateAt: new Date(),
@@ -216,7 +216,7 @@ describe('CaptureSessionManager — emu-http-proxy (docker-android)', () => {
     // (then result.httpProxy would be undefined and this test would fail).
     db.delete(schema.deviceInstances).run();
     db.insert(schema.deviceInstances).values({
-      providerId: 'adb-device', runtimeId: '', serial: DEVICE, state: 'offline',
+      providerId: 'adb-device', runtimeId: '', serial: DEVICE, state: 'stopped',
       spawnedByDarkride: false, createdAt: new Date(), lastStateAt: new Date(2026, 5, 15, 10, 0, 0),
     }).run();
     db.insert(schema.deviceInstances).values({

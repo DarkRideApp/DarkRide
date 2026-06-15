@@ -1,6 +1,5 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server as HttpServer } from 'http';
-import { URL } from 'url';
 import { handleWebSocketRestApi } from '../api/api-service';
 import { getWebsocketHandler, registerWebsocketEndpoint } from './handlers';
 import { createLoggers } from '../logs';

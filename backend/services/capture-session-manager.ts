@@ -195,7 +195,10 @@ export class CaptureSessionManager {
       // Java's Proxy() rather than rely on `settings put global http_proxy`,
       // which HttpURLConnection ignores in practice.
       const mode = this.resolveCaptureMode(deviceId, platform);
-      const result = await this.captureModeRegistry!.dispatch({
+      if (!this.captureModeRegistry) {
+        throw new Error('Capture cannot start: CaptureModeRegistry not wired (setCaptureModeRegistry was never called)');
+      }
+      const result = await this.captureModeRegistry.dispatch({
         deviceId,
         sessionId,
         platform,
