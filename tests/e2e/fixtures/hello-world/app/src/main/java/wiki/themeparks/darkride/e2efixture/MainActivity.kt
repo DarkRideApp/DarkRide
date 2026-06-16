@@ -12,7 +12,7 @@ import kotlin.concurrent.thread
 
 /**
  * E2E fixture for DarkRide emulator-capture testing.
- * On create, issues a single HTTPS GET to https://e2e.example.test/ping.
+ * On create, issues a single HTTPS GET to https://example.com/?darkride-e2e=ping.
  * The DarkRide E2E test (tests/e2e/emulator-capture.test.ts) asserts the
  * captured request appears in the traffic store with the expected hostname.
  *

@@ -5,7 +5,7 @@ Minimal Android app used by the E2E emulator-capture test
 
 ## What it does
 
-On launch, fires a single HTTPS GET to `https://e2e.example.test/ping`.
+On launch, fires a single HTTPS GET to `https://example.com/?darkride-e2e=ping`.
 The DarkRide E2E test asserts the captured request appears in mitmproxy's
 traffic store with the expected hostname + path.
 

@@ -31,7 +31,10 @@ export const devices = sqliteTable('devices', {
   bootloaderLocked: integer('bootloader_locked', { mode: 'boolean' }),
   // FK to device_instances row that spawned this device (managed emulators).
   // Null for unmanaged / physical devices that connect directly via ADB.
-  instanceId: integer('instance_id'),
+  // Declared to match migration 0095's `REFERENCES device_instances(id)` (no
+  // ON DELETE — defaults to NO ACTION). Forward ref via callback since
+  // deviceInstances is defined below.
+  instanceId: integer('instance_id').references(() => deviceInstances.id),
 });
 
 /**

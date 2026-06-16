@@ -280,14 +280,16 @@ export class MitmproxyManager {
 
   /**
    * Start a mitmdump capture in regular HTTP forward-proxy mode (no
-   * WireGuard tunnel). Used by docker-android emulators, where the
-   * device is reachable via `adb reverse` rather than the WireGuard
-   * routing path used by physical devices.
+   * WireGuard tunnel). Used by docker-android emulators (the emu-http-proxy
+   * capture mode) instead of the WireGuard routing physical devices use.
    *
-   * Picks a free localhost port for mitmproxy to listen on; the caller
-   * is responsible for wiring the device to point at it (e.g. via
-   * `adb shell settings put global http_proxy 127.0.0.1:<port>` paired
-   * with `adb reverse tcp:<port> tcp:<port>`).
+   * Picks a free port and binds mitmdump to 0.0.0.0 (NOT loopback): a
+   * docker-android emulator's QEMU NAT only reaches the host via the
+   * docker-bridge gateway (typically 172.17.0.1), not 127.0.0.1. The caller
+   * (CaptureSessionManager.startCapture) then spawns an in-container TCP
+   * forwarder and points the emulator at 10.0.2.2:<port>, which relays to the
+   * gateway and on to mitmproxy. `adb reverse` only works for the adb
+   * transport itself, not arbitrary forward-proxy ports.
    *
    * Shares the same `processes` map as `startCapture` so `stopCapture`
    * and `isCapturing` work uniformly across modes.
@@ -331,7 +333,7 @@ export class MitmproxyManager {
     if (options?.interceptHooks) mitmdumpArgs.push('--set', 'intercept_hooks=true');
 
     const mitmdumpBin = resolveVenvBin('mitmdump');
-    log(`Starting mitmdump (http-proxy mode) for ${deviceId} on 127.0.0.1:${port} (${mitmdumpBin})`);
+    log(`Starting mitmdump (http-proxy mode) for ${deviceId} on 0.0.0.0:${port} (${mitmdumpBin})`);
     const child = spawn(mitmdumpBin, mitmdumpArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
