@@ -89,10 +89,10 @@ describe('docker-android provider', () => {
     })).rejects.toThrow(/hardware virtualization/i);
   });
 
-  it('declares videoTransport: webrtc (device-only emulator gRPC stream)', async () => {
+  it('declares videoTransport: scrcpy (smooth H264 over adb, same as physical devices)', async () => {
     const d = makeDockerMock();
     const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
-    expect(p.videoTransport).toBe('webrtc');
+    expect(p.videoTransport).toBe('scrcpy');
   });
 
   it('enables the emulator gRPC (unauthenticated) and publishes it to host loopback', async () => {

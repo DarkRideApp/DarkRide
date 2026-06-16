@@ -262,7 +262,14 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   return {
     id: 'docker-android',
     displayName: 'Docker Android',
-    videoTransport: 'webrtc',
+    // scrcpy (H264 over adb), the same smooth path physical devices use. The
+    // emulator is just an adb device (serial localhost:<hostport>) and the
+    // scrcpy-server is pushed during setup. WebRTC was the prior default but
+    // its media can't reliably traverse Docker NAT (TURN-through-Docker-Desktop
+    // is fragile), so it degraded to a laggy PNG screenshot stream. The WebRTC
+    // path (getGrpcEndpoint + the grpc-web bridge) is currently unreached and
+    // slated for removal once scrcpy-on-emulator is confirmed in the field.
+    videoTransport: 'scrcpy',
 
     async isAvailable(): Promise<ProviderAvailability> {
       const r = await detectDockerDaemon(d);
