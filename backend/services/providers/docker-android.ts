@@ -262,14 +262,15 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   return {
     id: 'docker-android',
     displayName: 'Docker Android',
-    // scrcpy (H264 over adb), the same smooth path physical devices use. The
-    // emulator is just an adb device (serial localhost:<hostport>) and the
-    // scrcpy-server is pushed during setup. WebRTC was the prior default but
-    // its media can't reliably traverse Docker NAT (TURN-through-Docker-Desktop
-    // is fragile), so it degraded to a laggy PNG screenshot stream. The WebRTC
-    // path (getGrpcEndpoint + the grpc-web bridge) is currently unreached and
-    // slated for removal once scrcpy-on-emulator is confirmed in the field.
-    videoTransport: 'scrcpy',
+    // WebRTC (the emulator's native gRPC RTC stream). scrcpy is NOT usable
+    // here: it requires a MediaCodec H264 hardware encoder, and the budtmo
+    // emulator runs on a software GPU (SwiftShader) with no such encoder —
+    // scrcpy-server starts, sends 0 bytes, and dies (verified 2026-06-16). So
+    // emulators must use WebRTC. Its real H264 media needs a reachable ICE
+    // path (TURN relay) to cross Docker NAT; when that fails the client
+    // degrades to a laggy PNG screenshot stream. Making the TURN media path
+    // work is the open item for smooth emulator video.
+    videoTransport: 'webrtc',
 
     async isAvailable(): Promise<ProviderAvailability> {
       const r = await detectDockerDaemon(d);
