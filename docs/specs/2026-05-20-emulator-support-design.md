@@ -452,3 +452,11 @@ Two things shipped differently from the original plan above. Recording them here
 - **No custom Docker image.** The implementation pulls `budtmo/docker-android:emulator_<N>.0` directly from Docker Hub. The planned `ghcr.io/darkrideapp/docker-android:<ver>` image (with pre-baked wg-go / Frida) was dropped: with `emu-http-proxy` there's no in-container WireGuard to bake in, so a custom image bought nothing over tracking budtmo directly.
 
 Capture is dispatched through `CaptureModeRegistry`, which `CaptureSessionManager.resolveCaptureMode` selects per device from its provider's `getNetworkConfig(serial).mode`. Registered handlers: `wireguard`, `emu-http-proxy`, `ios-bridge` (see `backend/services/capture-handlers.ts`).
+
+## Known limitation — emulator video is not yet smooth (2026-06-17)
+
+docker-android emulator video uses `videoTransport: 'webrtc'` (the emulator's native gRPC RTC stream), rendered by `frontend/lib/video/EmulatorVideo.tsx`. For real H264 media to reach the browser it must cross Docker's NAT, which needs a TURN relay. The emulator-side wiring exists (`-turncfg` points it at `host.docker.internal:3478`), but **the coturn server half was never implemented** — DarkRide does not start coturn or generate `turncfg.sh`. So the WebRTC media channel can't connect; `EmulatorVideo` times out after 9s and degrades to a **PNG screenshot stream** over the grpc-web bridge — functional but laggy.
+
+scrcpy is NOT an alternative here: it needs a MediaCodec H264 hardware encoder, and the budtmo emulator runs on a software GPU (SwiftShader) with none — scrcpy-server starts, sends 0 bytes, and dies (verified 2026-06-16).
+
+**Follow-up (smooth emulator video):** implement the coturn TURN server — launch it reachable from both the browser and the emulator container, generate `turncfg.sh` with matching credentials, and wire the browser's iceServers. Tracked separately; physical-device video (scrcpy) and capture are unaffected.
