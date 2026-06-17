@@ -2,6 +2,24 @@ import { describe, it, expect, vi } from 'vitest';
 import { createDockerAndroidProvider } from '../docker-android';
 import type { DockerLike } from '../docker-helpers';
 
+/**
+ * Build the provider with the TURN relay stubbed off by default. The real
+ * coturn setup shells out to Docker + the filesystem (and reads the host LAN
+ * IP), none of which belong in a unit test. Tests that specifically exercise
+ * the TURN path pass their own `coturn` override. By default we let coturn
+ * write the turncfg so -turncfg appears (matching production), but use a no-op
+ * `ensure` so no extra createContainer call lands on the mock.
+ */
+function makeProvider(d: DockerLike, opts: Parameters<typeof createDockerAndroidProvider>[1] = {}) {
+  return createDockerAndroidProvider(d, {
+    coturn: {
+      ensure: vi.fn().mockResolvedValue(undefined),
+      writeTurncfg: (_lanIp, _creds, hostPath) => hostPath,
+    },
+    ...opts,
+  });
+}
+
 function makeDockerMock(overrides: Partial<DockerLike> & { getImage?: any } = {}): DockerLike {
   return {
     ping: vi.fn().mockResolvedValue('OK'),
@@ -33,13 +51,13 @@ function makeDockerMock(overrides: Partial<DockerLike> & { getImage?: any } = {}
 
 describe('docker-android provider', () => {
   it('isAvailable returns true when daemon is up', async () => {
-    const p = createDockerAndroidProvider(makeDockerMock());
+    const p = makeProvider(makeDockerMock());
     expect((await p.isAvailable()).available).toBe(true);
   });
 
   it('createInstance creates a labelled container with mapped adb port', async () => {
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d);
+    const p = makeProvider(d);
     const inst = await p.createInstance!({
       displayName: 'test-emu',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
@@ -59,7 +77,7 @@ describe('docker-android provider', () => {
     // resulting container spawn omitted Devices → budtmo fell back to
     // software emulation and the container exited 137 within seconds.
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     await p.createInstance!({
       displayName: 'kvm-test',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
@@ -82,7 +100,7 @@ describe('docker-android provider', () => {
         new Error('error gathering device information while adding custom device "/dev/kvm": no such file or directory'),
       ),
     });
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     await expect(p.createInstance!({
       displayName: 'kvm-missing',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
@@ -91,7 +109,7 @@ describe('docker-android provider', () => {
 
   it('declares videoTransport: webrtc (scrcpy needs an H264 encoder the software-GPU emulator lacks)', async () => {
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     expect(p.videoTransport).toBe('webrtc');
   });
 
@@ -101,7 +119,7 @@ describe('docker-android provider', () => {
     // specific) and published to host 127.0.0.1 only (loopback; grpc-web bridge
     // is the sole reader).
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     await p.createInstance!({
       displayName: 'grpc-port',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
@@ -122,7 +140,7 @@ describe('docker-android provider', () => {
     // 127.0.0.1 (same as the gRPC port). The DarkRide backend is the sole adb
     // client and runs on the same host.
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     await p.createInstance!({
       displayName: 'adb-loopback',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
@@ -131,23 +149,56 @@ describe('docker-android provider', () => {
     expect(call.HostConfig.PortBindings['5555/tcp']).toEqual([{ HostIp: '127.0.0.1', HostPort: '0' }]);
   });
 
-  it('mounts the TURN-config script + adds -turncfg when the script exists', async () => {
+  it('always launches coturn + mounts the turncfg script and adds -turncfg', async () => {
     // WebRTC media needs a TURN relay on Docker NAT; the emulator reads it from
-    // a mounted script via -turncfg (a single space-free token).
+    // a mounted script via -turncfg (a single space-free token). The coturn
+    // launch + turncfg write are injected here so the test stays Docker-free
+    // and deterministic — the real impls live in coturn-manager.
     const d = makeDockerMock();
-    // Use a path known to exist (this test file) to satisfy existsSync.
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false, turnCfgHostPath: __filename });
+    const ensure = vi.fn().mockResolvedValue(undefined);
+    const writeTurncfg = vi.fn().mockReturnValue('/tmp/turncfg.sh');
+    const p = makeProvider(d, {
+      hasDevDri: () => false, hasNvidia: async () => false,
+      turnCfgHostPath: '/tmp/turncfg.sh',
+      coturn: { ensure, writeTurncfg },
+    });
     await p.createInstance!({ displayName: 'turn', config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 } });
+    expect(ensure).toHaveBeenCalledTimes(1);
+    expect(writeTurncfg).toHaveBeenCalledWith(expect.any(String), expect.any(Object), '/tmp/turncfg.sh');
     const call = (d.createContainer as any).mock.calls[0][0];
     const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
     expect(addArgs).toContain('-turncfg /opt/turncfg.sh');
-    expect(call.HostConfig.Binds).toEqual([`${__filename}:/opt/turncfg.sh:ro`]);
+    expect(call.HostConfig.Binds).toEqual(['/tmp/turncfg.sh:/opt/turncfg.sh:ro']);
   });
 
-  it('skips -turncfg (and Binds) when no TURN-config script is present', async () => {
+  it('skips -turncfg (and Binds) when turncfg generation returns null', async () => {
+    // writeTurncfg returning null is the graceful-degradation signal: coturn
+    // unavailable, fall back to png. No -turncfg, no Binds.
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false, turnCfgHostPath: '/no/such/turncfg.sh' });
+    const p = makeProvider(d, {
+      hasDevDri: () => false, hasNvidia: async () => false,
+      coturn: { ensure: vi.fn().mockResolvedValue(undefined), writeTurncfg: vi.fn().mockReturnValue(null) },
+    });
     await p.createInstance!({ displayName: 'noturn', config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 } });
+    const call = (d.createContainer as any).mock.calls[0][0];
+    const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
+    expect(addArgs).not.toContain('-turncfg');
+    expect(call.HostConfig.Binds).toBeUndefined();
+  });
+
+  it('continues without -turncfg when coturn setup throws (no abort, png fallback)', async () => {
+    // A TURN failure must never abort emulator creation. The container is still
+    // created, just without -turncfg.
+    const d = makeDockerMock();
+    const p = makeProvider(d, {
+      hasDevDri: () => false, hasNvidia: async () => false,
+      coturn: {
+        ensure: vi.fn().mockRejectedValue(new Error('docker down')),
+        writeTurncfg: vi.fn().mockReturnValue('/tmp/turncfg.sh'),
+      },
+    });
+    const inst = await p.createInstance!({ displayName: 'turnfail', config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 } });
+    expect(inst.state).toBe('created');
     const call = (d.createContainer as any).mock.calls[0][0];
     const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
     expect(addArgs).not.toContain('-turncfg');
@@ -167,7 +218,7 @@ describe('docker-android provider', () => {
         }),
       })),
     });
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     const ep = await p.getGrpcEndpoint!('container-abc');
     expect(ep).toEqual({ host: '127.0.0.1', port: 34567 });
   });
@@ -179,7 +230,7 @@ describe('docker-android provider', () => {
         inspect: vi.fn().mockResolvedValue({ State: { Running: false }, NetworkSettings: { Ports: {} } }),
       })),
     });
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     await expect(p.getGrpcEndpoint!('container-abc')).rejects.toThrow(/not running/i);
   });
 
@@ -193,7 +244,7 @@ describe('docker-android provider', () => {
         }),
       })),
     });
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     await expect(p.getGrpcEndpoint!('container-abc')).rejects.toThrow(/8554/);
   });
 
@@ -201,7 +252,7 @@ describe('docker-android provider', () => {
     const d = makeDockerMock({
       createContainer: vi.fn().mockRejectedValue(new Error('Conflict. The container name "/foo" is already in use')),
     });
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => false });
     await expect(p.createInstance!({
       displayName: 'name-conflict',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
@@ -210,7 +261,7 @@ describe('docker-android provider', () => {
 
   it('does NOT auto-pass /dev/dri even if the host has it (avoids triggering the WSL nvidia prestart hook)', async () => {
     const d = makeDockerMock();
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => true, hasNvidia: async () => false });
+    const p = makeProvider(d, { hasDevDri: () => true, hasNvidia: async () => false });
     await p.createInstance!({
       displayName: 'gpu-test',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
@@ -224,7 +275,7 @@ describe('docker-android provider', () => {
 
   it('does NOT request NVIDIA DeviceRequests by default (budtmo uses swiftshader software rendering; nvidia-container init fails on Docker Desktop WSL)', async () => {
     const d = makeDockerMock({ info: vi.fn().mockResolvedValue({ Runtimes: { nvidia: {} } }) });
-    const p = createDockerAndroidProvider(d, { hasDevDri: () => false, hasNvidia: async () => true });
+    const p = makeProvider(d, { hasDevDri: () => false, hasNvidia: async () => true });
     await p.createInstance!({
       displayName: 'gpu-test',
       config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 },
@@ -237,7 +288,7 @@ describe('docker-android provider', () => {
     const d = makeDockerMock();
     const adbConnect = vi.fn().mockResolvedValue(true);
     const bootCompleted = vi.fn().mockResolvedValue(true);
-    const p = createDockerAndroidProvider(d, {
+    const p = makeProvider(d, {
       hasDevDri: () => false, hasNvidia: async () => false,
       adbConnect, bootCompleted,
       // Collapse the retry window so unit tests don't sleep.
@@ -253,7 +304,7 @@ describe('docker-android provider', () => {
     const d = makeDockerMock();
     const stop = vi.fn().mockResolvedValue(undefined);
     (d.getContainer as any).mockReturnValue({ stop, remove: vi.fn(), inspect: vi.fn().mockResolvedValue({ State: { Running: false } }) });
-    const p = createDockerAndroidProvider(d);
+    const p = makeProvider(d);
     await p.stopInstance('container-test-emu');
     expect(stop).toHaveBeenCalled();
   });
@@ -264,12 +315,12 @@ describe('docker-android provider', () => {
       inspect: vi.fn().mockResolvedValue({ State: { Running: true } }),
       remove: vi.fn(),
     });
-    const p = createDockerAndroidProvider(d);
+    const p = makeProvider(d);
     await expect(p.deleteInstance!('container-test-emu')).rejects.toThrow(/running/i);
   });
 
   it('getNetworkConfig returns emu-http-proxy mode (HTTP forward proxy via adb reverse)', () => {
-    const p = createDockerAndroidProvider(makeDockerMock());
+    const p = makeProvider(makeDockerMock());
     expect(p.getNetworkConfig('any')).toEqual({ mode: 'emu-http-proxy' });
   });
 
@@ -285,7 +336,7 @@ describe('docker-android provider', () => {
       }),
     });
     const adbConnect = vi.fn().mockResolvedValue(false);
-    const p = createDockerAndroidProvider(d, {
+    const p = makeProvider(d, {
       hasDevDri: () => false, hasNvidia: async () => false,
       adbConnect,
       bootTimeoutMs: 100, bootRetryIntervalMs: 10,
@@ -303,7 +354,7 @@ describe('docker-android provider', () => {
       .mockResolvedValueOnce(false)
       .mockResolvedValue(true);
     const bootCompleted = vi.fn().mockResolvedValue(true);
-    const p = createDockerAndroidProvider(d, {
+    const p = makeProvider(d, {
       hasDevDri: () => false, hasNvidia: async () => false,
       adbConnect, bootCompleted,
       bootTimeoutMs: 500, bootRetryIntervalMs: 10,
@@ -326,7 +377,7 @@ describe('docker-android provider', () => {
     });
     const adbConnect = vi.fn().mockResolvedValue(true);
     const bootCompleted = vi.fn().mockResolvedValue(false);
-    const p = createDockerAndroidProvider(d, {
+    const p = makeProvider(d, {
       hasDevDri: () => false, hasNvidia: async () => false,
       adbConnect, bootCompleted,
       bootTimeoutMs: 100, bootRetryIntervalMs: 10,
