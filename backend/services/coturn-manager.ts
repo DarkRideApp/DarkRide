@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, resolve } from 'path';
-import { randomBytes } from 'crypto';
+import { randomBytes, createHash } from 'crypto';
 import { getDataRoot } from '../config/paths';
 import type { DockerLike } from './providers/docker-helpers';
 import { createLoggers } from '../logs';
@@ -11,6 +11,10 @@ const COTURN_IMAGE = 'coturn/coturn:latest';
 const COTURN_NAME = 'darkride-coturn';
 const COTURN_LABEL = 'darkride.coturn';
 const COTURN_LANIP_LABEL = 'darkride.coturn.lanip';
+// Hash of the full launch config (Cmd). Lets ensureCoturn recreate a container
+// whose args have changed (new creds, new ports, a code fix to the flags) even
+// when the LAN IP is unchanged, so a stale/broken coturn can't linger.
+const COTURN_CONFIG_LABEL = 'darkride.coturn.confighash';
 const DEFAULT_MIN_PORT = 49160;
 const DEFAULT_MAX_PORT = 49200;
 
@@ -101,7 +105,17 @@ export function buildCoturnContainerSpec(
   const minPort = opts.minPort ?? DEFAULT_MIN_PORT;
   const maxPort = opts.maxPort ?? DEFAULT_MAX_PORT;
 
+  // NOTE on the coturn/coturn entrypoint: it runs `eval "echo $arg"` on EVERY
+  // arg (to expand its default `--external-ip=$(detect-external-ip)`). So never
+  // pass a bare `-n` here — `echo -n` is echo's no-newline flag and expands to
+  // an EMPTY string, which coturn rejects as `Unknown argument:` and then stops
+  // applying the rest (external-ip, listening-ip, ...), leaving it advertising
+  // the unreachable container IP. All flags below are `--double-dash` and
+  // eval-safe (the password is hex). `--log-file=stdout` is required: we
+  // override the image's default CMD, which carried it, so without it coturn
+  // logs to a file and `docker logs darkride-coturn` is empty.
   const Cmd = [
+    '--log-file=stdout',
     '--listening-ip=0.0.0.0',
     '--listening-port=3478',
     `--external-ip=${lanIp}`,
@@ -113,7 +127,6 @@ export function buildCoturnContainerSpec(
     '--fingerprint',
     '--no-tls',
     '--no-dtls',
-    '--no-cli',
   ];
 
   const ExposedPorts: Record<string, Record<string, never>> = {
@@ -139,12 +152,15 @@ export function buildCoturnContainerSpec(
     PortBindings[`${port}/udp`] = [{ HostPort: String(port) }];
   }
 
+  const configHash = createHash('sha256').update(Cmd.join('\n')).digest('hex').slice(0, 16);
+
   return {
     Image: COTURN_IMAGE,
     name: COTURN_NAME,
     Labels: {
       [COTURN_LABEL]: 'true',
       [COTURN_LANIP_LABEL]: lanIp,
+      [COTURN_CONFIG_LABEL]: configHash,
     },
     Cmd,
     ExposedPorts,
@@ -193,18 +209,20 @@ async function ensureCoturnImageLocal(d: DockerLike): Promise<void> {
  */
 export async function ensureCoturn(d: DockerLike, lanIp: string, creds: CoturnCreds): Promise<void> {
   try {
+    const spec = buildCoturnContainerSpec(lanIp, creds);
+    const wantHash = spec.Labels[COTURN_CONFIG_LABEL];
     const existing = await findCoturnContainer(d);
     if (existing) {
       const info = await existing.inspect().catch(() => null);
       const running = info?.State?.Running === true;
-      const labelIp = info?.Config?.Labels?.[COTURN_LANIP_LABEL];
-      if (running && labelIp === lanIp) {
-        log(`coturn already running for ${lanIp} — reusing ${COTURN_NAME}`);
+      const haveHash = info?.Config?.Labels?.[COTURN_CONFIG_LABEL];
+      if (running && haveHash === wantHash) {
+        log(`coturn already running with the current config — reusing ${COTURN_NAME}`);
         return;
       }
       log(
-        `coturn ${COTURN_NAME} is stale (running=${running}, lanIp=${labelIp ?? 'unknown'} ` +
-        `wanted=${lanIp}) — removing and recreating`,
+        `coturn ${COTURN_NAME} is stale (running=${running}, config ${haveHash ?? 'unknown'} ` +
+        `wanted ${wantHash}) — removing and recreating`,
       );
       await existing.remove({ force: true }).catch((e: any) => {
         logError(`Failed to remove stale coturn container: ${e?.message ?? e}`);
@@ -213,7 +231,6 @@ export async function ensureCoturn(d: DockerLike, lanIp: string, creds: CoturnCr
 
     await ensureCoturnImageLocal(d);
 
-    const spec = buildCoturnContainerSpec(lanIp, creds);
     log(`Starting coturn relay ${COTURN_NAME} external-ip=${lanIp} (TURN on 3478, relay ${DEFAULT_MIN_PORT}-${DEFAULT_MAX_PORT})`);
     const container = await d.createContainer(spec as any);
     await container.start();

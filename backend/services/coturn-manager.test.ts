@@ -63,6 +63,14 @@ describe('buildCoturnContainerSpec', () => {
       'darkride.coturn': 'true',
       'darkride.coturn.lanip': '192.168.1.50',
     });
+    // A config-hash label drives recreate-on-change in ensureCoturn.
+    expect(spec.Labels['darkride.coturn.confighash']).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('the config hash changes when the args change (creds rotate)', () => {
+    const a = buildCoturnContainerSpec('192.168.1.50', CREDS);
+    const b = buildCoturnContainerSpec('192.168.1.50', { username: 'darkride', password: 'ffff' });
+    expect(a.Labels['darkride.coturn.confighash']).not.toBe(b.Labels['darkride.coturn.confighash']);
   });
 
   it('passes external-ip == lanIp and the lt-cred user in Cmd', () => {
@@ -71,6 +79,17 @@ describe('buildCoturnContainerSpec', () => {
     expect(spec.Cmd).toContain('--user=darkride:deadbeefcafef00d0123456789abcdef');
     expect(spec.Cmd).toContain('--lt-cred-mech');
     expect(spec.Cmd).toContain('--realm=darkride.local');
+  });
+
+  it('logs to stdout and avoids the entrypoint echo-n trap + the deprecated --no-cli', () => {
+    // The coturn/coturn entrypoint runs `eval "echo $arg"` on every arg, so a
+    // bare `-n` becomes empty (echo -n) and breaks parsing. --no-cli is also
+    // deprecated and logs an ERROR. Neither must appear; --log-file=stdout must.
+    const spec = buildCoturnContainerSpec('192.168.1.50', CREDS);
+    expect(spec.Cmd).toContain('--log-file=stdout');
+    expect(spec.Cmd).not.toContain('-n');
+    expect(spec.Cmd).not.toContain('--no-cli');
+    expect(spec.Cmd.every((a) => a.length > 0 && a.startsWith('--'))).toBe(true);
   });
 
   it('publishes 3478/tcp and 3478/udp on host port 3478', () => {
