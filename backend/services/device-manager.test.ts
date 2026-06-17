@@ -757,6 +757,137 @@ describe('DeviceManager', () => {
       await expect(manager.pollAdbDevices()).resolves.not.toThrow();
     });
   });
+
+  describe('provider-driven polling (live path)', () => {
+    let execMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(async () => {
+      const cp = await import('child_process');
+      execMock = cp.exec as unknown as ReturnType<typeof vi.fn>;
+      // Default: every adb shell command (checkRooted, getprop, etc.) succeeds
+      // with empty output so the reconcile path doesn't blow up.
+      execMock.mockImplementation((_cmd: string, _opts: any, cb: any) => cb(null, '', ''));
+    });
+
+    // Minimal in-memory ProviderRegistry that returns a fixed instance list.
+    // Matches the real registry's listInstancesAll() row shape:
+    // { providerId, instance: DeviceProviderInstance }.
+    function makeRegistry(rows: Array<{ providerId: string; instance: any }>): any {
+      return {
+        register: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn().mockReturnValue([]),
+        listInstancesAll: vi.fn().mockResolvedValue(rows),
+      };
+    }
+
+    it('pollDevicesFromProviders writes a devices row for a provider-reported serial', async () => {
+      const reg = makeRegistry([
+        {
+          providerId: 'adb-device',
+          instance: {
+            id: 'PROV_SERIAL_1',
+            displayName: 'PROV_SERIAL_1',
+            serial: 'PROV_SERIAL_1',
+            state: 'running',
+            spawnedByDarkride: false,
+          },
+        },
+      ]);
+      manager.setProviderRegistry(reg);
+
+      await manager.pollDevicesFromProviders();
+
+      const row = db.select().from(devices).where(eq(devices.id, 'PROV_SERIAL_1')).all();
+      expect(row).toHaveLength(1);
+      // A 'running' instance must be tracked as online — same as adb 'device' state.
+      expect(manager.isOnline('PROV_SERIAL_1')).toBe(true);
+    });
+
+    it('updates lastSeen for an already-known serial rather than inserting again', async () => {
+      db.insert(devices).values({ id: 'PROV_KNOWN', name: 'Known' }).run();
+      const reg = makeRegistry([
+        {
+          providerId: 'adb-device',
+          instance: { id: 'PROV_KNOWN', displayName: 'PROV_KNOWN', serial: 'PROV_KNOWN', state: 'running', spawnedByDarkride: false },
+        },
+      ]);
+      manager.setProviderRegistry(reg);
+
+      await manager.pollDevicesFromProviders();
+
+      const rows = db.select().from(devices).where(eq(devices.id, 'PROV_KNOWN')).all();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].name).toBe('Known'); // not clobbered by a re-insert
+      expect(rows[0].lastSeen).not.toBeNull();
+    });
+
+    it('skips instances without a serial (e.g. stopped emulators)', async () => {
+      const reg = makeRegistry([
+        {
+          providerId: 'avd',
+          instance: { id: 'avd-1', displayName: 'My AVD', state: 'stopped', spawnedByDarkride: true },
+        },
+      ]);
+      manager.setProviderRegistry(reg);
+
+      await manager.pollDevicesFromProviders();
+
+      expect(db.select().from(devices).all()).toHaveLength(0);
+    });
+
+    it('marks a previously-online provider device offline when it disappears', async () => {
+      const offlineListener = vi.fn();
+      manager.onDeviceOffline(offlineListener);
+      const bus = { define: vi.fn(), on: vi.fn(), off: vi.fn(), emit: vi.fn() };
+      manager.setHookBus(bus as any);
+
+      // First poll: device present + running.
+      const present = makeRegistry([
+        { providerId: 'adb-device', instance: { id: 'PROV_GONE', displayName: 'PROV_GONE', serial: 'PROV_GONE', state: 'running', spawnedByDarkride: false } },
+      ]);
+      manager.setProviderRegistry(present);
+      await manager.pollDevicesFromProviders();
+      expect(manager.isOnline('PROV_GONE')).toBe(true);
+
+      // Second poll: registry now returns nothing — device must go offline,
+      // exactly like pollAdbDevices's offline reconcile.
+      manager.setProviderRegistry(makeRegistry([]));
+      await manager.pollDevicesFromProviders();
+
+      expect(manager.isOnline('PROV_GONE')).toBe(false);
+      expect(offlineListener).toHaveBeenCalledWith('PROV_GONE');
+      expect(bus.emit).toHaveBeenCalledWith('device:disconnected', { id: 'PROV_GONE', platform: 'android' });
+    });
+
+    it('does nothing (returns early) when no registry is wired', async () => {
+      // No setProviderRegistry call.
+      await expect(manager.pollDevicesFromProviders()).resolves.not.toThrow();
+      expect(db.select().from(devices).all()).toHaveLength(0);
+    });
+
+    it('start() schedules pollDevicesFromProviders when a registry is wired', () => {
+      const reg = makeRegistry([]);
+      manager.setProviderRegistry(reg);
+      const providerSpy = vi.spyOn(manager, 'pollDevicesFromProviders').mockResolvedValue();
+      const adbSpy = vi.spyOn(manager, 'pollAdbDevices').mockResolvedValue();
+
+      manager.start();
+
+      expect(providerSpy).toHaveBeenCalled();
+      expect(adbSpy).not.toHaveBeenCalled();
+    });
+
+    it('start() falls back to pollAdbDevices when no registry is wired', () => {
+      const providerSpy = vi.spyOn(manager, 'pollDevicesFromProviders').mockResolvedValue();
+      const adbSpy = vi.spyOn(manager, 'pollAdbDevices').mockResolvedValue();
+
+      manager.start();
+
+      expect(adbSpy).toHaveBeenCalled();
+      expect(providerSpy).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('adb helpers — command-injection prevention', () => {
@@ -838,5 +969,23 @@ describe('adb helpers — command-injection prevention', () => {
     const realCp = await vi.importActual<typeof import('child_process')>('child_process');
     const reconstructed = realCp.execFileSync('/bin/sh', ['-c', `printf %s ${payload}`]).toString();
     expect(reconstructed).toBe(tricky);
+  });
+
+  it('adbShell sends a multi-statement getprop chain unwrapped (no literal "..." around it)', async () => {
+    // Regression for the collectDeviceProperties bug — the chain was wrapped in
+    // literal double quotes, so the device shell parsed the whole quoted string
+    // as a single command word and reported "inaccessible or not found". Same
+    // failure mode as the wrapped-suShell case above. The chain must arrive at
+    // the device shell as a bare `getprop A; getprop B; ...` so `;` is parsed
+    // as a statement separator.
+    const chain = 'getprop ro.product.manufacturer; getprop ro.product.model';
+    await adbShell('DEV001', chain, 1000);
+
+    const lastCall = execFileMock.mock.calls[execFileMock.mock.calls.length - 1];
+    const argv = lastCall[1] as string[];
+    const sent = argv[argv.length - 1];
+    expect(sent).toBe(chain);                 // exact bare form
+    expect(sent).not.toMatch(/^"/);           // never wrapped in literal quotes
+    expect(sent).not.toMatch(/"$/);
   });
 });

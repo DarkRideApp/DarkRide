@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from 'child_process';
+import net from 'net';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -10,9 +11,24 @@ import { getHiddenlistPath } from './hiddenlist-writer';
 import { SocksProxyServer } from './socks-proxy-server';
 import { syncInterceptConfig, getInterceptConfigPath } from './intercept-config-writer';
 import { clearWsFlowMap } from '../api/traffic';
+import { resolveVenvBin } from './venv-bin';
 import type { AppDatabase } from '../db';
 
 const { log, error } = createLoggers('mitmproxy-manager');
+
+/** Ask the OS for a free TCP port on 127.0.0.1. Subject to TOCTOU but acceptable here. */
+async function pickFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      srv.close(() => resolve(port));
+    });
+  });
+}
 
 /**
  * Persistent directory for mitmproxy CA certs. Uses MITMPROXY_DATA env var
@@ -172,8 +188,9 @@ export class MitmproxyManager {
       }
     }
 
-    log(`Starting mitmdump for ${deviceId}`);
-    const child = spawn('mitmdump', mitmdumpArgs, {
+    const mitmdumpBin = resolveVenvBin('mitmdump');
+    log(`Starting mitmdump for ${deviceId} (${mitmdumpBin})`);
+    const child = spawn(mitmdumpBin, mitmdumpArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
@@ -259,6 +276,127 @@ export class MitmproxyManager {
       clientAddress: configs.clientAddress,
       serverEndpoint: configs.serverEndpoint,
     };
+  }
+
+  /**
+   * Start a mitmdump capture in regular HTTP forward-proxy mode (no
+   * WireGuard tunnel). Used by docker-android emulators (the emu-http-proxy
+   * capture mode) instead of the WireGuard routing physical devices use.
+   *
+   * Picks a free port and binds mitmdump to 0.0.0.0 (NOT loopback): a
+   * docker-android emulator's QEMU NAT only reaches the host via the
+   * docker-bridge gateway (typically 172.17.0.1), not 127.0.0.1. The caller
+   * (CaptureSessionManager.startCapture) then spawns an in-container TCP
+   * forwarder and points the emulator at 10.0.2.2:<port>, which relays to the
+   * gateway and on to mitmproxy. `adb reverse` only works for the adb
+   * transport itself, not arbitrary forward-proxy ports.
+   *
+   * Shares the same `processes` map as `startCapture` so `stopCapture`
+   * and `isCapturing` work uniformly across modes.
+   */
+  async startHttpProxyCapture(deviceId: string, options?: MitmproxyOptions): Promise<{ port: number }> {
+    if (this.processes.has(deviceId)) {
+      log(`Capture already running for device ${deviceId}`);
+      // The caller doesn't know the port the existing process is on;
+      // return a sentinel that forces them to reconcile rather than
+      // silently reusing a (potentially different) port.
+      throw new Error(`Capture already running for device ${deviceId} — stop it first`);
+    }
+
+    // Pick a free port on localhost so several emulators can capture in parallel.
+    const port = await pickFreePort();
+
+    const absoluteScriptPath = path.resolve(this.bridgeScriptPath);
+    const confdir = getMitmproxyConfdir();
+    migrateCertsIfNeeded(confdir);
+    const webhookUrl = options?.webhookUrl || this.defaultWebhookUrl;
+    const mitmdumpArgs: string[] = [
+      '--set', `confdir=${confdir}`,
+      // Listen on all interfaces so docker-android emulators can reach
+      // mitmproxy via the host's docker-bridge gateway (typically
+      // 172.17.0.1 on Linux). adb reverse + 127.0.0.1 doesn't work for
+      // arbitrary ports on emulators — only the adb transport itself.
+      '--listen-host', '0.0.0.0',
+      '--listen-port', String(port),
+      '-s', absoluteScriptPath,
+      '--set', `node_webhook=${webhookUrl}`,
+      '--set', `blocklist_file=${path.resolve(getBlocklistPath())}`,
+      '--set', `hiddenlist_file=${path.resolve(getHiddenlistPath())}`,
+    ];
+    if (this.db) {
+      syncInterceptConfig(this.db);
+      mitmdumpArgs.push('--set', `intercept_config_file=${getInterceptConfigPath()}`);
+    }
+    if (options?.deviceId) mitmdumpArgs.push('--set', `device_id=${options.deviceId}`);
+    if (options?.sessionId != null) mitmdumpArgs.push('--set', `session_id=${options.sessionId}`);
+    if (options?.tlsProfile) mitmdumpArgs.push('--set', `tls_profile=${options.tlsProfile}`);
+    if (options?.interceptHooks) mitmdumpArgs.push('--set', 'intercept_hooks=true');
+
+    const mitmdumpBin = resolveVenvBin('mitmdump');
+    log(`Starting mitmdump (http-proxy mode) for ${deviceId} on 0.0.0.0:${port} (${mitmdumpBin})`);
+    const child = spawn(mitmdumpBin, mitmdumpArgs, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    });
+
+    const readyPromise = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error('mitmproxy did not become ready within 30s')),
+        30_000,
+      );
+      const onData = (data: Buffer) => {
+        if (data.toString().includes('[DarkRide] READY')) {
+          clearTimeout(timeout);
+          child.stdout?.off('data', onData);
+          resolve();
+        }
+      };
+      child.stdout?.on('data', onData);
+      child.once('exit', (code) => {
+        clearTimeout(timeout);
+        child.stdout?.off('data', onData);
+        reject(new Error(`mitmproxy exited with code ${code} before becoming ready`));
+      });
+    });
+
+    child.stdout?.on('data', (data: Buffer) => {
+      for (const line of data.toString().split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed && trimmed.includes('[DarkRide]')) log(`[${deviceId}] ${trimmed}`);
+      }
+    });
+    child.stderr?.on('data', (data: Buffer) => {
+      for (const line of data.toString().split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (trimmed.includes('[DarkRide]')) {
+          error(`[mitm-${deviceId}] ${trimmed}`);
+        } else {
+          log(`[mitm-${deviceId}] ${trimmed}`);
+        }
+      }
+    });
+
+    child.on('exit', (code) => {
+      log(`mitmdump for device ${deviceId} exited with code ${code}`);
+      if (this.processes.get(deviceId) === child) this.processes.delete(deviceId);
+    });
+    child.on('error', (err) => {
+      error(`mitmdump for device ${deviceId} error: ${err.message}`);
+      if (this.processes.get(deviceId) === child) this.processes.delete(deviceId);
+    });
+
+    this.processes.set(deviceId, child);
+
+    try {
+      await readyPromise;
+    } catch (err: any) {
+      this.processes.delete(deviceId);
+      child.kill('SIGKILL');
+      throw err;
+    }
+
+    return { port };
   }
 
   /**

@@ -101,8 +101,11 @@ describe('MitmproxyManager', () => {
       await manager.startCapture('device-1');
 
       expect(mockEnsureConfigs).toHaveBeenCalledWith('device-1', 51820);
+      // The branch resolves mitmdump through resolveVenvBin() (so the venv
+      // copy wins over any host install), so the command is an absolute
+      // path ending in mitmdump rather than the bare 'mitmdump' name.
       expect(spawnMock).toHaveBeenCalledWith(
-        'mitmdump',
+        expect.stringMatching(/mitmdump$/),
         expect.arrayContaining([
           '--mode', 'wireguard:./data/wireguard/device-1.json@51820',
           '-s', expect.stringContaining('mitmproxy_bridge.py'),

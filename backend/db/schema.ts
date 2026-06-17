@@ -29,7 +29,49 @@ export const devices = sqliteTable('devices', {
   cpuAbi: text('cpu_abi'),
   serialNumber: text('serial_number'),
   bootloaderLocked: integer('bootloader_locked', { mode: 'boolean' }),
+  // FK to device_instances row that spawned this device (managed emulators).
+  // Null for unmanaged / physical devices that connect directly via ADB.
+  // Declared to match migration 0095's `REFERENCES device_instances(id)` (no
+  // ON DELETE — defaults to NO ACTION). Forward ref via callback since
+  // deviceInstances is defined below.
+  instanceId: integer('instance_id').references(() => deviceInstances.id),
 });
+
+/**
+ * Managed device-instance lifecycle (emulator support). See spec
+ * `docs/specs/2026-05-20-emulator-support-design.md` §7.1.
+ *
+ * Every emulator created via DarkRide gets a row here. The provider+runtime
+ * pair identifies WHO owns it (e.g. `docker-android` + container id, `avd` +
+ * AVD name). When the instance boots, an ADB-side `devices` row is matched
+ * and linked via `devices.instance_id`.
+ */
+export const deviceInstances = sqliteTable('device_instances', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  providerId: text('provider_id').notNull(), // 'docker-android' | 'avd' | plugin-id
+  runtimeId: text('runtime_id').notNull(),   // container id / AVD name / VM uuid
+  displayName: text('display_name'),
+  serial: text('serial'),                     // ADB serial once known
+  state: text('state').notNull(),             // DeviceInstanceState
+  spawnedByDarkride: integer('spawned_by_darkride', { mode: 'boolean' }).notNull().default(false),
+  spawnMetadata: text('spawn_metadata', { mode: 'json' }).$type<Record<string, unknown>>(), // provider-specific snapshot of spawn opts
+  lastError: text('last_error'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  lastStateAt: integer('last_state_at', { mode: 'timestamp' }).notNull(),
+});
+
+/**
+ * Per-instance config bag (key/value strings). Holds provider-specific
+ * settings the create flow collected (image tag, RAM/CPU sliders, etc.)
+ * without polluting the canonical instance row.
+ */
+export const deviceInstanceConfig = sqliteTable('device_instance_config', {
+  instanceId: integer('instance_id').notNull().references(() => deviceInstances.id, { onDelete: 'cascade' }),
+  key: text('key').notNull(),
+  value: text('value').notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.instanceId, table.key] }),
+]);
 
 export const automations = sqliteTable('automations', {
   id: integer('id').primaryKey({ autoIncrement: true }),

@@ -6,6 +6,7 @@ import { registerEndpoint } from './api-service';
 import { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
 import { screenshots, devices } from '../db/schema';
+import { forgetDeviceRow } from '../services/forget-device';
 import type { AppDatabase } from '../db/index';
 import { createLoggers } from '../logs';
 import { generateWireGuardQrCode } from '../utils/qr-code';
@@ -86,6 +87,37 @@ export function registerDeviceEndpoints(deviceManager: DeviceManager, db?: AppDa
     } catch (err: any) {
       error(`Failed to update device ${req.params.id}: ${err.message}`);
       res.status(500).json({ success: false, error: 'Failed to update device' });
+    }
+  }, { requires: ['core.devices:manage'] });
+
+  // DELETE /v1/device/:id — remove the row from the devices table.
+  // Used for "Forget" on stale rows (emulators that no longer exist, USB
+  // devices that won't be reconnected, etc.). The device-manager will
+  // re-add the row on the next adb poll if it actually sees the device,
+  // so this only sticks for genuinely-absent devices.
+  //
+  // Three other tables hold device_id FKs that we deliberately keep as
+  // historical records: automation_sessions, captured_traffic,
+  // websocket_messages. SQLite's default FK action is NO ACTION which
+  // would reject the delete; we explicitly NULL the references in a
+  // single transaction so the history survives the rename event.
+  registerEndpoint('DELETE', '/v1/device/:id', async (req, res) => {
+    try {
+      const deviceId = req.params.id;
+      if (!db) {
+        res.status(500).json({ success: false, error: 'Database not available' });
+        return;
+      }
+      const removed = forgetDeviceRow(db, deviceId);
+      if (!removed) {
+        res.status(404).json({ success: false, error: 'Device not found' });
+        return;
+      }
+      log(`Forgot device ${deviceId}`);
+      res.json({ success: true });
+    } catch (err: any) {
+      error(`Failed to forget device ${req.params.id}: ${err.message}`);
+      res.status(500).json({ success: false, error: 'Failed to forget device' });
     }
   }, { requires: ['core.devices:manage'] });
 

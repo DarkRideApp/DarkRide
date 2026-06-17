@@ -238,6 +238,14 @@ export function csrfProtection(req: Request, res: Response, next: NextFunction):
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) { next(); return; }
   if (!req.authUser) { next(); return; }
 
+  // grpc-web requests (the emulator WebRTC bridge) are inherently CSRF-safe:
+  // `application/grpc-web*` is a non-simple content type, so a cross-site
+  // attacker cannot send one with the victim's cookies without a CORS
+  // preflight — which DarkRide does not grant. No forgeable request can reach
+  // here, and the grpc-web client cannot reliably attach our session CSRF
+  // header to every framed call. Auth is still enforced (session + scope).
+  if (String(req.headers['content-type'] ?? '').includes('application/grpc-web')) { next(); return; }
+
   const token = req.headers['x-csrf-token'] as string | undefined;
   if (!token || token !== req.authUser.csrfToken) {
     res.status(403).json({ success: false, error: 'Invalid CSRF token' });

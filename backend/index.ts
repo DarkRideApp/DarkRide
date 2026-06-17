@@ -36,7 +36,7 @@ import { registerAiChatApiEndpoints } from './api/ai-chat';
 import { registerAppEndpoints } from './api/apps';
 import { registerAppsUploadEndpoint } from './api/apps-upload';
 import { registerUtilsEndpoints } from './api/utils';
-import { dbSizeSnapshots, diskUsageSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, aiModels, aiProviders, capturedTraffic } from './db/schema';
+import { dbSizeSnapshots, diskUsageSnapshots, settings, apkVersions, apkDiffReports, trackedApps, devices, deviceInstances, aiModels, aiProviders, capturedTraffic } from './db/schema';
 import * as schema from './db/schema';
 import { SavedTrafficStore } from './services/saved-traffic-store';
 import { registerSavedTrafficEndpoints } from './api/saved-traffic';
@@ -136,6 +136,20 @@ import { AiAgentFactory } from './services/ai-agent-factory';
 import { AiCallLogger } from './services/ai-call-logger';
 import { ServiceUserManager } from './auth/service-user-manager';
 import { backfillFailedDiffs } from './services/apk-diff-backfill';
+import { createProviderRegistry } from './services/providers';
+import { createAdbDeviceProvider } from './services/providers/adb-device';
+import { createIosDeviceProvider } from './services/providers/ios-device';
+import { createDockerAndroidProvider } from './services/providers/docker-android';
+import { createDockerClient, setActiveDockerClient, getActiveDockerClient, spawnContainerHttpForwarder } from './services/providers/docker-helpers';
+import { createAvdProvider } from './services/providers/avd';
+import { createCaptureModeRegistry } from './services/capture-mode-registry';
+import { makeCaptureHandlers } from './services/capture-handlers';
+import { reconcileWithProviders } from './services/device-manager-reconcile';
+import { DeviceInstancesRepo } from './services/device-instances-repo';
+import { stopSpawnedInstances } from './services/stop-spawned-instances';
+import { registerDevicesProvidersEndpoints } from './api/devices-providers';
+import { registerVideoTransportEndpoint } from './api/video-transport';
+import { registerEmulatorGrpcBridge } from './api/emulator-grpc-bridge';
 import { measureDiskUsage } from './services/disk-usage';
 
 const { log, error } = createLoggers('server');
@@ -256,6 +270,23 @@ registerLicenseEndpoints(licenseService);
 
 // Initialize services
 const deviceManager = DeviceManager.getInstance(db);
+// Emulator support — provider abstraction (spec docs/specs/2026-05-20-emulator-support-design.md §4).
+// Discovery is now driven through the provider registry: once
+// setProviderRegistry() is called, DeviceManager.start() schedules
+// pollDevicesFromProviders() as the live poll. The legacy pollAdbDevices()
+// remains only as the no-registry fallback; both paths share the same
+// reconcileDiscovered() logic, so physical-device discovery is unchanged.
+const providerRegistry = createProviderRegistry();
+providerRegistry.register(createAdbDeviceProvider());
+deviceManager.setProviderRegistry(providerRegistry);
+
+const captureModeRegistry = createCaptureModeRegistry();
+deviceManager.setCaptureModeRegistry(captureModeRegistry);
+// Real handlers are registered AFTER captureManager is constructed below —
+// makeCaptureHandlers needs captureManager.waitForTunnelReady, and
+// captureManager needs this registry. Registration happens before any capture
+// can start (the API router only handles requests after startup completes).
+
 const proxyRotator = new ProxyRotator(db);
 const bridgeManager = new PythonBridgeManager(db);
 const compiler = new AutomationCompiler();
@@ -273,6 +304,24 @@ const scheduler = new AutomationScheduler(db, runner, deviceManager);
 const iosDeviceManager = new IosDeviceManager(db);
 const captureManager = new CaptureSessionManager(db, mitmproxyManager, deviceManager, runner, trafficHookRegistry);
 captureManager.setIosDeviceManager(iosDeviceManager);
+captureManager.setCaptureModeRegistry(captureModeRegistry);
+captureManager.setProviderRegistry(providerRegistry);
+
+// Register the three built-in capture-mode handlers. This must run after
+// captureManager exists (waitForTunnelReady dep) and before any capture starts.
+const captureHandlers = makeCaptureHandlers({
+  mitmproxyManager,
+  deviceManager,
+  spawnContainerHttpForwarder,
+  getActiveDockerClient,
+  // Running-first + recency selection so a stale adb-device row sharing the
+  // serial can't shadow the live emulator (mirrors resolveCaptureMode's H3 fix).
+  lookupRuntimeId: (serial) => deviceInstancesRepo?.findRuntimeIdBySerial(serial),
+  waitForTunnelReady: (serial) => captureManager.waitForTunnelReady(serial),
+});
+captureModeRegistry.register('wireguard', captureHandlers.wireguard);
+captureModeRegistry.register('emu-http-proxy', captureHandlers['emu-http-proxy']);
+captureModeRegistry.register('ios-bridge', captureHandlers['ios-bridge']);
 runner.setNotificationService(notificationService);
 runner.setIosDeviceManager(iosDeviceManager);
 
@@ -282,6 +331,9 @@ runner.setIosDeviceManager(iosDeviceManager);
 let pluginManager: PluginManager | null = null;
 // dispatcherApi likewise: constructed during startup, closed during shutdown.
 let dispatcherApi: ReturnType<typeof createDispatcherApi> | null = null;
+// deviceInstancesRepo likewise: constructed during startup, read during shutdown
+// to stop darkride-spawned emulator instances (M1).
+let deviceInstancesRepo: DeviceInstancesRepo | null = null;
 
 // Initialize saved traffic store and wire to hook registry
 const savedTrafficStore = new SavedTrafficStore(db);
@@ -841,6 +893,44 @@ httpServer.listen(PORT, HOST, () => {
   // Rehydrate any stored Pro license from the DB. Cheap (one row + one
   // JWS verify) so it can run before the slower phases below.
   await licenseService.init();
+
+  // docker-android — only register if the Docker daemon is reachable. The
+  // provider's isAvailable() check is async, so we do it here at boot time
+  // once rather than on every wizard load. Result is cached implicitly by
+  // the registration outcome — if Docker isn't running when DarkRide boots,
+  // the provider isn't available; user restarts DarkRide after starting
+  // Docker.
+  const dockerClient = createDockerClient();
+  const dockerAndroidProvider = createDockerAndroidProvider(dockerClient);
+  const dockerAvailability = await dockerAndroidProvider.isAvailable();
+  if (dockerAvailability.available) {
+    providerRegistry.register(dockerAndroidProvider);
+    // Expose the client to non-provider services (CaptureSessionManager's
+    // emu-http-proxy path execs a TCP forwarder inside the container).
+    setActiveDockerClient(dockerClient);
+    log(`docker-android provider registered (Docker daemon detected)`);
+  } else {
+    log(`docker-android provider NOT registered: ${dockerAvailability.reason ?? 'daemon unreachable'}`);
+  }
+
+  // avd — only register if emulator + avdmanager are on PATH (Google Android SDK).
+  const avdProvider = createAvdProvider();
+  const avdAvailability = await avdProvider.isAvailable();
+  if (avdAvailability.available) {
+    providerRegistry.register(avdProvider);
+    log(`avd provider registered (emulator + avdmanager detected)`);
+  } else {
+    log(`avd provider NOT registered: ${avdAvailability.reason ?? 'cmdline-tools missing'}`);
+  }
+
+  // Reconcile DB device_instances against what each provider currently reports.
+  // Runs before plugins load so DB state is accurate before any plugin queries it.
+  deviceInstancesRepo = new DeviceInstancesRepo(db);
+  await reconcileWithProviders(providerRegistry, deviceInstancesRepo);
+  registerDevicesProvidersEndpoints(providerRegistry, deviceInstancesRepo, db);
+  registerVideoTransportEndpoint(deviceInstancesRepo, providerRegistry);
+  // grpc-web ⇄ gRPC bridge for the emulator WebRTC video path (Phase 2).
+  registerEmulatorGrpcBridge(deviceInstancesRepo, providerRegistry);
 
   // Phase 1: Python environment
   setStartupPhase('preparing_python', 'Preparing Python environment...');
@@ -1432,10 +1522,29 @@ async function shutdown() {
     }
   }
 
+  // Stop darkride-spawned emulator instances (M1) so they don't orphan a
+  // container + KVM slot + in-container forwarder + stale adb-reverse. Only
+  // spawnedByDarkride===true && state==='running' rows are stopped; BYOE/observed
+  // devices are left alone. Bounded by an overall 15s race so a slow/hung
+  // stopInstance can never block process exit (per-instance errors are logged
+  // and swallowed inside stopSpawnedInstances).
+  if (deviceInstancesRepo) {
+    try {
+      await Promise.race([
+        stopSpawnedInstances(providerRegistry, deviceInstancesRepo),
+        // .unref() so a fast resolve doesn't leave this timer holding the loop
+        // open (mirrors the force-exit timer below).
+        new Promise((resolve) => setTimeout(resolve, 15_000).unref()),
+      ]);
+    } catch (err: any) {
+      error(`stopSpawnedInstances error: ${err?.message ?? String(err)}`);
+    }
+  }
+
   const wss = getWebSocketServer();
   if (wss) {
     for (const client of wss.clients) {
-      client.close();
+      client.close(1001, 'Server shutting down');
     }
     wss.close();
   }

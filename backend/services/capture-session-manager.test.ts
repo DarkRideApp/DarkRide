@@ -3,8 +3,39 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { CaptureSessionManager } from './capture-session-manager';
+import { createCaptureModeRegistry } from './capture-mode-registry';
+import { makeCaptureHandlers } from './capture-handlers';
 import type { AppDatabase } from '../db/index';
 import { createTestDb } from '../test-utils/create-test-db';
+
+/**
+ * Wire the real capture-mode handlers onto a manager using the test mocks.
+ * The handlers are the behavior-preserving extraction of the old inline
+ * branch, so they call the same mockMitm / mockDm methods in the same order —
+ * every existing assertion on those calls still holds. waitForTunnelReady is
+ * the manager's own method (which drives mockDm.testTunnelConnectivity), so the
+ * connectivity-retry timing tests are preserved.
+ */
+function wireRegistry(
+  manager: CaptureSessionManager,
+  mockMitm: ReturnType<typeof createMockMitmproxyManager>,
+  mockDm: ReturnType<typeof createMockDeviceManager>,
+): CaptureSessionManager {
+  const registry = createCaptureModeRegistry();
+  const handlers = makeCaptureHandlers({
+    mitmproxyManager: mockMitm as any,
+    deviceManager: mockDm as any,
+    spawnContainerHttpForwarder: vi.fn().mockResolvedValue(undefined) as any,
+    getActiveDockerClient: () => null,
+    lookupRuntimeId: () => undefined,
+    waitForTunnelReady: (serial: string) => manager.waitForTunnelReady(serial),
+  });
+  registry.register('wireguard', handlers.wireguard);
+  registry.register('emu-http-proxy', handlers['emu-http-proxy']);
+  registry.register('ios-bridge', handlers['ios-bridge']);
+  manager.setCaptureModeRegistry(registry);
+  return manager;
+}
 
 // Mock broadcastToAll
 const mockBroadcastToAll = vi.fn();
@@ -57,7 +88,7 @@ describe('CaptureSessionManager', () => {
     db = createTestDb();
     mockMitm = createMockMitmproxyManager();
     mockDm = createMockDeviceManager();
-    manager = new CaptureSessionManager(db, mockMitm as any, mockDm as any);
+    manager = wireRegistry(new CaptureSessionManager(db, mockMitm as any, mockDm as any), mockMitm, mockDm);
     mockBroadcastToAll.mockClear();
 
     // Seed a device
@@ -428,9 +459,9 @@ describe('CaptureSessionManager', () => {
         runCaptureRules: vi.fn().mockResolvedValue(undefined),
       };
 
-      const managerWithRunner = new CaptureSessionManager(
+      const managerWithRunner = wireRegistry(new CaptureSessionManager(
         db, mockMitm as any, mockDm as any, mockRunner as any,
-      );
+      ), mockMitm, mockDm);
 
       await managerWithRunner.startCapture('DEV001');
       // runCaptureRules is fire-and-forget, flush microtasks
@@ -449,9 +480,9 @@ describe('CaptureSessionManager', () => {
         runCaptureRules: vi.fn().mockResolvedValue(undefined),
       };
 
-      const managerWithRunner = new CaptureSessionManager(
+      const managerWithRunner = wireRegistry(new CaptureSessionManager(
         db, mockMitm as any, mockDm as any, mockRunner as any,
-      );
+      ), mockMitm, mockDm);
 
       await managerWithRunner.startCapture('DEV001');
 
@@ -465,9 +496,9 @@ describe('CaptureSessionManager', () => {
         runCaptureRules: vi.fn().mockResolvedValue(undefined),
       };
 
-      const managerWithRunner = new CaptureSessionManager(
+      const managerWithRunner = wireRegistry(new CaptureSessionManager(
         db, mockMitm as any, mockDm as any, mockRunner as any,
-      );
+      ), mockMitm, mockDm);
 
       await managerWithRunner.startCapture('DEV001');
 
@@ -481,9 +512,9 @@ describe('CaptureSessionManager', () => {
         clearHooks: vi.fn(),
       };
 
-      const managerWithRegistry = new CaptureSessionManager(
+      const managerWithRegistry = wireRegistry(new CaptureSessionManager(
         db, mockMitm as any, mockDm as any, undefined, mockRegistry as any,
-      );
+      ), mockMitm, mockDm);
 
       await managerWithRegistry.startCapture('DEV001');
       await managerWithRegistry.stopCapture('DEV001');
@@ -506,9 +537,9 @@ describe('CaptureSessionManager', () => {
         runCaptureRules: vi.fn().mockRejectedValue(new Error('capture rule error')),
       };
 
-      const managerWithRunner = new CaptureSessionManager(
+      const managerWithRunner = wireRegistry(new CaptureSessionManager(
         db, mockMitm as any, mockDm as any, mockRunner as any,
-      );
+      ), mockMitm, mockDm);
 
       const result = await managerWithRunner.startCapture('DEV001');
       // runCaptureRules is fire-and-forget, flush microtasks so .catch runs

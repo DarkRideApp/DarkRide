@@ -13,6 +13,7 @@ export default defineConfig({
   build: {
     outDir: '../dist/frontend',
     emptyOutDir: true,
+    target: 'es2022',
     commonjsOptions: {
       // Workspace package outputs CJS; tell Rollup to transform it so named
       // exports are statically visible (e.g. pluginRegistry from /react).
@@ -30,6 +31,7 @@ export default defineConfig({
   // scanner crawls every `../../../../frontend/...` relative import in plugins/,
   // which can take 4+ minutes on cold start.
   optimizeDeps: {
+    esbuildOptions: { target: 'es2022' },
     include: [
       'react',
       'react-dom',
@@ -61,6 +63,13 @@ export default defineConfig({
     ],
   },
   server: {
+    // Dev server is for the developer's own machine + their LAN; the
+    // hostname can be anything (e.g. "code.home", a code-server proxy
+    // subdomain, a tailnet host). Disable Vite's Host-header allowlist
+    // so it doesn't error with "Blocked request. This host is not
+    // allowed." every time the dev runs it from somewhere other than
+    // localhost.
+    allowedHosts: true,
     proxy: {
       '/v1': backendOrigin,
       '/data': backendOrigin,

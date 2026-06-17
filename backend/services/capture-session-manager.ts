@@ -1,5 +1,5 @@
-import { eq } from 'drizzle-orm';
-import { automationSessions, devices as devicesTable, settings } from '../db/schema';
+import { eq, desc } from 'drizzle-orm';
+import { automationSessions, devices as devicesTable, deviceInstances, settings } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
@@ -11,6 +11,8 @@ import type { AutomationRunner } from './automation-runner';
 import type { TrafficHookRegistry } from './traffic-hook-registry';
 import type { CaptureStatusMessage, CaptureSubsystemStatus } from '../../shared/types/websocket';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
+import type { CaptureModeRegistry } from './capture-mode-registry';
+import type { ProviderRegistry } from './providers';
 
 const { log, error } = createLoggers('capture-session-manager');
 
@@ -25,6 +27,8 @@ export class CaptureSessionManager {
   private activeSessions = new Map<string, ActiveCapture>();
   private iosDeviceManager?: IosDeviceManager;
   private hookBus: HookBus | null = null;
+  private captureModeRegistry: CaptureModeRegistry | null = null;
+  private providerRegistry: ProviderRegistry | null = null;
 
   constructor(
     private db: AppDatabase,
@@ -38,6 +42,35 @@ export class CaptureSessionManager {
     this.hookBus = bus;
   }
 
+  setCaptureModeRegistry(reg: CaptureModeRegistry): void {
+    this.captureModeRegistry = reg;
+  }
+
+  setProviderRegistry(reg: ProviderRegistry): void {
+    this.providerRegistry = reg;
+  }
+
+  /**
+   * Resolve which capture-mode handler a device dispatches to. Mirrors the old
+   * inline branch selection exactly:
+   *   - docker-android provider instance -> 'emu-http-proxy'
+   *   - adb-device / avd provider instance -> 'wireguard'
+   *   - ios-device provider instance -> 'ios-bridge'
+   *   - no provider instance (bare ADB tracker) -> platform default
+   *     (android -> 'wireguard', ios -> 'ios-bridge')
+   */
+  private resolveCaptureMode(deviceId: string, platform: 'android' | 'ios'): string {
+    const inst = this.getProviderInstanceForDevice(deviceId);
+    if (inst) {
+      const provider = this.providerRegistry?.get(inst.providerId);
+      // getNetworkConfig is keyed on the provider instance id (runtime id) per
+      // the DeviceProvider contract, NOT the adb serial. Built-in providers
+      // ignore the arg, but a plugin provider may key its config off the id.
+      if (provider) return provider.getNetworkConfig(inst.runtimeId).mode;
+    }
+    return platform === 'ios' ? 'ios-bridge' : 'wireguard';
+  }
+
   setIosDeviceManager(iosManager: IosDeviceManager): void {
     this.iosDeviceManager = iosManager;
   }
@@ -47,7 +80,34 @@ export class CaptureSessionManager {
     return (device?.platform as 'android' | 'ios') ?? 'android';
   }
 
-  async startCapture(deviceId: string, proxyOptions?: { mode: 'none' | 'normal' | 'nordvpn'; country?: string }, tlsProfile?: string): Promise<{ sessionId: number }> {
+  /**
+   * Look up the provider that spawned this device, if any. Returns undefined
+   * for physical devices that came in through the bare ADB tracker rather
+   * than a managed provider instance.
+   *
+   * Used to branch the Android capture path: docker-android emulators take
+   * the HTTP-proxy route (mitmproxy in forward-proxy mode + adb reverse +
+   * `settings put global http_proxy`); physical Android devices take the
+   * WireGuard + system-CA-injection route.
+   *
+   * A serial is NOT unique: a docker-android emulator is also observed by the
+   * adb-device provider, and host-port reuse can leave a stale adb-device row
+   * sharing the serial. Prefer a running row, then the most-recently-updated,
+   * so a stale row can't shadow the live emulator and mis-route capture to
+   * WireGuard. Mirrors the H3 tiebreak in video-transport's pickVideoInstance.
+   */
+  private getProviderInstanceForDevice(deviceId: string): { providerId: string; runtimeId: string } | undefined {
+    const rows = this.db
+      .select({ providerId: deviceInstances.providerId, runtimeId: deviceInstances.runtimeId, state: deviceInstances.state })
+      .from(deviceInstances)
+      .where(eq(deviceInstances.serial, deviceId))
+      .orderBy(desc(deviceInstances.lastStateAt))
+      .all();
+    const chosen = rows.find((r) => r.state === 'running') ?? rows[0];
+    return chosen ? { providerId: chosen.providerId, runtimeId: chosen.runtimeId } : undefined;
+  }
+
+  async startCapture(deviceId: string, proxyOptions?: { mode: 'none' | 'normal' | 'nordvpn'; country?: string }, tlsProfile?: string): Promise<{ sessionId: number; httpProxy?: { host: string; port: number } }> {
     // Guard: already capturing
     const existing = this.activeSessions.get(deviceId);
     if (existing) {
@@ -126,45 +186,44 @@ export class CaptureSessionManager {
         mitmOptions.useProxy = false;
       }
 
-      // Start mitmproxy capture
-      const tunnelInfo = await this.mitmproxyManager.startCapture(deviceId, mitmOptions);
-      subsystems.mitmproxy = 'ok';
-      this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
-
-      if (tunnelInfo && platform === 'android') {
-        // Inject CA cert
-        await this.deviceManager.injectMitmproxyCaCert(deviceId);
-        subsystems.certInjection = 'ok';
-        this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
-
-        // Activate WireGuard tunnel
-        await this.deviceManager.activateWireGuardTunnel(deviceId, tunnelInfo);
-        tunnelActivated = true;
-        subsystems.wireguard = 'ok';
-        this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
-
-        // Sanity-check: ensure mitmproxy didn't crash during cert/tunnel setup
-        if (!this.mitmproxyManager.isCapturing(deviceId)) {
-          subsystems.mitmproxy = 'error';
-          throw new Error('mitmproxy process exited during capture startup');
-        }
-
-        // Wait for tunnel connectivity
-        const ready = await this.waitForTunnelReady(deviceId);
-        subsystems.connectivity = ready ? 'ok' : 'warning';
-        if (!ready) {
-          log(`Tunnel connectivity not confirmed for device ${deviceId}, proceeding anyway`);
-        }
-      } else {
-        // iOS: user configures WireGuard manually via QR code
-        subsystems.certInjection = 'skipped';
-        subsystems.wireguard = 'skipped';
-        subsystems.connectivity = 'skipped';
+      // Dispatch capture wiring to the per-mode handler. The mode is resolved
+      // from the device's provider (docker-android -> emu-http-proxy, physical
+      // adb/avd -> wireguard, ios -> ios-bridge), falling back to the platform
+      // default for bare-ADB-tracker devices with no provider instance. The
+      // handlers are a behavior-preserving extraction of the old inline branch.
+      //
+      // emuHttpProxy is set only on the emu-http-proxy path so the API response
+      // can tell callers (E2E tests, custom launchers) where mitmproxy is
+      // listening — they need this to point apps at the proxy explicitly via
+      // Java's Proxy() rather than rely on `settings put global http_proxy`,
+      // which HttpURLConnection ignores in practice.
+      const mode = this.resolveCaptureMode(deviceId, platform);
+      if (!this.captureModeRegistry) {
+        throw new Error('Capture cannot start: CaptureModeRegistry not wired (setCaptureModeRegistry was never called)');
       }
+      const result = await this.captureModeRegistry.dispatch({
+        deviceId,
+        sessionId,
+        platform,
+        mode,
+        mitmOptions,
+        setSubsystem: (key, status) => {
+          subsystems[key] = status;
+          this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
+        },
+      });
+      tunnelActivated = result.tunnelActivated;
+      const emuHttpProxy = result.emuHttpProxy;
 
       this.activeSessions.set(deviceId, { sessionId, deviceId, tunnelActivated, subsystems });
 
-      this.broadcastStatus(deviceId, 'capturing', sessionId, undefined, subsystems);
+      // NOTE: no extra "final" broadcast here. Each capture handler ends by
+      // calling ctx.setSubsystem on its terminal subsystem (connectivity),
+      // which already broadcasts the complete final state. The old inline code
+      // needed a trailing broadcast because some branches set their last field
+      // without broadcasting; the extracted handlers broadcast on every
+      // transition, so a trailing broadcast would be a duplicate (and would
+      // break the wireguard path's asserted 4-broadcast sequence).
       log(`Capture started for device ${deviceId} (session ${sessionId})`);
 
       // Run capture rules in background (don't block the API response)
@@ -175,7 +234,7 @@ export class CaptureSessionManager {
         });
       }
 
-      return { sessionId };
+      return emuHttpProxy ? { sessionId, httpProxy: emuHttpProxy } : { sessionId };
     } catch (err: any) {
       // Cleanup on error
       error(`Failed to start capture for device ${deviceId}: ${err.message}`);
@@ -286,7 +345,9 @@ export class CaptureSessionManager {
     }
   }
 
-  private async waitForTunnelReady(
+  // Public because the wireguard capture-mode handler consumes it via its
+  // `waitForTunnelReady` dependency (wired in backend/index.ts). Keep public.
+  async waitForTunnelReady(
     deviceId: string,
     maxAttempts: number = 5,
     intervalMs: number = 1000,

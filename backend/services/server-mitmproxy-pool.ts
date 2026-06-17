@@ -4,6 +4,7 @@ import net from 'net';
 import { readFileSync, existsSync } from 'fs';
 import { createLoggers } from '../logs';
 import { getMitmproxyConfdir } from './mitmproxy-manager';
+import { resolveVenvBin } from './venv-bin';
 
 const { log, error } = createLoggers('server-mitmproxy-pool');
 
@@ -108,8 +109,9 @@ export class ServerMitmproxyPool {
       '--set', `tls_profile=${profile}`,
     ];
 
-    log(`Spawning server mitmproxy for profile=${profile} on 127.0.0.1:${port}`);
-    const child = spawn('mitmdump', args, {
+    const mitmdumpBin = resolveVenvBin('mitmdump');
+    log(`Spawning server mitmproxy for profile=${profile} on 127.0.0.1:${port} (${mitmdumpBin})`);
+    const child = spawn(mitmdumpBin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });

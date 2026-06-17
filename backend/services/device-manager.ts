@@ -16,6 +16,8 @@ import type { DeviceFilter } from '../../shared/types/api';
 import { matchesDeviceFilter, migrateDeviceFilter } from '../../shared/lib/device-filter';
 import { getMitmproxyConfdir } from './mitmproxy-manager';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
+import type { ProviderRegistry } from './providers';
+import type { CaptureModeRegistry } from './capture-mode-registry';
 
 const execFileAsync = promisify(execFile);
 
@@ -286,11 +288,35 @@ export class DeviceManager {
   private stayAwakeDevices = new Set<string>(); // devices with stay_on_while_plugged_in enabled
   private offlineListeners: Array<(deviceId: string) => void> = [];
   private hookBus: HookBus | null = null;
+  private providerRegistry: ProviderRegistry | null = null;
+  // TODO(phase-2): read in capture-startup path. Setter is present so the
+  // boot wiring (Task 1.6) can install it now; the read site lands when
+  // Phase 2 implements the capture-mode dispatch.
+  private captureModeRegistry: CaptureModeRegistry | null = null;
 
   constructor(private db: AppDatabase) {}
 
   setHookBus(bus: HookBus): void {
     this.hookBus = bus;
+  }
+
+  /**
+   * Wire the provider registry. Once wired, `pollDevicesFromProviders()`
+   * routes device discovery through registered DeviceProviders instead of
+   * the legacy inline `adb devices` parsing. Existing `pollAdbDevices()`
+   * remains as the no-registry fallback during the refactor.
+   */
+  setProviderRegistry(reg: ProviderRegistry): void {
+    this.providerRegistry = reg;
+  }
+
+  /**
+   * Wire the capture-mode registry for per-mode capture dispatch.
+   * Phase 1 wires a no-op stub for `wireguard` mode; Phase 2 replaces it
+   * with the real handler.
+   */
+  setCaptureModeRegistry(reg: CaptureModeRegistry): void {
+    this.captureModeRegistry = reg;
   }
 
   /** Register a callback to check if a device has active stream viewers. */
@@ -359,12 +385,19 @@ export class DeviceManager {
   }
 
   /**
-   * Start the ADB polling loop and standby management.
+   * Start the device polling loop and standby management.
+   *
+   * When a provider registry is wired, discovery runs through
+   * `pollDevicesFromProviders()` (the live path); otherwise it falls back to
+   * the legacy inline `pollAdbDevices()`. Both paths share the same reconcile
+   * logic (`reconcileDiscovered`), so physical-device discovery behaves
+   * identically regardless of which one runs.
    */
   start(): void {
     log('Starting device manager');
-    this.pollAdbDevices();
-    this.pollTimer = setInterval(() => this.pollAdbDevices(), ADB_POLL_INTERVAL);
+    const poll = () => this.providerRegistry ? this.pollDevicesFromProviders() : this.pollAdbDevices();
+    poll();
+    this.pollTimer = setInterval(poll, ADB_POLL_INTERVAL);
     this.standbyTimer = setInterval(() => this.checkStandby(), 10000);
   }
 
@@ -384,93 +417,160 @@ export class DeviceManager {
   }
 
   /**
-   * Poll `adb devices` and upsert discovered devices into the database.
+   * Reconcile a snapshot of discovered devices against the DB + in-memory
+   * online state. This is the single source of truth for device discovery:
+   * both `pollAdbDevices` (legacy fallback) and `pollDevicesFromProviders`
+   * (live path) feed their snapshot here, so physical-device behaviour
+   * (online/offline transitions, root checks, property collection, stay-awake
+   * reset, hook emits, websocket broadcasts, set cleanup) is IDENTICAL no
+   * matter which poller ran.
+   *
+   * @param discovered every serial seen this poll, with `online === true` for
+   *   serials in adb `device` state (provider `running` state) and `false`
+   *   for any other state (offline/unauthorized/stopped/error). `source` is a
+   *   label for log messages only.
+   */
+  private async reconcileDiscovered(
+    discovered: Array<{ id: string; online: boolean; source?: string }>,
+  ): Promise<void> {
+    const currentIds = new Set<string>();
+
+    for (const { id, online, source } of discovered) {
+      currentIds.add(id);
+
+      if (online) {
+        const wasOnline = this.onlineDevices.has(id);
+        this.onlineDevices.add(id);
+        // On first discovery (or server restart), reset stay_on_while_plugged_in
+        // so devices don't stay awake indefinitely from a previous session
+        if (!wasOnline) {
+          this.setStayAwake(id, false).catch(() => {});
+          this.hookBus?.emit('device:connected', { id, platform: 'android' });
+        }
+      } else {
+        this.onlineDevices.delete(id);
+        this.stayAwakeDevices.delete(id);
+      }
+
+      // Upsert device
+      const existing = this.db
+        .select()
+        .from(devices)
+        .where(eq(devices.id, id))
+        .all();
+
+      if (existing.length === 0) {
+        log(`New device discovered${source ? ` via ${source}` : ''}: ${id}`);
+        // Check if rooted
+        const isRooted = await this.checkRooted(id);
+        this.db.insert(devices).values({
+          id,
+          isRooted,
+          lastSeen: new Date(),
+        }).run();
+        // Collect extended properties for new device
+        if (online) {
+          this.collectDeviceProperties(id).catch(() => {});
+        }
+      } else {
+        // Re-check root status if currently marked as non-rooted
+        // (covers devices rooted after first discovery, or Magisk prompt not approved on first check)
+        const wasRooted = existing[0].isRooted ?? false;
+        if (!wasRooted) {
+          const isNowRooted = await this.checkRooted(id);
+          if (isNowRooted) {
+            log(`Device ${id} is now rooted`);
+          }
+          this.db.update(devices)
+            .set({ lastSeen: new Date(), ...(isNowRooted ? { isRooted: true } : {}) })
+            .where(eq(devices.id, id))
+            .run();
+        } else {
+          this.db.update(devices)
+            .set({ lastSeen: new Date() })
+            .where(eq(devices.id, id))
+            .run();
+        }
+        // Backfill properties if any are missing (one-time per device)
+        if (online && existing[0].manufacturer == null) {
+          this.collectDeviceProperties(id).catch(() => {});
+        }
+      }
+    }
+
+    // Mark devices no longer seen as offline
+    for (const onlineId of [...this.onlineDevices]) {
+      if (!currentIds.has(onlineId)) {
+        this.onlineDevices.delete(onlineId);
+        this.kernelWgSupport.delete(onlineId);
+        this.sleepingDevices.delete(onlineId);
+        this.stayAwakeDevices.delete(onlineId);
+        log(`Android device offline: ${onlineId}`);
+        broadcastToAll({ type: 'device-status', deviceId: onlineId, status: 'offline' });
+        this.hookBus?.emit('device:disconnected', { id: onlineId, platform: 'android' });
+        this.notifyOffline(onlineId);
+      }
+    }
+  }
+
+  /**
+   * Legacy polling path: parse `adb devices` directly and reconcile.
+   *
+   * Retained as the no-registry fallback for `start()` (a boot where no
+   * provider registry was wired). When a registry IS wired,
+   * `pollDevicesFromProviders` runs instead — it delegates to the same
+   * `reconcileDiscovered` helper, so this path and the provider path produce
+   * identical physical-device discovery.
    */
   async pollAdbDevices(): Promise<void> {
     try {
       const output = await adbCommand(['devices']);
       const parsed = parseAdbDevices(output);
-
-      const currentIds = new Set<string>();
-
-      for (const { id, status } of parsed) {
-        currentIds.add(id);
-
-        if (status === 'device') {
-          const wasOnline = this.onlineDevices.has(id);
-          this.onlineDevices.add(id);
-          // On first discovery (or server restart), reset stay_on_while_plugged_in
-          // so devices don't stay awake indefinitely from a previous session
-          if (!wasOnline) {
-            this.setStayAwake(id, false).catch(() => {});
-            this.hookBus?.emit('device:connected', { id, platform: 'android' });
-          }
-        } else {
-          this.onlineDevices.delete(id);
-          this.stayAwakeDevices.delete(id);
-        }
-
-        // Upsert device
-        const existing = this.db
-          .select()
-          .from(devices)
-          .where(eq(devices.id, id))
-          .all();
-
-        if (existing.length === 0) {
-          log(`New device discovered: ${id}`);
-          // Check if rooted
-          const isRooted = await this.checkRooted(id);
-          this.db.insert(devices).values({
-            id,
-            isRooted,
-            lastSeen: new Date(),
-          }).run();
-          // Collect extended properties for new device
-          if (status === 'device') {
-            this.collectDeviceProperties(id).catch(() => {});
-          }
-        } else {
-          // Re-check root status if currently marked as non-rooted
-          // (covers devices rooted after first discovery, or Magisk prompt not approved on first check)
-          const wasRooted = existing[0].isRooted ?? false;
-          if (!wasRooted) {
-            const isNowRooted = await this.checkRooted(id);
-            if (isNowRooted) {
-              log(`Device ${id} is now rooted`);
-            }
-            this.db.update(devices)
-              .set({ lastSeen: new Date(), ...(isNowRooted ? { isRooted: true } : {}) })
-              .where(eq(devices.id, id))
-              .run();
-          } else {
-            this.db.update(devices)
-              .set({ lastSeen: new Date() })
-              .where(eq(devices.id, id))
-              .run();
-          }
-          // Backfill properties if any are missing (one-time per device)
-          if (status === 'device' && existing[0].manufacturer == null) {
-            this.collectDeviceProperties(id).catch(() => {});
-          }
-        }
-      }
-
-      // Mark devices no longer seen as offline
-      for (const onlineId of [...this.onlineDevices]) {
-        if (!currentIds.has(onlineId)) {
-          this.onlineDevices.delete(onlineId);
-          this.kernelWgSupport.delete(onlineId);
-          this.sleepingDevices.delete(onlineId);
-          this.stayAwakeDevices.delete(onlineId);
-          log(`Android device offline: ${onlineId}`);
-          broadcastToAll({ type: 'device-status', deviceId: onlineId, status: 'offline' });
-          this.hookBus?.emit('device:disconnected', { id: onlineId, platform: 'android' });
-          this.notifyOffline(onlineId);
-        }
-      }
+      await this.reconcileDiscovered(
+        parsed.map(({ id, status }) => ({ id, online: status === 'device' })),
+      );
     } catch (err: any) {
       error(`ADB poll failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Provider-driven polling path — the live discovery loop once a provider
+   * registry is wired (see `start()`). Asks the registry for all instances
+   * across every registered provider, then reconciles them through the same
+   * `reconcileDiscovered` helper `pollAdbDevices` uses.
+   *
+   * The built-in `adb-device` provider's `listInstances()` returns the same
+   * serials adb reports, with `state === 'running'` for adb `device` state
+   * and a non-running state otherwise — so this path reproduces
+   * `pollAdbDevices`'s online/offline transitions, root checks, property
+   * collection, stay-awake reset, hook emits and websocket broadcasts exactly.
+   *
+   * Instances without a serial (e.g. a stopped/created emulator that has no
+   * adb serial yet) are skipped here — they are managed by the emulator
+   * orchestrator, not the physical-device discovery reconcile.
+   *
+   * Returns early if no registry is wired (defensive — `start()` only calls
+   * this when a registry exists).
+   */
+  async pollDevicesFromProviders(): Promise<void> {
+    if (!this.providerRegistry) {
+      return;
+    }
+    try {
+      const all = await this.providerRegistry.listInstancesAll();
+      const discovered: Array<{ id: string; online: boolean; source?: string }> = [];
+      for (const row of all) {
+        if (!row.instance.serial) continue;
+        discovered.push({
+          id: row.instance.serial,
+          online: row.instance.state === 'running',
+          source: `provider ${row.providerId}`,
+        });
+      }
+      await this.reconcileDiscovered(discovered);
+    } catch (err: any) {
+      error(`Provider poll failed: ${err.message}`);
     }
   }
 
@@ -512,9 +612,14 @@ export class DeviceManager {
    */
   async collectDeviceProperties(deviceId: string): Promise<void> {
     try {
+      // No literal double-quote wrapping — adbShell uses execFile, so the
+      // string arrives at the device shell verbatim. The bare `cmd1; cmd2`
+      // form is what /system/bin/sh actually parses; wrapped in `"..."` it
+      // becomes a single bogus command word that fails "inaccessible or not
+      // found". Same pattern as the suShell fix (see test at L798).
       const output = await adbShell(
         deviceId,
-        '"getprop ro.product.manufacturer; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.cpu.abi; getprop ro.serialno; getprop ro.boot.flash.locked; getprop ro.boot.verifiedbootstate"',
+        'getprop ro.product.manufacturer; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.cpu.abi; getprop ro.serialno; getprop ro.boot.flash.locked; getprop ro.boot.verifiedbootstate',
         10000,
       );
       const lines = output.split('\n').map(l => l.trim());
@@ -1163,7 +1268,7 @@ export class DeviceManager {
   async findWgTool(deviceId: string): Promise<string | null> {
     // 1. Check system PATH
     try {
-      const result = await suShell(deviceId, 'which wg');
+      const result = await adbShell(deviceId, `"su -c 'which wg'"`);
       if (result && !result.includes('not found')) {
         return result.trim();
       }
@@ -1173,7 +1278,7 @@ export class DeviceManager {
 
     // 2. Check our pushed binary
     try {
-      const result = await suShell(deviceId, `test -x ${DeviceManager.WG_DEVICE_PATH} && echo ok`);
+      const result = await adbShell(deviceId, `"su -c 'test -x ${DeviceManager.WG_DEVICE_PATH} && echo ok'"`);
       if (result && result.includes('ok')) {
         return DeviceManager.WG_DEVICE_PATH;
       }
@@ -1203,7 +1308,7 @@ export class DeviceManager {
 
     // Push to device and make executable
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_DEVICE_PATH]);
-    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_DEVICE_PATH}`);
+    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_DEVICE_PATH}'"`);
     log(`Pushed wg binary to ${deviceId} (${arch})`);
   }
 
@@ -1231,9 +1336,9 @@ export class DeviceManager {
     if (cached !== undefined) return cached;
 
     try {
-      await suShell(
+      await adbShell(
         deviceId,
-        'ip link add wg_test type wireguard && ip link del wg_test',
+        `"su -c 'ip link add wg_test type wireguard && ip link del wg_test'"`,
       );
       log(`Device ${deviceId}: kernel WireGuard support confirmed`);
       this.kernelWgSupport.set(deviceId, true);
@@ -1250,9 +1355,9 @@ export class DeviceManager {
    */
   async findWgGoTool(deviceId: string): Promise<string | null> {
     try {
-      const result = await suShell(
+      const result = await adbShell(
         deviceId,
-        `test -x ${DeviceManager.WG_GO_DEVICE_PATH} && echo ok`,
+        `"su -c 'test -x ${DeviceManager.WG_GO_DEVICE_PATH} && echo ok'"`,
       );
       if (result && result.includes('ok')) {
         return DeviceManager.WG_GO_DEVICE_PATH;
@@ -1279,7 +1384,7 @@ export class DeviceManager {
     }
 
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_GO_DEVICE_PATH]);
-    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_GO_DEVICE_PATH}`);
+    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_GO_DEVICE_PATH}'"`);
     log(`Pushed wireguard-go binary to ${deviceId} (${abi})`);
   }
 
@@ -1305,9 +1410,9 @@ export class DeviceManager {
    */
   async findWgUapiTool(deviceId: string): Promise<string | null> {
     try {
-      const result = await suShell(
+      const result = await adbShell(
         deviceId,
-        `test -x ${DeviceManager.WG_UAPI_DEVICE_PATH} && echo ok`,
+        `"su -c 'test -x ${DeviceManager.WG_UAPI_DEVICE_PATH} && echo ok'"`,
       );
       if (result && result.includes('ok')) {
         return DeviceManager.WG_UAPI_DEVICE_PATH;
@@ -1333,7 +1438,7 @@ export class DeviceManager {
     }
 
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_UAPI_DEVICE_PATH]);
-    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_UAPI_DEVICE_PATH}`);
+    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_UAPI_DEVICE_PATH}'"`);
     log(`Pushed wg-uapi binary to ${deviceId} (${abi})`);
   }
 
@@ -1456,7 +1561,7 @@ export class DeviceManager {
       'rm -f /data/local/tmp/wg_peer.conf',
     ];
 
-    await suShell(deviceId, commands.join(' && '));
+    await adbShell(deviceId, `"su -c '${commands.join(' && ')}'"`);
 
     log(`WireGuard tunnel activated on ${deviceId} (${mode})`);
   }
@@ -1472,9 +1577,9 @@ export class DeviceManager {
   ): Promise<{ success: boolean; details: string }> {
     // Try curl first (fast and reliable when available)
     try {
-      const result = await suShell(
+      const result = await adbShell(
         deviceId,
-        `curl -sf --max-time 10 ${testUrl}`,
+        `"su -c 'curl -sf --max-time 10 ${testUrl}'"`,
       );
       if (result && result.trim().length > 0) {
         return { success: true, details: result.substring(0, 200) };
@@ -1489,9 +1594,9 @@ export class DeviceManager {
     try {
       const wgPath = await this.findWgTool(deviceId);
       if (wgPath) {
-        const result = await suShell(
+        const result = await adbShell(
           deviceId,
-          `${wgPath} show wg0 latest-handshakes`,
+          `"su -c '${wgPath} show wg0 latest-handshakes'"`,
         );
         if (result) {
           const ts = parseInt(result.trim().split('\t')[1], 10);
@@ -1517,14 +1622,90 @@ export class DeviceManager {
   async deactivateWireGuardTunnel(deviceId: string): Promise<void> {
     log(`Deactivating WireGuard tunnel on ${deviceId}`);
     try {
-      await suShell(
+      await adbShell(
         deviceId,
-        'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true',
+        `"su -c 'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true'"`,
       );
     } catch {
       // Interface may not exist — that's fine
     }
     log(`WireGuard tunnel deactivated on ${deviceId}`);
+  }
+
+  /**
+   * Configure an emulator (docker-android or AVD with userdebug build) to
+   * route HTTPS traffic through a host-side mitmproxy.
+   *
+   * Steps:
+   *  1. `adb root` to make adbd run as root (works on userdebug/eng builds)
+   *  2. push mitmproxy's CA cert into the user trust store
+   *     (`/data/misc/user/0/cacerts-added/<hash>.0`). The E2E fixture
+   *     (and any app that opts in via `networkSecurityConfig` trusting
+   *     user CAs) will then validate mitmproxy's intercepted TLS.
+   *  3. `adb reverse tcp:<port> tcp:<port>` so the emulator can reach the
+   *     host's mitmproxy via the device's own localhost
+   *  4. `adb shell settings put global http_proxy 127.0.0.1:<port>`
+   *
+   * Differs from `injectMitmproxyCaCert` in two important ways:
+   *  - Uses `adb root` instead of `su -c` (emulators don't have Magisk)
+   *  - Installs as a USER cert (no /system remount, no APEX namespace
+   *    bind-mounts) — paired with the fixture's networkSecurityConfig,
+   *    this is the minimum needed for the E2E to validate the chain.
+   *
+   * `proxyHost` is the IP the *emulator* should target — typically the
+   * host's docker-bridge gateway (172.17.0.1), not 127.0.0.1.
+   */
+  async setupEmulatorHttpProxy(deviceId: string, proxyHost: string, proxyPort: number): Promise<void> {
+    const certPath = path.join(getMitmproxyConfdir(), 'mitmproxy-ca-cert.pem');
+    if (!fs.existsSync(certPath)) {
+      throw new Error(`mitmproxy CA cert not found at ${certPath}. Start mitmproxy at least once to generate it.`);
+    }
+
+    log(`Elevating adbd to root on ${deviceId}`);
+    // `adb root` restarts adbd; the connection drops and reconnects.
+    // Bake in a wait-for-device so subsequent shell commands succeed.
+    await adbCommand(['-s', deviceId, 'root'], 10_000).catch(() => {
+      // `adb root` returns success even when adbd is already root.
+      // Some emulator images print "adbd is already running as root"
+      // on stderr — that's fine.
+    });
+    await adbCommand(['-s', deviceId, 'wait-for-device'], 10_000);
+    // Confirm we have root. On user-build emulators `adb root` is a no-op
+    // and `id` still returns shell uid; fail fast in that case.
+    const idOut = await adbShell(deviceId, 'id', 5_000);
+    if (!idOut.includes('uid=0')) {
+      throw new Error(`Failed to elevate adbd to root on ${deviceId} — emulator may be a "user" build (need userdebug/eng). id=${idOut}`);
+    }
+
+    const certPem = fs.readFileSync(certPath, 'utf-8');
+    const certHash = computeSubjectHashOld(certPem);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'emu-cert-'));
+    const tmpCert = path.join(tmpDir, `${certHash}.0`);
+    try {
+      fs.copyFileSync(certPath, tmpCert);
+      // Push into the user trust store. Path is fixed across modern Android.
+      log(`Pushing user CA cert ${certHash}.0 to ${deviceId}`);
+      await adbCommand(['-s', deviceId, 'shell', 'mkdir', '-p', '/data/misc/user/0/cacerts-added'], 5_000);
+      await adbCommand(['-s', deviceId, 'push', tmpCert, `/data/misc/user/0/cacerts-added/${certHash}.0`]);
+      await adbShell(deviceId, `chmod 644 /data/misc/user/0/cacerts-added/${certHash}.0`, 5_000);
+      await adbShell(deviceId, `chown system:system /data/misc/user/0/cacerts-added/${certHash}.0`, 5_000);
+    } finally {
+      try { fs.unlinkSync(tmpCert); } catch {}
+      try { fs.rmdirSync(tmpDir); } catch {}
+    }
+
+    // `adb reverse` works for the adb transport itself but doesn't
+    // tunnel arbitrary TCP for emulators inside Docker — the in-container
+    // QEMU NAT prevents the emulator's localhost from reaching the
+    // container's adbd as a real transport. Instead, route the emulator's
+    // outbound traffic through the host's docker-bridge gateway
+    // (typically 172.17.0.1 on Linux). mitmproxy listens on 0.0.0.0:<port>
+    // and is reachable from the container via the bridge.
+    //   emulator -> 10.0.2.2 (QEMU NAT to container) -> bridge gateway -> host:<port>
+    // Keep `settings put global http_proxy` too — system-aware apps will
+    // pick it up even though HttpURLConnection ignores it.
+    log(`Setting global http_proxy=${proxyHost}:${proxyPort} on ${deviceId}`);
+    await adbShell(deviceId, `settings put global http_proxy ${proxyHost}:${proxyPort}`, 5_000);
   }
 
   /**
@@ -1653,7 +1834,7 @@ export class DeviceManager {
       try { fs.rmdirSync(tmpDir3); } catch {}
     }
 
-    await suShell(deviceId, 'chmod +x /data/local/tmp/inject_cert.sh && /data/local/tmp/inject_cert.sh 2>&1 && rm /data/local/tmp/inject_cert.sh', 30000);
+    await adbShell(deviceId, `"su -c 'chmod +x /data/local/tmp/inject_cert.sh && /data/local/tmp/inject_cert.sh 2>&1 && rm /data/local/tmp/inject_cert.sh'"`, 30000);
     log(`CA cert injected on ${deviceId}`);
   }
 }

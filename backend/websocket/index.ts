@@ -92,17 +92,34 @@ export function setupWebSocket(
   );
   const allowedOrigins = opts?.allowedOrigins ?? [...defaultOrigins, ...envOrigins];
 
-  wss = new WebSocketServer({
-    server,
-    path: '/ws',
-    verifyClient: (info, callback) => {
-      if (verifyOrigin(info.origin, allowedOrigins)) {
-        callback(true);
-        return;
-      }
-      log(`ws upgrade rejected: disallowed origin "${info.origin}" — add it to WEBSOCKET_ALLOWED_ORIGINS env var to allow (current allowlist: ${allowedOrigins.join(',') || '(empty=disabled)'})`);
-      callback(false, 403, 'Origin not allowed');
-    },
+  // Use noServer mode so the upgrade event is handled by our shared router
+  // below, keeping all path dispatch in one place.
+  wss = new WebSocketServer({ noServer: true });
+
+  // Shared upgrade router: a single 'upgrade' listener dispatches to the
+  // right WSS instance based on the request path.
+  const routes = new Map<string, WebSocketServer>([['/ws', wss]]);
+
+  server.on('upgrade', (req, socket, head) => {
+    // Origin allow-list check (CSWSH defence) — was previously handled by
+    // the verifyClient callback in the WSS constructor options.
+    if (!verifyOrigin(req.headers.origin, allowedOrigins)) {
+      log(`ws upgrade rejected: disallowed origin "${req.headers.origin}" — add it to WEBSOCKET_ALLOWED_ORIGINS env var to allow (current allowlist: ${allowedOrigins.join(',') || '(empty=disabled)'})`);
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    const path = (req.url ?? '/').split('?')[0];
+    const target = routes.get(path);
+    if (!target) {
+      socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    target.handleUpgrade(req, socket, head, (ws) => {
+      target.emit('connection', ws, req);
+    });
   });
 
   wss.on('connection', (socket: WebSocket, req) => {

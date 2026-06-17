@@ -14,3 +14,4 @@ export * from './services';
 export * from './doc-store';
 export * from './host-tables';
 export * from './ctx-extensions';
+export * from './device-providers';

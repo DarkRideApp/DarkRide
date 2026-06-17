@@ -2,6 +2,22 @@ import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, waitFor, fireEvent, screen } from '@testing-library/react';
 import { WebSocketContext, WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
+
+// Mock android-emulator-webrtc's <Emulator> (used by EmulatorVideo, rendered
+// in DeviceViewer's emulator mode) before importing the component. A class
+// mock so refs resolve to an instance exposing sendKey. lastEmulator tracks
+// the most recent instance so tests can assert nav/keyboard → sendKey.
+let lastEmulator: any = null;
+vi.mock('android-emulator-webrtc/emulator', () => ({
+  Emulator: class MockEmulator extends React.Component<any> {
+    sendKey = vi.fn();
+    constructor(props: any) { super(props); lastEmulator = this; }
+    render() {
+      return React.createElement('div', { 'data-testid': 'mock-emulator', 'data-view': this.props.view });
+    }
+  },
+}));
+
 import { DeviceViewer } from './DeviceViewer';
 import { pluginRegistry } from '@darkrideapp/plugin-sdk/react';
 
@@ -708,5 +724,82 @@ describe('DeviceViewer — reserved aspect ratio', () => {
     );
     const wrap = container.querySelector('canvas')!.parentElement!;
     expect(wrap.style.aspectRatio).toBe('');
+  });
+});
+
+describe('DeviceViewer — emulator mode (webrtcGrpcPath)', () => {
+  beforeEach(() => { lastEmulator = null; });
+
+  it('renders the EmulatorVideo surface (no scrcpy canvas) when webrtcGrpcPath is set', () => {
+    const ws = makeWs();
+    const { getByTestId, container } = render(
+      <WebSocketContext.Provider value={ws}>
+        <DeviceViewer deviceId="localhost:32771" webrtcGrpcPath="/v1/devices/localhost%3A32771/grpc" />
+      </WebSocketContext.Provider>,
+    );
+    expect(getByTestId('emulator-video-localhost:32771')).toBeTruthy();
+    // No scrcpy <canvas> and no device-stream-start in emulator mode.
+    expect(container.querySelector('canvas')).toBeNull();
+    const startCalls = (ws.sendMessage as any).mock.calls.filter((c: any[]) => c[0] === 'device-stream-start');
+    expect(startCalls.length).toBe(0);
+  });
+
+  it('nav buttons route to the emulator gRPC sendKey with the mapped keys', () => {
+    const ws = makeWs();
+    const { getByTestId } = render(
+      <WebSocketContext.Provider value={ws}>
+        <DeviceViewer deviceId="dev-emu" webrtcGrpcPath="/v1/devices/dev-emu/grpc" />
+      </WebSocketContext.Provider>,
+    );
+    fireEvent.click(getByTestId('dv-nav-home'));
+    expect(lastEmulator.sendKey).toHaveBeenCalledWith('GoHome');
+    fireEvent.click(getByTestId('dv-nav-back'));
+    expect(lastEmulator.sendKey).toHaveBeenCalledWith('GoBack');
+    fireEvent.click(getByTestId('dv-nav-recents'));
+    expect(lastEmulator.sendKey).toHaveBeenCalledWith('AppSwitch');
+    fireEvent.click(getByTestId('dv-nav-power'));
+    expect(lastEmulator.sendKey).toHaveBeenCalledWith('Power');
+    // adb path is NOT used in emulator mode.
+    expect(ws.sendMessage).not.toHaveBeenCalledWith('device-nav', expect.anything());
+  });
+
+  it('forwards window keydown to the emulator sendKey (skipping browser shortcuts)', () => {
+    const ws = makeWs();
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <DeviceViewer deviceId="dev-emu" webrtcGrpcPath="/v1/devices/dev-emu/grpc" />
+      </WebSocketContext.Provider>,
+    );
+    fireEvent.keyDown(window, { key: 'p' });
+    expect(lastEmulator.sendKey).toHaveBeenCalledWith('p');
+    lastEmulator.sendKey.mockClear();
+    fireEvent.keyDown(window, { key: 'r', ctrlKey: true });
+    fireEvent.keyDown(window, { key: 'F5' });
+    expect(lastEmulator.sendKey).not.toHaveBeenCalled();
+  });
+
+  it('does not render the quality selector in emulator mode', () => {
+    const ws = makeWs();
+    const { container, queryByTestId } = render(
+      <WebSocketContext.Provider value={ws}>
+        <DeviceViewer deviceId="dev-emu" webrtcGrpcPath="/v1/devices/dev-emu/grpc" />
+      </WebSocketContext.Provider>,
+    );
+    // VideoQualitySelector is gone; nav/swipe/screenshot remain.
+    expect(container.querySelector('.video-quality-selector')).toBeNull();
+    expect(queryByTestId('dv-nav-home')).toBeTruthy();
+    expect(queryByTestId('dv-swipe')).toBeTruthy();
+    expect(queryByTestId('dv-screenshot')).toBeTruthy();
+  });
+
+  it('does not show Retry stream in the overflow menu in emulator mode', () => {
+    const ws = makeWs();
+    const { getByTestId } = render(
+      <WebSocketContext.Provider value={ws}>
+        <DeviceViewer deviceId="dev-emu" webrtcGrpcPath="/v1/devices/dev-emu/grpc" />
+      </WebSocketContext.Provider>,
+    );
+    fireEvent.click(getByTestId('dv-overflow'));
+    expect(screen.queryByRole('button', { name: /Retry stream/i })).toBeNull();
   });
 });

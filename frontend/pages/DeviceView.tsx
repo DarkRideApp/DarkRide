@@ -54,6 +54,8 @@ export function DeviceView() {
   const [reprobing, setReprobing] = useState(false);
   const [pairing, setPairing] = useState(false);
   const [busyWarning, setBusyWarning] = useState<number | null>(null); // remaining seconds
+  const [videoTransport, setVideoTransport] = useState<'webrtc' | 'scrcpy' | null>(null);
+  const [grpcWebPath, setGrpcWebPath] = useState<string | null>(null);
   const [showSyslog, setShowSyslog] = useState(false);
   const [syslogRunning, setSyslogRunning] = useState(false);
   const [syslogEntries, setSyslogEntries] = useState<Array<{
@@ -72,6 +74,28 @@ export function DeviceView() {
       setLoading(false);
     }).catch(() => setLoading(false));
   }, [ws, deviceId]);
+
+  // Fetch video transport type — determines whether to render the WebRTC
+  // DeviceViewer (docker-android emulators) or the default scrcpy DeviceViewer.
+  useEffect(() => {
+    if (!deviceId || !ws.connected) return;
+    let cancelled = false;
+    ws.sendRestApi('GET', `/v1/devices/${encodeURIComponent(deviceId)}/video-transport`)
+      .then((r: any) => {
+        if (cancelled) return;
+        const data = r?.body?.data ?? {};
+        const t = data.transport === 'webrtc' ? 'webrtc' : 'scrcpy';
+        setVideoTransport(t);
+        setGrpcWebPath(data.grpcWebPath ?? null);
+      })
+      .catch(() => {
+        // Network/WS errors are non-fatal — fall through to the scrcpy
+        // default. A docker-android emulator will retry on the next mount
+        // once the WS reconnects (this effect re-runs when ws changes).
+        if (!cancelled) setVideoTransport('scrcpy');
+      });
+    return () => { cancelled = true; };
+  }, [deviceId, ws]);
 
   // DeviceViewer drives the live stream. When it fires onStreamReady we treat
   // the stream as live and clear any prior polling/error state.
@@ -223,15 +247,26 @@ export function DeviceView() {
   // Key forwarding — page-level, not canvas-related.
   useEffect(() => {
     if (!deviceId) return;
+    // The emulator (webrtc) owns its own keyboard via the gRPC channel
+    // (EmulatorView). Its adb input path fails, so forwarding here would only
+    // spam failures and double-send. Leave keyboard entirely to EmulatorView.
+    if (videoTransport === 'webrtc') return;
     const handler = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if ((e.target as HTMLElement).closest?.('.live-log-wrapper')) return;
+      // Don't hijack browser shortcuts — modifier combos (Ctrl/Cmd/Alt, e.g.
+      // Ctrl+Shift+R, Ctrl+R) and function keys (F5 refresh, F12 devtools).
+      // These would otherwise be swallowed by preventDefault + forwarded to the
+      // device, making it impossible to reload or open devtools while a device
+      // page is open.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (/^F\d{1,2}$/.test(e.key)) return;
       e.preventDefault();
       ws.sendMessage('device-key', { deviceId, key: e.key });
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [ws, deviceId]);
+  }, [ws, deviceId, videoTransport]);
 
   // DOM capture: fetch DOM via ADB, store in sessionStorage, open selector debugger
   const handleCaptureDom = useCallback(async () => {
@@ -544,13 +579,24 @@ export function DeviceView() {
 
   const canvasSection = (
     <div className="device-canvas-container">
-      <DeviceViewer
-        deviceId={deviceId!}
-        captureSessionId={captureSessionId ?? undefined}
-        extraActions={extraActions}
-        onStreamReady={handleStreamReady}
-        onError={handleStreamError}
-      />
+      {videoTransport === 'webrtc' && grpcWebPath ? (
+        <DeviceViewer
+          deviceId={deviceId!}
+          webrtcGrpcPath={grpcWebPath}
+          captureSessionId={captureSessionId ?? undefined}
+          extraActions={extraActions}
+          onStreamReady={handleStreamReady}
+          onError={handleStreamError}
+        />
+      ) : (
+        <DeviceViewer
+          deviceId={deviceId!}
+          captureSessionId={captureSessionId ?? undefined}
+          extraActions={extraActions}
+          onStreamReady={handleStreamReady}
+          onError={handleStreamError}
+        />
+      )}
       {automationLog.length > 0 && (
         <div className="automation-overlay" data-testid="automation-overlay">
           <strong>Automation Running</strong>

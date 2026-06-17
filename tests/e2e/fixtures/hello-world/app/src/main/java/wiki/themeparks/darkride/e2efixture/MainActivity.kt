@@ -1,0 +1,76 @@
+package wiki.themeparks.darkride.e2efixture
+
+import android.app.Activity
+import android.os.Bundle
+import android.util.Log
+import android.widget.TextView
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.URL
+import kotlin.concurrent.thread
+
+/**
+ * E2E fixture for DarkRide emulator-capture testing.
+ * On create, issues a single HTTPS GET to https://example.com/?darkride-e2e=ping.
+ * The DarkRide E2E test (tests/e2e/emulator-capture.test.ts) asserts the
+ * captured request appears in the traffic store with the expected hostname.
+ *
+ * Proxy selection priority:
+ *   1. Intent extra "proxy_url" (format "host:port") — set by the E2E
+ *      harness via `am start ... --es proxy_url 127.0.0.1:NNNNN`. This
+ *      is the only reliable way to get HttpURLConnection to honour a
+ *      specific proxy on Android — the system-wide `settings put global
+ *      http_proxy` value is not consistently picked up by Java code.
+ *   2. No proxy — direct connection. The fixture still works without
+ *      DarkRide; useful for sanity-checking the APK on a real device.
+ *
+ * Implementation notes:
+ * - Uses HttpURLConnection (no library deps — keeps the APK tiny).
+ * - Network call runs on a background thread (Android disallows network on UI thread).
+ * - networkSecurityConfig (res/xml/network_security_config.xml) trusts
+ *   user-installed CAs so mitmproxy's intercepted TLS validates.
+ */
+private const val TAG = "e2efixture"
+
+class MainActivity : Activity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val tv = TextView(this).apply { textSize = 16f }
+        setContentView(tv)
+        val proxyUrl = intent?.getStringExtra("proxy_url")
+        Log.i(TAG, "onCreate: proxy_url=${proxyUrl ?: "(none)"}")
+        thread {
+            try {
+                // Use a real domain so the CONNECT through mitmproxy
+                // actually resolves and completes. example.com is reserved
+                // for documentation/testing (RFC 2606) and stable — perfect
+                // for an E2E that just wants to validate the capture chain.
+                // mitmproxy intercepts TLS, presents its own cert (trusted
+                // via networkSecurityConfig + user CA push), and the
+                // request appears in DarkRide's traffic store keyed by
+                // hostname=example.com.
+                Log.i(TAG, "opening https://example.com/?darkride-e2e=ping via proxy=${proxyUrl ?: "(direct)"}")
+                val url = URL("https://example.com/?darkride-e2e=ping")
+                val conn = if (proxyUrl != null && proxyUrl.contains(':')) {
+                    val (host, portStr) = proxyUrl.split(":", limit = 2)
+                    val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(host, portStr.toInt()))
+                    url.openConnection(proxy) as HttpURLConnection
+                } else {
+                    url.openConnection() as HttpURLConnection
+                }
+                conn.connectTimeout = 5000
+                conn.readTimeout = 5000
+                conn.requestMethod = "GET"
+                conn.connect()
+                val code = conn.responseCode
+                Log.i(TAG, "ping sent: $code")
+                runOnUiThread { tv.text = "ping sent via proxy=${proxyUrl ?: "(none)"}: $code" }
+                conn.disconnect()
+            } catch (e: Exception) {
+                Log.e(TAG, "ping failed", e)
+                runOnUiThread { tv.text = "ping failed via proxy=${proxyUrl ?: "(none)"}: ${e.message}" }
+            }
+        }
+    }
+}

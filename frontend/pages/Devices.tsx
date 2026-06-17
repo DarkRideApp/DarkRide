@@ -1,17 +1,45 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
+import { useWebSocket, useToast } from '@darkrideapp/plugin-sdk/react';
 import { StatusBadge } from '@darkrideapp/plugin-sdk/react';
 import { LoadingSpinner } from '@darkrideapp/plugin-sdk/react';
 import { SkeletonCard } from '@darkrideapp/plugin-sdk/react';
 import { PageHeader } from '@darkrideapp/plugin-sdk/react';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
-import { Smartphone, Apple, RefreshCw } from 'lucide-react';
+import { Smartphone, Apple, RefreshCw, Server, AlertTriangle } from 'lucide-react';
 import { CURRENT_SETUP_VERSION } from '../../shared/types/api';
 import type { Device } from '../../shared/types/api';
 import { SetupWizardModal } from '../components/devices/SetupWizardModal';
+import { CreateEmulatorModal } from '../components/devices/CreateEmulatorModal';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
+
+/**
+ * Managed instance row as returned by `/v1/devices/providers/:id/instances`.
+ * `serial` is set after `startInstance` resolves; null while still spawning.
+ */
+interface ManagedInstance {
+  id: number;
+  providerId: string;
+  runtimeId: string;
+  displayName: string | null;
+  serial: string | null;
+  state: 'pulling' | 'created' | 'starting' | 'running' | 'stopped' | 'error';
+  spawnMetadata: { image?: string; androidVersion?: string; arch?: string; ramMb?: number } | null;
+  lastError: string | null;
+  createdAt: string | number | Date;
+  /** Updated on every state transition — best timestamp for "how long has this been in its current state". */
+  lastStateAt?: string | number | Date;
+}
+
+interface PullProgress {
+  percent: number | null;
+  phase: string;
+  bytesDone: number;
+  bytesTotal: number;
+  completedLayers: number;
+  totalLayers: number;
+}
 
 function isOnline(device: Device): boolean {
   if (!device.lastSeen) return false;
@@ -29,15 +57,29 @@ export function Devices() {
   useDocumentTitle('Devices');
   const auth = useAuthOptional();
   const ws = useWebSocket();
+  const toast = useToast();
   const navigate = useNavigate();
   const [devices, setDevices] = useState<Device[]>([]);
+  const [instances, setInstances] = useState<ManagedInstance[]>([]);
+  // Live pull progress per instance — keyed by row id. Sidecar payload on
+  // `provider-instance-updated`; not persisted server-side. Cleared when
+  // the instance leaves `pulling` state.
+  const [pullProgress, setPullProgress] = useState<Map<number, PullProgress>>(new Map());
   const [loading, setLoading] = useState(true);
   const [setupDevice, setSetupDevice] = useState<Device | null>(null);
+  const [showCreateModal, setShowCreateModal] = useState(false);
 
   const fetchDevices = useCallback(async () => {
     try {
       const res = await ws.sendRestApi('GET', '/v1/device/list');
-      setDevices(res.body?.data || []);
+      const raw: Device[] = res.body?.data || [];
+      // Defensive dedupe by id — the reconcile path can transiently surface
+      // the same physical device twice when both the legacy adb-poll and the
+      // new provider-driven path emit a row for it. Real fix lives in the
+      // backend reconciler; this stops React's duplicate-key warning while
+      // we sort that out.
+      const seen = new Set<string>();
+      setDevices(raw.filter(d => (seen.has(d.id) ? false : (seen.add(d.id), true))));
     } catch {
       // ignore
     } finally {
@@ -45,9 +87,79 @@ export function Devices() {
     }
   }, [ws]);
 
+  /**
+   * Fetch managed instances across every registered provider so the grid
+   * can show emulators that are still booting (state=created/starting) and
+   * therefore not yet visible to the adb-device tracker. Providers without
+   * `canCreate` (e.g. adb-device) have no managed instances and are skipped.
+   */
+  const fetchInstances = useCallback(async () => {
+    try {
+      const provs = await ws.sendRestApi('GET', '/v1/devices/providers');
+      const list = (provs.body?.data?.providers ?? []) as Array<{ id: string; capabilities: { canCreate: boolean }; available: boolean }>;
+      const creatable = list.filter((p) => p.capabilities.canCreate && p.available);
+      const all: ManagedInstance[] = [];
+      await Promise.all(creatable.map(async (p) => {
+        const r = await ws.sendRestApi('GET', `/v1/devices/providers/${p.id}/instances`);
+        const rows = (r.body?.data?.instances ?? []) as ManagedInstance[];
+        for (const row of rows) all.push(row);
+      }));
+      setInstances(all);
+    } catch {
+      // ignore — partial failure shouldn't blank the page
+    }
+  }, [ws]);
+
   useEffect(() => {
-    if (ws.connected) fetchDevices();
-  }, [ws.connected, fetchDevices]);
+    if (!ws.connected) return;
+    void fetchDevices();
+    void fetchInstances();
+  }, [ws.connected, fetchDevices, fetchInstances]);
+
+  // Live state: backend broadcasts provider-instance-updated on every state
+  // transition (created → starting → running → error). Refetch on each
+  // event so the grid reflects the boot progress without polling.
+  useEffect(() => {
+    const unsub = ws.subscribe('provider-instance-updated', (msg: any) => {
+      const inst = msg?.instance as ManagedInstance | undefined;
+      const prog = msg?.pullProgress as PullProgress | undefined;
+      if (inst?.id != null && prog) {
+        // Update progress without a refetch round-trip — sub-second updates
+        // would otherwise hammer the API.
+        setPullProgress((prev) => {
+          const next = new Map(prev);
+          next.set(inst.id, prog);
+          return next;
+        });
+      }
+      if (inst?.id != null && inst.state !== 'pulling') {
+        setPullProgress((prev) => {
+          if (!prev.has(inst.id)) return prev;
+          const next = new Map(prev);
+          next.delete(inst.id);
+          return next;
+        });
+      }
+      // Refetch on real state transitions (cheap, debounced by React batching).
+      void fetchInstances();
+      void fetchDevices();
+    });
+    return unsub;
+  }, [ws, fetchInstances, fetchDevices]);
+
+  // Deletes don't fit the "updated" event shape (the row is gone) — the
+  // backend emits a dedicated provider-instance-deleted with the row id.
+  // Remove the matching card from local state directly to avoid a full
+  // refetch round-trip.
+  useEffect(() => {
+    const unsub = ws.subscribe('provider-instance-deleted', (msg: any) => {
+      const deletedId = msg?.id as number | undefined;
+      if (typeof deletedId === 'number') {
+        setInstances((prev) => prev.filter((i) => i.id !== deletedId));
+      }
+    });
+    return unsub;
+  }, [ws]);
 
   if (auth && !auth.hasScope('core.devices:read')) return <AccessDenied scope="core.devices:read" />;
 
@@ -56,37 +168,151 @@ export function Devices() {
     fetchDevices();
   };
 
+  async function startInstance(inst: ManagedInstance) {
+    try {
+      const r = await ws.sendRestApi('POST', `/v1/devices/providers/${inst.providerId}/instances/${inst.id}/start`);
+      if (!r.body?.success) toast.error(r.body?.error ?? 'Failed to start');
+    } catch (e: any) {
+      toast.error(e?.message ?? 'Failed to start');
+    }
+  }
+  async function stopInstance(inst: ManagedInstance) {
+    try {
+      const r = await ws.sendRestApi('POST', `/v1/devices/providers/${inst.providerId}/instances/${inst.id}/stop`);
+      if (!r.body?.success) toast.error(r.body?.error ?? 'Failed to stop');
+    } catch (e: any) {
+      toast.error(e?.message ?? 'Failed to stop');
+    }
+  }
+  async function deleteInstance(inst: ManagedInstance) {
+    if (!window.confirm(`Delete "${inst.displayName ?? inst.runtimeId}"? This removes the container as well.`)) return;
+    // Optimistically drop the card so the click feels instant. The
+    // broadcast (`provider-instance-deleted`) handler will agree once the
+    // backend confirms; if the request fails we restore.
+    const snapshot = instances;
+    setInstances((prev) => prev.filter((i) => i.id !== inst.id));
+    try {
+      const r = await ws.sendRestApi('DELETE', `/v1/devices/providers/${inst.providerId}/instances/${inst.id}`);
+      if (!r.body?.success) {
+        setInstances(snapshot);
+        toast.error(r.body?.error ?? 'Failed to delete');
+      }
+    } catch (e: any) {
+      setInstances(snapshot);
+      toast.error(e?.message ?? 'Failed to delete');
+    }
+  }
+
+  async function forgetDevice(device: Device) {
+    if (!window.confirm(`Forget "${device.name || device.id}"? This removes the row from the devices table — useful for cleaning up stale emulator serials. If the device is still reachable via adb it will be re-added on the next poll.`)) return;
+    const snapshot = devices;
+    setDevices((prev) => prev.filter((d) => d.id !== device.id));
+    try {
+      const r = await ws.sendRestApi('DELETE', `/v1/device/${encodeURIComponent(device.id)}`);
+      if (!r.body?.success) {
+        setDevices(snapshot);
+        toast.error(r.body?.error ?? 'Failed to forget device');
+      }
+    } catch (e: any) {
+      setDevices(snapshot);
+      toast.error(e?.message ?? 'Failed to forget device');
+    }
+  }
+
   if (loading) return <div className="skeleton-grid"><SkeletonCard /><SkeletonCard /><SkeletonCard /></div>;
 
-  const onlineCount = devices.filter(isOnline).length;
-  const offlineCount = devices.length - onlineCount;
+  // Two sources of cards: managed-instance rows and adb-tracked device
+  // rows. They overlap when a running docker-android emulator is reachable
+  // via adb (same serial in both tables). The rules:
+  //
+  //   1. RUNNING instance + matching device row → show device card only.
+  //      The device card has its own Stop/Delete surfaced via the
+  //      backing-instance lookup below.
+  //   2. NON-RUNNING instance (stopped/created/error/pulling) → show
+  //      instance card. Its serial may still match a stale device row
+  //      because the device-manager doesn't clean those up when the
+  //      container dies (separate issue); we hide the stale device card
+  //      in that case so the user sees one card, not two.
+  //   3. Device row with no matching instance (USB phones, iOS, etc.) →
+  //      show device card.
+  //
+  // Without rule 2 a stopped emulator leaves the user staring at an
+  // unactionable device card (no Start, because Start is an instance op).
+  const instanceBySerial = new Map<string, ManagedInstance>();
+  for (const i of instances) {
+    if (i.serial) instanceBySerial.set(i.serial, i);
+  }
+  const deviceSerials = new Set(devices.map((d) => d.id));
+  const visibleInstances = instances.filter((i) => {
+    // Rule 2: non-running instances always show their card.
+    if (i.state !== 'running') return true;
+    // Rule 1: running instance is superseded by the device card if one exists.
+    return !i.serial || !deviceSerials.has(i.serial);
+  });
+  const visibleDevices = devices.filter((d) => {
+    // Rule 2: hide stale device cards backed by non-running instances.
+    const inst = instanceBySerial.get(d.id);
+    return !inst || inst.state === 'running';
+  });
+  // Counts reflect what the user actually sees, not raw row counts.
+  const onlineCount = visibleDevices.filter(isOnline).length;
+  const offlineCount = visibleDevices.length - onlineCount;
+  const bootingCount = visibleInstances.filter((i) => i.state === 'created' || i.state === 'starting').length;
+  const errorCount = visibleInstances.filter((i) => i.state === 'error').length;
+  const subtitle = [
+    `${onlineCount} online`,
+    `${offlineCount} offline`,
+    bootingCount > 0 ? `${bootingCount} booting` : null,
+    errorCount > 0 ? `${errorCount} error` : null,
+  ].filter(Boolean).join(' · ');
+
+  const hasAnything = visibleDevices.length > 0 || visibleInstances.length > 0;
 
   return (
     <div data-testid="devices-page">
       <PageHeader
         title="Devices"
-        subtitle={`${onlineCount} online · ${offlineCount} offline`}
+        subtitle={subtitle}
         actions={
           <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn btn-sm" onClick={() => fetchDevices()}>
+            <button className="btn btn-sm" onClick={() => { void fetchDevices(); void fetchInstances(); }}>
               <RefreshCw size={14} style={{ marginRight: 6 }} />
               Sync All
+            </button>
+            <button
+              className="btn btn-sm btn-primary"
+              onClick={() => setShowCreateModal(true)}
+            >
+              + New emulator
             </button>
           </div>
         }
       />
-      {devices.length === 0 ? (
+      {!hasAnything ? (
         <div className="empty-state">
           <div className="empty-icon" aria-hidden><Smartphone size={32} /></div>
           <div>No devices connected</div>
           <div style={{ marginTop: 8, fontSize: '0.85em', opacity: 0.7 }}>
-            Connect an Android device via USB and enable USB debugging, or pair an iOS device to get started.
+            Connect an Android device via USB and enable USB debugging, pair
+            an iOS device, or click <strong>+ New emulator</strong> to spin
+            up a virtual device.
           </div>
         </div>
       ) : (
         <div className="card-grid">
-          {devices.map(device => {
+          {visibleInstances.map((inst) => (
+            <InstanceCard
+              key={`inst-${inst.id}`}
+              instance={inst}
+              pullProgress={pullProgress.get(inst.id) ?? null}
+              onStart={() => startInstance(inst)}
+              onStop={() => stopInstance(inst)}
+              onDelete={() => deleteInstance(inst)}
+            />
+          ))}
+          {visibleDevices.map(device => {
             const online = isOnline(device);
+            const backingInstance = instanceBySerial.get(device.id) ?? null;
             return (
               <div
                 key={device.id}
@@ -110,6 +336,11 @@ export function Devices() {
                       )}
                       {device.platform !== 'ios' && !device.isRooted && (
                         <span className="badge badge-sm badge-muted">Factory</span>
+                      )}
+                      {backingInstance && (
+                        <span className="badge badge-sm badge-muted" title={`${backingInstance.providerId} instance #${backingInstance.id}`}>
+                          Emulator
+                        </span>
                       )}
                     </div>
                   </div>
@@ -165,6 +396,48 @@ export function Devices() {
                       {online ? 'Connect' : 'View Details'}
                     </span>
                   )}
+                  {backingInstance && (
+                    // Emulator-lifecycle actions surface on the device card
+                    // ONLY when this device is backed by a managed instance.
+                    // Without this row the only way to stop/delete the
+                    // emulator was to manually `docker rm -f` the container,
+                    // because the instance card is hidden once adb sees it.
+                    <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
+                      <button
+                        className="device-card-action"
+                        onClick={e => { e.stopPropagation(); stopInstance(backingInstance); }}
+                        data-testid={`emu-stop-${device.id}`}
+                        title="Stop the emulator container"
+                      >
+                        Stop
+                      </button>
+                      <button
+                        className="device-card-action"
+                        onClick={e => { e.stopPropagation(); deleteInstance(backingInstance); }}
+                        data-testid={`emu-delete-${device.id}`}
+                        title="Delete the emulator container (irreversible)"
+                        style={{ borderColor: 'var(--danger)', color: 'var(--danger)' }}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  )}
+                  {!online && !backingInstance && (
+                    // Forget action for genuinely-orphaned offline rows.
+                    // Common case: stale `localhost:NNNNN` serials from old
+                    // emulator sessions that the device-manager never cleaned
+                    // up. Hidden for online devices (they're real) and for
+                    // backing-instance devices (use the instance lifecycle).
+                    <button
+                      className="device-card-action"
+                      onClick={e => { e.stopPropagation(); forgetDevice(device); }}
+                      data-testid={`forget-btn-${device.id}`}
+                      title="Remove this row from the devices table. If the device reconnects via adb it will re-appear."
+                      style={{ marginLeft: 'auto', borderColor: 'var(--text-muted)', color: 'var(--text-muted)' }}
+                    >
+                      Forget
+                    </button>
+                  )}
                 </div>
               </div>
             );
@@ -178,6 +451,214 @@ export function Devices() {
           onSetupComplete={handleSetupComplete}
         />
       )}
+      {showCreateModal && (
+        <CreateEmulatorModal
+          onCancel={() => setShowCreateModal(false)}
+          onCreated={() => {
+            setShowCreateModal(false);
+            fetchDevices();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+const STATE_LABEL: Record<ManagedInstance['state'], string> = {
+  pulling: 'Pulling image',
+  created: 'Created',
+  starting: 'Booting',
+  running: 'Connecting',  // running per backend, not yet visible to adb tracker
+  stopped: 'Stopped',
+  error: 'Error',
+};
+
+function relativeTime(input: string | number | Date): string {
+  const t = typeof input === 'object' ? input.getTime() : new Date(input).getTime();
+  const delta = Math.max(0, Date.now() - t);
+  const sec = Math.floor(delta / 1000);
+  if (sec < 5) return 'just now';
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return `${Math.floor(hr / 24)}d ago`;
+}
+
+interface InstanceCardProps {
+  instance: ManagedInstance;
+  /** Sidecar progress for state='pulling' — null otherwise. */
+  pullProgress: PullProgress | null;
+  onStart: () => void;
+  onStop: () => void;
+  onDelete: () => void;
+}
+
+/**
+ * Card for a managed emulator instance. Shows boot/error state with the
+ * right affordance for each:
+ *   - created/stopped → Start button
+ *   - starting/running-pre-tracker → spinner + "Booting" / "Connecting"
+ *   - error → red badge + lastError message + Retry / Delete
+ *
+ * Distinct visual treatment (instance-card class) so users can tell at a
+ * glance which cards are managed by DarkRide vs adb-discovered devices.
+ */
+function InstanceCard({ instance: inst, pullProgress, onStart, onStop, onDelete }: InstanceCardProps) {
+  const isPulling = inst.state === 'pulling';
+  const isBooting = inst.state === 'starting' || inst.state === 'running';
+  const isError = inst.state === 'error';
+  const isStartable = inst.state === 'created' || inst.state === 'stopped';
+  const hasSpinner = isPulling || isBooting;
+  const meta = inst.spawnMetadata ?? {};
+  const subtitle: string[] = [];
+  if (meta.image) subtitle.push(meta.image.split(':').pop() ?? meta.image);
+  if (meta.arch) subtitle.push(meta.arch);
+  if (meta.ramMb) subtitle.push(`${meta.ramMb} MB RAM`);
+
+  return (
+    <div
+      className={`card instance-card instance-card-${inst.state}`}
+      data-testid={`instance-card-${inst.id}`}
+    >
+      <div className="device-card-header">
+        <div className="device-card-header-info">
+          <span className="device-card-name">
+            {inst.displayName || `Instance #${inst.id}`}
+          </span>
+          {inst.serial && (
+            <span className="device-card-id" style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+              {inst.serial}
+            </span>
+          )}
+          <div className="device-card-badges">
+            <span className={`badge badge-sm instance-state-${inst.state}`}>
+              {hasSpinner && <span className="spin" aria-hidden style={{ display: 'inline-block', marginRight: 4 }}>⟳</span>}
+              {STATE_LABEL[inst.state]}
+            </span>
+            <span className="badge badge-sm badge-muted">{inst.providerId}</span>
+          </div>
+        </div>
+        <div className="device-card-icon">
+          {isError ? <AlertTriangle size={20} color="var(--danger)" /> : <Server size={20} />}
+        </div>
+      </div>
+
+      <div className="device-card-details">
+        {subtitle.length > 0 && (
+          <div className="device-card-detail-row">
+            <span className="detail-label">Spec</span>
+            <span className="detail-value">{subtitle.join(' · ')}</span>
+          </div>
+        )}
+        <div className="device-card-detail-row">
+          <span className="detail-label">Created</span>
+          <span className="detail-value">{relativeTime(inst.createdAt)}</span>
+        </div>
+        {isError && inst.lastError && (
+          <div className="instance-card-error" data-testid="instance-error">
+            {inst.lastError}
+          </div>
+        )}
+        {isPulling && <InstancePullProgress progress={pullProgress} />}
+        {isBooting && <InstanceBootProgress inst={inst} />}
+      </div>
+
+      <div className="device-card-footer instance-card-footer">
+        {isStartable && (
+          <button className="btn btn-sm btn-primary" onClick={onStart} data-testid={`start-instance-${inst.id}`}>
+            Start
+          </button>
+        )}
+        {inst.state === 'running' && (
+          <button className="btn btn-sm" onClick={onStop} data-testid={`stop-instance-${inst.id}`}>
+            Stop
+          </button>
+        )}
+        {isError && (
+          <button className="btn btn-sm" onClick={onStart} data-testid={`retry-instance-${inst.id}`}>
+            Retry
+          </button>
+        )}
+        {(inst.state === 'stopped' || inst.state === 'error' || inst.state === 'created') && (
+          <button
+            className="btn btn-sm btn-danger-ghost"
+            onClick={onDelete}
+            data-testid={`delete-instance-${inst.id}`}
+          >
+            Delete
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Live elapsed-time + escalating helpfulness during boot. Ticks every
+ * second so the displayed counter updates without waiting for another
+ * provider-instance-updated event (boots between events are silent).
+ */
+function InstanceBootProgress({ inst }: { inst: ManagedInstance }) {
+  const since = (inst.lastStateAt ?? inst.createdAt) as string | number | Date;
+  const startMs = typeof since === 'object' ? since.getTime() : new Date(since).getTime();
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const elapsed = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+  // 0-90s: normal boot expected
+  // 90-180s: still booting, fine
+  // 180-240s: getting slow
+  // 240s+: probably stuck (server-side bootTimeoutMs default)
+  let tone: 'normal' | 'warn' | 'stuck' = 'normal';
+  let msg = 'Cold boot takes ~90 seconds on KVM. The device will appear in your list once adbd binds.';
+  if (elapsed >= 240) {
+    tone = 'stuck';
+    msg = "This is taking longer than expected (~240s) — the in-container emulator may have crashed. Try Delete + create a fresh one, or check the docker container logs.";
+  } else if (elapsed >= 90) {
+    tone = 'warn';
+    msg = 'Still booting. Cold-boot of the Android emulator inside the container can take 1–3 minutes on slower hosts.';
+  }
+  return (
+    <div className={`instance-card-progress-hint instance-card-progress-${tone}`}>
+      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
+        elapsed: {elapsed}s
+      </div>
+      {msg}
+    </div>
+  );
+}
+
+/**
+ * Shows aggregated image-pull progress on a 'pulling' instance card.
+ * Single percent + single phrase — no per-layer flipping. The backend
+ * (docker-android's ensureImageLocal) aggregates across all layers and
+ * throttles to ~500ms before pushing here.
+ */
+function InstancePullProgress({ progress }: { progress: PullProgress | null }) {
+  if (!progress) {
+    return (
+      <div className="instance-card-progress-hint">
+        Preparing image…
+      </div>
+    );
+  }
+  const pct = progress.percent ?? 0;
+  return (
+    <div className="instance-card-pull">
+      <div className="instance-card-pull-bar" aria-label="Image pull progress">
+        <div
+          className="instance-card-pull-bar-fill"
+          style={{ width: progress.percent === null ? '5%' : `${pct}%` }}
+        />
+      </div>
+      <div className="instance-card-pull-label">
+        <span>{progress.percent === null ? '—' : `${pct}%`}</span>
+        <span style={{ opacity: 0.7, fontSize: 11 }}>{progress.phase}</span>
+      </div>
     </div>
   );
 }
