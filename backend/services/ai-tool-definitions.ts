@@ -22,6 +22,9 @@ import { callFridaBridge } from './frida-bridge';
 import { broadcastToAll } from '../websocket/index';
 import { lookupVersionMeta, analysisDir as getAnalysisDir, analysisDbPath, resolveApkLocal, apkFilePath, getApkDir } from '../utils/apk-paths';
 import { getNote, setNote, patchNoteSection } from './apk-notes';
+import type { SourceRegistry } from './apk-sources/registry';
+import type { RemoteApkSource } from './apk-sources/types';
+import { ensureAppSources } from './apk-sources';
 
 /**
  * Services available to AI tool implementations. Tools that need to mutate
@@ -45,6 +48,20 @@ export interface AiToolServices {
    * a full ApkAnalyzerService.
    */
   apkAnalyzer?: { enqueue: (versionId: number) => Promise<number> };
+  /**
+   * Optional — the `fetch_app_from_source` tool drives a one-off remote fetch
+   * through the tracker. Typed structurally on the single method it needs so
+   * tests can pass a minimal fake.
+   */
+  apkTracker?: {
+    checkRemoteSource: (
+      app: { id: number; packageName: string; appName: string | null },
+      source: RemoteApkSource,
+      opts?: { force?: boolean },
+    ) => Promise<{ newVersionId: number | null; error?: string }>;
+  };
+  /** Registry of remote APK sources (Play Store, QQ, …). */
+  sourceRegistry?: SourceRegistry;
 }
 
 /**
@@ -144,6 +161,8 @@ export function registerAllTools(
     pluginStateManager,
     systemStateService,
     apkAnalyzer,
+    apkTracker,
+    sourceRegistry,
   } = services;
   // ── Session Timeline tools ──────────────────────────────────────
 
@@ -1235,6 +1254,11 @@ export function registerAllTools(
           downloadedAt: v.downloadedAt,
           analysisStatus: latestJobByVersion.get(v.id)?.status ?? null,
         })),
+        // Per-app remote fetch sources (enable via set_app_source, fetch via
+        // fetch_app_from_source).
+        sources: db.select().from(schema.appSources)
+          .where(eq(schema.appSources.trackedAppId, app.id)).all()
+          .map(s => ({ source: s.source, enabled: !!s.enabled, lastVersion: s.lastVersion, lastError: s.lastError })),
       };
     },
   });
@@ -1262,6 +1286,92 @@ export function registerAllTools(
       if (!apkAnalyzer) return { error: 'APK analyzer not wired into AI tools' };
       const jobId = await apkAnalyzer.enqueue(params.versionId);
       return { jobId, versionId: params.versionId };
+    },
+  });
+
+  // Resolve a tracked app by numeric id or package name. Returns null if not found.
+  function resolveTrackedApp(params: { trackedAppId?: number; packageName?: string }) {
+    if (typeof params.trackedAppId === 'number') {
+      return db.select().from(schema.trackedApps).where(eq(schema.trackedApps.id, params.trackedAppId)).all()[0] ?? null;
+    }
+    if (params.packageName) {
+      return db.select().from(schema.trackedApps).where(eq(schema.trackedApps.packageName, params.packageName)).all()[0] ?? null;
+    }
+    return null;
+  }
+
+  registry.register({
+    name: 'set_app_source',
+    description:
+      'Enable or disable a remote fetch source for a tracked app. Sources: "playstore" (Google Play / APKPure) and "qq" (Tencent App Store / 应用宝, China-registry apps only). Identify the app by trackedAppId or packageName. Enabling a source makes the background tracker fetch new versions from it each cycle.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        trackedAppId: { type: 'number', description: 'Numeric id from list_tracked_apps' },
+        packageName: { type: 'string', description: 'Reverse-DNS package name (e.g. com.hytch.ftthemepark)' },
+        source: { type: 'string', enum: ['playstore', 'qq'], description: 'Source id to toggle' },
+        enabled: { type: 'boolean', description: 'true to enable, false to disable' },
+      },
+      required: ['source', 'enabled'],
+    },
+    context: ['dashboard', 'apk-analysis'],
+    requiredScope: 'core.apk:manage',
+    async execute(params: { trackedAppId?: number; packageName?: string; source: string; enabled: boolean }) {
+      if (sourceRegistry && !sourceRegistry.has(params.source)) return { error: `Unknown source: ${params.source}` };
+      const app = resolveTrackedApp(params);
+      if (!app) return { error: 'Tracked app not found' };
+
+      const existing = db.select().from(schema.appSources)
+        .where(eq(schema.appSources.trackedAppId, app.id)).all()
+        .find(r => r.source === params.source);
+      if (existing) {
+        db.update(schema.appSources).set({ enabled: params.enabled }).where(eq(schema.appSources.id, existing.id)).run();
+      } else {
+        db.insert(schema.appSources).values({
+          trackedAppId: app.id, source: params.source, enabled: params.enabled, createdAt: new Date(),
+        }).run();
+      }
+      return { trackedAppId: app.id, packageName: app.packageName, source: params.source, enabled: params.enabled };
+    },
+  });
+
+  registry.register({
+    name: 'fetch_app_from_source',
+    description:
+      'Fetch the latest APK for a tracked app from a specific remote source right now (one-off, bypassing the enabled flag and the scheduled cycle). Sources: "playstore" or "qq". Returns the new versionId if a newer version was downloaded, or null if it was already up to date. Identify the app by trackedAppId or packageName.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        trackedAppId: { type: 'number', description: 'Numeric id from list_tracked_apps' },
+        packageName: { type: 'string', description: 'Reverse-DNS package name (e.g. com.hytch.ftthemepark)' },
+        source: { type: 'string', enum: ['playstore', 'qq'], description: 'Source to fetch from' },
+      },
+      required: ['source'],
+    },
+    context: ['dashboard', 'apk-analysis'],
+    requiredScope: 'core.apk:manage',
+    requiresConfirmation: true,
+    async execute(params: { trackedAppId?: number; packageName?: string; source: string }) {
+      const app = resolveTrackedApp(params);
+      if (!app) return { error: 'Tracked app not found' };
+      const source = sourceRegistry?.get(params.source);
+      if (!source || !apkTracker) return { error: `Source not available: ${params.source}` };
+      try {
+        const result = await apkTracker.checkRemoteSource(
+          { id: app.id, packageName: app.packageName, appName: app.appName },
+          source,
+          { force: true },
+        );
+        return {
+          trackedAppId: app.id,
+          packageName: app.packageName,
+          source: params.source,
+          newVersionId: result.newVersionId,
+          error: result.error ?? null,
+        };
+      } catch (err: any) {
+        return { error: err.message };
+      }
     },
   });
 

@@ -31,6 +31,10 @@ function mockWs(): WebSocketContextValue {
       if (path === '/v1/apps/tracked') return Promise.resolve({ type: 'restapi', id: '1', status: 200, body: { success: true, data: [app] } });
       if (path === '/v1/apps/versions/1') return Promise.resolve({ type: 'restapi', id: '2', status: 200, body: { success: true, data: versions } });
       if (path === '/v1/frida/gadget/injected') return Promise.resolve({ type: 'restapi', id: '3', status: 200, body: { success: true, data: injected } });
+      if (path === '/v1/apps/track/1/sources') return Promise.resolve({ type: 'restapi', id: '8', status: 200, body: { success: true, data: [
+        { source: 'playstore', label: 'Play Store', enabled: true, lastVersion: '11.4.0', lastError: null },
+        { source: 'qq', label: 'QQ App Store (应用宝)', enabled: false, lastVersion: null, lastError: null },
+      ] } });
       if (path === '/v1/device/list') return Promise.resolve({ type: 'restapi', id: '6', status: 200, body: { success: true, data: [] } });
       if (path === '/v1/apps/analysis-jobs/recent') return Promise.resolve({ type: 'restapi', id: '7', status: 200, body: { success: true, data: [] } });
       return Promise.resolve({ type: 'restapi', id: '9', status: 200, body: { success: true, data: [] } });
@@ -136,11 +140,53 @@ describe('AppDetail', () => {
     await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('DELETE', '/v1/apps/version/99'));
   });
 
-  it('toggles Play Store auto-fetch', async () => {
+  it('toggles a source via the Sources panel', async () => {
     const ws = renderDetail();
-    await waitFor(() => screen.getByRole('switch', { name: /auto-fetch/i }));
-    fireEvent.click(screen.getByRole('switch', { name: /auto-fetch/i }));
-    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('PATCH', '/v1/apps/track/1', { autoFetchPlayStore: false }));
+    await waitFor(() => screen.getByRole('switch', { name: /auto-fetch from play store/i }));
+    fireEvent.click(screen.getByRole('switch', { name: /auto-fetch from play store/i }));
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('PATCH', '/v1/apps/track/1/sources/playstore', { enabled: false }));
+  });
+
+  it('enables QQ and triggers a fetch-now', async () => {
+    const ws = renderDetail();
+    await waitFor(() => screen.getByTestId('source-row-qq'));
+    fireEvent.click(screen.getByRole('switch', { name: /auto-fetch from qq/i }));
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('PATCH', '/v1/apps/track/1/sources/qq', { enabled: true }));
+    fireEvent.click(screen.getByTestId('source-fetch-qq'));
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/apps/track/1/sources/qq/fetch', {}));
+  });
+
+  // Override specific REST paths on top of the default mock.
+  function wsWith(overrides: Record<string, any>) {
+    const ws = mockWs();
+    const base = ws.sendRestApi as any;
+    (ws.sendRestApi as any) = vi.fn((m: string, path: string, body?: any) =>
+      path in overrides ? Promise.resolve(overrides[path]) : base(m, path, body));
+    return ws;
+  }
+
+  it('fetch-now failure (502) shows no "up to date" success toast', async () => {
+    const ws = wsWith({
+      '/v1/apps/track/1/sources/qq/fetch': { type: 'restapi', id: 'x', status: 502, body: { success: false, error: 'sha256 mismatch' } },
+    });
+    renderDetail(ws);
+    await waitFor(() => screen.getByTestId('source-fetch-qq'));
+    fireEvent.click(screen.getByTestId('source-fetch-qq'));
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/apps/track/1/sources/qq/fetch', {}));
+    expect(screen.queryByText(/already up to date|downloaded a new version/i)).toBeNull();
+  });
+
+  it('a server-rejected toggle does not flip the switch or claim success', async () => {
+    const ws = wsWith({
+      '/v1/apps/track/1/sources/qq': { type: 'restapi', id: 'x', status: 400, body: { success: false, error: 'nope' } },
+    });
+    renderDetail(ws);
+    const sw = await waitFor(() => screen.getByRole('switch', { name: /auto-fetch from qq/i }));
+    expect(sw).toHaveAttribute('aria-checked', 'false');
+    fireEvent.click(sw);
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('PATCH', '/v1/apps/track/1/sources/qq', { enabled: true }));
+    expect(sw).toHaveAttribute('aria-checked', 'false'); // not flipped on failure
+    expect(screen.queryByText(/auto-fetch enabled/i)).toBeNull();
   });
 
   it('shows not-found state for unknown app id', async () => {

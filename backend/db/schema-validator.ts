@@ -14,7 +14,7 @@
  */
 import type Database from 'better-sqlite3';
 import { getTableName, getTableColumns, type Table } from 'drizzle-orm';
-import { SQLiteColumn } from 'drizzle-orm/sqlite-core';
+import { SQLiteColumn, getTableConfig } from 'drizzle-orm/sqlite-core';
 import * as schema from './schema';
 import { createLoggers } from '../logs';
 
@@ -210,6 +210,16 @@ function createTableFromSchema(sqlite: Database.Database, tableName: string, tab
 
     colDefs.push(def);
   }
+
+  // Preserve table-level UNIQUE constraints (e.g. app_sources'
+  // (tracked_app_id, source)) so a validator-recreated table keeps the same
+  // data-integrity guarantees the migration's CREATE TABLE established.
+  try {
+    for (const uc of getTableConfig(table).uniqueConstraints) {
+      const cols = uc.columns.map(c => `"${c.name}"`).join(', ');
+      colDefs.push(`UNIQUE (${cols})`);
+    }
+  } catch { /* older drizzle / no constraints — best-effort */ }
 
   sqlite.exec(`CREATE TABLE IF NOT EXISTS "${tableName}" (${colDefs.join(', ')})`);
 }

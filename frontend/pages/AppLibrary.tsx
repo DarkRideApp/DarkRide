@@ -22,7 +22,6 @@ interface TrackedAppRow {
   id: number;
   packageName: string;
   appName: string | null;
-  autoFetchPlayStore?: boolean | null;
   createdAt: string | number;
   versionCount: number;
   latestVersion: LatestVersion | null;

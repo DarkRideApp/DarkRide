@@ -253,10 +253,32 @@ export const trackedApps = sqliteTable('tracked_apps', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   packageName: text('package_name').notNull().unique(),
   appName: text('app_name'),
-  autoFetchPlayStore: integer('auto_fetch_play_store', { mode: 'boolean' }).default(true),
-  lastPlayStoreVersion: text('last_play_store_version'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
+
+/**
+ * Per-app remote fetch sources. Replaces the single `autoFetchPlayStore`
+ * boolean — each network store an app can be fetched from (Play Store, QQ /
+ * 应用宝, future Amazon, …) gets its own row, so an app can live on several
+ * stores at once with independent enable flags + dedup state. Device pulls are
+ * NOT modelled here: they happen automatically whenever a tracked package is
+ * installed on a connected device, so there is no per-app device toggle.
+ */
+export const appSources = sqliteTable('app_sources', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  trackedAppId: integer('tracked_app_id')
+    .references(() => trackedApps.id, { onDelete: 'cascade' }).notNull(),
+  source: text('source').notNull(), // 'playstore' | 'qq' | future store ids
+  enabled: integer('enabled', { mode: 'boolean' }).notNull().default(false),
+  /** Last versionName seen from this source — skips re-download next cycle. */
+  lastVersion: text('last_version'),
+  lastCheckedAt: integer('last_checked_at', { mode: 'timestamp' }),
+  /** Last per-source failure message, surfaced in the UI (null = healthy). */
+  lastError: text('last_error'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+}, (table) => ({
+  appSource: unique('app_sources_app_source').on(table.trackedAppId, table.source),
+}));
 
 export const apkVersions = sqliteTable('apk_versions', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -266,7 +288,7 @@ export const apkVersions = sqliteTable('apk_versions', {
   filename: text('filename').notNull(),
   fileSize: integer('file_size'),
   deviceId: text('device_id'),
-  source: text('source').default('device'), // 'device' | 'playstore' | 'upload'
+  source: text('source').default('device'), // 'device' | 'playstore' | 'qq' | 'upload'
   downloadedAt: integer('downloaded_at', { mode: 'timestamp' }).notNull(),
 });
 
