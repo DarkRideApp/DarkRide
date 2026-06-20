@@ -51,13 +51,13 @@ const inFlightFetches = new Map<string, Promise<{ newVersionId: number | null; e
 
 /** Upsert the enabled flag on an app's app_sources row for a given source. */
 function setSourceEnabled(db: AppDatabase, trackedAppId: number, source: string, enabled: boolean): void {
-  const existing = db.select().from(appSources)
-    .where(and(eq(appSources.trackedAppId, trackedAppId), eq(appSources.source, source))).all()[0];
-  if (existing) {
-    db.update(appSources).set({ enabled }).where(eq(appSources.id, existing.id)).run();
-  } else {
-    db.insert(appSources).values({ trackedAppId, source, enabled, createdAt: new Date() }).run();
-  }
+  // Atomic upsert on the (tracked_app_id, source) unique key — a single
+  // statement so a concurrent toggle + tracker seeding can't both see "no row"
+  // and race into a duplicate-insert that violates the constraint.
+  db.insert(appSources)
+    .values({ trackedAppId, source, enabled, createdAt: new Date() })
+    .onConflictDoUpdate({ target: [appSources.trackedAppId, appSources.source], set: { enabled } })
+    .run();
 }
 
 // extractIconFromLocalApk and fetchIconFromGooglePlay imported from apk-tracker.ts

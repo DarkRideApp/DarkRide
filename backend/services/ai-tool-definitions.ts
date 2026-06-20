@@ -24,7 +24,6 @@ import { lookupVersionMeta, analysisDir as getAnalysisDir, analysisDbPath, resol
 import { getNote, setNote, patchNoteSection } from './apk-notes';
 import type { SourceRegistry } from './apk-sources/registry';
 import type { RemoteApkSource } from './apk-sources/types';
-import { ensureAppSources } from './apk-sources';
 
 /**
  * Services available to AI tool implementations. Tools that need to mutate

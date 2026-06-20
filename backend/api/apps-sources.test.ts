@@ -15,7 +15,7 @@ vi.mock('../services/device-manager', async (importOriginal) => {
 });
 vi.mock('../logs', () => ({ createLoggers: () => ({ log: vi.fn(), error: vi.fn(), warn: vi.fn() }) }));
 
-const { trackedApps, appSources } = schema;
+const { appSources } = schema;
 
 function fakeSource(id: string, defaultEnabled: boolean): RemoteApkSource {
   return {

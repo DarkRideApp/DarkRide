@@ -40,11 +40,15 @@ export function ensureAppSources(
   );
   for (const source of registry.all()) {
     if (existing.has(source.id)) continue;
+    // onConflictDoNothing keeps this genuinely idempotent: if a concurrent
+    // caller (e.g. the tracker cycle seeding the same app) inserted the row
+    // between our read and this write, the insert is a no-op instead of a
+    // unique-constraint failure.
     db.insert(appSources).values({
       trackedAppId,
       source: source.id,
       enabled: source.defaultEnabled(),
       createdAt: new Date(),
-    }).run();
+    }).onConflictDoNothing().run();
   }
 }

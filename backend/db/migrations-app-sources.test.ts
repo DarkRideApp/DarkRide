@@ -5,7 +5,7 @@ import path from 'path';
 import { applyMigrations } from '../test-utils/create-test-db';
 
 /**
- * Verifies migration 0095_app_sources:
+ * Verifies migration 0096_app_sources:
  *  - creates the app_sources table (+ unique index),
  *  - backfills a `playstore` row per tracked app from the old
  *    auto_fetch_play_store / last_play_store_version columns,
@@ -18,7 +18,7 @@ describe('migration: app_sources', () => {
   beforeEach(() => {
     db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
-    // Pre-0095 shape of the apk-tracking tables.
+    // Pre-0096 shape of the apk-tracking tables.
     db.exec(`
       CREATE TABLE tracked_apps (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,7 +104,7 @@ describe('migration: app_sources', () => {
 /**
  * Full-chain guard: run EVERY migration (0000…latest) via the real migrator on
  * a blank DB, so a future intervening migration that mutates tracked_apps can't
- * silently break 0095.
+ * silently break 0096.
  */
 describe('migration: app_sources (full chain via real migrator)', () => {
   it('runs the whole chain and leaves the expected app_sources shape', () => {

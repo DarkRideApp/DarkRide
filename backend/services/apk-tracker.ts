@@ -17,7 +17,7 @@ import type { NotificationService } from './notification-service';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
-import { APK_DIR, packageDir, sanitizeVersionName } from '../utils/apk-paths';
+import { packageDir, sanitizeVersionName } from '../utils/apk-paths';
 import { safeJoinInside } from '../utils/safe-path';
 import { enumerateApkPaths } from '../utils/apk-utils';
 import { applyRetentionForApp, applyRetentionForAllApps } from './apk-retention';
@@ -319,14 +319,20 @@ export class ApkTracker {
     // A forced fetch (fetch-now / AI tool) may target an app with no row yet
     // (e.g. a pre-existing app whose qq row was never backfilled). Create it so
     // lastVersion/lastError state is recorded rather than silently dropped.
+    // onConflictDoNothing + re-select by the (tracked_app_id, source) key makes
+    // this safe under concurrent fetch-now calls: if another request inserted
+    // the row first, we don't fail the constraint and we still get the row
+    // (relying on lastInsertRowid would be wrong when the insert was ignored).
     if (!row && opts.force) {
-      const insert = this.db.insert(appSources).values({
+      this.db.insert(appSources).values({
         trackedAppId: app.id,
         source: source.id,
         enabled: source.defaultEnabled(),
         createdAt: new Date(),
-      }).run();
-      row = this.db.select().from(appSources).where(eq(appSources.id, Number(insert.lastInsertRowid))).all()[0];
+      }).onConflictDoNothing().run();
+      row = this.db.select().from(appSources)
+        .where(and(eq(appSources.trackedAppId, app.id), eq(appSources.source, source.id)))
+        .all()[0];
     }
 
     // Scheduled cycles respect the enabled flag; an explicit force (fetch-now)
