@@ -1268,7 +1268,7 @@ export class DeviceManager {
   async findWgTool(deviceId: string): Promise<string | null> {
     // 1. Check system PATH
     try {
-      const result = await adbShell(deviceId, `"su -c 'which wg'"`);
+      const result = await suShell(deviceId, 'which wg');
       if (result && !result.includes('not found')) {
         return result.trim();
       }
@@ -1278,7 +1278,7 @@ export class DeviceManager {
 
     // 2. Check our pushed binary
     try {
-      const result = await adbShell(deviceId, `"su -c 'test -x ${DeviceManager.WG_DEVICE_PATH} && echo ok'"`);
+      const result = await suShell(deviceId, `test -x ${DeviceManager.WG_DEVICE_PATH} && echo ok`);
       if (result && result.includes('ok')) {
         return DeviceManager.WG_DEVICE_PATH;
       }
@@ -1308,7 +1308,7 @@ export class DeviceManager {
 
     // Push to device and make executable
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_DEVICE_PATH]);
-    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_DEVICE_PATH}'"`);
+    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_DEVICE_PATH}`);
     log(`Pushed wg binary to ${deviceId} (${arch})`);
   }
 
@@ -1336,10 +1336,7 @@ export class DeviceManager {
     if (cached !== undefined) return cached;
 
     try {
-      await adbShell(
-        deviceId,
-        `"su -c 'ip link add wg_test type wireguard && ip link del wg_test'"`,
-      );
+      await suShell(deviceId, 'ip link add wg_test type wireguard && ip link del wg_test');
       log(`Device ${deviceId}: kernel WireGuard support confirmed`);
       this.kernelWgSupport.set(deviceId, true);
       return true;
@@ -1355,10 +1352,7 @@ export class DeviceManager {
    */
   async findWgGoTool(deviceId: string): Promise<string | null> {
     try {
-      const result = await adbShell(
-        deviceId,
-        `"su -c 'test -x ${DeviceManager.WG_GO_DEVICE_PATH} && echo ok'"`,
-      );
+      const result = await suShell(deviceId, `test -x ${DeviceManager.WG_GO_DEVICE_PATH} && echo ok`);
       if (result && result.includes('ok')) {
         return DeviceManager.WG_GO_DEVICE_PATH;
       }
@@ -1384,7 +1378,7 @@ export class DeviceManager {
     }
 
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_GO_DEVICE_PATH]);
-    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_GO_DEVICE_PATH}'"`);
+    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_GO_DEVICE_PATH}`);
     log(`Pushed wireguard-go binary to ${deviceId} (${abi})`);
   }
 
@@ -1410,10 +1404,7 @@ export class DeviceManager {
    */
   async findWgUapiTool(deviceId: string): Promise<string | null> {
     try {
-      const result = await adbShell(
-        deviceId,
-        `"su -c 'test -x ${DeviceManager.WG_UAPI_DEVICE_PATH} && echo ok'"`,
-      );
+      const result = await suShell(deviceId, `test -x ${DeviceManager.WG_UAPI_DEVICE_PATH} && echo ok`);
       if (result && result.includes('ok')) {
         return DeviceManager.WG_UAPI_DEVICE_PATH;
       }
@@ -1438,7 +1429,7 @@ export class DeviceManager {
     }
 
     await adbCommand(['-s', deviceId, 'push', binaryPath, DeviceManager.WG_UAPI_DEVICE_PATH]);
-    await adbShell(deviceId, `"su -c 'chmod 755 ${DeviceManager.WG_UAPI_DEVICE_PATH}'"`);
+    await suShell(deviceId, `chmod 755 ${DeviceManager.WG_UAPI_DEVICE_PATH}`);
     log(`Pushed wg-uapi binary to ${deviceId} (${abi})`);
   }
 
@@ -1561,7 +1552,7 @@ export class DeviceManager {
       'rm -f /data/local/tmp/wg_peer.conf',
     ];
 
-    await adbShell(deviceId, `"su -c '${commands.join(' && ')}'"`);
+    await suShell(deviceId, commands.join(' && '));
 
     log(`WireGuard tunnel activated on ${deviceId} (${mode})`);
   }
@@ -1577,10 +1568,7 @@ export class DeviceManager {
   ): Promise<{ success: boolean; details: string }> {
     // Try curl first (fast and reliable when available)
     try {
-      const result = await adbShell(
-        deviceId,
-        `"su -c 'curl -sf --max-time 10 ${testUrl}'"`,
-      );
+      const result = await suShell(deviceId, `curl -sf --max-time 10 ${testUrl}`);
       if (result && result.trim().length > 0) {
         return { success: true, details: result.substring(0, 200) };
       }
@@ -1594,10 +1582,7 @@ export class DeviceManager {
     try {
       const wgPath = await this.findWgTool(deviceId);
       if (wgPath) {
-        const result = await adbShell(
-          deviceId,
-          `"su -c '${wgPath} show wg0 latest-handshakes'"`,
-        );
+        const result = await suShell(deviceId, `${wgPath} show wg0 latest-handshakes`);
         if (result) {
           const ts = parseInt(result.trim().split('\t')[1], 10);
           if (ts > 0) {
@@ -1622,9 +1607,9 @@ export class DeviceManager {
   async deactivateWireGuardTunnel(deviceId: string): Promise<void> {
     log(`Deactivating WireGuard tunnel on ${deviceId}`);
     try {
-      await adbShell(
+      await suShell(
         deviceId,
-        `"su -c 'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true'"`,
+        'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true',
       );
     } catch {
       // Interface may not exist — that's fine
@@ -1834,7 +1819,7 @@ export class DeviceManager {
       try { fs.rmdirSync(tmpDir3); } catch {}
     }
 
-    await adbShell(deviceId, `"su -c 'chmod +x /data/local/tmp/inject_cert.sh && /data/local/tmp/inject_cert.sh 2>&1 && rm /data/local/tmp/inject_cert.sh'"`, 30000);
+    await suShell(deviceId, 'chmod +x /data/local/tmp/inject_cert.sh && /data/local/tmp/inject_cert.sh 2>&1 && rm /data/local/tmp/inject_cert.sh', 30000);
     log(`CA cert injected on ${deviceId}`);
   }
 }
