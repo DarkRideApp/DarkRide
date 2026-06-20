@@ -66,6 +66,8 @@ export function AppLibrary() {
   const [addAppPackage, setAddAppPackage] = useState('');
   const [addAppSaving, setAddAppSaving] = useState(false);
   const [addAppError, setAddAppError] = useState<string | null>(null);
+  const [storeSources, setStoreSources] = useState<{ source: string; label: string; defaultEnabled: boolean }[]>([]);
+  const [selectedSources, setSelectedSources] = useState<Record<string, boolean>>({});
 
   const [untrackConfirm, setUntrackConfirm] = useState<TrackedAppRow | null>(null);
 
@@ -108,6 +110,19 @@ export function AppLibrary() {
     }
   }, [ws, scanning, toast]);
 
+  // Load the available remote stores when the Add App modal opens, defaulting
+  // each checkbox to the source's defaultEnabled (Play Store on, QQ opt-in off).
+  useEffect(() => {
+    if (!addAppOpen || !ws.connected) return;
+    ws.sendRestApi('GET', '/v1/apps/sources').then(res => {
+      if (res.body?.success) {
+        const list = res.body.data as { source: string; label: string; defaultEnabled: boolean }[];
+        setStoreSources(list);
+        setSelectedSources(Object.fromEntries(list.map(s => [s.source, s.defaultEnabled])));
+      }
+    }).catch(() => {});
+  }, [addAppOpen, ws]);
+
   const addApp = useCallback(async () => {
     const pkg = addAppPackage.trim();
     if (!pkg) return;
@@ -117,13 +132,16 @@ export function AppLibrary() {
     }
     setAddAppSaving(true);
     setAddAppError(null);
+    const anySelected = Object.values(selectedSources).some(Boolean);
     try {
-      const res = await ws.sendRestApi('POST', '/v1/apps/track', { packageName: pkg, appName: null });
+      const res = await ws.sendRestApi('POST', '/v1/apps/track', {
+        packageName: pkg, appName: null, sources: selectedSources, fetch: true,
+      });
       if (res.body?.success) {
         setAddAppOpen(false);
         setAddAppPackage('');
         fetchApps();
-        toast.success('App added');
+        toast.success(anySelected ? 'App added — fetching new versions…' : 'App added');
       } else {
         setAddAppError(res.body?.error || 'Failed to add app');
       }
@@ -132,7 +150,7 @@ export function AppLibrary() {
     } finally {
       setAddAppSaving(false);
     }
-  }, [ws, addAppPackage, fetchApps, toast]);
+  }, [ws, addAppPackage, selectedSources, fetchApps, toast]);
 
   const untrack = useCallback(async (appId: number) => {
     try {
@@ -302,13 +320,34 @@ export function AppLibrary() {
               data-testid="add-app-package-input"
               style={{ width: '100%', fontFamily: 'var(--font-mono)', marginBottom: 12, boxSizing: 'border-box' }}
             />
+            {storeSources.length > 0 && (
+              <div style={{ marginBottom: 12 }} data-testid="add-app-sources">
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 6 }}>Fetch from</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {storeSources.map(s => (
+                    <label key={s.source} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={!!selectedSources[s.source]}
+                        onChange={e => setSelectedSources(prev => ({ ...prev, [s.source]: e.target.checked }))}
+                        data-testid={`add-app-source-${s.source}`}
+                      />
+                      {s.label}
+                    </label>
+                  ))}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
+                  Checked stores are fetched immediately, then on each scan. QQ (应用宝) only carries apps registered in mainland China.
+                </div>
+              </div>
+            )}
             {addAppError && (
               <div className="status-strip status-strip-error" data-testid="add-app-error">
                 <span className="status-strip-label">{addAppError}</span>
               </div>
             )}
             <button className="btn btn-primary" type="submit" disabled={addAppSaving || !addAppPackage.trim()} data-testid="add-app-submit-btn">
-              {addAppSaving ? 'Adding…' : 'Track App'}
+              {addAppSaving ? 'Adding…' : (Object.values(selectedSources).some(Boolean) ? 'Add + fetch' : 'Track app')}
             </button>
           </form>
         </Modal>

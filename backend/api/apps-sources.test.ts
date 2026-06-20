@@ -134,6 +134,64 @@ describe('Apps source-config API', () => {
     expect(res.body.data.outcome).toBe('not-found');
   });
 
+  it('GET /v1/apps/sources lists the registry stores with labels + defaults', async () => {
+    const res = await request(h.app).get('/v1/apps/sources');
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual([
+      { source: 'playstore', label: 'playstore', defaultEnabled: true },
+      { source: 'qq', label: 'qq', defaultEnabled: false },
+    ]);
+  });
+
+  it('track applies an explicit store selection, overriding registry defaults', async () => {
+    const res = await request(h.app).post('/v1/apps/track')
+      .send({ packageName: 'com.example.app', sources: { playstore: false, qq: true } });
+    expect(res.status).toBe(201);
+    const id = res.body.data.id;
+    const rows = h.db.select().from(appSources).all().filter(r => r.trackedAppId === id);
+    expect(rows.map(r => [r.source, !!r.enabled]).sort()).toEqual([['playstore', false], ['qq', true]]);
+  });
+
+  it('track ignores unknown source ids in the selection (no orphan rows)', async () => {
+    const res = await request(h.app).post('/v1/apps/track')
+      .send({ packageName: 'com.example.app', sources: { qq: true, bogus: true } });
+    expect(res.status).toBe(201);
+    const id = res.body.data.id;
+    const rows = h.db.select().from(appSources).all().filter(r => r.trackedAppId === id);
+    expect(rows.map(r => r.source).sort()).toEqual(['playstore', 'qq']);
+  });
+
+  it('track with fetch:true force-fetches each ENABLED store and nothing else', async () => {
+    await request(h.app).post('/v1/apps/track')
+      .send({ packageName: 'com.example.app', sources: { playstore: false, qq: true }, fetch: true });
+    expect(h.apkTracker.checkRemoteSource).toHaveBeenCalledTimes(1);
+    expect(h.apkTracker.checkRemoteSource).toHaveBeenCalledWith(
+      expect.objectContaining({ packageName: 'com.example.app' }),
+      expect.objectContaining({ id: 'qq' }),
+      { force: true },
+    );
+  });
+
+  it('track without fetch does NOT trigger any download', async () => {
+    await request(h.app).post('/v1/apps/track')
+      .send({ packageName: 'com.example.app', sources: { qq: true } });
+    expect(h.apkTracker.checkRemoteSource).not.toHaveBeenCalled();
+  });
+
+  it('re-adding an existing app applies the new selection + fetch (not just first track)', async () => {
+    const first = await request(h.app).post('/v1/apps/track').send({ packageName: 'com.example.app' });
+    const id = first.body.data.id;
+    expect(h.apkTracker.checkRemoteSource).not.toHaveBeenCalled(); // default track, no fetch
+    const again = await request(h.app).post('/v1/apps/track')
+      .send({ packageName: 'com.example.app', sources: { qq: true }, fetch: true });
+    expect(again.body.data.id).toBe(id); // same app
+    const row = h.db.select().from(appSources).all().find(r => r.trackedAppId === id && r.source === 'qq');
+    expect(row?.enabled).toBe(true);
+    expect(h.apkTracker.checkRemoteSource).toHaveBeenCalledWith(
+      expect.objectContaining({ id }), expect.objectContaining({ id: 'qq' }), { force: true },
+    );
+  });
+
   it('coalesces concurrent fetch-now triggers into a single download', async () => {
     const id = await trackApp();
     let resolveFn: (v: any) => void = () => {};
