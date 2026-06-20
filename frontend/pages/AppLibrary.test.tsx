@@ -106,6 +106,39 @@ describe('AppLibrary', () => {
     expect(ws.sendRestApi).not.toHaveBeenCalledWith('POST', '/v1/apps/track', expect.anything());
   });
 
+  it('renders store checkboxes from /v1/apps/sources and submits the selection + fetch flag', async () => {
+    const sources = [
+      { source: 'playstore', label: 'Play Store', defaultEnabled: true },
+      { source: 'qq', label: 'QQ (应用宝)', defaultEnabled: false },
+    ];
+    const ws = mockWs([]);
+    (ws.sendRestApi as any).mockImplementation((method: string, path: string) => {
+      if (path === '/v1/apps/sources') return Promise.resolve({ type: 'restapi', id: 's', status: 200, body: { success: true, data: sources } });
+      if (method === 'POST' && path === '/v1/apps/track') return Promise.resolve({ type: 'restapi', id: 't', status: 201, body: { success: true, data: { id: 5 } } });
+      return Promise.resolve({ type: 'restapi', id: '9', status: 200, body: { success: true, data: [] } });
+    });
+    renderLibrary(ws);
+
+    await waitFor(() => screen.getByTestId('add-app-empty-btn'));
+    fireEvent.click(screen.getByTestId('add-app-empty-btn'));
+
+    // Checkboxes appear from the registry; defaults match each source's defaultEnabled.
+    await waitFor(() => screen.getByTestId('add-app-source-qq'));
+    const playstoreCb = screen.getByTestId('add-app-source-playstore') as HTMLInputElement;
+    const qqCb = screen.getByTestId('add-app-source-qq') as HTMLInputElement;
+    expect(playstoreCb.checked).toBe(true);
+    expect(qqCb.checked).toBe(false);
+
+    // Enable QQ, fill the package, submit.
+    fireEvent.click(qqCb);
+    fireEvent.change(screen.getByTestId('add-app-package-input'), { target: { value: 'com.hytch.ftthemepark' } });
+    fireEvent.click(screen.getByTestId('add-app-submit-btn'));
+
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/apps/track', {
+      packageName: 'com.hytch.ftthemepark', appName: null, sources: { playstore: true, qq: true }, fetch: true,
+    }));
+  });
+
   it('navigates on Enter keypress for keyboard users', async () => {
     renderLibrary();
     await waitFor(() => screen.getByTestId('app-row-1'));

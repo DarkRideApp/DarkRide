@@ -9,7 +9,7 @@ import { registerEndpoint } from './api-service';
 import { trackedApps, apkVersions, analysisJobs, apkContents, apkDiffReports, devices, appSources } from '../db/schema';
 import { and } from 'drizzle-orm';
 import { ensureAppSources } from '../services/apk-sources';
-import { sourceLabel } from '../services/apk-sources/types';
+import { sourceLabel, type RemoteApkSource } from '../services/apk-sources/types';
 import type { SourceRegistry } from '../services/apk-sources/registry';
 import { adbShell, adbCommand, adbPull } from '../services/device-manager';
 import type { DeviceManager } from '../services/device-manager';
@@ -49,6 +49,28 @@ export function clearAppListCache(deviceId: string): void {
 /** In-flight one-off fetches keyed by `${trackedAppId}:${source}` (concurrency coalescing). */
 const inFlightFetches = new Map<string, Promise<{ newVersionId: number | null; error?: string; notFound?: boolean }>>();
 
+/**
+ * Fire (or join) a coalesced force-fetch for one (app, source). A double-click,
+ * or an add-with-fetch overlapping the scheduled scan, shouldn't launch two
+ * 100MB pulls — concurrent triggers for the same key share one in-flight
+ * promise. Shared by the explicit "Fetch now" endpoint and add-on-fetch.
+ */
+function coalescedFetch(
+  apkTracker: ApkTracker,
+  app: { id: number; packageName: string; appName: string | null },
+  source: RemoteApkSource,
+): Promise<{ newVersionId: number | null; error?: string; notFound?: boolean }> {
+  const key = `${app.id}:${source.id}`;
+  let pending = inFlightFetches.get(key);
+  if (!pending) {
+    // force: ignore the enabled flag + last-version skip for an explicit fetch.
+    pending = apkTracker.checkRemoteSource(app, source, { force: true })
+      .finally(() => inFlightFetches.delete(key));
+    inFlightFetches.set(key, pending);
+  }
+  return pending;
+}
+
 /** Upsert the enabled flag on an app's app_sources row for a given source. */
 function setSourceEnabled(db: AppDatabase, trackedAppId: number, source: string, enabled: boolean): void {
   // Atomic upsert on the (tracked_app_id, source) unique key — a single
@@ -58,6 +80,41 @@ function setSourceEnabled(db: AppDatabase, trackedAppId: number, source: string,
     .values({ trackedAppId, source, enabled, createdAt: new Date() })
     .onConflictDoUpdate({ target: [appSources.trackedAppId, appSources.source], set: { enabled } })
     .run();
+}
+
+/**
+ * Apply the Add-App store selection. Enables/disables each named source on the
+ * app's app_sources rows (unknown ids ignored — fail closed); then, when
+ * `fetch` is set, kicks off a NON-blocking coalesced fetch for every enabled
+ * remote source. A QQ APK can be 100MB, so we never block the track response:
+ * the version populates via the apk:version-pulled WS event, and any fetch
+ * failure is recorded on the app_sources row (shown on the Sources panel)
+ * rather than failing the add.
+ */
+function applyTrackSources(
+  db: AppDatabase,
+  sourceRegistry: SourceRegistry | undefined,
+  apkTracker: ApkTracker | undefined,
+  app: { id: number; packageName: string; appName: string | null },
+  sources: unknown,
+  fetch: boolean,
+): void {
+  if (!sourceRegistry) return;
+  if (sources && typeof sources === 'object') {
+    for (const [sourceId, enabled] of Object.entries(sources as Record<string, unknown>)) {
+      if (typeof enabled !== 'boolean') continue;
+      if (!sourceRegistry.has(sourceId)) continue; // ignore unknown ids
+      setSourceEnabled(db, app.id, sourceId, enabled);
+    }
+  }
+  if (!fetch || !apkTracker) return;
+  const rows = db.select().from(appSources).where(eq(appSources.trackedAppId, app.id)).all();
+  for (const row of rows) {
+    if (!row.enabled) continue;
+    const source = sourceRegistry.get(row.source);
+    if (!source) continue;
+    coalescedFetch(apkTracker, app, source).catch(() => { /* recorded on the row */ });
+  }
 }
 
 // extractIconFromLocalApk and fetchIconFromGooglePlay imported from apk-tracker.ts
@@ -661,8 +718,15 @@ export function registerAppEndpoints(
       .where(eq(trackedApps.packageName, packageName))
       .all()[0];
 
+    // Optional store selection from the Add App modal: { qq: true, ... } plus
+    // an optional `fetch` flag to pull immediately from the enabled stores.
+    const { sources, fetch } = req.body as { sources?: unknown; fetch?: unknown };
+    const fetchNow = fetch === true;
+
     if (existing) {
       if (sourceRegistry) ensureAppSources(db, existing.id, sourceRegistry);
+      applyTrackSources(db, sourceRegistry, apkTracker,
+        { id: existing.id, packageName: existing.packageName, appName: existing.appName }, sources, fetchNow);
       res.json({ success: true, data: existing });
       return;
     }
@@ -680,11 +744,25 @@ export function registerAppEndpoints(
       .all()[0];
 
     // Seed per-source rows (Play Store on by default, QQ opt-in) so the app
-    // can be fetched remotely with no device attached.
+    // can be fetched remotely with no device attached, then apply the modal's
+    // explicit selection + optional immediate fetch.
     if (sourceRegistry) ensureAppSources(db, inserted.id, sourceRegistry);
+    applyTrackSources(db, sourceRegistry, apkTracker,
+      { id: inserted.id, packageName: inserted.packageName, appName: inserted.appName }, sources, fetchNow);
 
     res.status(201).json({ success: true, data: inserted });
   }, { requires: ['core.apk:manage'] });
+
+  // GET /v1/apps/sources — list available remote stores (registry-level, no app
+  // needed) so the Add App modal can render a store picker dynamically.
+  registerEndpoint('GET', '/v1/apps/sources', (_req, res) => {
+    const data = (sourceRegistry?.all() ?? []).map(s => ({
+      source: s.id,
+      label: s.label,
+      defaultEnabled: s.defaultEnabled(),
+    }));
+    res.json({ success: true, data });
+  }, { requires: ['core.apk:read'] });
 
   // PATCH /v1/apps/track/:id — Update per-app settings (e.g. autoFetchPlayStore)
   registerEndpoint('PATCH', '/v1/apps/track/:id', (req, res) => {
@@ -801,20 +879,11 @@ export function registerAppEndpoints(
       return;
     }
     try {
-      // Coalesce concurrent triggers for the same (app, source) onto one
-      // in-flight download — a double-click shouldn't launch two 100MB pulls.
-      const key = `${id}:${source}`;
-      let pending = inFlightFetches.get(key);
-      if (!pending) {
-        // force: ignore the enabled flag + last-version skip for an explicit fetch.
-        pending = apkTracker.checkRemoteSource(
-          { id: app.id, packageName: app.packageName, appName: app.appName },
-          remoteSource,
-          { force: true },
-        ).finally(() => inFlightFetches.delete(key));
-        inFlightFetches.set(key, pending);
-      }
-      const result = await pending;
+      const result = await coalescedFetch(
+        apkTracker,
+        { id: app.id, packageName: app.packageName, appName: app.appName },
+        remoteSource,
+      );
 
       // A download/verify failure is a real error, not a success-with-note.
       if (result.error) {
