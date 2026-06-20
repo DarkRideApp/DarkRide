@@ -10,6 +10,21 @@ import { safeJoinInside } from './safe-path';
 // ── Tier 1: Constants + Pure Path Construction (no I/O) ──────────────
 
 /**
+ * Sanitise a versionName for safe use inside a filename / cloud key.
+ *
+ * versionName can originate from an untrusted source (a remote store's JSON,
+ * an APK manifest) and flows into on-disk filenames, the cloud key, and the
+ * persisted `apk_versions.filename`. We strip everything outside a strict
+ * filename-safe set so it can never introduce a path separator or `..`
+ * traversal. The display value stored in `apk_versions.versionName` keeps the
+ * original string — only the *filename* component is sanitised.
+ */
+export function sanitizeVersionName(versionName: string | null | undefined): string {
+  const cleaned = String(versionName ?? '').replace(/[^A-Za-z0-9._-]/g, '_');
+  return cleaned.length > 0 ? cleaned : 'unknown';
+}
+
+/**
  * Absolute path to the APK storage directory (resolved at import time).
  * APK_DIR kept as a backward-compat eager constant. For code that needs
  * rename/chdir-aware behaviour (tests, tools), use getApkDir().

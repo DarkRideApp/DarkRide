@@ -22,14 +22,25 @@ interface ApkVersionRow {
   analysis?: { status: string; stage: string | null; error: string | null; aiRunning?: boolean } | null;
 }
 interface TrackedApp {
-  id: number; packageName: string; appName: string | null; autoFetchPlayStore?: boolean | null;
+  id: number; packageName: string; appName: string | null;
   createdAt: string | number; versionCount: number; latestVersion: ApkVersionRow | null;
+}
+interface AppSourceRow {
+  source: string; label: string; enabled: boolean;
+  lastVersion: string | null; lastError: string | null; lastCheckedAt?: string | number | null;
 }
 interface InjectedApk { id: number; packageName: string; versionCode: number; fridaVersion: string; createdAt: string | number; }
 interface VersionAnalysis { status: string; stage?: string | null; error?: string | null; aiRunning?: boolean; }
 
 const STAGE_LABELS: Record<string, string> = {
   metadata: 'Metadata', decompiling: 'Decompiling', storing: 'Storing', scanning: 'Scanning',
+};
+
+/** Provenance badge per APK source id. One place so labels/colours never drift. */
+const SOURCE_BADGE: Record<string, { label: string; className: string; style?: React.CSSProperties }> = {
+  playstore: { label: 'Play Store', className: 'badge badge-running' },
+  qq: { label: 'QQ (应用宝)', className: 'badge', style: { background: '#2ea043', color: '#fff' } },
+  upload: { label: 'Upload', className: 'badge', style: { background: 'var(--bg-tertiary)' } },
 };
 
 function isOnline(d: { lastSeen: string | null }): boolean {
@@ -60,6 +71,8 @@ export function AppDetail() {
   const [deleteVersion, setDeleteVersion] = useState<ApkVersionRow | null>(null);
   const [deleteInjected, setDeleteInjected] = useState<InjectedApk | null>(null);
   const [busyVersion, setBusyVersion] = useState<number | null>(null);
+  const [sources, setSources] = useState<AppSourceRow[]>([]);
+  const [sourceBusy, setSourceBusy] = useState<string | null>(null);
 
   useDocumentTitle(app ? (app.appName || app.packageName) : 'App');
 
@@ -100,8 +113,15 @@ export function AppDetail() {
     }).catch(() => {});
   }, [ws]);
 
+  const fetchSources = useCallback(() => {
+    if (!ws.connected) return;
+    ws.sendRestApi('GET', `/v1/apps/track/${appId}/sources`).then(res => {
+      if (res.body?.success) setSources(res.body.data as AppSourceRow[]);
+    }).catch(() => {});
+  }, [ws, appId]);
+
   // ws.connected is explicit so a cold start / reconnect re-runs the initial fetch.
-  useEffect(() => { fetchApp(); fetchVersions(); fetchInjected(); }, [fetchApp, fetchVersions, fetchInjected, ws.connected]);
+  useEffect(() => { fetchApp(); fetchVersions(); fetchInjected(); fetchSources(); }, [fetchApp, fetchVersions, fetchInjected, fetchSources, ws.connected]);
 
   useEffect(() => {
     if (!ws.connected) return;
@@ -198,15 +218,41 @@ export function AppDetail() {
     } catch { toast.error('Failed to delete injected APK'); }
   }, [ws, toast]);
 
-  const togglePlayStore = useCallback(async () => {
-    if (!app) return;
-    const newValue = !(app.autoFetchPlayStore !== false);
+  const toggleSource = useCallback(async (source: string, label: string, enabled: boolean) => {
     try {
-      await ws.sendRestApi('PATCH', `/v1/apps/track/${app.id}`, { autoFetchPlayStore: newValue });
-      setApp(prev => prev ? { ...prev, autoFetchPlayStore: newValue } : prev);
-      toast.success(`Play Store auto-fetch ${newValue ? 'enabled' : 'disabled'}`);
-    } catch { toast.error('Failed to update Play Store setting'); }
-  }, [ws, app, toast]);
+      const res = await ws.sendRestApi('PATCH', `/v1/apps/track/${appId}/sources/${source}`, { enabled });
+      // sendRestApi resolves on any HTTP status; only commit + toast on success
+      // (the SDK already surfaces the error toast for a non-2xx response).
+      if (!res.body?.success) return;
+      setSources(prev => prev.map(s => (s.source === source ? { ...s, enabled } : s)));
+      toast.success(`${label} auto-fetch ${enabled ? 'enabled' : 'disabled'}`);
+    } catch { toast.error(`Failed to update ${label} setting`); }
+  }, [ws, appId, toast]);
+
+  const fetchNow = useCallback(async (source: string, label: string) => {
+    setSourceBusy(source);
+    try {
+      const res = await ws.sendRestApi('POST', `/v1/apps/track/${appId}/sources/${source}/fetch`, {});
+      // A failed/verify-rejected fetch comes back as success:false (the SDK
+      // already toasts the real error) — don't claim "up to date".
+      if (res.body?.success) {
+        const outcome = res.body.data?.outcome;
+        if (outcome === 'new') {
+          toast.success(`${label}: downloaded a new version`);
+          fetchVersions();
+        } else if (outcome === 'not-found') {
+          toast.success(`${label}: app not found on this store`);
+        } else {
+          toast.success(`${label}: already up to date`);
+        }
+      }
+    } catch {
+      toast.error(`${label}: fetch failed`);
+    } finally {
+      setSourceBusy(null);
+      fetchSources();
+    }
+  }, [ws, appId, toast, fetchVersions, fetchSources]);
 
   const untrack = useCallback(async () => {
     if (!app) return;
@@ -230,8 +276,6 @@ export function AppDetail() {
       </div>
     );
   }
-
-  const psEnabled = app.autoFetchPlayStore !== false;
 
   const primaryAction = (v: ApkVersionRow) => {
     const s = analysisStatus[v.id];
@@ -306,20 +350,6 @@ export function AppDetail() {
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer' }}>
-            Auto-fetch from Play Store
-            <button
-              role="switch"
-              aria-checked={psEnabled}
-              aria-label="Auto-fetch from Play Store"
-              data-testid="ps-toggle"
-              onClick={togglePlayStore}
-              className={`btn btn-sm${psEnabled ? ' btn-primary' : ''}`}
-              style={{ minWidth: 44 }}
-            >
-              {psEnabled ? 'On' : 'Off'}
-            </button>
-          </label>
           {canManage && (
             <button className="btn" onClick={() => setUploadOpen(true)} data-testid="upload-version-btn">
               <Upload size={13} /> Upload version
@@ -328,6 +358,49 @@ export function AppDetail() {
           <ActionMenu label="App settings" items={[{ key: 'untrack', label: 'Untrack app…', danger: true, onSelect: () => setUntrackOpen(true) }]} />
         </div>
       </div>
+
+      {sources.length > 0 && (
+        <div className="card" style={{ padding: '12px 20px', marginBottom: 16 }} data-testid="sources-panel">
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>Fetch sources</div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+            Pull new APK versions from app stores automatically. QQ (应用宝) only carries apps registered in mainland China.
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {sources.map(s => (
+              <div key={s.source} data-testid={`source-row-${s.source}`} style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13 }}>
+                <button
+                  role="switch"
+                  aria-checked={s.enabled}
+                  aria-label={`Auto-fetch from ${s.label}`}
+                  data-testid={`source-toggle-${s.source}`}
+                  disabled={!canManage}
+                  onClick={() => toggleSource(s.source, s.label, !s.enabled)}
+                  className={`btn btn-sm${s.enabled ? ' btn-primary' : ''}`}
+                  style={{ minWidth: 44 }}
+                >
+                  {s.enabled ? 'On' : 'Off'}
+                </button>
+                <span style={{ fontWeight: 500, minWidth: 160 }}>{s.label}</span>
+                <span style={{ color: 'var(--text-muted)', fontSize: 12, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {s.lastError
+                    ? <span style={{ color: 'var(--danger, #f87171)' }} title={s.lastError}><span aria-hidden="true">⚠</span> {s.lastError}</span>
+                    : s.lastVersion ? `latest seen: v${s.lastVersion}` : 'not checked yet'}
+                </span>
+                {canManage && (
+                  <button
+                    className="btn btn-sm"
+                    data-testid={`source-fetch-${s.source}`}
+                    disabled={sourceBusy === s.source}
+                    onClick={() => fetchNow(s.source, s.label)}
+                  >
+                    {sourceBusy === s.source ? 'Fetching…' : 'Fetch now'}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="table-card">
         <table className="data-table">
@@ -354,9 +427,12 @@ export function AppDetail() {
                   <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{v.versionCode}</td>
                   <td>{formatBytes(v.fileSize)}</td>
                   <td style={{ fontSize: 12 }}>
-                    {v.source === 'playstore' ? <span className="badge badge-running" style={{ fontSize: 10 }}>Play Store</span>
-                      : v.source === 'upload' ? <span className="badge" style={{ fontSize: 10, background: 'var(--bg-tertiary)' }}>Upload</span>
-                      : <span style={{ color: 'var(--text-muted)' }}>{v.deviceId || '—'}</span>}
+                    {(() => {
+                      const b = SOURCE_BADGE[v.source ?? ''];
+                      return b
+                        ? <span className={b.className} style={{ fontSize: 10, ...b.style }}>{b.label}</span>
+                        : <span style={{ color: 'var(--text-muted)' }}>{v.deviceId || '—'}</span>;
+                    })()}
                   </td>
                   <td style={{ color: 'var(--text-muted)', fontSize: 12 }}>{v.downloadedAt ? formatDate(v.downloadedAt) : '—'}</td>
                   <td>{v.availability ? <AvailabilityBadge state={v.availability} /> : <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>—</span>}</td>

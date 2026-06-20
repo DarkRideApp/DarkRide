@@ -46,7 +46,7 @@ import { syncBlocklistFile } from './services/blocklist-writer';
 import { syncHiddenlistFile } from './services/hiddenlist-writer';
 import { trafficHookRegistry } from './services/traffic-hook-registry';
 import { ApkTracker } from './services/apk-tracker';
-import { PlayStoreSource } from './services/play-store-source';
+import { createSourceRegistry } from './services/apk-sources';
 import { ApkAnalyzerService } from './services/apk-analyzer';
 import { FridaReleaseManager } from './services/frida-release-manager';
 import { registerFridaEndpoints, registerFridaGadgetEndpoints } from './api/frida';
@@ -562,11 +562,10 @@ const apkTracker = new ApkTracker(db, deviceManager);
 const apkAnalyzer = new ApkAnalyzerService(db);
 apkTracker.setApkAnalyzer(apkAnalyzer);
 apkTracker.setFileSync(fileSync);
-const playStoreSource = new PlayStoreSource();
-playStoreSource.setDatabase(db);
-apkTracker.setPlayStoreSource(playStoreSource);
+const sourceRegistry = createSourceRegistry(db);
+apkTracker.setSourceRegistry(sourceRegistry);
 apkTracker.setNotificationService(notificationService);
-registerAppEndpoints(deviceManager, db, apkTracker, apkAnalyzer, fileSync, iosDeviceManager);
+registerAppEndpoints(deviceManager, db, apkTracker, apkAnalyzer, fileSync, iosDeviceManager, sourceRegistry);
 registerAppsUploadEndpoint(db, apkAnalyzer);
 registerAnalysisEndpoints(db, apkAnalyzer, deviceManager, captureManager, fileSync);
 const fridaReleaseManager = new FridaReleaseManager(db);
@@ -638,6 +637,8 @@ registerAllTools(aiToolRegistry, db, {
   pluginStateManager,
   systemStateService,
   apkAnalyzer,
+  apkTracker,
+  sourceRegistry,
 });
 
 // Disk space endpoint

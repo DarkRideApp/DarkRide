@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import fs from 'fs';
 import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
 import { ApkTracker } from './apk-tracker';
@@ -33,11 +34,15 @@ vi.mock('fs', async (importOriginal) => {
       statSync: vi.fn(() => ({ size: 54321 })),
       existsSync: vi.fn(() => true),
       writeFileSync: vi.fn(),
+      renameSync: vi.fn(),
+      unlinkSync: vi.fn(),
     },
     mkdirSync: vi.fn(),
     statSync: vi.fn(() => ({ size: 54321 })),
     existsSync: vi.fn(() => true),
     writeFileSync: vi.fn(),
+    renameSync: vi.fn(),
+    unlinkSync: vi.fn(),
   };
 });
 
@@ -51,7 +56,9 @@ vi.mock('child_process', async (importOriginal) => {
 
 import { adbShell, adbPull } from './device-manager';
 import { createTestDb } from '../test-utils/create-test-db';
+import { SourceRegistry } from './apk-sources/registry';
 
+const { appSources } = schema;
 const mockedAdbShell = vi.mocked(adbShell);
 const mockedAdbPull = vi.mocked(adbPull);
 
@@ -296,13 +303,16 @@ describe('ApkTracker', () => {
     });
   });
 
-  describe('checkPlayStore - lastPlayStoreVersion', () => {
-    function createMockPlayStoreSource(overrides: Record<string, any> = {}) {
+  describe('checkRemoteSource - per-source dedup via app_sources', () => {
+    // A stand-in remote source (id 'playstore') exercising the generic
+    // registry path that replaced the old hard-wired Play Store check.
+    function fakeSource(overrides: Record<string, any> = {}) {
       return {
-        checkVersion: vi.fn(async () => ({
-          versionName: '3.0.0',
-          appName: 'Test App',
-        })),
+        id: 'playstore',
+        label: 'Play Store',
+        isConfigured: () => true,
+        defaultEnabled: () => true,
+        checkVersion: vi.fn(async () => ({ versionName: '3.0.0', appName: 'Test App' })),
         downloadApk: vi.fn(async () => ({
           success: true,
           versionCode: 300,
@@ -314,143 +324,153 @@ describe('ApkTracker', () => {
       } as any;
     }
 
-    it('should skip download when lastPlayStoreVersion matches scraper output', async () => {
-      db.insert(trackedApps).values({
-        packageName: 'com.example.app',
-        lastPlayStoreVersion: '3.0.0',
+    function trackerWith(source: any) {
+      const dm = createMockDeviceManager({ getAllDeviceStatuses: vi.fn(async () => []) });
+      const tracker = new ApkTracker(db as any, dm);
+      tracker.setSourceRegistry(new SourceRegistry().register(source));
+      return tracker;
+    }
+
+    function addApp(): number {
+      db.insert(trackedApps).values({ packageName: 'com.example.app', createdAt: new Date() }).run();
+      return db.select().from(trackedApps).all()[0].id;
+    }
+
+    function seedSource(appId: number, opts: { enabled?: boolean; lastVersion?: string | null } = {}) {
+      db.insert(appSources).values({
+        trackedAppId: appId,
+        source: 'playstore',
+        enabled: opts.enabled ?? true,
+        lastVersion: opts.lastVersion ?? null,
         createdAt: new Date(),
       }).run();
+    }
 
-      const dm = createMockDeviceManager({ getAllDeviceStatuses: vi.fn(async () => []) });
-      const ps = createMockPlayStoreSource();
-      const tracker = new ApkTracker(db as any, dm);
-      tracker.setPlayStoreSource(ps);
+    function sourceRow(appId: number) {
+      return db.select().from(appSources).all().find(r => r.trackedAppId === appId && r.source === 'playstore');
+    }
 
-      await tracker.checkForUpdates();
+    it('skips download when the source reports the last-seen version', async () => {
+      const appId = addApp();
+      seedSource(appId, { lastVersion: '3.0.0' });
+      const ps = fakeSource();
+      await trackerWith(ps).checkForUpdates();
 
-      // checkVersion is called, but downloadApk should NOT be called
       expect(ps.checkVersion).toHaveBeenCalled();
       expect(ps.downloadApk).not.toHaveBeenCalled();
     });
 
-    it('should download when Play Store version string changes and versionCode is newer', async () => {
-      db.insert(trackedApps).values({
-        packageName: 'com.example.app',
-        lastPlayStoreVersion: '2.0.0',
-        createdAt: new Date(),
-      }).run();
+    it('does not check a disabled source', async () => {
+      const appId = addApp();
+      seedSource(appId, { enabled: false, lastVersion: '2.0.0' });
+      const ps = fakeSource();
+      await trackerWith(ps).checkForUpdates();
 
-      const dm = createMockDeviceManager({ getAllDeviceStatuses: vi.fn(async () => []) });
-      const ps = createMockPlayStoreSource();
-      const tracker = new ApkTracker(db as any, dm);
-      tracker.setPlayStoreSource(ps);
+      expect(ps.checkVersion).not.toHaveBeenCalled();
+    });
 
-      await tracker.checkForUpdates();
+    it('downloads + inserts when the version changes and is newer', async () => {
+      const appId = addApp();
+      seedSource(appId, { lastVersion: '2.0.0' });
+      const ps = fakeSource();
+      await trackerWith(ps).checkForUpdates();
 
       expect(ps.downloadApk).toHaveBeenCalled();
-
-      // lastPlayStoreVersion should be updated
-      const apps = db.select().from(trackedApps).all();
-      expect(apps[0].lastPlayStoreVersion).toBe('3.0.0');
-
-      // Version record should be inserted
+      expect(sourceRow(appId)?.lastVersion).toBe('3.0.0');
       const versions = db.select().from(apkVersions).all();
       expect(versions).toHaveLength(1);
       expect(versions[0].versionCode).toBe(300);
+      expect(versions[0].source).toBe('playstore');
     });
 
-    it('should not keep a Play Store download when we already have a newer version from another source', async () => {
-      db.insert(trackedApps).values({
-        packageName: 'com.example.app',
-        lastPlayStoreVersion: '2.0.0',
-        createdAt: new Date(),
-      }).run();
-      const apps = db.select().from(trackedApps).all();
-
-      // Already have a newer version from device (versionCode 400 > 300)
+    it('discards a download older than what we already have, but still records lastVersion', async () => {
+      const appId = addApp();
+      seedSource(appId, { lastVersion: '2.0.0' });
       db.insert(apkVersions).values({
-        trackedAppId: apps[0].id,
-        versionCode: 400,
-        versionName: '4.0.0-beta',
-        filename: '400_4.0.0-beta.apk',
-        source: 'device',
-        downloadedAt: new Date(),
+        trackedAppId: appId, versionCode: 400, versionName: '4.0.0-beta',
+        filename: '400_4.0.0-beta.apk', source: 'device', downloadedAt: new Date(),
       }).run();
 
-      const dm = createMockDeviceManager({ getAllDeviceStatuses: vi.fn(async () => []) });
-      // Play Store returns 3.0.0 (versionCode 300) — older than what we have
-      const ps = createMockPlayStoreSource();
-      const tracker = new ApkTracker(db as any, dm);
-      tracker.setPlayStoreSource(ps);
+      const ps = fakeSource();
+      await trackerWith(ps).checkForUpdates();
 
-      await tracker.checkForUpdates();
-
-      // Download was attempted (version string changed), but dedup discards it
       expect(ps.downloadApk).toHaveBeenCalled();
-
-      // No new version record — only the original device-pulled one
       const versions = db.select().from(apkVersions).all();
       expect(versions).toHaveLength(1);
       expect(versions[0].versionCode).toBe(400);
-
-      // lastPlayStoreVersion still updated so we don't re-download next cycle
-      const updatedApps = db.select().from(trackedApps).all();
-      expect(updatedApps[0].lastPlayStoreVersion).toBe('3.0.0');
+      expect(sourceRow(appId)?.lastVersion).toBe('3.0.0');
     });
 
-    it('should download when lastPlayStoreVersion is null (first check)', async () => {
-      db.insert(trackedApps).values({
-        packageName: 'com.example.app',
-        createdAt: new Date(),
-      }).run();
-
-      const dm = createMockDeviceManager({ getAllDeviceStatuses: vi.fn(async () => []) });
-      const ps = createMockPlayStoreSource();
-      const tracker = new ApkTracker(db as any, dm);
-      tracker.setPlayStoreSource(ps);
-
-      await tracker.checkForUpdates();
+    it('downloads on first check (lastVersion null)', async () => {
+      const appId = addApp();
+      seedSource(appId, { lastVersion: null });
+      const ps = fakeSource();
+      await trackerWith(ps).checkForUpdates();
 
       expect(ps.downloadApk).toHaveBeenCalled();
-
-      const apps = db.select().from(trackedApps).all();
-      expect(apps[0].lastPlayStoreVersion).toBe('3.0.0');
+      expect(sourceRow(appId)?.lastVersion).toBe('3.0.0');
     });
 
-    it('should update lastPlayStoreVersion even when versionCode is already stored (dedup)', async () => {
-      db.insert(trackedApps).values({
-        packageName: 'com.example.app',
-        lastPlayStoreVersion: '2.0.0',
-        createdAt: new Date(),
-      }).run();
-      const apps = db.select().from(trackedApps).all();
+    it('records lastError when checkVersion throws', async () => {
+      const appId = addApp();
+      seedSource(appId, { lastVersion: '2.0.0' });
+      const ps = fakeSource({ checkVersion: vi.fn(async () => { throw new Error('boom'); }) });
+      await trackerWith(ps).checkForUpdates();
 
-      // Already have versionCode 300 from a device pull
+      expect(sourceRow(appId)?.lastError).toBe('boom');
+    });
+
+    it('auto-creates missing app_sources rows from the registry defaults', async () => {
+      const appId = addApp();
+      // No seeded row — ensureAppSources should create one with defaultEnabled().
+      const ps = fakeSource();
+      await trackerWith(ps).checkForUpdates();
+
+      const row = sourceRow(appId);
+      expect(row).toBeTruthy();
+      expect(row?.enabled).toBe(true);
+    });
+
+    it('a forced fetch on an app with no source row creates it and records state', async () => {
+      const appId = addApp();
+      // No seeded row at all (e.g. a pre-existing app whose qq row was never backfilled).
+      const ps = fakeSource();
+      const tracker = trackerWith(ps);
+      const result = await tracker.checkRemoteSource(
+        { id: appId, packageName: 'com.example.app', appName: null }, ps, { force: true },
+      );
+
+      expect(ps.downloadApk).toHaveBeenCalled();
+      expect(result.newVersionId).not.toBeNull();
+      const row = sourceRow(appId);
+      expect(row).toBeTruthy();
+      expect(row?.lastVersion).toBe('3.0.0'); // state recorded, not silently dropped
+    });
+
+    it('finalizes the staged download via rename on keep (never overwrites in place)', async () => {
+      const appId = addApp();
+      seedSource(appId, { lastVersion: '2.0.0' });
+      const ps = fakeSource(); // downloadApk returns filePath: '/tmp/test.apk' (staged)
+      await trackerWith(ps).checkForUpdates();
+
+      // ingestVersion renames the staged temp file to the final name.
+      expect(vi.mocked(fs.renameSync)).toHaveBeenCalledWith('/tmp/test.apk', expect.stringContaining('300_3.0.0.apk'));
+    });
+
+    it('discards (unlinks) the staged download on dedup, never renaming it', async () => {
+      const appId = addApp();
+      seedSource(appId, { lastVersion: '2.0.0' });
       db.insert(apkVersions).values({
-        trackedAppId: apps[0].id,
-        versionCode: 300,
-        versionName: '3.0.0',
-        filename: '300_3.0.0.apk',
-        downloadedAt: new Date(),
+        trackedAppId: appId, versionCode: 400, versionName: '4.0.0',
+        filename: '400_4.0.0.apk', source: 'device', downloadedAt: new Date(),
       }).run();
+      vi.mocked(fs.renameSync).mockClear();
 
-      const dm = createMockDeviceManager({ getAllDeviceStatuses: vi.fn(async () => []) });
-      const ps = createMockPlayStoreSource();
-      const tracker = new ApkTracker(db as any, dm);
-      tracker.setPlayStoreSource(ps);
+      const ps = fakeSource(); // returns versionCode 300 < stored 400 → dedup
+      await trackerWith(ps).checkForUpdates();
 
-      await tracker.checkForUpdates();
-
-      // Download was attempted (version name changed), but dedup kicked in
-      expect(ps.downloadApk).toHaveBeenCalled();
-
-      // lastPlayStoreVersion should still be updated to prevent re-downloading
-      const updatedApps = db.select().from(trackedApps).all();
-      expect(updatedApps[0].lastPlayStoreVersion).toBe('3.0.0');
-
-      // No new version record
-      const versions = db.select().from(apkVersions).all();
-      expect(versions).toHaveLength(1);
+      expect(vi.mocked(fs.unlinkSync)).toHaveBeenCalledWith('/tmp/test.apk');
+      expect(vi.mocked(fs.renameSync)).not.toHaveBeenCalled();
     });
   });
 

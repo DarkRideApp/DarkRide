@@ -1,20 +1,23 @@
-import { eq } from 'drizzle-orm';
+import { eq, and } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import AdmZip from 'adm-zip';
-import { trackedApps, apkVersions } from '../db/schema';
+import { trackedApps, apkVersions, appSources } from '../db/schema';
 import { adbShell, adbPull } from './device-manager';
 import type { DeviceManager } from './device-manager';
 import type { ApkAnalyzerService } from './apk-analyzer';
 import type { FileStorageService } from './file-storage';
-import type { PlayStoreSource } from './play-store-source';
+import type { SourceRegistry } from './apk-sources/registry';
+import type { RemoteApkSource } from './apk-sources/types';
+import { ensureAppSources } from './apk-sources';
+import { sourceLabel } from './apk-sources/types';
 import type { NotificationService } from './notification-service';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
-import { APK_DIR, packageDir } from '../utils/apk-paths';
+import { packageDir, sanitizeVersionName } from '../utils/apk-paths';
 import { safeJoinInside } from '../utils/safe-path';
 import { enumerateApkPaths } from '../utils/apk-utils';
 import { applyRetentionForApp, applyRetentionForAllApps } from './apk-retention';
@@ -171,7 +174,7 @@ export class ApkTracker {
   private checking = false;
   private apkAnalyzer: ApkAnalyzerService | null = null;
   private fileSync: FileStorageService | null = null;
-  private playStoreSource: PlayStoreSource | null = null;
+  private sourceRegistry: SourceRegistry | null = null;
   private notificationService: NotificationService | null = null;
 
   constructor(
@@ -188,8 +191,8 @@ export class ApkTracker {
     this.fileSync = sync;
   }
 
-  setPlayStoreSource(source: PlayStoreSource): void {
-    this.playStoreSource = source;
+  setSourceRegistry(registry: SourceRegistry): void {
+    this.sourceRegistry = registry;
   }
 
   setNotificationService(service: NotificationService): void {
@@ -242,17 +245,23 @@ export class ApkTracker {
         return;
       }
 
-      // Fire off Play Store checks in parallel (don't block device checks)
-      const playStorePromises: Promise<boolean>[] = [];
-      if (this.playStoreSource) {
+      // Fire off remote-source checks in parallel (don't block device checks).
+      // Each enabled (app, source) pair is one independent check.
+      const remotePromises: Promise<boolean>[] = [];
+      if (this.sourceRegistry) {
+        const registry = this.sourceRegistry;
         for (const app of tracked) {
-          if (app.autoFetchPlayStore === false) continue;
-          playStorePromises.push(
-            this.checkPlayStore(app).catch(err => {
-              error(`Play Store check failed for ${app.packageName}: ${err.message}`);
-              return false;
-            }),
-          );
+          ensureAppSources(this.db, app.id, registry);
+          for (const source of registry.all()) {
+            remotePromises.push(
+              this.checkRemoteSource(app, source)
+                .then(r => r.newVersionId !== null)
+                .catch(err => {
+                  error(`${source.label} check failed for ${app.packageName}: ${err.message}`);
+                  return false;
+                }),
+            );
+          }
         }
       }
 
@@ -279,9 +288,9 @@ export class ApkTracker {
         }
       }
 
-      // Wait for Play Store checks to complete
-      const playStoreResults = await Promise.all(playStorePromises);
-      newVersions += playStoreResults.filter(Boolean).length;
+      // Wait for remote-source checks to complete
+      const remoteResults = await Promise.all(remotePromises);
+      newVersions += remoteResults.filter(Boolean).length;
     } catch (err: any) {
       error(`APK tracker check failed: ${err.message}`);
     } finally {
@@ -290,117 +299,210 @@ export class ApkTracker {
     }
   }
 
-  private async checkPlayStore(
-    app: { id: number; packageName: string; appName: string | null; lastPlayStoreVersion: string | null },
-  ): Promise<boolean> {
-    if (!this.playStoreSource) return false;
+  /**
+   * Check one remote source for one app, downloading + ingesting a new version
+   * if there is one. Gated on the app's app_sources row being enabled. Persists
+   * per-source state (lastVersion / lastCheckedAt / lastError) so the UI can
+   * surface health and the next cycle can skip unchanged versions.
+   *
+   * Public so the API can trigger a one-off "fetch now" for a single source.
+   */
+  async checkRemoteSource(
+    app: { id: number; packageName: string; appName: string | null },
+    source: RemoteApkSource,
+    opts: { force?: boolean } = {},
+  ): Promise<{ newVersionId: number | null; error?: string; notFound?: boolean }> {
+    let row = this.db.select().from(appSources)
+      .where(and(eq(appSources.trackedAppId, app.id), eq(appSources.source, source.id)))
+      .all()[0];
 
-    // Check latest version on Play Store
-    const versionInfo = await this.playStoreSource.checkVersion(app.packageName);
-    if (!versionInfo) return false;
-
-    // Skip download if Play Store reports the same version we last saw
-    if (versionInfo.versionName && versionInfo.versionName === app.lastPlayStoreVersion) {
-      return false;
+    // A forced fetch (fetch-now / AI tool) may target an app with no row yet
+    // (e.g. a pre-existing app whose qq row was never backfilled). Create it so
+    // lastVersion/lastError state is recorded rather than silently dropped.
+    // onConflictDoNothing + re-select by the (tracked_app_id, source) key makes
+    // this safe under concurrent fetch-now calls: if another request inserted
+    // the row first, we don't fail the constraint and we still get the row
+    // (relying on lastInsertRowid would be wrong when the insert was ignored).
+    if (!row && opts.force) {
+      this.db.insert(appSources).values({
+        trackedAppId: app.id,
+        source: source.id,
+        enabled: source.defaultEnabled(),
+        createdAt: new Date(),
+      }).onConflictDoNothing().run();
+      row = this.db.select().from(appSources)
+        .where(and(eq(appSources.trackedAppId, app.id), eq(appSources.source, source.id)))
+        .all()[0];
     }
 
-    // Download via apkeep
-    const appName = versionInfo.appName || app.appName || app.packageName;
-    const result = await this.playStoreSource.downloadApk(app.packageName, appName);
-    if (!result.success || !result.versionCode) {
-      if (result.error) log(`Play Store download skipped for ${app.packageName}: ${result.error}`);
-      return false;
-    }
+    // Scheduled cycles respect the enabled flag; an explicit force (fetch-now)
+    // bypasses it but still records state.
+    if (!opts.force && !(row?.enabled)) return { newVersionId: null };
 
-    // Dedup: check if this versionCode already exists or is older than what we have
-    const allVersions = this.db.select().from(apkVersions)
+    const markState = (patch: Partial<typeof appSources.$inferInsert>) => {
+      if (row) {
+        this.db.update(appSources).set(patch).where(eq(appSources.id, row.id)).run();
+      }
+    };
+
+    try {
+      const versionInfo = await source.checkVersion(app.packageName);
+      if (!versionInfo) {
+        markState({ lastCheckedAt: new Date(), lastError: null });
+        return { newVersionId: null, notFound: true };
+      }
+
+      // Skip the download if the source reports the same version we last saw,
+      // unless the caller forced a refresh.
+      if (!opts.force && versionInfo.versionName && versionInfo.versionName === row?.lastVersion) {
+        markState({ lastCheckedAt: new Date(), lastError: null });
+        return { newVersionId: null };
+      }
+
+      const appName = versionInfo.appName || app.appName || app.packageName;
+      const result = await source.downloadApk(app.packageName, appName);
+      if (!result.success || !result.versionCode) {
+        const msg = result.error || 'download failed';
+        markState({ lastCheckedAt: new Date(), lastError: msg });
+        log(`${source.label} download skipped for ${app.packageName}: ${msg}`);
+        return { newVersionId: null, error: msg };
+      }
+
+      // Build a path-safe filename from the (untrusted) versionName; the
+      // display versionName stored on the row keeps its original value.
+      const filename = `${result.versionCode}_${sanitizeVersionName(result.versionName)}.apk`;
+
+      const versionId = this.ingestVersion(app, source.id, {
+        versionCode: result.versionCode,
+        versionName: result.versionName || 'unknown',
+        filename,
+        fileSize: result.fileSize || 0,
+        displayName: appName,
+        // Remote sources return a STAGED temp file; ingestVersion moves it to
+        // `filename` only if the version is kept, discards it on dedup.
+        staged: result.filePath
+          ? { path: result.filePath, cloudKey: `apks/${app.packageName}/${filename}` }
+          : undefined,
+      });
+
+      // Record the version string + clear errors regardless of dedup outcome so
+      // we don't re-download an already-stored version next cycle.
+      markState({ lastVersion: versionInfo.versionName ?? row?.lastVersion ?? null, lastCheckedAt: new Date(), lastError: null });
+      if (!app.appName && versionInfo.appName) {
+        this.db.update(trackedApps).set({ appName: versionInfo.appName }).where(eq(trackedApps.id, app.id)).run();
+        app.appName = versionInfo.appName;
+      }
+
+      return { newVersionId: versionId };
+    } catch (err: any) {
+      markState({ lastCheckedAt: new Date(), lastError: err.message });
+      throw err;
+    }
+  }
+
+  /**
+   * Shared ingestion tail for every source (device + remote): dedup by
+   * versionCode, finalize the downloaded file, insert the apk_versions row,
+   * track cloud files, apply retention, broadcast, notify, and enqueue
+   * analysis. Returns the new versionId, or null when deduped away.
+   *
+   * Device callers pass `cloudFiles` already at their final on-disk location.
+   * Remote callers pass a `staged` temp file: it is moved into place ONLY when
+   * the version is kept, and unlinked on dedup — so a deduped re-download can
+   * never overwrite or delete an identically-named already-stored APK.
+   */
+  private ingestVersion(
+    app: { id: number; packageName: string; appName: string | null },
+    sourceId: string,
+    data: {
+      versionCode: number;
+      versionName: string;
+      filename: string;
+      fileSize: number;
+      deviceId?: string | null;
+      /** Display name for the notification (avoids a trackedApps re-read). */
+      displayName?: string | null;
+      cloudFiles?: Array<{ localPath: string; cloudKey: string; size: number }>;
+      staged?: { path: string; cloudKey: string };
+    },
+  ): number | null {
+    const versions = this.db.select().from(apkVersions)
       .where(eq(apkVersions.trackedAppId, app.id))
       .all();
+    const hasExact = versions.some(v => v.versionCode === data.versionCode);
+    const latestCode = versions.length > 0 ? Math.max(...versions.map(v => v.versionCode)) : 0;
 
-    const hasExact = allVersions.find(v => v.versionCode === result.versionCode);
-    const latestCode = allVersions.length > 0
-      ? Math.max(...allVersions.map(v => v.versionCode))
-      : 0;
-
-    if (hasExact || result.versionCode <= latestCode) {
-      // Already have this version or it's older — clean up downloaded file
-      if (result.filePath) {
-        try { fs.unlinkSync(result.filePath); } catch {}
+    if (hasExact || data.versionCode <= latestCode) {
+      // Discard the staged download — never touch the stored final file.
+      if (data.staged) {
+        try { fs.unlinkSync(data.staged.path); } catch { /* best-effort */ }
       }
-      // Still update lastPlayStoreVersion so we don't re-download next cycle
-      if (versionInfo.versionName) {
-        this.db.update(trackedApps).set({ lastPlayStoreVersion: versionInfo.versionName }).where(eq(trackedApps.id, app.id)).run();
+      if (!hasExact && data.versionCode < latestCode) {
+        log(`${sourceLabel(sourceId)} version skipped for ${app.packageName}: v${data.versionName} (${data.versionCode}) is older than stored (${latestCode})`);
       }
-      if (!hasExact && result.versionCode < latestCode) {
-        log(`Play Store download skipped for ${app.packageName}: downloaded v${result.versionName} (${result.versionCode}) is older than stored (${latestCode})`);
-      }
-      return false;
+      return null;
     }
 
-    const filename = `${result.versionCode}_${result.versionName || 'unknown'}.apk`;
+    // Kept: finalize a staged remote download into its real filename. The
+    // versionCode is new (> latestCode), so `filename` cannot collide with an
+    // existing version's file.
+    let cloudFiles = data.cloudFiles ?? [];
+    if (data.staged) {
+      const pkgDir = packageDir(app.packageName);
+      fs.mkdirSync(pkgDir, { recursive: true });
+      const finalPath = safeJoinInside(pkgDir, data.filename);
+      fs.renameSync(data.staged.path, finalPath);
+      cloudFiles = [{ localPath: finalPath, cloudKey: data.staged.cloudKey, size: data.fileSize }];
+    }
 
-    // Insert version record
     const insertResult = this.db.insert(apkVersions)
       .values({
         trackedAppId: app.id,
-        versionCode: result.versionCode,
-        versionName: result.versionName || null,
-        filename,
-        fileSize: result.fileSize || null,
-        deviceId: null,
-        source: 'playstore',
+        versionCode: data.versionCode,
+        versionName: data.versionName || null,
+        filename: data.filename,
+        fileSize: data.fileSize || null,
+        deviceId: data.deviceId ?? null,
+        source: sourceId,
         downloadedAt: new Date(),
       })
       .run();
-
     const versionId = Number(insertResult.lastInsertRowid);
 
-    // Update lastPlayStoreVersion so we skip re-downloading the same version next cycle
-    this.db.update(trackedApps)
-      .set({
-        lastPlayStoreVersion: versionInfo.versionName,
-        ...(!app.appName && versionInfo.appName ? { appName: versionInfo.appName } : {}),
-      })
-      .where(eq(trackedApps.id, app.id))
-      .run();
+    log(`Pulled APK from ${sourceLabel(sourceId)}: ${app.packageName} v${data.versionName} (${data.versionCode})`);
 
-    log(`Pulled APK from Play Store: ${app.packageName} v${result.versionName} (${result.versionCode})`);
-
-    // Cloud sync
-    if (this.fileSync && result.filePath) {
-      const cloudKey = `apks/${app.packageName}/${filename}`;
-      this.fileSync.trackFile(result.filePath, cloudKey, 'apk', result.fileSize || 0);
+    if (this.fileSync) {
+      for (const cf of cloudFiles) {
+        this.fileSync.trackFile(cf.localPath, cf.cloudKey, 'apk', cf.size);
+      }
     }
     applyRetentionForApp(this.db, app.id, app.packageName);
 
-    // Broadcast
     broadcastToAll({
       type: 'apk:version-pulled',
       trackedAppId: app.id,
       packageName: app.packageName,
-      versionCode: result.versionCode,
-      versionName: result.versionName || null,
-      source: 'playstore',
+      versionCode: data.versionCode,
+      versionName: data.versionName || null,
+      source: sourceId,
     });
 
-    // Notify
     this.notificationService?.emit({
       type: 'apk:new-version',
-      title: `New APK: ${app.appName || app.packageName}`,
-      body: `v${result.versionName || result.versionCode} downloaded from Play Store`,
+      title: `New APK: ${data.displayName || app.appName || app.packageName}`,
+      body: `v${data.versionName || data.versionCode} from ${sourceLabel(sourceId)}`,
       sourceType: 'apk',
       sourceId: String(versionId),
       url: `/ui/apps/${app.id}/analysis/${versionId}`,
     });
 
-    // Auto-enqueue for analysis
     if (this.apkAnalyzer) {
       this.apkAnalyzer.enqueue(versionId).catch(err => {
-        error(`Failed to enqueue analysis for ${app.packageName} v${result.versionCode}: ${err.message}`);
+        error(`Failed to enqueue analysis for ${app.packageName} v${data.versionCode}: ${err.message}`);
       });
     }
 
-    return true;
+    return versionId;
   }
 
   private async checkAppOnDevice(
@@ -448,6 +550,9 @@ export class ApkTracker {
     log(`New version detected: ${packageName} v${currentVersionCode} on ${deviceId}`);
 
     const versionName = parseVersionName(dumpsys) ?? 'unknown';
+    // Path-safe component for on-disk filenames; the display versionName stored
+    // on the row keeps its original value.
+    const safeVersionName = sanitizeVersionName(versionName);
 
     // Get APK paths (split APKs return multiple paths)
     const pathOutput = await adbShell(deviceId, `pm path ${packageName}`, 5000);
@@ -470,7 +575,7 @@ export class ApkTracker {
 
     if (isSplit) {
       // Split APK: store all files in a subdirectory
-      filename = `${currentVersionCode}_${versionName}`;
+      filename = `${currentVersionCode}_${safeVersionName}`;
       const splitDir = safeJoinInside(pkgDir,filename);
       fs.mkdirSync(splitDir, { recursive: true });
       for (const apkPath of apkPaths) {
@@ -481,79 +586,45 @@ export class ApkTracker {
       }
       log(`Pulled split APK (${apkPaths.length} files) for ${packageName} v${versionName} from ${deviceId}`);
     } else {
-      filename = `${currentVersionCode}_${versionName}.apk`;
+      filename = `${currentVersionCode}_${safeVersionName}.apk`;
       const localPath = safeJoinInside(pkgDir,filename);
       await adbPull(deviceId, apkPaths[0], localPath);
       totalSize = fs.statSync(localPath).size;
     }
 
-    // Insert version record
-    const result = this.db.insert(apkVersions)
-      .values({
-        trackedAppId,
-        versionCode: currentVersionCode,
-        versionName,
-        filename,
-        fileSize: totalSize,
-        deviceId,
-        source: 'device',
-        downloadedAt: new Date(),
-      })
-      .run();
-
-    const versionId = Number(result.lastInsertRowid);
-
-    log(`Pulled APK: ${packageName} v${versionName} (${currentVersionCode}) from ${deviceId}, ${totalSize} bytes`);
-
-    // Track file(s) in cloud storage
-    if (this.fileSync) {
-      if (isSplit) {
-        // Split APKs: track each individual .apk file inside the directory
-        const splitDir = safeJoinInside(pkgDir,filename);
-        for (const apkPath of apkPaths) {
-          const apkName = path.basename(apkPath);
-          const localFilePath = path.join(splitDir, apkName);
-          const fileSize = fs.statSync(localFilePath).size;
-          const cloudKey = `apks/${packageName}/${filename}/${apkName}`;
-          this.fileSync.trackFile(localFilePath, cloudKey, 'apk', fileSize);
-        }
-      } else {
-        const apkLocalPath = safeJoinInside(pkgDir,filename);
-        const cloudKey = `apks/${packageName}/${filename}`;
-        this.fileSync.trackFile(apkLocalPath, cloudKey, 'apk', totalSize);
+    // Build the cloud-file list (split APKs track each part individually).
+    const cloudFiles: Array<{ localPath: string; cloudKey: string; size: number }> = [];
+    if (isSplit) {
+      const splitDir = safeJoinInside(pkgDir, filename);
+      for (const apkPath of apkPaths) {
+        const apkName = path.basename(apkPath);
+        const localFilePath = path.join(splitDir, apkName);
+        cloudFiles.push({
+          localPath: localFilePath,
+          cloudKey: `apks/${packageName}/${filename}/${apkName}`,
+          size: fs.statSync(localFilePath).size,
+        });
       }
-    }
-    applyRetentionForApp(this.db, trackedAppId, packageName);
-
-    // Broadcast to frontend
-    broadcastToAll({
-      type: 'apk:version-pulled',
-      trackedAppId,
-      packageName,
-      versionCode: currentVersionCode,
-      versionName,
-      source: 'device',
-    });
-
-    // Notify
-    const appRow = this.db.select().from(trackedApps).where(eq(trackedApps.id, trackedAppId)).all()[0];
-    this.notificationService?.emit({
-      type: 'apk:new-version',
-      title: `New APK: ${appRow?.appName || packageName}`,
-      body: `v${versionName || currentVersionCode} pulled from device`,
-      sourceType: 'apk',
-      sourceId: String(versionId),
-      url: `/ui/apps/${trackedAppId}/analysis/${versionId}`,
-    });
-
-    // Auto-enqueue for analysis
-    if (this.apkAnalyzer) {
-      this.apkAnalyzer.enqueue(versionId).catch(err => {
-        error(`Failed to enqueue analysis for ${packageName} v${currentVersionCode}: ${err.message}`);
+    } else {
+      cloudFiles.push({
+        localPath: safeJoinInside(pkgDir, filename),
+        cloudKey: `apks/${packageName}/${filename}`,
+        size: totalSize,
       });
     }
 
-    return true;
+    // Funnel through the shared ingestion tail. The device path already
+    // pre-checked the version above, so dedup here is just defence.
+    const versionId = this.ingestVersion(app, 'device', {
+      versionCode: currentVersionCode,
+      versionName,
+      filename,
+      fileSize: totalSize,
+      deviceId,
+      cloudFiles,
+    });
+
+    return versionId !== null;
   }
 
   private async getAppLabel(deviceId: string, packageName: string): Promise<string | null> {

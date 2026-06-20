@@ -26,6 +26,7 @@ const ALLOWED_KEYS = new Set([
   'mcp_enabled',
   'oauth_public_base_url',
   'apk_local_retention_count',
+  'qq_fetch_default', // 'true' | 'false' — default enablement for QQ on newly-tracked apps
 ]);
 const PASSWORD_KEYS = new Set([
   'nordvpn_password',

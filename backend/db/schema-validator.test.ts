@@ -62,6 +62,21 @@ describe('Schema Validator', () => {
     expect(repairs).toBe(0);
   });
 
+  it('preserves the app_sources unique constraint when recreating the table', () => {
+    const sqlite = new Database(':memory:');
+    applyMigrations(sqlite, './migrations');
+    // Simulate a skipped 0095 CREATE TABLE — validator must rebuild it.
+    sqlite.exec('DROP TABLE app_sources');
+
+    const repairs = validateAndRepairSchema(sqlite);
+    expect(repairs).toBeGreaterThanOrEqual(1);
+
+    sqlite.prepare(`INSERT INTO app_sources (tracked_app_id, source, enabled, created_at) VALUES (1, 'qq', 0, 1)`).run();
+    expect(() =>
+      sqlite.prepare(`INSERT INTO app_sources (tracked_app_id, source, enabled, created_at) VALUES (1, 'qq', 1, 1)`).run(),
+    ).toThrow();
+  });
+
   it('inserts missing built-in signing key', () => {
     const sqlite = new Database(':memory:');
     applyMigrations(sqlite, './migrations');

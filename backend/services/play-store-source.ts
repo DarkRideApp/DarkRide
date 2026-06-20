@@ -2,6 +2,7 @@ import gplay from 'google-play-scraper';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { eq } from 'drizzle-orm';
 import AdmZip from 'adm-zip';
@@ -10,6 +11,9 @@ import { createLoggers } from '../logs';
 import { settings } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { APK_DIR } from '../utils/apk-paths';
+import type { RemoteApkSource, VersionCheckResult, DownloadResult } from './apk-sources/types';
+
+export type { VersionCheckResult, DownloadResult };
 
 const { log, error } = createLoggers('play-store');
 const TOOLS_DIR = path.resolve('./data/tools');
@@ -19,20 +23,6 @@ const MIN_REQUEST_INTERVAL = 2000; // 2s between Play Store API calls
 
 const APKEEP_VERSION = '0.18.0';
 const APKEEP_DOWNLOAD_URL = `https://github.com/EFForg/apkeep/releases/download/${APKEEP_VERSION}/apkeep-x86_64-unknown-linux-gnu`;
-
-export interface VersionCheckResult {
-  versionName: string;
-  appName: string;
-}
-
-export interface DownloadResult {
-  success: boolean;
-  filePath?: string;
-  versionCode?: number;
-  versionName?: string;
-  fileSize?: number;
-  error?: string;
-}
 
 /** Run apkeep CLI and return stdout. */
 function runApkeep(args: string[], timeoutMs = 300000): Promise<string> {
@@ -81,12 +71,25 @@ function extractBaseApkFromXapk(xapkPath: string, tmpDir: string): string | null
   }
 }
 
-export class PlayStoreSource {
+export class PlayStoreSource implements RemoteApkSource {
+  readonly id = 'playstore';
+  readonly label = 'Play Store';
+
   private lastRequestTime = 0;
   private db: AppDatabase | null = null;
 
   setDatabase(db: AppDatabase): void {
     this.db = db;
+  }
+
+  /** Always usable — falls back to APKPure when Google Play creds are absent. */
+  isConfigured(): boolean {
+    return true;
+  }
+
+  /** Default-on, preserving the legacy autoFetchPlayStore=true behaviour. */
+  defaultEnabled(): boolean {
+    return true;
   }
 
   private async rateLimit(): Promise<void> {
@@ -248,19 +251,22 @@ export class PlayStoreSource {
       }
 
       const versionName = versionInfo.versionName || 'unknown';
-      const filename = `${versionInfo.versionCode}_${versionName}.apk`;
+      // Copy into a uniquely-named staging file inside the package dir. The
+      // tracker dedups first and finalizes the move only when the version is
+      // kept, so a deduped download can't overwrite/delete a stored APK.
       const pkgDir = path.join(APK_DIR, packageName);
       fs.mkdirSync(pkgDir, { recursive: true });
-      const finalPath = path.join(pkgDir, filename);
+      const stagedPath = path.join(pkgDir, `.dl-${crypto.randomUUID()}.apk`);
 
-      fs.copyFileSync(apkPath, finalPath);
-      const fileSize = fs.statSync(finalPath).size;
+      fs.copyFileSync(apkPath, stagedPath);
+      const fileSize = fs.statSync(stagedPath).size;
 
       log(`Downloaded ${packageName} v${versionName} (${versionInfo.versionCode}) — ${fileSize} bytes via ${sourceName}`);
 
+      // filePath is a STAGED file; the tracker finalizes or discards it.
       return {
         success: true,
-        filePath: finalPath,
+        filePath: stagedPath,
         versionCode: versionInfo.versionCode,
         versionName,
         fileSize,

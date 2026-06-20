@@ -6,7 +6,11 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import AdmZip from 'adm-zip';
 import { registerEndpoint } from './api-service';
-import { trackedApps, apkVersions, analysisJobs, apkContents, apkDiffReports, devices } from '../db/schema';
+import { trackedApps, apkVersions, analysisJobs, apkContents, apkDiffReports, devices, appSources } from '../db/schema';
+import { and } from 'drizzle-orm';
+import { ensureAppSources } from '../services/apk-sources';
+import { sourceLabel } from '../services/apk-sources/types';
+import type { SourceRegistry } from '../services/apk-sources/registry';
 import { adbShell, adbCommand, adbPull } from '../services/device-manager';
 import type { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
@@ -40,6 +44,20 @@ const APP_LIST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 /** Expose cache invalidation for external callers (e.g. when device goes offline). */
 export function clearAppListCache(deviceId: string): void {
   appListCache.delete(deviceId);
+}
+
+/** In-flight one-off fetches keyed by `${trackedAppId}:${source}` (concurrency coalescing). */
+const inFlightFetches = new Map<string, Promise<{ newVersionId: number | null; error?: string; notFound?: boolean }>>();
+
+/** Upsert the enabled flag on an app's app_sources row for a given source. */
+function setSourceEnabled(db: AppDatabase, trackedAppId: number, source: string, enabled: boolean): void {
+  // Atomic upsert on the (tracked_app_id, source) unique key — a single
+  // statement so a concurrent toggle + tracker seeding can't both see "no row"
+  // and race into a duplicate-insert that violates the constraint.
+  db.insert(appSources)
+    .values({ trackedAppId, source, enabled, createdAt: new Date() })
+    .onConflictDoUpdate({ target: [appSources.trackedAppId, appSources.source], set: { enabled } })
+    .run();
 }
 
 // extractIconFromLocalApk and fetchIconFromGooglePlay imported from apk-tracker.ts
@@ -267,6 +285,7 @@ export function registerAppEndpoints(
   apkAnalyzer?: ApkAnalyzerService,
   fileSync?: FileStorageService,
   iosDeviceManager?: IosDeviceManager,
+  sourceRegistry?: SourceRegistry,
 ): void {
   // GET /v1/device/apps/:deviceId — List installed third-party apps
   registerEndpoint('GET', '/v1/device/apps/:deviceId', async (req, res) => {
@@ -630,6 +649,12 @@ export function registerAppEndpoints(
       res.status(400).json({ success: false, error: 'packageName is required' });
       return;
     }
+    // Validate before persisting — this value becomes the DB-canonical id and
+    // flows into cloud keys + the QQ request body.
+    if (!isValidPackageName(packageName)) {
+      res.status(400).json({ success: false, error: 'Invalid packageName' });
+      return;
+    }
 
     // Check if already tracked
     const existing = db.select().from(trackedApps)
@@ -637,6 +662,7 @@ export function registerAppEndpoints(
       .all()[0];
 
     if (existing) {
+      if (sourceRegistry) ensureAppSources(db, existing.id, sourceRegistry);
       res.json({ success: true, data: existing });
       return;
     }
@@ -652,6 +678,10 @@ export function registerAppEndpoints(
     const inserted = db.select().from(trackedApps)
       .where(eq(trackedApps.packageName, packageName))
       .all()[0];
+
+    // Seed per-source rows (Play Store on by default, QQ opt-in) so the app
+    // can be fetched remotely with no device attached.
+    if (sourceRegistry) ensureAppSources(db, inserted.id, sourceRegistry);
 
     res.status(201).json({ success: true, data: inserted });
   }, { requires: ['core.apk:manage'] });
@@ -673,13 +703,19 @@ export function registerAppEndpoints(
       return;
     }
 
-    const updates: Record<string, any> = {};
+    // Back-compat: `autoFetchPlayStore` now lives in app_sources('playstore').
     if (typeof req.body.autoFetchPlayStore === 'boolean') {
-      updates.autoFetchPlayStore = req.body.autoFetchPlayStore;
+      setSourceEnabled(db, id, 'playstore', req.body.autoFetchPlayStore);
     }
-
-    if (Object.keys(updates).length > 0) {
-      db.update(trackedApps).set(updates).where(eq(trackedApps.id, id)).run();
+    if (typeof req.body.appName === 'string') {
+      const appName = req.body.appName.trim();
+      // Reject blank renames (the tracker's `!appName` auto-fill would re-clobber
+      // them anyway) and cap length defensively.
+      if (appName.length === 0 || appName.length > 200) {
+        res.status(400).json({ success: false, error: 'appName must be 1–200 non-blank characters' });
+        return;
+      }
+      db.update(trackedApps).set({ appName }).where(eq(trackedApps.id, id)).run();
     }
 
     const updated = db.select().from(trackedApps)
@@ -687,6 +723,109 @@ export function registerAppEndpoints(
       .all()[0];
 
     res.json({ success: true, data: updated });
+  }, { requires: ['core.apk:manage'] });
+
+  // GET /v1/apps/track/:id/sources — per-app remote source config + health
+  registerEndpoint('GET', '/v1/apps/track/:id/sources', (req, res) => {
+    const id = parseInt(req.params.id as string, 10);
+    if (isNaN(id)) {
+      res.status(400).json({ success: false, error: 'Invalid id' });
+      return;
+    }
+    if (!db.select().from(trackedApps).where(eq(trackedApps.id, id)).all()[0]) {
+      res.status(404).json({ success: false, error: 'Tracked app not found' });
+      return;
+    }
+    if (sourceRegistry) ensureAppSources(db, id, sourceRegistry);
+
+    const rows = db.select().from(appSources).where(eq(appSources.trackedAppId, id)).all();
+    // Order by registry order when available, else stable by source id.
+    const order = sourceRegistry?.ids() ?? rows.map(r => r.source);
+    const data = rows
+      .map(r => ({
+        source: r.source,
+        label: sourceLabel(r.source),
+        enabled: !!r.enabled,
+        lastVersion: r.lastVersion,
+        lastCheckedAt: r.lastCheckedAt,
+        lastError: r.lastError,
+      }))
+      .sort((a, b) => order.indexOf(a.source) - order.indexOf(b.source));
+
+    res.json({ success: true, data });
+  }, { requires: ['core.apk:read'] });
+
+  // PATCH /v1/apps/track/:id/sources/:source — enable/disable a source
+  registerEndpoint('PATCH', '/v1/apps/track/:id/sources/:source', (req, res) => {
+    const id = parseInt(req.params.id as string, 10);
+    const source = req.params.source as string;
+    if (isNaN(id)) {
+      res.status(400).json({ success: false, error: 'Invalid id' });
+      return;
+    }
+    // Fail closed: only accept known sources (mirrors the fetch endpoint).
+    if (!sourceRegistry || !sourceRegistry.has(source)) {
+      res.status(400).json({ success: false, error: `Unknown source: ${source}` });
+      return;
+    }
+    if (typeof req.body.enabled !== 'boolean') {
+      res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
+      return;
+    }
+    if (!db.select().from(trackedApps).where(eq(trackedApps.id, id)).all()[0]) {
+      res.status(404).json({ success: false, error: 'Tracked app not found' });
+      return;
+    }
+    setSourceEnabled(db, id, source, req.body.enabled);
+    const row = db.select().from(appSources)
+      .where(and(eq(appSources.trackedAppId, id), eq(appSources.source, source))).all()[0];
+    res.json({ success: true, data: row });
+  }, { requires: ['core.apk:manage'] });
+
+  // POST /v1/apps/track/:id/sources/:source/fetch — fetch now from one source
+  registerEndpoint('POST', '/v1/apps/track/:id/sources/:source/fetch', async (req, res) => {
+    const id = parseInt(req.params.id as string, 10);
+    const source = req.params.source as string;
+    if (isNaN(id)) {
+      res.status(400).json({ success: false, error: 'Invalid id' });
+      return;
+    }
+    const app = db.select().from(trackedApps).where(eq(trackedApps.id, id)).all()[0];
+    if (!app) {
+      res.status(404).json({ success: false, error: 'Tracked app not found' });
+      return;
+    }
+    const remoteSource = sourceRegistry?.get(source);
+    if (!remoteSource || !apkTracker) {
+      res.status(400).json({ success: false, error: `Source not available: ${source}` });
+      return;
+    }
+    try {
+      // Coalesce concurrent triggers for the same (app, source) onto one
+      // in-flight download — a double-click shouldn't launch two 100MB pulls.
+      const key = `${id}:${source}`;
+      let pending = inFlightFetches.get(key);
+      if (!pending) {
+        // force: ignore the enabled flag + last-version skip for an explicit fetch.
+        pending = apkTracker.checkRemoteSource(
+          { id: app.id, packageName: app.packageName, appName: app.appName },
+          remoteSource,
+          { force: true },
+        ).finally(() => inFlightFetches.delete(key));
+        inFlightFetches.set(key, pending);
+      }
+      const result = await pending;
+
+      // A download/verify failure is a real error, not a success-with-note.
+      if (result.error) {
+        res.status(502).json({ success: false, error: result.error });
+        return;
+      }
+      const outcome = result.newVersionId ? 'new' : result.notFound ? 'not-found' : 'up-to-date';
+      res.json({ success: true, data: { newVersionId: result.newVersionId, outcome } });
+    } catch (err: any) {
+      res.status(502).json({ success: false, error: err.message });
+    }
   }, { requires: ['core.apk:manage'] });
 
   // DELETE /v1/apps/track/:id — Stop tracking (keeps archived APKs)

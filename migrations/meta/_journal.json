@@ -554,6 +554,13 @@
 			"when": 1779785033966,
 			"tag": "0095_device_instances",
 			"breakpoints": true
+		},
+		{
+			"idx": 96,
+			"version": "7",
+			"when": 1779785033967,
+			"tag": "0096_app_sources",
+			"breakpoints": true
 		}
 	]
 }
