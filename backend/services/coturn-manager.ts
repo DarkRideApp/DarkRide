@@ -1,0 +1,289 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { dirname, resolve } from 'path';
+import { randomBytes, createHash } from 'crypto';
+import { getDataRoot } from '../config/paths';
+import type { DockerLike } from './providers/docker-helpers';
+import { createLoggers } from '../logs';
+
+const { log, error: logError } = createLoggers('coturn-manager');
+
+// Pinned by digest for reproducibility — `:latest` would silently change
+// coturn's flags/entrypoint under us and break emulator video (the launch args
+// in buildCoturnContainerSpec are version-sensitive: see the eval/-n trap note).
+// This digest is coturn 4.13.1-r0, verified against the args below. Bump
+// intentionally after re-verifying a launch.
+const COTURN_IMAGE = 'coturn/coturn@sha256:6a1d1a281b8f64ca1a343429bb0232fa70c5f0eae3c8424ba0859b696e880974';
+const COTURN_NAME = 'darkride-coturn';
+const COTURN_LABEL = 'darkride.coturn';
+const COTURN_LANIP_LABEL = 'darkride.coturn.lanip';
+// Hash of the full launch config (Cmd). Lets ensureCoturn recreate a container
+// whose args have changed (new creds, new ports, a code fix to the flags) even
+// when the LAN IP is unchanged, so a stale/broken coturn can't linger.
+const COTURN_CONFIG_LABEL = 'darkride.coturn.confighash';
+const DEFAULT_MIN_PORT = 49160;
+const DEFAULT_MAX_PORT = 49200;
+
+export interface CoturnCreds {
+  username: string;
+  password: string;
+}
+
+/**
+ * Read the persisted coturn long-term credentials, creating them on first
+ * use. Credentials must be stable across restarts: the turncfg script handed
+ * to the emulator and the `--user` baked into the running coturn container
+ * have to agree, and the browser caches the iceServers from JSEP. A fresh
+ * random password every boot would break in-flight sessions.
+ */
+export function loadOrCreateCoturnCreds(): CoturnCreds {
+  const file = resolve(getDataRoot(), 'coturn-creds.json');
+  if (existsSync(file)) {
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf-8')) as Partial<CoturnCreds>;
+      if (parsed && typeof parsed.username === 'string' && typeof parsed.password === 'string') {
+        return { username: parsed.username, password: parsed.password };
+      }
+      logError(`coturn-creds.json malformed at ${file} — regenerating`);
+    } catch (e: any) {
+      logError(`coturn-creds.json unreadable at ${file} (${e?.message ?? e}) — regenerating`);
+    }
+  }
+  const creds: CoturnCreds = {
+    username: 'darkride',
+    // 24 bytes of hex = 48 chars; comfortably past the 24-char floor.
+    password: randomBytes(24).toString('hex'),
+  };
+  mkdirSync(dirname(file), { recursive: true });
+  // 0600: the long-term TURN secret, host-only (read by this Node process,
+  // never the container). Owner-only so other local users can't lift it.
+  writeFileSync(file, JSON.stringify(creds, null, 2), { mode: 0o600 });
+  log(`Generated coturn credentials at ${file}`);
+  return creds;
+}
+
+/**
+ * Build the `-turncfg` script the emulator runs in-container. It must print
+ * the iceServers JSON to stdout and return in under a second, so it's a plain
+ * printf — no network, no env lookups (the file is mounted read-only, the
+ * container has no coturn env). Values are baked in directly.
+ *
+ * DUAL-URL: both peers receive the same urls array (android-emulator-webrtc
+ * has no browser-side iceServers hook). The browser reaches coturn via the
+ * host LAN IP; the in-container emulator reaches it via host.docker.internal
+ * (which resolves only inside containers). Listing both lets each peer use the
+ * one that works and fail the other candidate fast.
+ */
+export function buildTurncfgScript(lanIp: string, creds: CoturnCreds): string {
+  return [
+    '#!/bin/sh',
+    `printf '{"iceServers":[{"urls":["turn:%s:3478?transport=udp","turn:host.docker.internal:3478?transport=udp"],"username":"%s","credential":"%s"}]}' "${lanIp}" "${creds.username}" "${creds.password}"`,
+    '',
+  ].join('\n');
+}
+
+export interface CoturnContainerSpec {
+  Image: string;
+  name: string;
+  Labels: Record<string, string>;
+  Cmd: string[];
+  ExposedPorts: Record<string, Record<string, never>>;
+  HostConfig: {
+    PortBindings: Record<string, Array<{ HostPort: string }>>;
+    RestartPolicy: { Name: string };
+  };
+}
+
+/**
+ * Build the dockerode createContainer spec for coturn. Pure — no Docker calls.
+ *
+ * coturn runs with `-n` semantics (all config via CLI flags, no config file):
+ * long-term credential auth, a single static user, the host LAN IP as the
+ * advertised external relay address, TLS/DTLS/CLI disabled (we only need plain
+ * UDP/TCP relay on the LAN), and a bounded relay port range that we publish
+ * 1:1 so the relayed media actually reaches the host.
+ */
+export function buildCoturnContainerSpec(
+  lanIp: string,
+  creds: CoturnCreds,
+  opts: { minPort?: number; maxPort?: number } = {},
+): CoturnContainerSpec {
+  const minPort = opts.minPort ?? DEFAULT_MIN_PORT;
+  const maxPort = opts.maxPort ?? DEFAULT_MAX_PORT;
+
+  // NOTE on the coturn/coturn entrypoint: it runs `eval "echo $arg"` on EVERY
+  // arg (to expand its default `--external-ip=$(detect-external-ip)`). So never
+  // pass a bare `-n` here — `echo -n` is echo's no-newline flag and expands to
+  // an EMPTY string, which coturn rejects as `Unknown argument:` and then stops
+  // applying the rest (external-ip, listening-ip, ...), leaving it advertising
+  // the unreachable container IP. All flags below are `--double-dash` and
+  // eval-safe (the password is hex). `--log-file=stdout` is required: we
+  // override the image's default CMD, which carried it, so without it coturn
+  // logs to a file and `docker logs darkride-coturn` is empty.
+  const Cmd = [
+    '--log-file=stdout',
+    '--listening-ip=0.0.0.0',
+    '--listening-port=3478',
+    `--external-ip=${lanIp}`,
+    '--realm=darkride.local',
+    '--lt-cred-mech',
+    `--user=${creds.username}:${creds.password}`,
+    `--min-port=${minPort}`,
+    `--max-port=${maxPort}`,
+    '--fingerprint',
+    '--no-tls',
+    '--no-dtls',
+  ];
+
+  const ExposedPorts: Record<string, Record<string, never>> = {
+    '3478/tcp': {},
+    '3478/udp': {},
+  };
+  // 3478 is published on 0.0.0.0 (no HostIp), DELIBERATELY — unlike the
+  // emulator's adb/gRPC ports which are loopback-only. Both WebRTC peers must
+  // reach coturn: the host browser via the LAN IP, and the in-container
+  // emulator via host.docker.internal (the Docker gateway), which only routes
+  // to a 0.0.0.0-published port, not a 127.0.0.1-bound one. The trade is a
+  // LAN-reachable TURN relay guarded by a 96-bit static credential; acceptable
+  // for a single-host dev tool on a trusted LAN.
+  const PortBindings: Record<string, Array<{ HostPort: string }>> = {
+    '3478/tcp': [{ HostPort: '3478' }],
+    '3478/udp': [{ HostPort: '3478' }],
+  };
+  // Publish every relay port 1:1 (HostPort == container port). coturn hands
+  // out these ports as the relay candidate; without a matching host binding
+  // the relayed UDP can't cross Docker NAT back to the browser.
+  for (let port = minPort; port <= maxPort; port++) {
+    ExposedPorts[`${port}/udp`] = {};
+    PortBindings[`${port}/udp`] = [{ HostPort: String(port) }];
+  }
+
+  const configHash = createHash('sha256').update(Cmd.join('\n')).digest('hex').slice(0, 16);
+
+  return {
+    Image: COTURN_IMAGE,
+    name: COTURN_NAME,
+    Labels: {
+      [COTURN_LABEL]: 'true',
+      [COTURN_LANIP_LABEL]: lanIp,
+      [COTURN_CONFIG_LABEL]: configHash,
+    },
+    Cmd,
+    ExposedPorts,
+    HostConfig: {
+      PortBindings,
+      RestartPolicy: { Name: 'unless-stopped' },
+    },
+  };
+}
+
+/** Pull coturn if it isn't already local. Mirrors docker-android's check. */
+async function ensureCoturnImageLocal(d: DockerLike): Promise<void> {
+  const dAny = d as any;
+  try {
+    if (typeof dAny.getImage === 'function') {
+      await dAny.getImage(COTURN_IMAGE).inspect();
+      return; // already local
+    }
+  } catch {
+    // fall through to pull
+  }
+  log(`Pulling ${COTURN_IMAGE} (small, ~20 MB)`);
+  const stream: any = await d.pull(COTURN_IMAGE);
+  await new Promise<void>((res, rej) => {
+    // dockerode's followProgress isn't on our DockerLike surface; drain the
+    // raw stream to completion. Docker reports a pull FAILURE as a JSON frame
+    // `{"error":"...","errorDetail":{...}}` on the data stream and then ends
+    // the stream cleanly — so 'end' alone is NOT proof of success. Buffer the
+    // newline-delimited JSON and reject if any frame carries an `error`.
+    let buf = '';
+    let pullError: string | null = null;
+    const scan = (text: string) => {
+      buf += text;
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const frame = JSON.parse(line);
+          if (frame && typeof frame.error === 'string') pullError = frame.error;
+        } catch { /* partial/non-JSON chunk — keep buffering */ }
+      }
+    };
+    stream.on('data', (chunk: Buffer | string) => scan(chunk.toString()));
+    stream.on('end', () => {
+      if (buf.trim()) scan(buf + '\n'); // flush any trailing frame
+      if (pullError) rej(new Error(`docker pull failed: ${pullError}`));
+      else res();
+    });
+    stream.on('error', (err: Error) => rej(err));
+  });
+  log(`Pulled ${COTURN_IMAGE}`);
+}
+
+/**
+ * Idempotently ensure a coturn relay is running for `lanIp`. Returns `true`
+ * when a relay is up afterwards (created or reused), `false` when it could not
+ * be started. Callers use the result to decide whether to mount `-turncfg`:
+ * pointing the emulator at a dead relay is pointless, so on `false` they skip
+ * it and let WebRTC degrade to the PNG stream.
+ *
+ * Reuse is keyed on the `darkride.coturn.confighash` label — a hash of the full
+ * launch config (which already incorporates `lanIp` via `--external-ip`, plus
+ * the creds and ports). So:
+ * - If `darkride-coturn` exists, is running, and its config hash matches the
+ *   wanted config, reuse it.
+ * - If it exists but the hash differs (lanIp/creds/ports/flags changed) or it
+ *   isn't running, remove and recreate it.
+ * - If it's absent, pull the image (when needed) and create + start it.
+ *
+ * A coturn failure must never abort emulator creation, so every Docker call is
+ * wrapped: on any error this logs and returns `false` rather than throwing.
+ */
+export async function ensureCoturn(d: DockerLike, lanIp: string, creds: CoturnCreds): Promise<boolean> {
+  try {
+    const spec = buildCoturnContainerSpec(lanIp, creds);
+    const wantHash = spec.Labels[COTURN_CONFIG_LABEL];
+    const existing = await findCoturnContainer(d);
+    if (existing) {
+      const info = await existing.inspect().catch(() => null);
+      const running = info?.State?.Running === true;
+      const haveHash = info?.Config?.Labels?.[COTURN_CONFIG_LABEL];
+      if (running && haveHash === wantHash) {
+        log(`coturn already running with the current config — reusing ${COTURN_NAME}`);
+        return true;
+      }
+      log(
+        `coturn ${COTURN_NAME} is stale (running=${running}, config ${haveHash ?? 'unknown'} ` +
+        `wanted ${wantHash}) — removing and recreating`,
+      );
+      await existing.remove({ force: true }).catch((e: any) => {
+        logError(`Failed to remove stale coturn container: ${e?.message ?? e}`);
+      });
+    }
+
+    await ensureCoturnImageLocal(d);
+
+    log(`Starting coturn relay ${COTURN_NAME} external-ip=${lanIp} (TURN on 3478, relay ${DEFAULT_MIN_PORT}-${DEFAULT_MAX_PORT})`);
+    const container = await d.createContainer(spec as any);
+    await container.start();
+    log(`coturn relay ${COTURN_NAME} started`);
+    return true;
+  } catch (e: any) {
+    // Graceful degradation: log and report failure. The caller skips -turncfg
+    // and WebRTC media falls back to the png stream — same as before this relay
+    // existed.
+    logError(`ensureCoturn failed (WebRTC will fall back to png): ${e?.message ?? e}`);
+    return false;
+  }
+}
+
+/** Find the darkride-coturn container by its label, if any. */
+async function findCoturnContainer(d: DockerLike): Promise<any | null> {
+  const list = await d.listContainers({
+    all: true,
+    filters: { label: [`${COTURN_LABEL}=true`] },
+  });
+  if (!list || list.length === 0) return null;
+  return d.getContainer(list[0].Id);
+}

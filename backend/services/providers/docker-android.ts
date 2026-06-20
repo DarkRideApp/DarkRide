@@ -1,5 +1,5 @@
-import { existsSync } from 'fs';
-import { resolve } from 'path';
+import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'fs';
+import { dirname, resolve } from 'path';
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import type {
@@ -8,6 +8,10 @@ import type {
 } from '@darkrideapp/plugin-sdk';
 import { type DockerLike, detectDockerDaemon, listDarkrideContainers } from './docker-helpers';
 import { createLoggers } from '../../logs';
+import { getServerIp } from '../wireguard-config';
+import {
+  loadOrCreateCoturnCreds, buildTurncfgScript, ensureCoturn, type CoturnCreds,
+} from '../coturn-manager';
 
 const execFile = promisify(execFileCb);
 const { log, error: logError } = createLoggers('docker-android');
@@ -52,10 +56,18 @@ const LABEL_KEY = 'darkride.emulator';
 const GRPC_PORT = 8554;
 
 // WebRTC media can't traverse Docker NAT on its own — the emulator's media
-// track reaches `connected` then drops. A TURN relay (DarkRide's coturn) fixes
-// it: we mount a turncfg script and point the emulator at it with `-turncfg`.
-// The script emits iceServers at `host.docker.internal:3478`, which resolves to
-// the host from BOTH the browser and the container, so both peers reach coturn.
+// track reaches `connected` then drops. DarkRide launches a coturn relay
+// (see coturn-manager.ts) and points the emulator at it with `-turncfg`,
+// supplying a mounted script that prints iceServers JSON to stdout.
+//
+// The two peers (host browser + in-container emulator) share ONE urls array
+// (android-emulator-webrtc has no browser-side iceServers hook), but they reach
+// the host differently: `host.docker.internal` resolves ONLY inside containers,
+// NOT from the host browser. So the script emits a DUAL-URL array — the host
+// LAN IP (which the browser uses; its host.docker.internal candidate fails fast
+// on host DNS) and host.docker.internal (which the in-container emulator uses,
+// guaranteed). When coturn isn't available we skip -turncfg and the client
+// degrades to the PNG screenshot stream.
 const TURN_CFG_CONTAINER_PATH = '/opt/turncfg.sh';
 
 /** Aggregated pull progress broadcast to the UI. One number, one phrase, no per-layer noise. */
@@ -196,12 +208,25 @@ export interface DockerAndroidOptions {
   bootTimeoutMs?: number;
   bootRetryIntervalMs?: number;
   /**
-   * Host path to the WebRTC TURN-config script bind-mounted into each emulator
-   * (see TURN_CFG_CONTAINER_PATH). When present, the emulator launches with
-   * `-turncfg`; when absent (script missing), TURN is skipped and WebRTC media
-   * may not traverse Docker NAT. Defaults to `<cwd>/data/turncfg.sh`.
+   * Host path of the WebRTC TURN-config script bind-mounted into each emulator
+   * (see TURN_CFG_CONTAINER_PATH). DarkRide generates this file on every
+   * createInstance (pointing at the coturn relay it launches). Defaults to
+   * `<cwd>/data/turncfg.sh`.
    */
   turnCfgHostPath?: string;
+  /**
+   * TURN relay setup hooks. Injectable so unit tests can stub out the Docker
+   * container launch and the on-disk script write — the real impls shell out
+   * to Docker and the filesystem and can't run in a unit test. `ensure`
+   * launches/reuses coturn; `writeTurncfg` writes the `-turncfg` script and
+   * returns the host path mounted into the emulator, or null to skip -turncfg
+   * (graceful degradation to png). Defaults call the real coturn-manager.
+   */
+  coturn?: {
+    /** Launch/reuse coturn. Resolves true when a relay is up, false on degrade. */
+    ensure: (d: DockerLike, lanIp: string, creds: CoturnCreds) => Promise<boolean>;
+    writeTurncfg: (lanIp: string, creds: CoturnCreds, hostPath: string) => string | null;
+  };
 }
 
 /**
@@ -258,6 +283,22 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   const bootTimeoutMs = opts.bootTimeoutMs ?? 240_000;
   const bootRetryIntervalMs = opts.bootRetryIntervalMs ?? 5_000;
   const turnCfgHostPath = opts.turnCfgHostPath ?? resolve(process.cwd(), 'data', 'turncfg.sh');
+  // TURN relay setup. Default impls call coturn-manager; tests pass no-op
+  // stubs to assert the emulator args deterministically without Docker.
+  const coturn = opts.coturn ?? {
+    ensure: ensureCoturn,
+    writeTurncfg: (lanIp: string, creds: CoturnCreds, hostPath: string): string | null => {
+      mkdirSync(dirname(hostPath), { recursive: true });
+      writeFileSync(hostPath, buildTurncfgScript(lanIp, creds));
+      // 0700, NOT 0755: this script embeds the long-term TURN credential, so a
+      // world-readable mode would leak the LAN-reachable relay's secret to
+      // every local user. The budtmo emulator container runs as root and reads
+      // it through the bind mount regardless of host ownership, so owner-only
+      // (rwx for the DarkRide user) keeps it functional while host-private.
+      chmodSync(hostPath, 0o700);
+      return hostPath;
+    },
+  };
 
   return {
     id: 'docker-android',
@@ -341,12 +382,27 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       // turncfg value is a mounted script path, not an inline command.
       const emulatorArgs = ['-no-skin', `-grpc ${GRPC_PORT}`];
       const binds: string[] = [];
-      if (existsSync(turnCfgHostPath)) {
-        emulatorArgs.push(`-turncfg ${TURN_CFG_CONTAINER_PATH}`);
-        binds.push(`${turnCfgHostPath}:${TURN_CFG_CONTAINER_PATH}:ro`);
-        log(`docker-android: WebRTC TURN enabled (mounting ${turnCfgHostPath})`);
-      } else {
-        log(`docker-android: no turncfg at ${turnCfgHostPath} — WebRTC media may not traverse Docker NAT (png fallback still works)`);
+      // Set up the TURN relay: launch (or reuse) coturn, and ONLY when it's
+      // actually up, generate + mount the turncfg script pointing at it.
+      // Mounting -turncfg toward a relay that failed to start is pointless, so
+      // we gate on coturn.ensure's result. A failure here must NOT abort
+      // emulator creation — without -turncfg the client falls back to the png
+      // stream, exactly as it did before this relay existed — so the whole
+      // block is wrapped and any failure just logs and continues.
+      try {
+        const lanIp = getServerIp();
+        const creds = loadOrCreateCoturnCreds();
+        const turnReady = await coturn.ensure(d, lanIp, creds);
+        const mountPath = turnReady ? coturn.writeTurncfg(lanIp, creds, turnCfgHostPath) : null;
+        if (mountPath) {
+          emulatorArgs.push(`-turncfg ${TURN_CFG_CONTAINER_PATH}`);
+          binds.push(`${mountPath}:${TURN_CFG_CONTAINER_PATH}:ro`);
+          log(`docker-android: WebRTC TURN enabled (coturn external-ip ${lanIp}, mounting ${mountPath})`);
+        } else {
+          log('docker-android: coturn relay unavailable — skipping -turncfg; WebRTC media may not traverse Docker NAT (png fallback still works)');
+        }
+      } catch (e: any) {
+        logError(`docker-android: TURN setup failed (${e?.message ?? e}) — continuing without -turncfg (png fallback still works)`);
       }
 
       log(`Creating docker-android container "${spec.displayName}" image=${image} ram=${ramMb}MB arch=${arch}`);
