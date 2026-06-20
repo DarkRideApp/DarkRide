@@ -7,7 +7,12 @@ import { createLoggers } from '../logs';
 
 const { log, error: logError } = createLoggers('coturn-manager');
 
-const COTURN_IMAGE = 'coturn/coturn:latest';
+// Pinned by digest for reproducibility — `:latest` would silently change
+// coturn's flags/entrypoint under us and break emulator video (the launch args
+// in buildCoturnContainerSpec are version-sensitive: see the eval/-n trap note).
+// This digest is coturn 4.13.1-r0, verified against the args below. Bump
+// intentionally after re-verifying a launch.
+const COTURN_IMAGE = 'coturn/coturn@sha256:6a1d1a281b8f64ca1a343429bb0232fa70c5f0eae3c8424ba0859b696e880974';
 const COTURN_NAME = 'darkride-coturn';
 const COTURN_LABEL = 'darkride.coturn';
 const COTURN_LANIP_LABEL = 'darkride.coturn.lanip';
@@ -186,28 +191,56 @@ async function ensureCoturnImageLocal(d: DockerLike): Promise<void> {
   const stream: any = await d.pull(COTURN_IMAGE);
   await new Promise<void>((res, rej) => {
     // dockerode's followProgress isn't on our DockerLike surface; drain the
-    // raw stream to completion. Errors surface via the stream's 'error' event.
-    stream.on('data', () => { /* ignore per-layer chunks */ });
-    stream.on('end', () => res());
+    // raw stream to completion. Docker reports a pull FAILURE as a JSON frame
+    // `{"error":"...","errorDetail":{...}}` on the data stream and then ends
+    // the stream cleanly — so 'end' alone is NOT proof of success. Buffer the
+    // newline-delimited JSON and reject if any frame carries an `error`.
+    let buf = '';
+    let pullError: string | null = null;
+    const scan = (text: string) => {
+      buf += text;
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const frame = JSON.parse(line);
+          if (frame && typeof frame.error === 'string') pullError = frame.error;
+        } catch { /* partial/non-JSON chunk — keep buffering */ }
+      }
+    };
+    stream.on('data', (chunk: Buffer | string) => scan(chunk.toString()));
+    stream.on('end', () => {
+      if (buf.trim()) scan(buf + '\n'); // flush any trailing frame
+      if (pullError) rej(new Error(`docker pull failed: ${pullError}`));
+      else res();
+    });
     stream.on('error', (err: Error) => rej(err));
   });
   log(`Pulled ${COTURN_IMAGE}`);
 }
 
 /**
- * Idempotently ensure a coturn relay is running for `lanIp`.
+ * Idempotently ensure a coturn relay is running for `lanIp`. Returns `true`
+ * when a relay is up afterwards (created or reused), `false` when it could not
+ * be started. Callers use the result to decide whether to mount `-turncfg`:
+ * pointing the emulator at a dead relay is pointless, so on `false` they skip
+ * it and let WebRTC degrade to the PNG stream.
  *
- * - If `darkride-coturn` exists, is running, and was launched for the same
- *   LAN IP (compared via the darkride.coturn.lanip label), do nothing.
- * - If it exists but is stale (different lanIp) or not running, remove and
- *   recreate it.
+ * Reuse is keyed on the `darkride.coturn.confighash` label — a hash of the full
+ * launch config (which already incorporates `lanIp` via `--external-ip`, plus
+ * the creds and ports). So:
+ * - If `darkride-coturn` exists, is running, and its config hash matches the
+ *   wanted config, reuse it.
+ * - If it exists but the hash differs (lanIp/creds/ports/flags changed) or it
+ *   isn't running, remove and recreate it.
  * - If it's absent, pull the image (when needed) and create + start it.
  *
- * A coturn failure must never abort emulator creation. WebRTC simply falls
- * back to the PNG screenshot stream — the same behavior as before this relay
- * existed — so every Docker call here is wrapped and a failure only logs.
+ * A coturn failure must never abort emulator creation, so every Docker call is
+ * wrapped: on any error this logs and returns `false` rather than throwing.
  */
-export async function ensureCoturn(d: DockerLike, lanIp: string, creds: CoturnCreds): Promise<void> {
+export async function ensureCoturn(d: DockerLike, lanIp: string, creds: CoturnCreds): Promise<boolean> {
   try {
     const spec = buildCoturnContainerSpec(lanIp, creds);
     const wantHash = spec.Labels[COTURN_CONFIG_LABEL];
@@ -218,7 +251,7 @@ export async function ensureCoturn(d: DockerLike, lanIp: string, creds: CoturnCr
       const haveHash = info?.Config?.Labels?.[COTURN_CONFIG_LABEL];
       if (running && haveHash === wantHash) {
         log(`coturn already running with the current config — reusing ${COTURN_NAME}`);
-        return;
+        return true;
       }
       log(
         `coturn ${COTURN_NAME} is stale (running=${running}, config ${haveHash ?? 'unknown'} ` +
@@ -235,11 +268,13 @@ export async function ensureCoturn(d: DockerLike, lanIp: string, creds: CoturnCr
     const container = await d.createContainer(spec as any);
     await container.start();
     log(`coturn relay ${COTURN_NAME} started`);
+    return true;
   } catch (e: any) {
-    // Graceful degradation: log and continue. The emulator still gets a
-    // turncfg pointing at this LAN IP; if coturn isn't up, WebRTC media
-    // can't relay and the client falls back to png — same as before.
+    // Graceful degradation: log and report failure. The caller skips -turncfg
+    // and WebRTC media falls back to the png stream — same as before this relay
+    // existed.
     logError(`ensureCoturn failed (WebRTC will fall back to png): ${e?.message ?? e}`);
+    return false;
   }
 }
 

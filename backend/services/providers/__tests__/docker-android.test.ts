@@ -13,7 +13,7 @@ import type { DockerLike } from '../docker-helpers';
 function makeProvider(d: DockerLike, opts: Parameters<typeof createDockerAndroidProvider>[1] = {}) {
   return createDockerAndroidProvider(d, {
     coturn: {
-      ensure: vi.fn().mockResolvedValue(undefined),
+      ensure: vi.fn().mockResolvedValue(true),
       writeTurncfg: (_lanIp, _creds, hostPath) => hostPath,
     },
     ...opts,
@@ -155,7 +155,7 @@ describe('docker-android provider', () => {
     // launch + turncfg write are injected here so the test stays Docker-free
     // and deterministic — the real impls live in coturn-manager.
     const d = makeDockerMock();
-    const ensure = vi.fn().mockResolvedValue(undefined);
+    const ensure = vi.fn().mockResolvedValue(true);
     const writeTurncfg = vi.fn().mockReturnValue('/tmp/turncfg.sh');
     const p = makeProvider(d, {
       hasDevDri: () => false, hasNvidia: async () => false,
@@ -172,14 +172,33 @@ describe('docker-android provider', () => {
   });
 
   it('skips -turncfg (and Binds) when turncfg generation returns null', async () => {
-    // writeTurncfg returning null is the graceful-degradation signal: coturn
-    // unavailable, fall back to png. No -turncfg, no Binds.
+    // coturn is up (ensure → true) but writeTurncfg returns null — the
+    // graceful-degradation signal that the script couldn't be written. No
+    // -turncfg, no Binds.
     const d = makeDockerMock();
     const p = makeProvider(d, {
       hasDevDri: () => false, hasNvidia: async () => false,
-      coturn: { ensure: vi.fn().mockResolvedValue(undefined), writeTurncfg: vi.fn().mockReturnValue(null) },
+      coturn: { ensure: vi.fn().mockResolvedValue(true), writeTurncfg: vi.fn().mockReturnValue(null) },
     });
     await p.createInstance!({ displayName: 'noturn', config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 } });
+    const call = (d.createContainer as any).mock.calls[0][0];
+    const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
+    expect(addArgs).not.toContain('-turncfg');
+    expect(call.HostConfig.Binds).toBeUndefined();
+  });
+
+  it('skips -turncfg (and never writes the script) when coturn.ensure reports the relay is down', async () => {
+    // ensure → false means the relay couldn't start. Pointing the emulator at a
+    // dead relay is pointless, so writeTurncfg must NOT be called and -turncfg
+    // must be absent — WebRTC falls back to png.
+    const d = makeDockerMock();
+    const writeTurncfg = vi.fn().mockReturnValue('/tmp/turncfg.sh');
+    const p = makeProvider(d, {
+      hasDevDri: () => false, hasNvidia: async () => false,
+      coturn: { ensure: vi.fn().mockResolvedValue(false), writeTurncfg },
+    });
+    await p.createInstance!({ displayName: 'turndown', config: { androidVersion: '14', architecture: 'x86_64', ramMb: 2048 } });
+    expect(writeTurncfg).not.toHaveBeenCalled();
     const call = (d.createContainer as any).mock.calls[0][0];
     const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
     expect(addArgs).not.toContain('-turncfg');

@@ -223,7 +223,8 @@ export interface DockerAndroidOptions {
    * (graceful degradation to png). Defaults call the real coturn-manager.
    */
   coturn?: {
-    ensure: (d: DockerLike, lanIp: string, creds: CoturnCreds) => Promise<void>;
+    /** Launch/reuse coturn. Resolves true when a relay is up, false on degrade. */
+    ensure: (d: DockerLike, lanIp: string, creds: CoturnCreds) => Promise<boolean>;
     writeTurncfg: (lanIp: string, creds: CoturnCreds, hostPath: string) => string | null;
   };
 }
@@ -289,7 +290,12 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     writeTurncfg: (lanIp: string, creds: CoturnCreds, hostPath: string): string | null => {
       mkdirSync(dirname(hostPath), { recursive: true });
       writeFileSync(hostPath, buildTurncfgScript(lanIp, creds));
-      chmodSync(hostPath, 0o755);
+      // 0700, NOT 0755: this script embeds the long-term TURN credential, so a
+      // world-readable mode would leak the LAN-reachable relay's secret to
+      // every local user. The budtmo emulator container runs as root and reads
+      // it through the bind mount regardless of host ownership, so owner-only
+      // (rwx for the DarkRide user) keeps it functional while host-private.
+      chmodSync(hostPath, 0o700);
       return hostPath;
     },
   };
@@ -376,22 +382,24 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       // turncfg value is a mounted script path, not an inline command.
       const emulatorArgs = ['-no-skin', `-grpc ${GRPC_PORT}`];
       const binds: string[] = [];
-      // Always set up the TURN relay: launch (or reuse) coturn and generate the
-      // turncfg script pointing at it. A failure here must NOT abort emulator
-      // creation — without -turncfg the client falls back to the png stream,
-      // exactly as it did before this relay existed. So the whole block is
-      // wrapped and a failure just logs and continues with no -turncfg.
+      // Set up the TURN relay: launch (or reuse) coturn, and ONLY when it's
+      // actually up, generate + mount the turncfg script pointing at it.
+      // Mounting -turncfg toward a relay that failed to start is pointless, so
+      // we gate on coturn.ensure's result. A failure here must NOT abort
+      // emulator creation — without -turncfg the client falls back to the png
+      // stream, exactly as it did before this relay existed — so the whole
+      // block is wrapped and any failure just logs and continues.
       try {
         const lanIp = getServerIp();
         const creds = loadOrCreateCoturnCreds();
-        await coturn.ensure(d, lanIp, creds);
-        const mountPath = coturn.writeTurncfg(lanIp, creds, turnCfgHostPath);
+        const turnReady = await coturn.ensure(d, lanIp, creds);
+        const mountPath = turnReady ? coturn.writeTurncfg(lanIp, creds, turnCfgHostPath) : null;
         if (mountPath) {
           emulatorArgs.push(`-turncfg ${TURN_CFG_CONTAINER_PATH}`);
           binds.push(`${mountPath}:${TURN_CFG_CONTAINER_PATH}:ro`);
           log(`docker-android: WebRTC TURN enabled (coturn external-ip ${lanIp}, mounting ${mountPath})`);
         } else {
-          log('docker-android: turncfg generation skipped — WebRTC media may not traverse Docker NAT (png fallback still works)');
+          log('docker-android: coturn relay unavailable — skipping -turncfg; WebRTC media may not traverse Docker NAT (png fallback still works)');
         }
       } catch (e: any) {
         logError(`docker-android: TURN setup failed (${e?.message ?? e}) — continuing without -turncfg (png fallback still works)`);

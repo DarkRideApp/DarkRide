@@ -1,12 +1,14 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'child_process';
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'fs';
+import { Readable } from 'stream';
 import { tmpdir } from 'os';
 import path from 'path';
 import {
   buildTurncfgScript,
   buildCoturnContainerSpec,
   loadOrCreateCoturnCreds,
+  ensureCoturn,
 } from './coturn-manager';
 
 const CREDS = { username: 'darkride', password: 'deadbeefcafef00d0123456789abcdef' };
@@ -57,7 +59,8 @@ describe('buildTurncfgScript', () => {
 describe('buildCoturnContainerSpec', () => {
   it('sets Image / name / labels and stores lanIp in a label for idempotency', () => {
     const spec = buildCoturnContainerSpec('192.168.1.50', CREDS);
-    expect(spec.Image).toBe('coturn/coturn:latest');
+    // Pinned by digest (coturn 4.13.1-r0) for reproducible launches.
+    expect(spec.Image).toBe('coturn/coturn@sha256:6a1d1a281b8f64ca1a343429bb0232fa70c5f0eae3c8424ba0859b696e880974');
     expect(spec.name).toBe('darkride-coturn');
     expect(spec.Labels).toMatchObject({
       'darkride.coturn': 'true',
@@ -157,5 +160,115 @@ describe('loadOrCreateCoturnCreds', () => {
     const first = loadOrCreateCoturnCreds();
     const second = loadOrCreateCoturnCreds();
     expect(second).toEqual(first);
+  });
+});
+
+const LAN = '192.168.1.50';
+const WANT_HASH = buildCoturnContainerSpec(LAN, CREDS).Labels['darkride.coturn.confighash'];
+
+/**
+ * Minimal fake of the DockerLike surface ensureCoturn touches. `existingInfo`
+ * is the inspect() payload of an already-present darkride-coturn (null = none);
+ * `imageLocal=false` forces the pull path; `pullFrames` are the JSON lines the
+ * pull stream emits; `createThrows` makes createContainer reject.
+ */
+function fakeDocker(opts: {
+  existingInfo?: any;
+  imageLocal?: boolean;
+  pullFrames?: string[];
+  createThrows?: boolean;
+} = {}) {
+  const start = vi.fn().mockResolvedValue(undefined);
+  const remove = vi.fn().mockResolvedValue(undefined);
+  const createContainer = opts.createThrows
+    ? vi.fn().mockRejectedValue(new Error('daemon down'))
+    : vi.fn().mockResolvedValue({ start });
+  const existing = opts.existingInfo
+    ? { inspect: vi.fn().mockResolvedValue(opts.existingInfo), remove }
+    : null;
+  const d: any = {
+    listContainers: vi.fn().mockResolvedValue(existing ? [{ Id: 'coturn-1' }] : []),
+    getContainer: vi.fn().mockReturnValue(existing),
+    getImage: vi.fn().mockReturnValue({
+      inspect: opts.imageLocal === false
+        ? vi.fn().mockRejectedValue(new Error('no such image'))
+        : vi.fn().mockResolvedValue({}),
+    }),
+    pull: vi.fn().mockImplementation(async () =>
+      Readable.from((opts.pullFrames ?? []).map(f => f + '\n')),
+    ),
+    createContainer,
+  };
+  return { d, start, remove, createContainer };
+}
+
+describe('ensureCoturn (container lifecycle)', () => {
+  it('creates + starts coturn when none exists, and returns true', async () => {
+    const { d, start, createContainer } = fakeDocker();
+    const ok = await ensureCoturn(d, LAN, CREDS);
+    expect(ok).toBe(true);
+    expect(createContainer).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledTimes(1);
+    // The spec it launches carries the wanted config hash.
+    expect(createContainer.mock.calls[0][0].Labels['darkride.coturn.confighash']).toBe(WANT_HASH);
+  });
+
+  it('reuses a running container whose config hash matches (no recreate)', async () => {
+    const { d, createContainer, remove } = fakeDocker({
+      existingInfo: { State: { Running: true }, Config: { Labels: { 'darkride.coturn.confighash': WANT_HASH } } },
+    });
+    const ok = await ensureCoturn(d, LAN, CREDS);
+    expect(ok).toBe(true);
+    expect(remove).not.toHaveBeenCalled();
+    expect(createContainer).not.toHaveBeenCalled();
+  });
+
+  it('removes + recreates a container whose config hash is stale', async () => {
+    const { d, createContainer, remove } = fakeDocker({
+      existingInfo: { State: { Running: true }, Config: { Labels: { 'darkride.coturn.confighash': 'deadbeefdeadbeef' } } },
+    });
+    const ok = await ensureCoturn(d, LAN, CREDS);
+    expect(ok).toBe(true);
+    expect(remove).toHaveBeenCalledWith({ force: true });
+    expect(createContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it('recreates when the container exists but is not running', async () => {
+    const { d, createContainer, remove } = fakeDocker({
+      existingInfo: { State: { Running: false }, Config: { Labels: { 'darkride.coturn.confighash': WANT_HASH } } },
+    });
+    const ok = await ensureCoturn(d, LAN, CREDS);
+    expect(ok).toBe(true);
+    expect(remove).toHaveBeenCalledWith({ force: true });
+    expect(createContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it('degrades to false (never throws) when a Docker call fails', async () => {
+    const { d } = fakeDocker({ createThrows: true });
+    await expect(ensureCoturn(d, LAN, CREDS)).resolves.toBe(false);
+  });
+
+  it('treats a docker-pull error frame as failure and returns false', async () => {
+    // Docker reports pull failures as a `{"error":...}` frame then ends cleanly;
+    // ensureCoturnImageLocal must reject on it rather than logging success.
+    const { d, createContainer } = fakeDocker({
+      imageLocal: false,
+      pullFrames: ['{"status":"Pulling from coturn/coturn"}', '{"error":"toomanyrequests: rate limited"}'],
+    });
+    const ok = await ensureCoturn(d, LAN, CREDS);
+    expect(ok).toBe(false);
+    expect(createContainer).not.toHaveBeenCalled();
+  });
+
+  it('pulls then creates when the image is absent and the pull succeeds', async () => {
+    const { d, createContainer, start } = fakeDocker({
+      imageLocal: false,
+      pullFrames: ['{"status":"Pulling from coturn/coturn"}', '{"status":"Download complete"}'],
+    });
+    const ok = await ensureCoturn(d, LAN, CREDS);
+    expect(ok).toBe(true);
+    expect(d.pull).toHaveBeenCalledTimes(1);
+    expect(createContainer).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledTimes(1);
   });
 });
