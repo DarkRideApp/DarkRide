@@ -585,6 +585,49 @@ describe('ApkAnalysis', () => {
     await waitFor(() => expect(screen.getByTestId('menu-item-download')).toBeInTheDocument());
   });
 
+  describe('Install on device', () => {
+    // Base mock returns the overview object for any unmatched path; override
+    // /v1/device/list so the install action's device source is deterministic.
+    function wsWithDevices(devices: Array<{ id: string; name: string | null; lastSeen: string | null }>): WebSocketContextValue {
+      const ws = createMockWs();
+      const orig = ws.sendRestApi;
+      ws.sendRestApi = vi.fn().mockImplementation((method: string, path: string, body?: any) => {
+        if (path === '/v1/device/list') {
+          return Promise.resolve({ type: 'restapi', id: 'd', status: 200, body: { success: true, data: devices } });
+        }
+        return (orig as any)(method, path, body);
+      });
+      return ws;
+    }
+
+    it('shows "Install on device…" when a device is online and opens the device picker', async () => {
+      renderApkAnalysis(wsWithDevices([{ id: 'pixel7', name: 'Pixel 7', lastSeen: new Date().toISOString() }]));
+      await waitFor(() => screen.getByRole('button', { name: 'More actions' }));
+      fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+      await waitFor(() => expect(screen.getByTestId('menu-item-install')).toBeInTheDocument());
+      fireEvent.click(screen.getByTestId('menu-item-install'));
+      await waitFor(() => expect(screen.getByTestId('install-device-pixel7')).toBeInTheDocument());
+    });
+
+    it('hides "Install on device…" when no devices are online', async () => {
+      renderApkAnalysis(wsWithDevices([]));
+      await waitFor(() => screen.getByRole('button', { name: 'More actions' }));
+      fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+      // Menu is open (download present), but install is absent with no devices.
+      await waitFor(() => expect(screen.getByTestId('menu-item-download')).toBeInTheDocument());
+      expect(screen.queryByTestId('menu-item-install')).not.toBeInTheDocument();
+    });
+
+    it('hides "Install on device…" when the only device is stale (offline)', async () => {
+      const stale = new Date(Date.now() - 10 * 60 * 1000).toISOString(); // 10 min ago
+      renderApkAnalysis(wsWithDevices([{ id: 'old', name: 'Old', lastSeen: stale }]));
+      await waitFor(() => screen.getByRole('button', { name: 'More actions' }));
+      fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+      await waitFor(() => expect(screen.getByTestId('menu-item-download')).toBeInTheDocument());
+      expect(screen.queryByTestId('menu-item-install')).not.toBeInTheDocument();
+    });
+  });
+
   describe('re-analyze button', () => {
     it('renders re-analyze item in the More actions menu', async () => {
       renderApkAnalysis();
