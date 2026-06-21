@@ -21,6 +21,7 @@ import { AccessDenied } from '../components/auth/AccessDenied';
 import { AvailabilityBadge, type AvailabilityState } from '../components/apks/AvailabilityBadge';
 import { NonLocalEmptyState } from '../components/apks/NonLocalEmptyState';
 import { RestoreButton } from '../components/apks/RestoreButton';
+import { InstallDeviceModal, type OnlineDevice } from '../components/apks/InstallDeviceModal';
 import { useToast } from '@darkrideapp/plugin-sdk/react';
 
 type Tab = 'overview' | 'code' | 'assets' | 'findings' | 'strings' | 'reactnative' | 'diff' | 'notes';
@@ -37,6 +38,12 @@ const TAB_LABELS: Record<Tab, string> = {
 };
 
 const ALL_TABS: Tab[] = ['overview', 'code', 'assets', 'findings', 'strings', 'reactnative', 'diff', 'notes'];
+
+/** A device counts as online if it was seen within the last 2 minutes. */
+function isOnline(d: { lastSeen: string | null }): boolean {
+  if (!d.lastSeen) return false;
+  return Date.now() - new Date(d.lastSeen).getTime() < 120000;
+}
 
 interface ApkDiffResult {
   newVersionName: string | null;
@@ -183,6 +190,8 @@ export function ApkAnalysis() {
   const [captureLaunching, setCaptureLaunching] = useState(false);
   const [captureLaunchError, setCaptureLaunchError] = useState<string | null>(null);
   const [pkgIdCopied, setPkgIdCopied] = useState(false);
+  const [devices, setDevices] = useState<OnlineDevice[]>([]);
+  const [installOpen, setInstallOpen] = useState(false);
   const [diffReport, setDiffReport] = useState<DiffReportData | null | undefined>(undefined); // undefined = not fetched yet
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffRunning, setDiffRunning] = useState(false);
@@ -202,6 +211,14 @@ export function ApkAnalysis() {
 
   const displayName = overview?.appName || overview?.packageName || 'APK Analysis';
   useDocumentTitle(overview ? `Analysis - ${displayName}` : 'APK Analysis');
+
+  // Online devices for the "Install on device…" action (same source as App Detail).
+  useEffect(() => {
+    if (!ws.connected) return;
+    ws.sendRestApi('GET', '/v1/device/list').then(res => {
+      setDevices(((res.body?.data || []) as OnlineDevice[]).filter(isOnline));
+    }).catch(() => {});
+  }, [ws]);
 
   const fetchOverview = useCallback(async () => {
     if (!versionId) return;
@@ -617,6 +634,9 @@ export function ApkAnalysis() {
                   a.click();
                   document.body.removeChild(a);
                 } },
+                ...(canManageApk && devices.length > 0
+                  ? [{ key: 'install', label: 'Install on device…', onSelect: () => setInstallOpen(true) }]
+                  : []),
                 { key: 'diff', label: 'Diff vs previous', onSelect: () => setActiveTab('diff') },
               ]}
             />
@@ -1174,6 +1194,16 @@ export function ApkAnalysis() {
             </div>
           )}
         </div>
+      )}
+      {installOpen && overview && versionId && (
+        <InstallDeviceModal
+          versionId={Number(versionId)}
+          packageName={overview.packageName}
+          versionName={overview.versionName}
+          versionCode={overview.versionCode}
+          devices={devices}
+          onClose={() => setInstallOpen(false)}
+        />
       )}
     </div>
   );
