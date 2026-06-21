@@ -3,6 +3,9 @@ import { appSources } from '../../db/schema';
 import type { AppDatabase } from '../../db/index';
 import { PlayStoreSource } from '../play-store-source';
 import { QqSource } from './qq-source';
+import { HuaweiSource } from './huawei-source';
+import { ApkPureSource } from './apkpure-source';
+import { XiaomiSource } from './xiaomi-source';
 import { SourceRegistry } from './registry';
 
 export { SourceRegistry } from './registry';
@@ -11,18 +14,24 @@ export * from './types';
 
 /**
  * Build the default registry of remote APK sources, wired to the DB so each
- * source can read its settings (credentials, defaults).
+ * source can read its settings (credentials, defaults). Registration order is
+ * the UI display order: download-capable Western/Play first, then the China
+ * stores. QQ + Huawei + APKPure can download; Xiaomi is availability-only.
  */
 export function createSourceRegistry(db: AppDatabase): SourceRegistry {
-  const playStore = new PlayStoreSource();
-  playStore.setDatabase(db);
-
-  const qq = new QqSource();
-  qq.setDatabase(db);
-
-  return new SourceRegistry()
-    .register(playStore)
-    .register(qq);
+  const sources = [
+    new PlayStoreSource(),
+    new ApkPureSource(),
+    new QqSource(),
+    new HuaweiSource(),
+    new XiaomiSource(),
+  ];
+  const registry = new SourceRegistry();
+  for (const s of sources) {
+    s.setDatabase(db);
+    registry.register(s);
+  }
+  return registry;
 }
 
 /**

@@ -27,6 +27,7 @@ const ALLOWED_KEYS = new Set([
   'oauth_public_base_url',
   'apk_local_retention_count',
   'qq_fetch_default', // 'true' | 'false' — default enablement for QQ on newly-tracked apps
+  'xiaomi_fetch_default', // 'true' | 'false' — default enablement for Xiaomi GetApps (availability-only)
 ]);
 const PASSWORD_KEYS = new Set([
   'nordvpn_password',
