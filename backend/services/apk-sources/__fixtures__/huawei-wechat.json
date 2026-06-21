@@ -1,0 +1,28 @@
+{
+  "rtnCode": 0,
+  "count": 1,
+  "total": 1,
+  "list": [
+    {
+      "id": "C5683",
+      "package_": "com.tencent.mm",
+      "name": "微信",
+      "version": "8.0.74",
+      "versionCode": 3120,
+      "size": 261152116,
+      "fullSize": 261152116,
+      "sha256": "E69E0C5E1F0A8B2D3C4A5B6C7D8E9F0011223344556677889900AABBCCDDEEFF",
+      "fullDownUrl": "https://appdlc-dre.hispace.dbankcloud.com/dl/appdl/application/apk/52/52f0/com.tencent.mm/261152116/com.tencent.mm.20240611.apk?maple=0&distOpEntity=HWSW",
+      "downurl": "https://appdlc-dre.hispace.dbankcloud.com/dl/appdl/application/apk/52/52f0/com.tencent.mm/261152116/com.tencent.mm.20240611.apk?maple=0&distOpEntity=HWSW",
+      "icon": "https://appimg-dre.hispace.dbankcloud.com/appicon/com.tencent.mm/icon.png",
+      "name_": "微信",
+      "detailId": "C5683",
+      "diffSize": 0,
+      "oldVersionCode": 1,
+      "packingType": 0,
+      "maple": 0,
+      "newType": 0,
+      "stars": "4.0"
+    }
+  ]
+}

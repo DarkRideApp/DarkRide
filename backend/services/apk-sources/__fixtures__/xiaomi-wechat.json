@@ -1,0 +1,22 @@
+{
+  "host": "https://f9.market.xiaomi.com/download/AppStore",
+  "app": {
+    "appId": 1122,
+    "packageName": "com.tencent.mm",
+    "displayName": "微信",
+    "level1CategoryName": "社交",
+    "developer": "深圳市腾讯计算机系统有限公司",
+    "versionName": "8.0.74",
+    "versionCode": 3120,
+    "apkSize": 261152116,
+    "rating": 6.5,
+    "ratingTotalCount": 123456,
+    "introduction": "微信是一个生活方式。",
+    "updateTime": 1781091809683,
+    "icon": "AppStore/0a1b2c3d4e5f6071829304a5b6c7d8e9f",
+    "screenShot": [
+      "AppStore/shot/com.tencent.mm/1",
+      "AppStore/shot/com.tencent.mm/2"
+    ]
+  }
+}

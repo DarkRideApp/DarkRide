@@ -63,6 +63,9 @@ export const SOURCE_LABELS: Record<string, string> = {
   device: 'Device',
   playstore: 'Play Store',
   qq: 'QQ App Store (应用宝)',
+  huawei: 'Huawei AppGallery',
+  apkpure: 'APKPure',
+  xiaomi: 'Xiaomi GetApps (小米应用商店)',
   upload: 'Upload',
 };
 
