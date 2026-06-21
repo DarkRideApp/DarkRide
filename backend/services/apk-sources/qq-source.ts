@@ -137,6 +137,11 @@ export class QqSource implements RemoteApkSource {
     return true; // No credentials required.
   }
 
+  /** Tencent App Store (应用宝) web listing, e.g. sj.qq.com/appdetail/com.x.y */
+  storeUrl(packageName: string): string {
+    return `https://sj.qq.com/appdetail/${encodeURIComponent(packageName)}`;
+  }
+
   defaultEnabled(): boolean {
     // Opt-in: off unless the operator flipped the global default.
     return this.getSetting('qq_fetch_default') === 'true';

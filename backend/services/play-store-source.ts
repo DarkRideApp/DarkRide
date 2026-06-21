@@ -92,6 +92,11 @@ export class PlayStoreSource implements RemoteApkSource {
     return true;
   }
 
+  /** Google Play web listing, e.g. play.google.com/store/apps/details?id=com.x.y */
+  storeUrl(packageName: string): string {
+    return `https://play.google.com/store/apps/details?id=${encodeURIComponent(packageName)}`;
+  }
+
   private async rateLimit(): Promise<void> {
     const now = Date.now();
     const elapsed = now - this.lastRequestTime;

@@ -810,7 +810,8 @@ export function registerAppEndpoints(
       res.status(400).json({ success: false, error: 'Invalid id' });
       return;
     }
-    if (!db.select().from(trackedApps).where(eq(trackedApps.id, id)).all()[0]) {
+    const app = db.select().from(trackedApps).where(eq(trackedApps.id, id)).all()[0];
+    if (!app) {
       res.status(404).json({ success: false, error: 'Tracked app not found' });
       return;
     }
@@ -820,18 +821,70 @@ export function registerAppEndpoints(
     // Order by registry order when available, else stable by source id.
     const order = sourceRegistry?.ids() ?? rows.map(r => r.source);
     const data = rows
-      .map(r => ({
-        source: r.source,
-        label: sourceLabel(r.source),
-        enabled: !!r.enabled,
-        lastVersion: r.lastVersion,
-        lastCheckedAt: r.lastCheckedAt,
-        lastError: r.lastError,
-      }))
+      .map(r => {
+        const src = sourceRegistry?.get(r.source);
+        return {
+          source: r.source,
+          label: sourceLabel(r.source),
+          enabled: !!r.enabled,
+          lastVersion: r.lastVersion,
+          lastCheckedAt: r.lastCheckedAt,
+          lastError: r.lastError,
+          // Deep link to the store listing (null when the source has no web page).
+          storeUrl: src?.storeUrl ? src.storeUrl(app.packageName) : null,
+        };
+      })
       .sort((a, b) => order.indexOf(a.source) - order.indexOf(b.source));
 
     res.json({ success: true, data });
   }, { requires: ['core.apk:read'] });
+
+  // POST /v1/apps/track/:id/sources/check — probe EVERY source's availability
+  // with a lightweight checkVersion (no download) and persist the result, so
+  // the UI can show whether the app is actually on each store before you decide
+  // to enable fetching. lastCheckedAt distinguishes "not on store" (checked, no
+  // version, no error) from "not checked yet" (lastCheckedAt null).
+  registerEndpoint('POST', '/v1/apps/track/:id/sources/check', async (req, res) => {
+    const id = parseInt(req.params.id as string, 10);
+    if (isNaN(id)) {
+      res.status(400).json({ success: false, error: 'Invalid id' });
+      return;
+    }
+    const app = db.select().from(trackedApps).where(eq(trackedApps.id, id)).all()[0];
+    if (!app) {
+      res.status(404).json({ success: false, error: 'Tracked app not found' });
+      return;
+    }
+    if (!sourceRegistry) {
+      res.status(503).json({ success: false, error: 'No remote sources configured' });
+      return;
+    }
+    ensureAppSources(db, id, sourceRegistry);
+
+    const setState = (source: string, patch: Partial<typeof appSources.$inferInsert>) => {
+      db.update(appSources).set(patch)
+        .where(and(eq(appSources.trackedAppId, id), eq(appSources.source, source))).run();
+    };
+    // Probe sources concurrently — distinct stores don't share a rate limiter.
+    const data = await Promise.all(sourceRegistry.all().map(async (source) => {
+      try {
+        const info = await source.checkVersion(app.packageName);
+        if (info) {
+          setState(source.id, { lastVersion: info.versionName, lastCheckedAt: new Date(), lastError: null });
+          return { source: source.id, available: true, version: info.versionName, error: null };
+        }
+        // null = genuinely not on this store (a normal, non-error outcome).
+        setState(source.id, { lastVersion: null, lastCheckedAt: new Date(), lastError: null });
+        return { source: source.id, available: false, version: null, error: null };
+      } catch (err: any) {
+        const msg = err?.message ?? String(err);
+        setState(source.id, { lastCheckedAt: new Date(), lastError: msg });
+        return { source: source.id, available: null, version: null, error: msg };
+      }
+    }));
+
+    res.json({ success: true, data });
+  }, { requires: ['core.apk:manage'] });
 
   // PATCH /v1/apps/track/:id/sources/:source — enable/disable a source
   registerEndpoint('PATCH', '/v1/apps/track/:id/sources/:source', (req, res) => {

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Copy, Check, Upload, Syringe } from 'lucide-react';
+import { Copy, Check, Upload, Syringe, ExternalLink } from 'lucide-react';
 import {
   Breadcrumbs, ConfirmDialog, SkeletonCard, SortableHeader, ActionMenu,
   useSortableTable, useWebSocket, useToast, useDocumentTitle, useAuthOptional,
@@ -28,6 +28,7 @@ interface TrackedApp {
 interface AppSourceRow {
   source: string; label: string; enabled: boolean;
   lastVersion: string | null; lastError: string | null; lastCheckedAt?: string | number | null;
+  storeUrl?: string | null;
 }
 interface InjectedApk { id: number; packageName: string; versionCode: number; fridaVersion: string; createdAt: string | number; }
 interface VersionAnalysis { status: string; stage?: string | null; error?: string | null; aiRunning?: boolean; }
@@ -73,6 +74,7 @@ export function AppDetail() {
   const [busyVersion, setBusyVersion] = useState<number | null>(null);
   const [sources, setSources] = useState<AppSourceRow[]>([]);
   const [sourceBusy, setSourceBusy] = useState<string | null>(null);
+  const [checkingStores, setCheckingStores] = useState(false);
 
   useDocumentTitle(app ? (app.appName || app.packageName) : 'App');
 
@@ -254,6 +256,24 @@ export function AppDetail() {
     }
   }, [ws, appId, toast, fetchVersions, fetchSources]);
 
+  // Probe every store (lightweight, no download) to surface where the app
+  // actually exists, so you can decide which sources to enable.
+  const checkStores = useCallback(async () => {
+    setCheckingStores(true);
+    try {
+      const res = await ws.sendRestApi('POST', `/v1/apps/track/${appId}/sources/check`, {});
+      if (res.body?.success) {
+        const found = (res.body.data as Array<{ available: boolean | null }>).filter(r => r.available === true).length;
+        toast.success(found > 0 ? `Available on ${found} store${found > 1 ? 's' : ''}` : 'Not found on any store');
+        fetchSources();
+      }
+    } catch {
+      toast.error('Failed to check stores');
+    } finally {
+      setCheckingStores(false);
+    }
+  }, [ws, appId, toast, fetchSources]);
+
   const untrack = useCallback(async () => {
     if (!app) return;
     try {
@@ -361,9 +381,22 @@ export function AppDetail() {
 
       {sources.length > 0 && (
         <div className="card" style={{ padding: '12px 20px', marginBottom: 16 }} data-testid="sources-panel">
-          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>Fetch sources</div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>Fetch sources</div>
+            {canManage && (
+              <button
+                className="btn btn-sm"
+                data-testid="sources-check-stores"
+                disabled={checkingStores}
+                onClick={checkStores}
+                title="Check which stores actually have this app (no download)"
+              >
+                {checkingStores ? 'Checking…' : 'Check stores'}
+              </button>
+            )}
+          </div>
           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
-            Pull new APK versions from app stores automatically. QQ (应用宝) only carries apps registered in mainland China.
+            Pull new APK versions from app stores automatically. Use <strong>Check stores</strong> to see where this app exists before enabling. QQ (应用宝) only carries apps registered in mainland China.
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {sources.map(s => (
@@ -381,11 +414,27 @@ export function AppDetail() {
                   {s.enabled ? 'On' : 'Off'}
                 </button>
                 <span style={{ fontWeight: 500, minWidth: 160 }}>{s.label}</span>
-                <span style={{ color: 'var(--text-muted)', fontSize: 12, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <span data-testid={`source-availability-${s.source}`} style={{ fontSize: 12, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {s.lastError
                     ? <span style={{ color: 'var(--danger, #f87171)' }} title={s.lastError}><span aria-hidden="true">⚠</span> {s.lastError}</span>
-                    : s.lastVersion ? `latest seen: v${s.lastVersion}` : 'not checked yet'}
+                    : s.lastCheckedAt
+                      ? (s.lastVersion
+                          ? <span style={{ color: 'var(--success, #4ade80)' }}>✓ Available v{s.lastVersion}</span>
+                          : <span style={{ color: 'var(--text-muted)' }}>✗ Not on this store</span>)
+                      : <span style={{ color: 'var(--text-muted)' }}>Not checked</span>}
                 </span>
+                {s.storeUrl && (
+                  <a
+                    href={s.storeUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-testid={`source-link-${s.source}`}
+                    title={`View ${s.label} listing`}
+                    style={{ flexShrink: 0, color: 'var(--text-muted)', display: 'inline-flex', alignItems: 'center', gap: 3, fontSize: 12, textDecoration: 'none' }}
+                  >
+                    <ExternalLink size={13} /> store
+                  </a>
+                )}
                 {canManage && (
                   <button
                     className="btn btn-sm"

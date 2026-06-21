@@ -50,6 +50,12 @@ export interface RemoteApkSource {
   downloadApk(packageName: string, appName?: string): Promise<DownloadResult>;
   /** Best-effort: fetch an app icon to data/apks/<package>/icon.png. */
   fetchIcon?(packageName: string): Promise<boolean>;
+  /**
+   * Public web URL for this package's listing on the store, for a "view on
+   * store" link. Pure string-building (no network); the page may 404 if the
+   * app isn't actually listed — pair it with checkVersion() for availability.
+   */
+  storeUrl?(packageName: string): string;
 }
 
 /** Display labels for every known source id (remote + device + upload). */
