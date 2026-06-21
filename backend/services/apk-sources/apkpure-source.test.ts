@@ -189,7 +189,9 @@ describe('ApkPureSource.downloadApk', () => {
   function mockDownload(blobOpts: Parameters<typeof makeBlob>[0], download: Buffer) {
     const blob = makeBlob(blobOpts);
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
-      if (url.includes('api.pureapk.com')) return new Response(blob, { status: 200 });
+      // Route by exact host (not a substring) so the metadata endpoint and the
+      // CDN download are cleanly distinguished.
+      if (new URL(url).hostname === 'api.pureapk.com') return new Response(blob, { status: 200 });
       return new Response(download, { status: 200 }); // the APK/XAPK download
     }));
   }
