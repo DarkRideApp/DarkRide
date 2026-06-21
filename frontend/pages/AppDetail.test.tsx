@@ -32,8 +32,8 @@ function mockWs(): WebSocketContextValue {
       if (path === '/v1/apps/versions/1') return Promise.resolve({ type: 'restapi', id: '2', status: 200, body: { success: true, data: versions } });
       if (path === '/v1/frida/gadget/injected') return Promise.resolve({ type: 'restapi', id: '3', status: 200, body: { success: true, data: injected } });
       if (path === '/v1/apps/track/1/sources') return Promise.resolve({ type: 'restapi', id: '8', status: 200, body: { success: true, data: [
-        { source: 'playstore', label: 'Play Store', enabled: true, lastVersion: '11.4.0', lastError: null },
-        { source: 'qq', label: 'QQ App Store (应用宝)', enabled: false, lastVersion: null, lastError: null },
+        { source: 'playstore', label: 'Play Store', enabled: true, lastVersion: '11.4.0', lastError: null, lastCheckedAt: '2026-06-10T08:00:00Z', storeUrl: 'https://play.google.com/store/apps/details?id=com.disney.shanghai' },
+        { source: 'qq', label: 'QQ App Store (应用宝)', enabled: false, lastVersion: null, lastError: null, lastCheckedAt: null, storeUrl: 'https://sj.qq.com/appdetail/com.disney.shanghai' },
       ] } });
       if (path === '/v1/device/list') return Promise.resolve({ type: 'restapi', id: '6', status: 200, body: { success: true, data: [] } });
       if (path === '/v1/apps/analysis-jobs/recent') return Promise.resolve({ type: 'restapi', id: '7', status: 200, body: { success: true, data: [] } });
@@ -154,6 +154,43 @@ describe('AppDetail', () => {
     await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('PATCH', '/v1/apps/track/1/sources/qq', { enabled: true }));
     fireEvent.click(screen.getByTestId('source-fetch-qq'));
     await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/apps/track/1/sources/qq/fetch', {}));
+  });
+
+  it('renders store links and per-source availability badges', async () => {
+    renderDetail();
+    await waitFor(() => screen.getByTestId('sources-panel'));
+    expect(screen.getByTestId('source-link-qq')).toHaveAttribute('href', 'https://sj.qq.com/appdetail/com.disney.shanghai');
+    expect(screen.getByTestId('source-link-playstore')).toHaveAttribute('href', 'https://play.google.com/store/apps/details?id=com.disney.shanghai');
+    // playstore has a stored version + lastCheckedAt → Available; qq never checked.
+    expect(screen.getByTestId('source-availability-playstore').textContent).toMatch(/available v11\.4\.0/i);
+    expect(screen.getByTestId('source-availability-qq').textContent).toMatch(/not checked/i);
+  });
+
+  it('Check stores probes availability and flips the badge from "not checked" to "not on this store"', async () => {
+    let checked = false;
+    const ws = mockWs();
+    const base = ws.sendRestApi as any;
+    (ws.sendRestApi as any) = vi.fn((m: string, path: string, body?: any) => {
+      if (path === '/v1/apps/track/1/sources/check') {
+        checked = true;
+        return Promise.resolve({ type: 'restapi', id: 'c', status: 200, body: { success: true, data: [
+          { source: 'playstore', available: true, version: '11.4.0', error: null },
+          { source: 'qq', available: false, version: null, error: null },
+        ] } });
+      }
+      if (path === '/v1/apps/track/1/sources') {
+        return Promise.resolve({ type: 'restapi', id: '8', status: 200, body: { success: true, data: [
+          { source: 'playstore', label: 'Play Store', enabled: true, lastVersion: '11.4.0', lastError: null, lastCheckedAt: 't', storeUrl: 'https://play.google.com/store/apps/details?id=x' },
+          { source: 'qq', label: 'QQ App Store (应用宝)', enabled: false, lastVersion: null, lastError: null, lastCheckedAt: checked ? 't' : null, storeUrl: 'https://sj.qq.com/appdetail/x' },
+        ] } });
+      }
+      return base(m, path, body);
+    });
+    renderDetail(ws);
+    await waitFor(() => expect(screen.getByTestId('source-availability-qq').textContent).toMatch(/not checked/i));
+    fireEvent.click(screen.getByTestId('sources-check-stores'));
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/apps/track/1/sources/check', {}));
+    await waitFor(() => expect(screen.getByTestId('source-availability-qq').textContent).toMatch(/not on this store/i));
   });
 
   // Override specific REST paths on top of the default mock.

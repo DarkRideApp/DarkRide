@@ -24,6 +24,7 @@ function fakeSource(id: string, defaultEnabled: boolean): RemoteApkSource {
     defaultEnabled: () => defaultEnabled,
     checkVersion: vi.fn(async () => ({ versionName: '1.0.0' })),
     downloadApk: vi.fn(async () => ({ success: false })),
+    storeUrl: (pkg: string) => `https://example.test/${id}/${pkg}`,
   };
 }
 
@@ -40,7 +41,7 @@ function buildHarness() {
   const app = express();
   app.use(express.json());
   app.use(getApiRouter());
-  return { app, db, apkTracker };
+  return { app, db, apkTracker, registry };
 }
 
 describe('Apps source-config API', () => {
@@ -132,6 +133,49 @@ describe('Apps source-config API', () => {
     const res = await request(h.app).post(`/v1/apps/track/${id}/sources/qq/fetch`).send({});
     expect(res.status).toBe(200);
     expect(res.body.data.outcome).toBe('not-found');
+  });
+
+  it('GET /sources includes a storeUrl deep-link per source', async () => {
+    const id = await trackApp();
+    const res = await request(h.app).get(`/v1/apps/track/${id}/sources`);
+    expect(res.status).toBe(200);
+    const qq = res.body.data.find((s: any) => s.source === 'qq');
+    expect(qq.storeUrl).toBe('https://example.test/qq/com.example.app');
+  });
+
+  it('sources/check probes each source and persists availability (available + not-on-store)', async () => {
+    const id = await trackApp();
+    // playstore stays available (default mock); qq reports not-on-store (null).
+    (h.registry.get('qq')!.checkVersion as any).mockResolvedValueOnce(null);
+    const res = await request(h.app).post(`/v1/apps/track/${id}/sources/check`).send({});
+    expect(res.status).toBe(200);
+    const byId = Object.fromEntries(res.body.data.map((r: any) => [r.source, r]));
+    expect(byId.playstore).toMatchObject({ available: true, version: '1.0.0', error: null });
+    expect(byId.qq).toMatchObject({ available: false, version: null, error: null });
+    // Persisted: lastCheckedAt set for both; lastVersion only for the available one.
+    const rows = h.db.select().from(appSources).all().filter(r => r.trackedAppId === id);
+    const ps = rows.find(r => r.source === 'playstore');
+    const qq = rows.find(r => r.source === 'qq');
+    expect(ps?.lastVersion).toBe('1.0.0');
+    expect(ps?.lastCheckedAt).toBeTruthy();
+    expect(qq?.lastVersion).toBeNull();
+    expect(qq?.lastCheckedAt).toBeTruthy();
+  });
+
+  it('sources/check records the error and reports available:null when a probe throws', async () => {
+    const id = await trackApp();
+    (h.registry.get('qq')!.checkVersion as any).mockRejectedValueOnce(new Error('network boom'));
+    const res = await request(h.app).post(`/v1/apps/track/${id}/sources/check`).send({});
+    const qq = res.body.data.find((r: any) => r.source === 'qq');
+    expect(qq).toMatchObject({ available: null, error: 'network boom' });
+    const row = h.db.select().from(appSources).all().find(r => r.trackedAppId === id && r.source === 'qq');
+    expect(row?.lastError).toBe('network boom');
+    expect(row?.lastCheckedAt).toBeTruthy();
+  });
+
+  it('sources/check 404s for an unknown app', async () => {
+    const res = await request(h.app).post('/v1/apps/track/9999/sources/check').send({});
+    expect(res.status).toBe(404);
   });
 
   it('GET /v1/apps/sources lists the registry stores with labels + defaults', async () => {
