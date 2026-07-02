@@ -124,6 +124,13 @@ export class H264Decoder {
     this.opts.onResetRequested?.();
   }
 
+  /** How many chunks are queued in the underlying decoder awaiting output.
+   *  A rising value means decode can't keep up with arrivals (latency will
+   *  grow). 0 when no decoder is configured. */
+  get decodeQueueSize(): number {
+    return this.decoder?.decodeQueueSize ?? 0;
+  }
+
   close(): void {
     if (this.decoder && this.decoder.state !== 'closed') {
       try { this.decoder.close(); } catch { /* ignore */ }

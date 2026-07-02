@@ -1,4 +1,5 @@
 import type { KeyframeReason } from './keyframe-trigger';
+import type { StreamSample } from './stream-controller';
 
 /** Messages the main thread sends to the stream worker. */
 export type WorkerInMsg =
@@ -12,6 +13,7 @@ export type WorkerInMsg =
 export type WorkerOutMsg =
   | { type: 'keyframe'; reason: KeyframeReason; gap: number }
   | { type: 'config' }
-  | { type: 'rendered' };  // first successful paint — main thread's health signal
+  | { type: 'rendered' }   // first successful paint — main thread's health signal
+  | { type: 'stats'; sample: StreamSample };
 
 export const WATCHDOG_INTERVAL_MS = 1000;

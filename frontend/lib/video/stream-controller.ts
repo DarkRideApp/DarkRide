@@ -9,6 +9,20 @@ export interface IDecoder {
   push(frame: DecodedFrame): void;
   close(): void;
   reset(): void;
+  /** Chunks queued in the underlying codec awaiting output (backlog signal). */
+  readonly decodeQueueSize?: number;
+}
+
+/** A rolling sample of stream health, emitted ~once per statsIntervalMs. */
+export interface StreamSample {
+  fps: number;
+  /** Mean glass-to-glass latency (now − frame capture ts) over the window, ms.
+   *  Meaningful only when backend and client clocks are comparable (dev: same
+   *  machine). Rising latency ⇒ a growing backlog somewhere in the path. */
+  avgLatencyMs: number;
+  maxLatencyMs: number;
+  frames: number;
+  decodeQueueSize: number;
 }
 
 export interface DecoderCallbacks {
@@ -32,12 +46,15 @@ export interface StreamControllerCallbacks {
   onRegression?: (info: { previous: number | null; received: number }) => void;
   onError?: (e: Error) => void;
   onWireVersionMismatch?: (info: { received: number; expected: number }) => void;
+  /** Periodic health sample for diagnostics. */
+  onStats?: (sample: StreamSample) => void;
 }
 
 export interface StreamControllerDeps {
   createDecoder?: (cb: DecoderCallbacks) => IDecoder;
   now?: () => number;
   watchdogTimeoutMs?: number;
+  statsIntervalMs?: number;
 }
 
 export interface StreamStats {
@@ -63,8 +80,14 @@ export class StreamController {
   private readonly trigger: KeyframeTrigger;
   private readonly now: () => number;
   private readonly watchdogTimeoutMs: number;
+  private readonly statsIntervalMs: number;
   private lastKeyframeAtMs: number;
   private pendingGap = 0;
+  private statsWindowStartMs: number;
+  private statsFrames = 0;
+  private statsLatencySum = 0;
+  private statsLatencyMax = 0;
+  private statsLatencyCount = 0;
   readonly stats: StreamStats = {
     totalGaps: 0, totalMissed: 0, regressions: 0, wraps: 0,
     keyframeRequests: 0, watchdogFires: 0,
@@ -77,7 +100,9 @@ export class StreamController {
   ) {
     this.now = deps.now ?? (() => Date.now());
     this.watchdogTimeoutMs = deps.watchdogTimeoutMs ?? 8000;
+    this.statsIntervalMs = deps.statsIntervalMs ?? 1000;
     this.lastKeyframeAtMs = this.now();
+    this.statsWindowStartMs = this.lastKeyframeAtMs;
 
     this.trigger = new KeyframeTrigger((reason) => {
       this.stats.keyframeRequests += 1;
@@ -87,10 +112,42 @@ export class StreamController {
 
     const createDecoder = deps.createDecoder ?? ((cb) => new H264Decoder(cb));
     this.decoder = createDecoder({
-      onFrame: (frame) => this.renderer.drawFrame(frame),
+      onFrame: (frame) => this.handleDecoded(frame),
       onError: (e) => this.callbacks.onError?.(e),
       onResetRequested: () => this.fire('decode-error'),
     });
+  }
+
+  /** Record a stats sample for the painted frame, then render it. Latency uses
+   *  the VideoFrame timestamp (µs) the decoder carried through from capture. */
+  private handleDecoded(frame: VideoFrame): void {
+    if (this.callbacks.onStats) {
+      const t = this.now();
+      const ts = frame.timestamp;
+      if (typeof ts === 'number' && ts > 0) {
+        const latency = t - ts / 1000;
+        this.statsLatencySum += latency;
+        if (latency > this.statsLatencyMax) this.statsLatencyMax = latency;
+        this.statsLatencyCount += 1;
+      }
+      this.statsFrames += 1;
+      const elapsed = t - this.statsWindowStartMs;
+      if (elapsed >= this.statsIntervalMs) {
+        this.callbacks.onStats({
+          fps: (this.statsFrames * 1000) / elapsed,
+          avgLatencyMs: this.statsLatencyCount ? this.statsLatencySum / this.statsLatencyCount : 0,
+          maxLatencyMs: this.statsLatencyMax,
+          frames: this.statsFrames,
+          decodeQueueSize: this.decoder.decodeQueueSize ?? 0,
+        });
+        this.statsWindowStartMs = t;
+        this.statsFrames = 0;
+        this.statsLatencySum = 0;
+        this.statsLatencyMax = 0;
+        this.statsLatencyCount = 0;
+      }
+    }
+    this.renderer.drawFrame(frame);
   }
 
   /** Parse one wire-format binary message and drive detection + decode. */

@@ -17,7 +17,7 @@ function fakeCanvas() {
 function setup() {
   const worker = fakeWorker();
   const canvas = fakeCanvas();
-  const cb = { onKeyframe: vi.fn(), onConfig: vi.fn(), onRendered: vi.fn() };
+  const cb = { onKeyframe: vi.fn(), onConfig: vi.fn(), onRendered: vi.fn(), onStats: vi.fn() };
   const client = createStreamWorkerClient(canvas as any, cb, () => worker as any);
   return { worker, canvas, cb, client };
 }
@@ -55,6 +55,13 @@ describe('createStreamWorkerClient', () => {
     const { worker, cb } = setup();
     worker.onmessage!({ data: { type: 'rendered' } });
     expect(cb.onRendered).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes a worker stats message to onStats', () => {
+    const { worker, cb } = setup();
+    const sample = { fps: 30, avgLatencyMs: 80, maxLatencyMs: 120, frames: 30, decodeQueueSize: 1 };
+    worker.onmessage!({ data: { type: 'stats', sample } });
+    expect(cb.onStats).toHaveBeenCalledWith(sample);
   });
 
   it('close posts close and terminates the worker', () => {

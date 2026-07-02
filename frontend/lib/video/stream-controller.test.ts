@@ -21,6 +21,7 @@ class FakeDecoder implements IDecoder {
   pushes: DecodedFrame[] = [];
   closed = false;
   resets = 0;
+  decodeQueueSize = 0;
   cb: DecoderCallbacks;
   constructor(cb: DecoderCallbacks) { this.cb = cb; }
   push(f: DecodedFrame): void { this.pushes.push(f); }
@@ -133,6 +134,33 @@ describe('StreamController', () => {
     controller.feedBinary(makeFrame(FrameMsgType.CONFIG, 1, [0x67]));
     controller.close();
     expect(getFake().closed).toBe(true);
+  });
+
+  it('emits stats (fps, latency, queue depth) once the interval elapses', () => {
+    let t = 1000;
+    const onStats = vi.fn();
+    let fake: FakeDecoder | null = null;
+    const controller = new StreamController(
+      { drawFrame: vi.fn() },
+      { requestKeyframe: vi.fn(), onStats },
+      { createDecoder: (cb) => { fake = new FakeDecoder(cb); return fake; }, now: () => t, statsIntervalMs: 1000 },
+    );
+    (fake as unknown as FakeDecoder).decodeQueueSize = 3;
+    const frameAt = (latencyMs: number) => ({ timestamp: (t - latencyMs) * 1000, close: vi.fn() } as any);
+
+    fake!.cb.onFrame(frameAt(40));
+    fake!.cb.onFrame(frameAt(60));
+    expect(onStats).not.toHaveBeenCalled(); // window not elapsed yet
+
+    t = 2001;
+    fake!.cb.onFrame(frameAt(50)); // crosses the 1s window → emit
+    expect(onStats).toHaveBeenCalledTimes(1);
+    const s = onStats.mock.calls[0][0];
+    expect(s.frames).toBeGreaterThanOrEqual(2);
+    expect(s.avgLatencyMs).toBeGreaterThan(0);
+    expect(s.maxLatencyMs).toBeGreaterThanOrEqual(s.avgLatencyMs);
+    expect(s.decodeQueueSize).toBe(3);
+    expect(s.fps).toBeGreaterThan(0);
   });
 
   it('surfaces a wire-version mismatch without throwing', () => {

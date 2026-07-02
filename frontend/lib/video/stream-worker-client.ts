@@ -1,10 +1,12 @@
 import type { KeyframeReason } from './keyframe-trigger';
+import type { StreamSample } from './stream-controller';
 import type { WorkerInMsg, WorkerOutMsg } from './stream-worker-protocol';
 
 export interface StreamWorkerClientCallbacks {
   onKeyframe: (reason: KeyframeReason, gap: number) => void;
   onConfig: () => void;
   onRendered?: () => void;
+  onStats?: (sample: StreamSample) => void;
 }
 
 export interface StreamWorkerClient {
@@ -36,6 +38,7 @@ export function createStreamWorkerClient(
     if (msg.type === 'keyframe') callbacks.onKeyframe(msg.reason, msg.gap);
     else if (msg.type === 'config') callbacks.onConfig();
     else if (msg.type === 'rendered') callbacks.onRendered?.();
+    else if (msg.type === 'stats') callbacks.onStats?.(msg.sample);
   };
 
   const off = canvas.transferControlToOffscreen();

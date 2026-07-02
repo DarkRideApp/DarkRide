@@ -119,6 +119,15 @@ describe('H264Decoder', () => {
     expect(deltaSubmitted.length).toBe(deltaNal.length);
   });
 
+  it('reports the underlying decoder queue depth (0 when unconfigured)', () => {
+    const d = new H264Decoder({ onFrame: vi.fn(), onError: vi.fn() });
+    expect(d.decodeQueueSize).toBe(0);
+    const sps = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e, 0x96, 0x35, 0x40]);
+    d.push({ msgType: FrameMsgType.CONFIG, timestampMs: 0n, nalData: sps.buffer });
+    (FakeVideoDecoder.instances[0] as any).decodeQueueSize = 7;
+    expect(d.decodeQueueSize).toBe(7);
+  });
+
   it('close() releases the underlying VideoDecoder', () => {
     const d = new H264Decoder({ onFrame: vi.fn(), onError: vi.fn() });
     const sps = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e, 0x96, 0x35, 0x40]);

@@ -64,6 +64,7 @@ export function createStreamWorkerCore(
           {
             requestKeyframe: (reason, gap) => post({ type: 'keyframe', reason, gap }),
             onConfig: () => post({ type: 'config' }),
+            onStats: (sample) => post({ type: 'stats', sample }),
           },
           { now: deps.now },
         );

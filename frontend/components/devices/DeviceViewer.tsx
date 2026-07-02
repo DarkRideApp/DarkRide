@@ -9,7 +9,7 @@ import { ButtonList } from '@darkrideapp/plugin-sdk/react';
 import type { ButtonListItem } from '@darkrideapp/plugin-sdk/react';
 import { pluginRegistry } from '@darkrideapp/plugin-sdk/react';
 import { DeviceNavButtons } from './DeviceNavButtons';
-import { StreamController } from '../../lib/video/stream-controller';
+import { StreamController, type StreamSample } from '../../lib/video/stream-controller';
 import { createCanvasRenderer } from '../../lib/video/canvas-renderer';
 import { createStreamWorkerClient } from '../../lib/video/stream-worker-client';
 import type { KeyframeReason } from '../../lib/video/keyframe-trigger';
@@ -375,6 +375,16 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
       ws.sendMessage('device-stream-request-keyframe', { deviceId, viewerId, reason });
     };
 
+    const logStats = (path: 'worker' | 'main', s: StreamSample) => {
+      console.info('[DeviceViewer] stream stats', {
+        deviceId, path,
+        fps: Math.round(s.fps),
+        avgLatencyMs: Math.round(s.avgLatencyMs),
+        maxLatencyMs: Math.round(s.maxLatencyMs),
+        decodeQueue: s.decodeQueueSize,
+      });
+    };
+
     let watchdogTimer: ReturnType<typeof setInterval> | null = null;
     let renderCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -387,6 +397,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
         onGap: (info) => console.warn('[DeviceViewer] frame gap', { deviceId, ...info }),
         onRegression: (info) => console.warn('[DeviceViewer] frame counter regression', { deviceId, ...info }),
         onWireVersionMismatch: (info) => console.error('[DeviceViewer] wire version mismatch — backend/frontend out of sync', { deviceId, ...info }),
+        onStats: (s) => logStats('main', s),
       });
       watchdogTimer = setInterval(() => controller.checkWatchdog(), 1000);
       return {
@@ -409,6 +420,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
             workerRenderedRef.current = true;
             console.info('[DeviceViewer] stream worker painted first frame', { deviceId });
           },
+          onStats: (s) => logStats('worker', s),
         });
         // Self-heal: if the worker never paints a frame, abandon it and remount
         // onto the main-thread path so the user is never left on a black canvas.
