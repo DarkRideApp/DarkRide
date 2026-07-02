@@ -119,6 +119,40 @@ describe('StreamBroadcaster', () => {
     expect(bc.isHealthy()).toBe(true);
   });
 
+  describe('ingest stats', () => {
+    it('reports ingested video-frame fps via onIngestStats about once per interval', () => {
+      let t = 0;
+      const onIngestStats = vi.fn();
+      const bc = new StreamBroadcaster(() => t, { onIngestStats });
+
+      // Two video frames (IDR + delta) inside the first window.
+      bc.ingest(Buffer.concat([sc4, nalHeader(5), Buffer.from([0xaa])])); // IDR
+      bc.ingest(Buffer.concat([sc4, nalHeader(1), Buffer.from([0xbb])])); // delta
+      expect(onIngestStats).not.toHaveBeenCalled();
+
+      t = 2001;
+      bc.ingest(Buffer.concat([sc4, nalHeader(1), Buffer.from([0xcc])])); // delta → crosses window
+      expect(onIngestStats).toHaveBeenCalledTimes(1);
+      const info = onIngestStats.mock.calls[0][0];
+      expect(info.frames).toBe(3);
+      expect(info.fps).toBeGreaterThan(0);
+    });
+
+    it('does not count SPS/PPS/SEI as video frames', () => {
+      let t = 0;
+      const onIngestStats = vi.fn();
+      const bc = new StreamBroadcaster(() => t, { onIngestStats });
+      bc.ingest(Buffer.concat([
+        sc4, nalHeader(7), Buffer.from([0xaa]), // SPS
+        sc4, nalHeader(8), Buffer.from([0xbb]), // PPS
+        sc4, nalHeader(5), Buffer.from([0xcc]), // IDR (counts)
+      ]));
+      t = 2001;
+      bc.ingest(Buffer.concat([sc4, nalHeader(1), Buffer.from([0xdd])])); // delta (counts) → fires
+      expect(onIngestStats.mock.calls[0][0].frames).toBe(2);
+    });
+  });
+
   describe('join keyframe', () => {
     it('invokes onKeyframeWanted with the viewer id when a viewer joins', () => {
       const onKeyframeWanted = vi.fn();

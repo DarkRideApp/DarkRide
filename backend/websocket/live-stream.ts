@@ -702,6 +702,9 @@ export function attachScrcpyH264Pipeline(stream: DeviceStream, scrcpySocket: Soc
         const action = stream.keyframeCoordinator.request();
         log(`keyframe-request ${stream.deviceId} viewer=${viewerId} reason=join action=${action}`);
       },
+      onIngestStats: (info) => {
+        log(`scrcpy ingest fps for ${stream.deviceId}: ${info.fps.toFixed(1)} (${info.frames} frames / 2s)`);
+      },
     });
   }
   // Re-add any viewers already on this stream (in case the broadcaster was just created post-restart)

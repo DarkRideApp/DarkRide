@@ -11,7 +11,12 @@ export interface BroadcasterOptions {
    *  immediate IDR. Without this, a viewer joining a running stream waits up
    *  to a full GOP (i-frame-interval) before its first decodable frame. */
   onKeyframeWanted?: (viewerId: string) => void;
+  /** Periodic count of video frames (IDR + non-IDR) ingested from scrcpy —
+   *  i.e. the encoder's actual output rate, before any per-viewer drops. */
+  onIngestStats?: (info: { fps: number; frames: number }) => void;
 }
+
+const INGEST_STATS_INTERVAL_MS = 2000;
 
 interface Viewer {
   ws: WebSocket;
@@ -30,6 +35,8 @@ export class StreamBroadcaster {
   private leftover = Buffer.alloc(0);
   private opts: BroadcasterOptions;
   private now: () => number;
+  private ingestFrames = 0;
+  private ingestStatsStartMs: number | null = null;
 
   constructor(now: () => number = () => Date.now(), opts: BroadcasterOptions = {}) {
     this.now = now;
@@ -117,12 +124,14 @@ export class StreamBroadcaster {
           this.broadcast(FrameMsgType.CONFIG, config);
         }
         this.broadcast(FrameMsgType.KEYFRAME, withStartCode(u.data));
+        this.ingestFrames++;
         pendingSps = null;
         pendingPps = null;
         continue;
       }
       if (u.type === NalType.NON_IDR) {
         this.broadcast(FrameMsgType.DELTA, withStartCode(u.data));
+        this.ingestFrames++;
         continue;
       }
       // Ignore SEI, AUD, etc.
@@ -134,6 +143,21 @@ export class StreamBroadcaster {
       const config = Buffer.concat([withStartCode(pendingSps.data), withStartCode(pendingPps.data)]);
       this.broadcast(FrameMsgType.CONFIG, config);
     }
+
+    this.maybeEmitIngestStats();
+  }
+
+  /** Emit encoder output rate ~once per interval. Measures scrcpy's actual
+   *  frame delivery, independent of viewers or per-viewer backpressure. */
+  private maybeEmitIngestStats(): void {
+    if (!this.opts.onIngestStats) return;
+    const now = this.now();
+    if (this.ingestStatsStartMs === null) { this.ingestStatsStartMs = now; return; }
+    const elapsed = now - this.ingestStatsStartMs;
+    if (elapsed < INGEST_STATS_INTERVAL_MS) return;
+    this.opts.onIngestStats({ fps: (this.ingestFrames * 1000) / elapsed, frames: this.ingestFrames });
+    this.ingestStatsStartMs = now;
+    this.ingestFrames = 0;
   }
 
   private broadcast(msgType: FrameMsgType, nalData: Buffer): void {
