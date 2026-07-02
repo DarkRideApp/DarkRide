@@ -15,7 +15,7 @@ import { adbShell, adbCommand, adbPull } from '../services/device-manager';
 import type { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
 import type { ApkTracker } from '../services/apk-tracker';
-import { extractIconFromLocalApk, fetchIconFromGooglePlay } from '../services/apk-tracker';
+import { extractIconFromLocalApk, fetchIconFromGooglePlay, fetchIconFromSources } from '../services/apk-tracker';
 import type { ApkAnalyzerService } from '../services/apk-analyzer';
 import type { FileStorageService } from '../services/file-storage';
 import type { AppDatabase } from '../db/index';
@@ -133,7 +133,12 @@ function resolveIconPath(packageName: string): { path: string; contentType: stri
  * Falls back to extracting from local APK if device method fails.
  * Best-effort — silently ignores failures.
  */
-async function saveAppIconFromDevice(deviceId: string, packageName: string): Promise<void> {
+async function saveAppIconFromDevice(
+  deviceId: string,
+  packageName: string,
+  db: AppDatabase,
+  sourceRegistry: SourceRegistry | undefined,
+): Promise<void> {
   if (resolveIconPath(packageName)) return;
 
   // Method 1: cmd package dump-icon (Android 13+)
@@ -156,7 +161,11 @@ async function saveAppIconFromDevice(deviceId: string, packageName: string): Pro
   // Method 2: Extract from local APK file
   if (extractIconFromLocalApk(packageName)) return;
 
-  // Method 3: Fetch from Google Play Store
+  // Method 3: Fetch from the stores this app is tracked on (works for
+  // adaptive-icon apps and China-store apps not on Google Play).
+  if (await fetchIconFromSources(db, sourceRegistry, packageName)) return;
+
+  // Method 4: Fetch from Google Play Store
   await fetchIconFromGooglePlay(packageName);
 }
 
@@ -506,10 +515,12 @@ export function registerAppEndpoints(
       const allDevices = await deviceManager.getAllDeviceStatuses();
       const firstOnline = allDevices.find(d => d.isOnline);
       if (firstOnline) {
-        await saveAppIconFromDevice(firstOnline.id, packageName);
+        await saveAppIconFromDevice(firstOnline.id, packageName, db, sourceRegistry);
       } else {
-        // No device online — try local extraction, then Google Play
-        if (!extractIconFromLocalApk(packageName)) {
+        // No device online — try local extraction, then the tracked stores,
+        // then Google Play.
+        if (!extractIconFromLocalApk(packageName) &&
+            !(await fetchIconFromSources(db, sourceRegistry, packageName))) {
           await fetchIconFromGooglePlay(packageName);
         }
       }
@@ -654,7 +665,7 @@ export function registerAppEndpoints(
         if (tracked && !tracked.appName && appName) {
           db.update(trackedApps).set({ appName }).where(eq(trackedApps.id, tracked.id)).run();
         }
-        saveAppIconFromDevice(deviceId, packageName).catch(() => {});
+        saveAppIconFromDevice(deviceId, packageName, db, sourceRegistry).catch(() => {});
         res.json({ success: true, data: existingVersion });
         return;
       }
@@ -684,7 +695,7 @@ export function registerAppEndpoints(
         db.update(trackedApps).set({ appName }).where(eq(trackedApps.id, tracked.id)).run();
       }
       // Fire-and-forget: cache icon
-      saveAppIconFromDevice(deviceId, packageName).catch(() => {});
+      saveAppIconFromDevice(deviceId, packageName, db, sourceRegistry).catch(() => {});
 
       log(`Pulled APK for ${packageName} v${vn} (${vc}) from ${deviceId}`);
       // Auto-enqueue for analysis

@@ -1,7 +1,10 @@
+import path from 'path';
+import fs from 'fs';
 import { eq } from 'drizzle-orm';
 import { createLoggers } from '../../logs';
 import { settings } from '../../db/schema';
 import type { AppDatabase } from '../../db/index';
+import { packageDir } from '../../utils/apk-paths';
 import type { RemoteApkSource, VersionCheckResult, DownloadResult } from './types';
 
 const { log } = createLoggers('xiaomi-source');
@@ -159,5 +162,32 @@ export class XiaomiSource implements RemoteApkSource {
       success: false,
       error: 'Xiaomi GetApps does not allow direct APK download (store-gated); use it for availability + version tracking only.',
     };
+  }
+
+  /**
+   * Fetch the store icon. This is the only icon path for a Xiaomi-only app:
+   * the store gates APK download (nothing to extract locally) and CN apps
+   * generally aren't on Google Play, so without this they'd never get one.
+   */
+  async fetchIcon(packageName: string): Promise<boolean> {
+    try {
+      const record = await this.fetchRecord(packageName);
+      const iconUrl = record?.app?.icon;
+      if (!iconUrl) return false;
+      const res = await fetch(iconUrl, {
+        headers: { 'User-Agent': USER_AGENT },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) return false;
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 100) return false;
+      const pkgDir = packageDir(packageName);
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgDir, 'icon.png'), buf);
+      log(`Fetched icon for ${packageName} from Xiaomi GetApps`);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
