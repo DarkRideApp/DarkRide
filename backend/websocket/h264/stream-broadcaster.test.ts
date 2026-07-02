@@ -119,6 +119,32 @@ describe('StreamBroadcaster', () => {
     expect(bc.isHealthy()).toBe(true);
   });
 
+  describe('join keyframe', () => {
+    it('invokes onKeyframeWanted with the viewer id when a viewer joins', () => {
+      const onKeyframeWanted = vi.fn();
+      const bc = new StreamBroadcaster(() => 1000, { onKeyframeWanted });
+      bc.addViewer('v1', makeWS() as any);
+      expect(onKeyframeWanted).toHaveBeenCalledWith('v1');
+    });
+
+    it('requests a join keyframe even before any SPS/PPS is cached', () => {
+      // A viewer joining a just-started stream (no config cached yet) should
+      // still trigger a keyframe request so the first decodable frame lands
+      // fast rather than waiting a full GOP.
+      const onKeyframeWanted = vi.fn();
+      const bc = new StreamBroadcaster(() => 1000, { onKeyframeWanted });
+      const ws = makeWS();
+      bc.addViewer('v1', ws as any);
+      expect(ws.send).not.toHaveBeenCalled(); // no cached config
+      expect(onKeyframeWanted).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not throw when onKeyframeWanted is not provided', () => {
+      const bc = new StreamBroadcaster(() => 1000);
+      expect(() => bc.addViewer('v1', makeWS() as any)).not.toThrow();
+    });
+  });
+
   describe('frameId', () => {
     it('first frame sent to a fresh viewer has frameId=1', () => {
       const bc = new StreamBroadcaster(() => 1000);

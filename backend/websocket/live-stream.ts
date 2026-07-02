@@ -695,6 +695,13 @@ export function attachScrcpyH264Pipeline(stream: DeviceStream, scrcpySocket: Soc
         log(`Viewer ${viewerId} requested reset due to backpressure on ${stream.deviceId}`);
         triggerStreamReset(stream, 'congestion');
       },
+      onKeyframeWanted: (viewerId) => {
+        // A viewer just joined — ask scrcpy for an immediate IDR so its first
+        // decodable frame lands within the coordinator's rate-limit window
+        // instead of waiting up to a full GOP. Coalesced across rapid joins.
+        const action = stream.keyframeCoordinator.request();
+        log(`keyframe-request ${stream.deviceId} viewer=${viewerId} reason=join action=${action}`);
+      },
     });
   }
   // Re-add any viewers already on this stream (in case the broadcaster was just created post-restart)

@@ -7,6 +7,10 @@ import {
 
 export interface BroadcasterOptions {
   onResetRequested?: (viewerId: string) => void;
+  /** Fired when a viewer joins, so the caller can ask the encoder for an
+   *  immediate IDR. Without this, a viewer joining a running stream waits up
+   *  to a full GOP (i-frame-interval) before its first decodable frame. */
+  onKeyframeWanted?: (viewerId: string) => void;
 }
 
 interface Viewer {
@@ -46,6 +50,10 @@ export class StreamBroadcaster {
       ]);
       this.sendToViewer(viewerId, FrameMsgType.CONFIG, config);
     }
+    // Ask the encoder for a fresh IDR so this viewer gets a decodable frame
+    // without waiting for the next natural keyframe. Cached config alone is
+    // not decodable until a keyframe follows.
+    this.opts.onKeyframeWanted?.(viewerId);
   }
 
   removeViewer(viewerId: string): void {
