@@ -23,6 +23,9 @@ export interface StreamSample {
   maxLatencyMs: number;
   frames: number;
   decodeQueueSize: number;
+  /** ms since the last painted frame; -1 if none yet. A large/growing value is
+   *  a stall (no frames arriving), distinct from low-but-nonzero fps. */
+  msSinceLastFrame: number;
 }
 
 export interface DecoderCallbacks {
@@ -54,7 +57,6 @@ export interface StreamControllerDeps {
   createDecoder?: (cb: DecoderCallbacks) => IDecoder;
   now?: () => number;
   watchdogTimeoutMs?: number;
-  statsIntervalMs?: number;
 }
 
 export interface StreamStats {
@@ -72,7 +74,7 @@ export interface StreamStats {
  * watchdog), and handing decoded frames to a renderer. Deliberately free of
  * DOM, WebSocket, and timers so it can run identically on the main thread or
  * inside a Worker — the adapter supplies the renderer, the keyframe-request
- * transport, and drives checkWatchdog() on an interval.
+ * transport, and drives tick() on an interval (watchdog + stats).
  */
 export class StreamController {
   private readonly decoder: IDecoder;
@@ -80,14 +82,18 @@ export class StreamController {
   private readonly trigger: KeyframeTrigger;
   private readonly now: () => number;
   private readonly watchdogTimeoutMs: number;
-  private readonly statsIntervalMs: number;
   private lastKeyframeAtMs: number;
   private pendingGap = 0;
+  private lastFrameAtMs = 0;
   private statsWindowStartMs: number;
   private statsFrames = 0;
   private statsLatencySum = 0;
   private statsLatencyMax = 0;
   private statsLatencyCount = 0;
+  // Watchdog backoff: once fired, wait longer each time until a keyframe
+  // arrives, so a dead/asleep stream isn't hammered with RESET_VIDEO every tick.
+  private watchdogBackoffMs = 0;
+  private nextWatchdogFireMs = 0;
   readonly stats: StreamStats = {
     totalGaps: 0, totalMissed: 0, regressions: 0, wraps: 0,
     keyframeRequests: 0, watchdogFires: 0,
@@ -100,13 +106,11 @@ export class StreamController {
   ) {
     this.now = deps.now ?? (() => Date.now());
     this.watchdogTimeoutMs = deps.watchdogTimeoutMs ?? 8000;
-    this.statsIntervalMs = deps.statsIntervalMs ?? 1000;
     this.lastKeyframeAtMs = this.now();
     this.statsWindowStartMs = this.lastKeyframeAtMs;
 
     this.trigger = new KeyframeTrigger((reason) => {
-      this.stats.keyframeRequests += 1;
-      this.callbacks.requestKeyframe(reason, this.pendingGap);
+      this.emitKeyframeRequest(reason, this.pendingGap);
       this.pendingGap = 0;
     });
 
@@ -118,8 +122,9 @@ export class StreamController {
     });
   }
 
-  /** Record a stats sample for the painted frame, then render it. Latency uses
-   *  the VideoFrame timestamp (µs) the decoder carried through from capture. */
+  /** Accumulate a stats sample for the painted frame, then render it. Latency
+   *  uses the VideoFrame timestamp (µs) carried through from capture. The
+   *  sample is emitted later by tick(), so stalls (no frames) still report. */
   private handleDecoded(frame: VideoFrame): void {
     if (this.callbacks.onStats) {
       const t = this.now();
@@ -131,21 +136,7 @@ export class StreamController {
         this.statsLatencyCount += 1;
       }
       this.statsFrames += 1;
-      const elapsed = t - this.statsWindowStartMs;
-      if (elapsed >= this.statsIntervalMs) {
-        this.callbacks.onStats({
-          fps: (this.statsFrames * 1000) / elapsed,
-          avgLatencyMs: this.statsLatencyCount ? this.statsLatencySum / this.statsLatencyCount : 0,
-          maxLatencyMs: this.statsLatencyMax,
-          frames: this.statsFrames,
-          decodeQueueSize: this.decoder.decodeQueueSize ?? 0,
-        });
-        this.statsWindowStartMs = t;
-        this.statsFrames = 0;
-        this.statsLatencySum = 0;
-        this.statsLatencyMax = 0;
-        this.statsLatencyCount = 0;
-      }
+      this.lastFrameAtMs = t;
     }
     this.renderer.drawFrame(frame);
   }
@@ -183,16 +174,45 @@ export class StreamController {
     if (frame.msgType === FrameMsgType.CONFIG) this.callbacks.onConfig?.();
     if (frame.msgType === FrameMsgType.KEYFRAME) {
       this.lastKeyframeAtMs = this.now();
+      // Recovery: stream is healthy again, so reset the watchdog backoff.
+      this.watchdogBackoffMs = 0;
+      this.nextWatchdogFireMs = 0;
       this.callbacks.onKeyframe?.();
     }
     this.decoder.push(frame);
   }
 
-  /** Fire a watchdog keyframe request if no keyframe has arrived recently. */
-  checkWatchdog(): void {
-    if (this.now() - this.lastKeyframeAtMs > this.watchdogTimeoutMs) {
+  /** Driven on an interval by the adapter. Emits a stats sample (so stalls are
+   *  visible even with no frames) and runs the watchdog with backoff. */
+  tick(): void {
+    const now = this.now();
+
+    if (this.callbacks.onStats) {
+      const elapsed = now - this.statsWindowStartMs;
+      if (elapsed > 0) {
+        this.callbacks.onStats({
+          fps: (this.statsFrames * 1000) / elapsed,
+          avgLatencyMs: this.statsLatencyCount ? this.statsLatencySum / this.statsLatencyCount : 0,
+          maxLatencyMs: this.statsLatencyMax,
+          frames: this.statsFrames,
+          decodeQueueSize: this.decoder.decodeQueueSize ?? 0,
+          msSinceLastFrame: this.lastFrameAtMs ? now - this.lastFrameAtMs : -1,
+        });
+      }
+      this.statsWindowStartMs = now;
+      this.statsFrames = 0;
+      this.statsLatencySum = 0;
+      this.statsLatencyMax = 0;
+      this.statsLatencyCount = 0;
+    }
+
+    // The watchdog has its own backoff, so it emits directly rather than
+    // through the trigger's burst-debounce (which would double-gate it).
+    if (now - this.lastKeyframeAtMs > this.watchdogTimeoutMs && now >= this.nextWatchdogFireMs) {
       this.stats.watchdogFires += 1;
-      this.fire('watchdog');
+      this.emitKeyframeRequest('watchdog', 0);
+      this.watchdogBackoffMs = this.watchdogBackoffMs ? Math.min(this.watchdogBackoffMs * 2, 60000) : 2000;
+      this.nextWatchdogFireMs = now + this.watchdogBackoffMs;
     }
   }
 
@@ -201,6 +221,8 @@ export class StreamController {
     this.gapDetector.reset();
     this.trigger.reset();
     this.lastKeyframeAtMs = this.now();
+    this.watchdogBackoffMs = 0;
+    this.nextWatchdogFireMs = 0;
   }
 
   close(): void {
@@ -211,5 +233,10 @@ export class StreamController {
     this.pendingGap = gap;
     this.trigger.maybeFire(reason, gap);
     this.pendingGap = 0;
+  }
+
+  private emitKeyframeRequest(reason: KeyframeReason, gap: number): void {
+    this.stats.keyframeRequests += 1;
+    this.callbacks.requestKeyframe(reason, gap);
   }
 }

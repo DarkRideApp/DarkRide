@@ -94,7 +94,7 @@ describe('StreamController', () => {
     const { controller, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
     controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
     t = 1000 + 8001;
-    controller.checkWatchdog();
+    controller.tick();
     expect(requestKeyframe).toHaveBeenCalledWith('watchdog', 0);
   });
 
@@ -103,7 +103,7 @@ describe('StreamController', () => {
     const { controller, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
     controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
     t = 1000 + 5000;
-    controller.checkWatchdog();
+    controller.tick();
     expect(requestKeyframe).not.toHaveBeenCalled();
   });
 
@@ -114,8 +114,30 @@ describe('StreamController', () => {
     t = 1000 + 5000;
     controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 2)); // resets clock
     t = 1000 + 5000 + 5000; // 10s from start, but only 5s since last keyframe
-    controller.checkWatchdog();
+    controller.tick();
     expect(requestKeyframe).not.toHaveBeenCalled();
+  });
+
+  it('backs off the watchdog — does not fire on every tick while stalled', () => {
+    let t = 1000;
+    const { controller, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
+    controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
+    t = 1000 + 8001; controller.tick();      // fire #1
+    expect(requestKeyframe).toHaveBeenCalledTimes(1);
+    t += 1000; controller.tick();            // 1s later — inside 2s backoff, no fire
+    expect(requestKeyframe).toHaveBeenCalledTimes(1);
+    t += 2000; controller.tick();            // backoff elapsed — fire #2
+    expect(requestKeyframe).toHaveBeenCalledTimes(2);
+  });
+
+  it('resets watchdog backoff once a keyframe arrives again', () => {
+    let t = 1000;
+    const { controller, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
+    controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
+    t = 1000 + 8001; controller.tick();      // fire #1, backoff grows
+    controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 2)); // recovery resets backoff
+    t += 8001; controller.tick();            // 8s after recovery → fires promptly again
+    expect(requestKeyframe).toHaveBeenCalledTimes(2);
   });
 
   it('reset() makes the next frame a fresh reference (no spurious gap request)', () => {
@@ -136,31 +158,46 @@ describe('StreamController', () => {
     expect(getFake().closed).toBe(true);
   });
 
-  it('emits stats (fps, latency, queue depth) once the interval elapses', () => {
+  it('emits stats (fps, latency, queue depth) on tick', () => {
     let t = 1000;
     const onStats = vi.fn();
     let fake: FakeDecoder | null = null;
     const controller = new StreamController(
       { drawFrame: vi.fn() },
       { requestKeyframe: vi.fn(), onStats },
-      { createDecoder: (cb) => { fake = new FakeDecoder(cb); return fake; }, now: () => t, statsIntervalMs: 1000 },
+      { createDecoder: (cb) => { fake = new FakeDecoder(cb); return fake; }, now: () => t },
     );
     (fake as unknown as FakeDecoder).decodeQueueSize = 3;
     const frameAt = (latencyMs: number) => ({ timestamp: (t - latencyMs) * 1000, close: vi.fn() } as any);
 
     fake!.cb.onFrame(frameAt(40));
     fake!.cb.onFrame(frameAt(60));
-    expect(onStats).not.toHaveBeenCalled(); // window not elapsed yet
+    expect(onStats).not.toHaveBeenCalled(); // stats emit on tick, not on paint
 
-    t = 2001;
-    fake!.cb.onFrame(frameAt(50)); // crosses the 1s window → emit
+    t = 2000;
+    controller.tick(); // 1s window elapsed → emit
     expect(onStats).toHaveBeenCalledTimes(1);
     const s = onStats.mock.calls[0][0];
-    expect(s.frames).toBeGreaterThanOrEqual(2);
+    expect(s.frames).toBe(2);
+    expect(s.fps).toBeCloseTo(2, 0);
     expect(s.avgLatencyMs).toBeGreaterThan(0);
     expect(s.maxLatencyMs).toBeGreaterThanOrEqual(s.avgLatencyMs);
     expect(s.decodeQueueSize).toBe(3);
-    expect(s.fps).toBeGreaterThan(0);
+  });
+
+  it('emits stats even when no frames arrive (fps 0), so stalls are visible', () => {
+    let t = 1000;
+    const onStats = vi.fn();
+    const controller = new StreamController(
+      { drawFrame: vi.fn() },
+      { requestKeyframe: vi.fn(), onStats },
+      { createDecoder: (cb) => new FakeDecoder(cb), now: () => t },
+    );
+    t = 2000;
+    controller.tick();
+    expect(onStats).toHaveBeenCalledTimes(1);
+    expect(onStats.mock.calls[0][0].fps).toBe(0);
+    expect(onStats.mock.calls[0][0].frames).toBe(0);
   });
 
   it('surfaces a wire-version mismatch without throwing', () => {

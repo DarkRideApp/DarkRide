@@ -382,6 +382,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
         avgLatencyMs: Math.round(s.avgLatencyMs),
         maxLatencyMs: Math.round(s.maxLatencyMs),
         decodeQueue: s.decodeQueueSize,
+        msSinceLastFrame: s.msSinceLastFrame,
       });
     };
 
@@ -399,7 +400,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
         onWireVersionMismatch: (info) => console.error('[DeviceViewer] wire version mismatch — backend/frontend out of sync', { deviceId, ...info }),
         onStats: (s) => logStats('main', s),
       });
-      watchdogTimer = setInterval(() => controller.checkWatchdog(), 1000);
+      watchdogTimer = setInterval(() => controller.tick(), 1000);
       return {
         feedBinary: (d) => controller.feedBinary(d),
         reset: () => controller.reset(),

@@ -4,7 +4,7 @@ import { WATCHDOG_INTERVAL_MS, type WorkerInMsg, type WorkerOutMsg } from './str
 
 interface ControllerLike {
   feedBinary(data: ArrayBuffer): void;
-  checkWatchdog(): void;
+  tick(): void;
   reset(): void;
   close(): void;
 }
@@ -68,7 +68,7 @@ export function createStreamWorkerCore(
           },
           { now: deps.now },
         );
-        watchdog = setIntervalFn(() => controller?.checkWatchdog(), WATCHDOG_INTERVAL_MS);
+        watchdog = setIntervalFn(() => controller?.tick(), WATCHDOG_INTERVAL_MS);
         break;
       }
       case 'frame':

@@ -4,7 +4,7 @@ import type { StreamControllerCallbacks } from './stream-controller';
 
 function harness() {
   const post = vi.fn();
-  const controller = { feedBinary: vi.fn(), checkWatchdog: vi.fn(), reset: vi.fn(), close: vi.fn() };
+  const controller = { feedBinary: vi.fn(), tick: vi.fn(), reset: vi.fn(), close: vi.fn() };
   let captured: StreamControllerCallbacks | null = null;
   const renderer = { drawFrame: vi.fn(), drawBitmap: vi.fn() };
   let intervalFn: (() => void) | null = null;
@@ -52,11 +52,11 @@ describe('createStreamWorkerCore', () => {
     expect(h.renderer.drawBitmap).toHaveBeenCalledTimes(1);
   });
 
-  it('drives the watchdog on the interval tick', () => {
+  it('drives the controller tick on the interval', () => {
     const h = harness();
     h.core.handle({ type: 'init', canvas: CANVAS });
     h.getIntervalFn()();
-    expect(h.controller.checkWatchdog).toHaveBeenCalledTimes(1);
+    expect(h.controller.tick).toHaveBeenCalledTimes(1);
   });
 
   it('resets the controller on reset', () => {
@@ -68,7 +68,7 @@ describe('createStreamWorkerCore', () => {
 
   it('closes the controller and clears the watchdog on close', () => {
     const clearIntervalFn = vi.fn();
-    const controller = { feedBinary: vi.fn(), checkWatchdog: vi.fn(), reset: vi.fn(), close: vi.fn() };
+    const controller = { feedBinary: vi.fn(), tick: vi.fn(), reset: vi.fn(), close: vi.fn() };
     const core = createStreamWorkerCore(vi.fn(), {
       createController: () => controller,
       createRenderer: () => ({ drawFrame: vi.fn(), drawBitmap: vi.fn() }),
