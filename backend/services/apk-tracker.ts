@@ -35,9 +35,46 @@ const DENSITY_ORDER = ['xxxhdpi', 'xxhdpi', 'xhdpi', 'hdpi', 'mdpi'] as const;
 const ICON_SKIP_SUFFIXES = ['_round', '_foreground', '_background', '_monochrome'];
 
 /**
+ * Find the largest launcher raster in an APK's mipmap dirs, scanning densities
+ * highest-first and returning at the first density that has an accepted match.
+ * `accept` receives the extension-less basename (e.g. `ic_launcher`,
+ * `ic_launcher_foreground`) so callers can prefer flat icons over layers.
+ * Entries whose uncompressed size is ≤100 bytes are ignored (placeholders).
+ * Returns null when nothing matches.
+ */
+function pickBestLauncherEntry(
+  allEntries: AdmZip.IZipEntry[],
+  accept: (base: string) => boolean,
+): AdmZip.IZipEntry | null {
+  for (const density of DENSITY_ORDER) {
+    // Search both mipmap-${density}-v4/ (AAPT2 default) and mipmap-${density}/ (legacy)
+    const prefixes = [`res/mipmap-${density}-v4/`, `res/mipmap-${density}/`];
+
+    const candidates = allEntries.filter(e => {
+      const matchedPrefix = prefixes.find(p => e.entryName.startsWith(p));
+      if (!matchedPrefix) return false;
+      const name = e.entryName.slice(matchedPrefix.length);
+      if (!name.includes('launcher')) return false;
+      if (!(name.endsWith('.png') || name.endsWith('.webp'))) return false;
+      if (e.header.size <= 100) return false;
+      const base = name.replace(/\.(png|webp)$/, '');
+      return accept(base);
+    });
+
+    if (candidates.length === 0) continue;
+
+    // Pick the largest candidate (most likely the branded icon)
+    candidates.sort((a, b) => b.header.size - a.header.size);
+    return candidates[0];
+  }
+  return null;
+}
+
+/**
  * Extract the launcher icon from a local APK file (ZIP) on disk.
  * At each density, finds the largest *launcher* PNG/WebP (handles apps
- * that use custom names like `dlp_ic_launcher.png` instead of `ic_launcher.png`).
+ * that use custom names like `dlp_ic_launcher.png` instead of `ic_launcher.png`),
+ * falling back to the adaptive-icon foreground layer when no flat icon exists.
  * Returns true if an icon was saved.
  */
 export function extractIconFromLocalApk(packageName: string): boolean {
@@ -68,26 +105,16 @@ export function extractIconFromLocalApk(packageName: string): boolean {
     const zip = new AdmZip(safeJoinInside(pkgDir,apkFile));
     const allEntries = zip.getEntries();
 
-    for (const density of DENSITY_ORDER) {
-      // Search both mipmap-${density}-v4/ (AAPT2 default) and mipmap-${density}/ (legacy)
-      const prefixes = [`res/mipmap-${density}-v4/`, `res/mipmap-${density}/`];
+    // Prefer a flat launcher raster (the finished icon). If the app ships only
+    // an adaptive icon — an anydpi XML plus separate foreground/background
+    // layers, with no flat ic_launcher.png at any density — fall back to the
+    // foreground layer, which is the branded glyph. Without this fallback,
+    // adaptive-icon-only apps (the modern default) yield no icon at all.
+    const best =
+      pickBestLauncherEntry(allEntries, base => !ICON_SKIP_SUFFIXES.some(s => base.endsWith(s))) ||
+      pickBestLauncherEntry(allEntries, base => base.endsWith('_foreground'));
 
-      // Find all launcher icon candidates at this density across both prefix variants
-      const candidates = allEntries.filter(e => {
-        const matchedPrefix = prefixes.find(p => e.entryName.startsWith(p));
-        if (!matchedPrefix) return false;
-        const name = e.entryName.slice(matchedPrefix.length);
-        if (!name.includes('launcher')) return false;
-        if (!(name.endsWith('.png') || name.endsWith('.webp'))) return false;
-        const base = name.replace(/\.(png|webp)$/, '');
-        return !ICON_SKIP_SUFFIXES.some(s => base.endsWith(s));
-      });
-
-      if (candidates.length === 0) continue;
-
-      // Pick the largest candidate (most likely the branded icon)
-      candidates.sort((a, b) => b.header.size - a.header.size);
-      const best = candidates[0];
+    if (best) {
       const buf = best.getData();
       if (buf.length > 100) {
         const ext = best.entryName.endsWith('.webp') ? 'webp' : 'png';
@@ -128,6 +155,37 @@ export async function fetchIconFromGooglePlay(packageName: string): Promise<bool
     log(`Fetched icon for ${packageName} from Google Play`);
     return true;
   } catch { return false; }
+}
+
+/**
+ * Fetch an app icon from the remote stores the app is tracked on.
+ *
+ * Iterates the app's enabled `app_sources` rows and asks each source that
+ * implements `fetchIcon` until a store returns an icon. This is the reliable
+ * path for apps that ship only an adaptive icon (nothing to extract locally)
+ * and aren't on Google Play — most notably the China-store apps this project
+ * tracks (QQ, Huawei, Xiaomi). Best-effort: returns false if no source has an
+ * icon or none is configured.
+ */
+export async function fetchIconFromSources(
+  db: AppDatabase,
+  registry: SourceRegistry | null | undefined,
+  packageName: string,
+): Promise<boolean> {
+  if (!registry) return false;
+  const app = db.select().from(trackedApps).where(eq(trackedApps.packageName, packageName)).all()[0];
+  if (!app) return false;
+  const rows = db.select().from(appSources)
+    .where(and(eq(appSources.trackedAppId, app.id), eq(appSources.enabled, true)))
+    .all();
+  for (const row of rows) {
+    const source = registry.get(row.source);
+    if (!source?.fetchIcon) continue;
+    try {
+      if (await source.fetchIcon(packageName)) return true;
+    } catch { /* try the next source */ }
+  }
+  return false;
 }
 
 /**
@@ -666,7 +724,11 @@ export class ApkTracker {
     // Method 2: Extract from local APK file
     if (extractIconFromLocalApk(packageName)) return;
 
-    // Method 3: Fetch from Google Play Store
+    // Method 3: Fetch from the stores this app is tracked on (branded icon,
+    // works for adaptive-icon apps and China-store apps not on Google Play).
+    if (await fetchIconFromSources(this.db, this.sourceRegistry, packageName)) return;
+
+    // Method 4: Fetch from Google Play Store
     await fetchIconFromGooglePlay(packageName);
   }
 }
