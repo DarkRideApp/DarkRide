@@ -13,6 +13,7 @@ import { StreamController } from '../../lib/video/stream-controller';
 import { createCanvasRenderer } from '../../lib/video/canvas-renderer';
 import { createStreamWorkerClient } from '../../lib/video/stream-worker-client';
 import type { KeyframeReason } from '../../lib/video/keyframe-trigger';
+import { streamWorkerEnabled, supportsOffscreenWorker } from '../../lib/video/worker-support';
 import { VideoHealthIndicator, HealthState } from './VideoHealthIndicator';
 import { VideoQualitySelector } from './VideoQualitySelector';
 import { EmulatorVideo, type EmulatorVideoHandle } from '../../lib/video/EmulatorVideo';
@@ -138,19 +139,6 @@ interface StreamSink {
   feedJpeg?(data: ArrayBuffer): void;
   reset(): void;
   close(): void;
-}
-
-/** Opt-in flag (off by default) for the experimental off-main-thread decode
- *  path. Enable per-browser with localStorage 'darkride:stream-worker' = '1'. */
-function streamWorkerEnabled(): boolean {
-  try { return localStorage.getItem('darkride:stream-worker') === '1'; } catch { return false; }
-}
-
-function supportsOffscreenWorker(): boolean {
-  return typeof Worker !== 'undefined'
-    && typeof OffscreenCanvas !== 'undefined'
-    && typeof HTMLCanvasElement !== 'undefined'
-    && typeof HTMLCanvasElement.prototype.transferControlToOffscreen === 'function';
 }
 
 function base64ToArrayBuffer(b64: string): ArrayBuffer | null {
@@ -365,9 +353,10 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
     });
   }, [ws, deviceId, isEmulator]);
 
-  // scrcpy H.264 path via WebCodecs. Frames drain into a StreamSink: either the
-  // main-thread StreamController, or (opt-in) a Worker that decodes and paints
-  // on an OffscreenCanvas so React re-renders can't stutter the video.
+  // scrcpy H.264 path via WebCodecs. Frames drain into a StreamSink: by default
+  // a Worker that decodes and paints on an OffscreenCanvas (so React re-renders
+  // can't stutter the video), or the main-thread StreamController when the
+  // worker is unsupported, opted out ('darkride:stream-worker'='0'), or fell back.
   const sinkRef = useRef<StreamSink | null>(null);
   // Set once when the worker path is abandoned (init threw, or it produced no
   // frames). Forces subsequent runs onto the main thread for this component.
@@ -412,10 +401,14 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
     if (useWorker && canvasRef.current) {
       try {
         workerRenderedRef.current = false;
+        console.info('[DeviceViewer] video decode path: worker (OffscreenCanvas)', { deviceId });
         sink = createStreamWorkerClient(canvasRef.current, {
           onKeyframe: (reason) => requestKeyframe(reason),
           onConfig: () => setReconnecting(false),
-          onRendered: () => { workerRenderedRef.current = true; },
+          onRendered: () => {
+            workerRenderedRef.current = true;
+            console.info('[DeviceViewer] stream worker painted first frame', { deviceId });
+          },
         });
         // Self-heal: if the worker never paints a frame, abandon it and remount
         // onto the main-thread path so the user is never left on a black canvas.
@@ -432,6 +425,10 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
         sink = makeMainThreadSink();
       }
     } else {
+      const reason = !streamWorkerEnabled() ? 'disabled'
+        : !supportsOffscreenWorker() ? 'unsupported'
+        : workerDisabledRef.current ? 'fell-back' : 'no-canvas';
+      console.info('[DeviceViewer] video decode path: main thread', { deviceId, reason });
       sink = makeMainThreadSink();
     }
     sinkRef.current = sink;
