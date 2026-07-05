@@ -1,7 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import type { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import '@xterm/xterm/css/xterm.css';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import { createShellTerminal } from '../terminal/createShellTerminal';
 

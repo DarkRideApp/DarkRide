@@ -118,4 +118,9 @@ describe('AdbShell', () => {
     expect(subscribedTypes).toContain('adb-shell/output');
     expect(subscribedTypes).toContain('adb-shell/exit');
   });
+
+  it('does NOT allow OSC 52 clipboard auto-copy (a connected device is untrusted output)', () => {
+    renderAdbShell();
+    expect(mockTerminal.parser.registerOscHandler).not.toHaveBeenCalled();
+  });
 });

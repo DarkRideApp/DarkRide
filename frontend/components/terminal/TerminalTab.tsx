@@ -1,7 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import type { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import '@xterm/xterm/css/xterm.css';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import { createShellTerminal } from './createShellTerminal';
 
@@ -35,7 +34,11 @@ export function TerminalTab({ sessionId, type, deviceId, initialCommand, visible
     const container = containerRef.current;
     if (!container) return;
 
-    const terminal = createShellTerminal();
+    // OSC 52 clipboard auto-copy is only safe for the host shell — its PTY output
+    // is the operator's own local shell. A device's ADB shell can be driven by an
+    // untrusted/compromised app, so it never gets to write to the OS clipboard on
+    // its own; the operator can still explicitly select+copy text either way.
+    const terminal = createShellTerminal({ allowOscClipboardWrite: type === 'host' });
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
     terminal.open(container);

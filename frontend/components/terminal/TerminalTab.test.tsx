@@ -164,4 +164,14 @@ describe('TerminalTab', () => {
     expect(onExit).toHaveBeenCalledTimes(1);
     expect(mockTerminal.write).toHaveBeenCalledWith(expect.stringContaining('exit code: 0'));
   });
+
+  it('allows OSC 52 clipboard auto-copy for the host shell (trusted local shell)', () => {
+    renderTab({ type: 'host' });
+    expect(mockTerminal.parser.registerOscHandler).toHaveBeenCalledWith(52, expect.any(Function));
+  });
+
+  it('does NOT allow OSC 52 clipboard auto-copy for a device shell (untrusted device output)', () => {
+    renderTab({ type: 'device', deviceId: 'DEV001' });
+    expect(mockTerminal.parser.registerOscHandler).not.toHaveBeenCalled();
+  });
 });
