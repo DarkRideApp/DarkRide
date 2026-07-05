@@ -89,9 +89,10 @@ describe('StreamController', () => {
     expect(requestKeyframe).toHaveBeenCalledWith('decode-error', 0);
   });
 
-  it('fires a watchdog keyframe request when no keyframe arrives within the timeout', () => {
+  it('fires a watchdog request when nothing paints within the timeout', () => {
     let t = 1000;
     const { controller, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
+    // A keyframe lands on the wire but never decodes/paints — viewer is stuck.
     controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
     t = 1000 + 8001;
     controller.tick();
@@ -107,21 +108,48 @@ describe('StreamController', () => {
     expect(requestKeyframe).not.toHaveBeenCalled();
   });
 
-  it('a fresh KEYFRAME resets the watchdog clock', () => {
+  it('a painted frame resets the watchdog clock', () => {
     let t = 1000;
-    const { controller, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
+    const { controller, getFake, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
     controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
     t = 1000 + 5000;
-    controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 2)); // resets clock
-    t = 1000 + 5000 + 5000; // 10s from start, but only 5s since last keyframe
+    getFake().cb.onFrame({ close: vi.fn() } as any); // a paint resets the clock
+    t = 1000 + 5000 + 5000; // 10s from start, but only 5s since last paint
     controller.tick();
     expect(requestKeyframe).not.toHaveBeenCalled();
   });
 
-  it('backs off the watchdog — does not fire on every tick while stalled', () => {
+  it('does NOT fire the watchdog while frames keep painting (live static screen)', () => {
+    // Regression: a static-but-live screen (occasional delta) must not be
+    // mistaken for a stall and hammered with RESET_VIDEO every timeout.
+    let t = 1000;
+    const { controller, getFake, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
+    controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
+    getFake().cb.onFrame({ close: vi.fn() } as any); // initial paint
+    // 60s of near-idle: a delta paints every 3s (< 8s timeout), tick every 1s.
+    for (let i = 0; i < 60; i++) {
+      t += 1000;
+      controller.tick();
+      if (i % 3 === 0) getFake().cb.onFrame({ close: vi.fn() } as any);
+    }
+    expect(requestKeyframe).not.toHaveBeenCalled();
+  });
+
+  it('probes only once paint actually stops (genuine freeze)', () => {
+    let t = 1000;
+    const { controller, getFake, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
+    controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
+    getFake().cb.onFrame({ close: vi.fn() } as any); // paint at t=1000
+    t += 5000; controller.tick(); // 5s since paint — still healthy, no fire
+    expect(requestKeyframe).not.toHaveBeenCalled();
+    t += 4000; controller.tick(); // 9s since paint — frozen → probe
+    expect(requestKeyframe).toHaveBeenCalledWith('watchdog', 0);
+  });
+
+  it('backs off the watchdog — does not fire on every tick while frozen', () => {
     let t = 1000;
     const { controller, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
-    controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
+    controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1)); // never paints
     t = 1000 + 8001; controller.tick();      // fire #1
     expect(requestKeyframe).toHaveBeenCalledTimes(1);
     t += 1000; controller.tick();            // 1s later — inside 2s backoff, no fire
@@ -130,13 +158,13 @@ describe('StreamController', () => {
     expect(requestKeyframe).toHaveBeenCalledTimes(2);
   });
 
-  it('resets watchdog backoff once a keyframe arrives again', () => {
+  it('resets watchdog backoff once a frame paints again', () => {
     let t = 1000;
-    const { controller, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
+    const { controller, getFake, requestKeyframe } = setup({ now: () => t, watchdogTimeoutMs: 8000 });
     controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 1));
-    t = 1000 + 8001; controller.tick();      // fire #1, backoff grows
-    controller.feedBinary(makeFrame(FrameMsgType.KEYFRAME, 2)); // recovery resets backoff
-    t += 8001; controller.tick();            // 8s after recovery → fires promptly again
+    t = 1000 + 8001; controller.tick();      // fire #1 (never painted), backoff grows
+    getFake().cb.onFrame({ close: vi.fn() } as any); // paint → recovery resets backoff + clock
+    t += 8001; controller.tick();            // 8s after paint → fires promptly again
     expect(requestKeyframe).toHaveBeenCalledTimes(2);
   });
 

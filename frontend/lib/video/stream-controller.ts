@@ -82,8 +82,12 @@ export class StreamController {
   private readonly trigger: KeyframeTrigger;
   private readonly now: () => number;
   private readonly watchdogTimeoutMs: number;
-  private lastKeyframeAtMs: number;
+  private startedAtMs: number;
   private pendingGap = 0;
+  /** Timestamp of the last painted (decoded) frame; 0 until the first paint.
+   *  The watchdog anchors to this: a live stream — even a static screen still
+   *  emitting the occasional delta — keeps painting, so no keyframe is forced.
+   *  Only a genuine freeze (no paint for watchdogTimeoutMs) triggers a probe. */
   private lastFrameAtMs = 0;
   private statsWindowStartMs: number;
   private statsFrames = 0;
@@ -106,8 +110,8 @@ export class StreamController {
   ) {
     this.now = deps.now ?? (() => Date.now());
     this.watchdogTimeoutMs = deps.watchdogTimeoutMs ?? 8000;
-    this.lastKeyframeAtMs = this.now();
-    this.statsWindowStartMs = this.lastKeyframeAtMs;
+    this.startedAtMs = this.now();
+    this.statsWindowStartMs = this.startedAtMs;
 
     this.trigger = new KeyframeTrigger((reason) => {
       this.emitKeyframeRequest(reason, this.pendingGap);
@@ -126,8 +130,14 @@ export class StreamController {
    *  uses the VideoFrame timestamp (µs) carried through from capture. The
    *  sample is emitted later by tick(), so stalls (no frames) still report. */
   private handleDecoded(frame: VideoFrame): void {
+    // A painted frame is the definitive "stream is alive" signal: anchor the
+    // watchdog here and clear any stall backoff so a later genuine freeze
+    // probes promptly.
+    const t = this.now();
+    this.lastFrameAtMs = t;
+    this.watchdogBackoffMs = 0;
+    this.nextWatchdogFireMs = 0;
     if (this.callbacks.onStats) {
-      const t = this.now();
       const ts = frame.timestamp;
       if (typeof ts === 'number' && ts > 0) {
         const latency = t - ts / 1000;
@@ -136,7 +146,6 @@ export class StreamController {
         this.statsLatencyCount += 1;
       }
       this.statsFrames += 1;
-      this.lastFrameAtMs = t;
     }
     this.renderer.drawFrame(frame);
   }
@@ -173,10 +182,9 @@ export class StreamController {
 
     if (frame.msgType === FrameMsgType.CONFIG) this.callbacks.onConfig?.();
     if (frame.msgType === FrameMsgType.KEYFRAME) {
-      this.lastKeyframeAtMs = this.now();
-      // Recovery: stream is healthy again, so reset the watchdog backoff.
-      this.watchdogBackoffMs = 0;
-      this.nextWatchdogFireMs = 0;
+      // Watchdog recovery is anchored to the next painted frame (handleDecoded),
+      // not merely to a keyframe landing on the wire — a keyframe that never
+      // decodes shouldn't silence the liveness probe.
       this.callbacks.onKeyframe?.();
     }
     this.decoder.push(frame);
@@ -206,9 +214,14 @@ export class StreamController {
       this.statsLatencyCount = 0;
     }
 
-    // The watchdog has its own backoff, so it emits directly rather than
-    // through the trigger's burst-debounce (which would double-gate it).
-    if (now - this.lastKeyframeAtMs > this.watchdogTimeoutMs && now >= this.nextWatchdogFireMs) {
+    // Watchdog: probe for liveness only when nothing has painted for the
+    // timeout — a genuine freeze. A live-but-static screen keeps painting
+    // (occasional deltas), so this stays silent instead of forcing a keyframe
+    // every timeout. Anchored to the first paint via startedAtMs until then, so
+    // a viewer that never decodes still probes. Own backoff (emits directly,
+    // not through the trigger's burst-debounce) so a dead stream isn't hammered.
+    const idleSinceMs = this.lastFrameAtMs || this.startedAtMs;
+    if (now - idleSinceMs > this.watchdogTimeoutMs && now >= this.nextWatchdogFireMs) {
       this.stats.watchdogFires += 1;
       this.emitKeyframeRequest('watchdog', 0);
       this.watchdogBackoffMs = this.watchdogBackoffMs ? Math.min(this.watchdogBackoffMs * 2, 60000) : 2000;
@@ -220,7 +233,8 @@ export class StreamController {
   reset(): void {
     this.gapDetector.reset();
     this.trigger.reset();
-    this.lastKeyframeAtMs = this.now();
+    this.startedAtMs = this.now();
+    this.lastFrameAtMs = 0;
     this.watchdogBackoffMs = 0;
     this.nextWatchdogFireMs = 0;
   }

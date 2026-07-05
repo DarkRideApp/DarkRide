@@ -145,29 +145,75 @@ export async function ensureMinitouch(arch: string): Promise<string> {
   return binary;
 }
 
-const SCRCPY_VERSION = '3.3.1';
+/**
+ * scrcpy-server version we spawn on the device. Must be >= 3.3.3: earlier
+ * servers crash at stream start on Android 16 / API 36 with an
+ * AbstractMethodError on IDisplayWindowListener (new framework callback the
+ * older server doesn't implement) → SIGABRT (exit 134), which manifests as
+ * choppy/delayed video from the crash-restart loop. See backend/vendor/scrcpy.
+ *
+ * The version string here is also passed as the first arg to
+ * com.genymobile.scrcpy.Server; scrcpy aborts if it doesn't match the jar's
+ * own BuildConfig version, so keep it in lockstep with the vendored jar.
+ */
+export const SCRCPY_VERSION = '3.3.4';
 
 /**
- * Get the scrcpy-server jar path from @u4/minicap-prebuilt.
+ * Locate a repo-vendored scrcpy server jar (versions newer than
+ * @u4/minicap-prebuilt ships). Walks up from this module's directory looking
+ * for `backend/vendor/scrcpy/<jar>` (or `vendor/scrcpy/<jar>` when running from
+ * within the backend source tree). This resolves correctly both in dev (tsx
+ * against source, __dirname = backend/services) and in a compiled prod build
+ * (node dist/backend/index.js, __dirname = dist/backend/services) — the repo
+ * checkout always has backend/vendor/ alongside dist/, so the walk-up finds it.
+ */
+function findVendoredScrcpyJar(fileName: string): string | null {
+  let dir = __dirname;
+  while (dir !== dirname(dir)) {
+    for (const candidate of [
+      resolve(dir, 'backend', 'vendor', 'scrcpy', fileName),
+      resolve(dir, 'vendor', 'scrcpy', fileName),
+    ]) {
+      if (existsSync(candidate)) return candidate;
+    }
+    dir = dirname(dir);
+  }
+  return null;
+}
+
+/**
+ * Get the scrcpy-server jar path. Prefers the repo-vendored jar (required for
+ * 3.3.3+, which @u4/minicap-prebuilt does not bundle), falling back to the
+ * jars bundled by @u4/minicap-prebuilt for older versions.
  * scrcpy-server works on all Android versions (API 21+) and replaces minicap
  * for devices where minicap's native .so is incompatible (API 31+).
  */
 export function getScrcpyServerJar(): string {
   log(`Resolving scrcpy-server v${SCRCPY_VERSION} jar`);
 
+  // 1) Repo-vendored jar (Android 16 / API 36 support lives here).
+  const vendored = findVendoredScrcpyJar(`scrcpy-server-v${SCRCPY_VERSION}.jar`);
+  if (vendored) {
+    log(`scrcpy-server jar (vendored): ${vendored}`);
+    return vendored;
+  }
+
+  // 2) Fall back to @u4/minicap-prebuilt's bundled jars (older versions only).
   try {
     const jar = resolve(
       packageDir('@u4/minicap-prebuilt'),
       'prebuilt', 'scrcpy', `scrcpy-server-v${SCRCPY_VERSION}.jar`,
     );
     if (existsSync(jar)) {
-      log(`scrcpy-server jar: ${jar}`);
+      log(`scrcpy-server jar (minicap-prebuilt): ${jar}`);
       return jar;
     }
-    error(`scrcpy-server jar not found at ${jar}`);
+    error(`scrcpy-server jar not found in backend/vendor/scrcpy or at ${jar}`);
   } catch {
-    error(`@u4/minicap-prebuilt not installed — cannot resolve scrcpy-server`);
+    error(`@u4/minicap-prebuilt not installed and no vendored jar in backend/vendor/scrcpy`);
   }
 
-  throw new Error(`scrcpy-server v${SCRCPY_VERSION} jar not found. Install @u4/minicap-prebuilt`);
+  throw new Error(
+    `scrcpy-server v${SCRCPY_VERSION} jar not found (looked in backend/vendor/scrcpy and @u4/minicap-prebuilt)`,
+  );
 }

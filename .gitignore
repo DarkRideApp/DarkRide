@@ -11,6 +11,11 @@ data/apks/*
 *.db-wal
 coverage/
 vendor/
+# ...but track the vendored scrcpy-server jars (3.3.3+ Android 16/API 36 fix,
+# not bundled by @u4/minicap-prebuilt). See backend/services/vendor-manager.ts.
+!backend/vendor/
+!backend/vendor/scrcpy/
+!backend/vendor/scrcpy/*.jar
 .venv/
 python/__pycache__/
 scripts/__pycache__/

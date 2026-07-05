@@ -7,7 +7,7 @@ import type { WebSocket } from 'ws';
 import { registerWebsocketEndpoint } from './handlers';
 import { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
-import { ensureMinicap, ensureMinitouch, getScrcpyServerJar } from '../services/vendor-manager';
+import { ensureMinicap, ensureMinitouch, getScrcpyServerJar, SCRCPY_VERSION } from '../services/vendor-manager';
 import { createLoggers } from '../logs';
 import { StreamBroadcaster } from './h264/stream-broadcaster';
 import { newAdapterState, onReset, onTick, bitrateForTier, AdapterState } from './h264/bitrate-adapter';
@@ -82,6 +82,28 @@ async function pushIfNeeded(deviceId: string, localPath: string, remotePath: str
 const STREAM_PORT_START = 9200;
 const STREAM_PORT_END = 9399;
 let nextPort = STREAM_PORT_START;
+
+/**
+ * Cap scrcpy's capture/encode rate. High-refresh devices (the Pixel 7 Pro here
+ * is 120 Hz) burst to 100+ fps under motion, which (a) overruns a ~60 Hz client
+ * — frames pile up in the decoder queue and latency climbs to seconds — and
+ * (b) keeps the device's display-capture + H.264 encoder pinned, which on this
+ * hardware correlates with the ADB/USB link degrading (ingest sagging to a few
+ * fps) and occasionally dropping the device off the bus entirely.
+ *
+ * 30 fps is smooth for device viewing/control, halves the encode + USB + client
+ * decode load versus 60, and trades peak fluidity for stability. Raise back to
+ * 60 on a setup with a rock-solid USB connection and a fast client.
+ */
+const SCRCPY_MAX_FPS = 30;
+
+/**
+ * Auto bitrate up-step opportunistically raises quality after a healthy window,
+ * but bitrate can only change by respawning scrcpy — a multi-second dropout
+ * every ~90s. Disabled for seamlessness: the stream holds its tier and only
+ * ever steps *down* on real congestion (which is a genuine recovery, not
+ * gratuitous). Users can still pin a higher tier manually. */
+const AUTO_BITRATE_UPSTEP = false;
 
 /**
  * Poll interval for the adb-screencap fallback stream. ADB exec-out
@@ -201,6 +223,12 @@ interface DeviceStream {
   minitouchSocket: Socket | null;
   scrcpyProcess: ChildProcess | null;
   broadcaster: StreamBroadcaster | null;
+  /** True once the current scrcpy capture has produced >=1 H.264 frame.
+   *  Reset to false on every (re)attach of the scrcpy pipeline. Used to gate
+   *  the join-time RESET_VIDEO: scrcpy 3.3.4 throws an NPE (null
+   *  SurfaceCapture.CaptureListener) and dies if a RESET_VIDEO arrives before
+   *  capture is live. A fresh start emits its own initial IDR anyway. */
+  captureReady: boolean;
   scrcpyPort: number;
   hasLiveVideo: boolean;
   screenWidth: number;
@@ -689,6 +717,8 @@ function attachScrcpyExitHandler(deviceId: string, stream: DeviceStream, proc: C
  * and pipes raw Annex-B H.264 data from the socket into the broadcaster.
  */
 export function attachScrcpyH264Pipeline(stream: DeviceStream, scrcpySocket: Socket): void {
+  // Fresh capture: the join-keyframe gate stays closed until the first frame.
+  stream.captureReady = false;
   if (!stream.broadcaster) {
     stream.broadcaster = new StreamBroadcaster(() => Date.now(), {
       onResetRequested: (viewerId) => {
@@ -699,6 +729,16 @@ export function attachScrcpyH264Pipeline(stream: DeviceStream, scrcpySocket: Soc
         // A viewer just joined — ask scrcpy for an immediate IDR so its first
         // decodable frame lands within the coordinator's rate-limit window
         // instead of waiting up to a full GOP. Coalesced across rapid joins.
+        //
+        // But only once capture is live: scrcpy 3.3.4 dereferences a still-null
+        // SurfaceCapture.CaptureListener if a RESET_VIDEO lands before the first
+        // frame (fresh start or mid-restart), throwing an NPE that kills the
+        // server (SIGKILL / exit 137). A fresh start emits its own initial IDR,
+        // so a viewer joining before then loses nothing by us skipping this.
+        if (!stream.captureReady) {
+          log(`keyframe-request ${stream.deviceId} viewer=${viewerId} reason=join action=skipped (capture not ready)`);
+          return;
+        }
         const action = stream.keyframeCoordinator.request();
         log(`keyframe-request ${stream.deviceId} viewer=${viewerId} reason=join action=${action}`);
       },
@@ -717,6 +757,8 @@ export function attachScrcpyH264Pipeline(stream: DeviceStream, scrcpySocket: Soc
   scrcpySocket.on('data', (chunk: Buffer) => {
     if (h264BytesReceived === 0) {
       log(`scrcpy: first H.264 data received for ${stream.deviceId} (${chunk.length} bytes)`);
+      // Capture is live — safe to honor join-time RESET_VIDEO from here on.
+      stream.captureReady = true;
     }
     h264BytesReceived += chunk.length;
     stream.broadcaster?.ingest(chunk);
@@ -762,6 +804,7 @@ function triggerStreamReset(stream: DeviceStream, reason: 'congestion' | 'manual
 }
 
 function startBitrateUpstepTimer(stream: DeviceStream): void {
+  if (!AUTO_BITRATE_UPSTEP) return;  // seamless: never respawn scrcpy just to raise bitrate
   if (stream.bitrateUpstepTimer) return;
   stream.bitrateUpstepTimer = setInterval(() => {
     if (!stream.broadcaster) return;
@@ -811,11 +854,11 @@ async function tryStartScrcpy(deviceId: string, stream: DeviceStream, props: Dev
 
     // Start scrcpy-server on device
     const bitrate = bitrateForTier(stream.bitrateState.tier);
-    log(`Starting scrcpy-server on ${deviceId} (port ${scrcpyPort}, max_size=${maxSize}, tier=${stream.bitrateState.tier}, bitrate=${bitrate})`);
+    log(`Starting scrcpy-server on ${deviceId} (port ${scrcpyPort}, max_size=${maxSize}, max_fps=${SCRCPY_MAX_FPS}, tier=${stream.bitrateState.tier}, bitrate=${bitrate})`);
     const scrcpyProcess = spawn('adb', [
       '-s', deviceId, 'shell',
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar',
-      'app_process', '/', 'com.genymobile.scrcpy.Server', '3.3.1',
+      'app_process', '/', 'com.genymobile.scrcpy.Server', SCRCPY_VERSION,
       'tunnel_forward=true',
       'audio=false',
       'control=true',
@@ -824,6 +867,7 @@ async function tryStartScrcpy(deviceId: string, stream: DeviceStream, props: Dev
       'stay_awake=true',
       'power_off_on_close=false',
       `max_size=${maxSize}`,
+      `max_fps=${SCRCPY_MAX_FPS}`,
       `video_bit_rate=${bitrateForTier(stream.bitrateState.tier)}`,
       'video_codec_options=i-frame-interval=2',
     ]);
@@ -1062,6 +1106,7 @@ async function startDeviceStream(deviceId: string, deviceManager: DeviceManager)
     minitouchSocket: null,
     scrcpyProcess: null,
     broadcaster: null,
+    captureReady: false,
     scrcpyPort: 0,
     hasLiveVideo: false,
     screenWidth: props.screenWidth,

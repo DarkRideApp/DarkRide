@@ -5,6 +5,7 @@ import {
   translateCoordinates,
   MinicapBanner,
   hasActiveViewers,
+  attachScrcpyH264Pipeline,
   __setPendingForTest,
 } from './live-stream';
 import { newAdapterState } from './h264/bitrate-adapter';
@@ -631,5 +632,73 @@ describe('keyframe-request integration', () => {
     });
     coordinator.request();
     expect(fakeSocket.write).not.toHaveBeenCalled();
+  });
+});
+
+describe('join keyframe gating (capture-ready)', () => {
+  // scrcpy 3.3.4 NPEs (SurfaceCapture.CaptureListener is null → SIGKILL) if a
+  // RESET_VIDEO arrives before the capture pipeline has produced its first
+  // frame. The join-time keyframe request must therefore be suppressed until
+  // capture is confirmed live (>=1 H.264 frame received). A fresh scrcpy start
+  // already emits its own initial IDR, so the joining viewer loses nothing.
+  function fakeControlSocket() {
+    const writes: Buffer[] = [];
+    return { writable: true, write: (b: Buffer) => { writes.push(b); }, writes };
+  }
+
+  function buildJoinStream() {
+    const control = fakeControlSocket();
+    const stream: any = {
+      deviceId: 'dev_join',
+      broadcaster: null,
+      captureReady: false,
+      viewers: new Map(),
+      scrcpyControlSocket: control,
+      keyframeCoordinator: new KeyframeCoordinator(() => {
+        if (control.writable) control.write(Buffer.from([RESET_VIDEO_BYTE]));
+      }),
+    };
+    const dataHandlers: ((c: Buffer) => void)[] = [];
+    const fakeVideoSocket: any = {
+      on: (ev: string, cb: any) => { if (ev === 'data') dataHandlers.push(cb); },
+    };
+    return { stream, control, dataHandlers, fakeVideoSocket };
+  }
+
+  it('suppresses the join RESET_VIDEO before the first frame, allows it after', () => {
+    const { stream, control, dataHandlers, fakeVideoSocket } = buildJoinStream();
+    attachScrcpyH264Pipeline(stream, fakeVideoSocket);
+
+    // Viewer joins a freshly-started stream, before any frame — must NOT reset.
+    stream.broadcaster.addViewer('v1', { readyState: 1, send: vi.fn() } as any);
+    expect(control.writes.length).toBe(0);
+
+    // First H.264 bytes arrive → capture is live.
+    dataHandlers.forEach((h) => h(Buffer.from([0, 0, 0, 1, 0x67])));
+    expect(stream.captureReady).toBe(true);
+
+    // A later viewer joining the running stream still gets its fast IDR.
+    stream.broadcaster.addViewer('v2', { readyState: 1, send: vi.fn() } as any);
+    expect(control.writes.length).toBe(1);
+    expect(control.writes[0][0]).toBe(RESET_VIDEO_BYTE);
+  });
+
+  it('resets capture-ready on each pipeline (re)attach so restarts stay guarded', () => {
+    const { stream, control, dataHandlers, fakeVideoSocket } = buildJoinStream();
+    attachScrcpyH264Pipeline(stream, fakeVideoSocket);
+    dataHandlers.forEach((h) => h(Buffer.from([0, 0, 0, 1, 0x67])));
+    expect(stream.captureReady).toBe(true);
+
+    // Simulate an intentional restart re-attaching a new video socket.
+    const dataHandlers2: ((c: Buffer) => void)[] = [];
+    const fakeVideoSocket2: any = {
+      on: (ev: string, cb: any) => { if (ev === 'data') dataHandlers2.push(cb); },
+    };
+    attachScrcpyH264Pipeline(stream, fakeVideoSocket2);
+    expect(stream.captureReady).toBe(false);
+
+    // Existing viewers re-added during capture reinit must not reset either.
+    stream.broadcaster.addViewer('v3', { readyState: 1, send: vi.fn() } as any);
+    expect(control.writes.length).toBe(0);
   });
 });

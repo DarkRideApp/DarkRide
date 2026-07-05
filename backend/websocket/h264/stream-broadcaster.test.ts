@@ -75,14 +75,18 @@ describe('StreamBroadcaster', () => {
     expect(ws.send).not.toHaveBeenCalled();
   });
 
-  it('emits onResetRequested when a viewer hits hard cap', () => {
+  it('drops (never resets the stream) for a viewer buried past hard cap', () => {
+    // A single slow viewer must not restart the shared encoder — it just gets
+    // its frames dropped until it catches up and resyncs on a keyframe.
     const onReset = vi.fn();
     const bc = new StreamBroadcaster(() => 1000, { onResetRequested: onReset });
-    const ws = makeWS(9 * 1024 * 1024); // above HARD_CAP
+    const ws = makeWS(9 * 1024 * 1024); // way above HARD_CAP
     bc.addViewer('v1', ws as any);
+    ws.send.mockClear();
 
     bc.ingest(Buffer.concat([sc4, nalHeader(1), Buffer.from([0xdd])]));
-    expect(onReset).toHaveBeenCalledWith('v1');
+    expect(onReset).not.toHaveBeenCalled();
+    expect(ws.send).not.toHaveBeenCalled();
   });
 
   it('removeViewer stops sending to that viewer', () => {

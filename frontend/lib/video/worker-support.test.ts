@@ -4,23 +4,23 @@ import { streamWorkerEnabled, supportsOffscreenWorker } from './worker-support';
 describe('streamWorkerEnabled', () => {
   beforeEach(() => { try { localStorage.clear(); } catch { /* ignore */ } });
 
-  it('defaults to ON when the flag is unset', () => {
-    expect(streamWorkerEnabled()).toBe(true);
-  });
-
-  it('is OFF when explicitly opted out with "0"', () => {
-    localStorage.setItem('darkride:stream-worker', '0');
+  it('defaults to OFF when the flag is unset', () => {
     expect(streamWorkerEnabled()).toBe(false);
   });
 
-  it('stays ON for any non-"0" value', () => {
+  it('is ON only when explicitly opted in with "1"', () => {
     localStorage.setItem('darkride:stream-worker', '1');
     expect(streamWorkerEnabled()).toBe(true);
   });
 
-  it('defaults to ON when localStorage is unavailable', () => {
+  it('stays OFF for any non-"1" value', () => {
+    localStorage.setItem('darkride:stream-worker', '0');
+    expect(streamWorkerEnabled()).toBe(false);
+  });
+
+  it('defaults to OFF when localStorage is unavailable', () => {
     const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('blocked'); });
-    expect(streamWorkerEnabled()).toBe(true);
+    expect(streamWorkerEnabled()).toBe(false);
     spy.mockRestore();
   });
 });
