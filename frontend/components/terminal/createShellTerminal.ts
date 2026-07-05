@@ -1,6 +1,7 @@
 import { Terminal, type ITerminalOptions } from '@xterm/xterm';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
+import { notifyClipboardCopied } from './clipboardEvents';
 
 const DEFAULT_OPTIONS: ITerminalOptions = {
   cursorBlink: true,
@@ -62,7 +63,7 @@ export function createShellTerminal(options: CreateShellTerminalOptions = {}): T
       const payload = separatorIndex === -1 ? '' : data.slice(separatorIndex + 1);
       if (!payload || payload === '?' || payload.length > MAX_OSC52_PAYLOAD_LENGTH) return true;
       try {
-        void navigator.clipboard?.writeText(decodeOscBase64(payload)).catch(() => {});
+        navigator.clipboard?.writeText(decodeOscBase64(payload)).then(notifyClipboardCopied, () => {});
       } catch {
         // Malformed OSC 52 payload — ignore rather than break the terminal.
       }
@@ -74,7 +75,7 @@ export function createShellTerminal(options: CreateShellTerminalOptions = {}): T
     if (event.type !== 'keydown') return true;
     const isCopyCombo = (event.ctrlKey || event.metaKey) && !event.altKey && event.code === 'KeyC';
     if (isCopyCombo && terminal.hasSelection() && navigator.clipboard) {
-      navigator.clipboard.writeText(terminal.getSelection()).catch(() => {});
+      navigator.clipboard.writeText(terminal.getSelection()).then(notifyClipboardCopied, () => {});
       terminal.clearSelection();
       return false;
     }

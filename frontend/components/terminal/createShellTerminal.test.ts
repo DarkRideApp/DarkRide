@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const oscHandlers: Record<number, (data: string) => boolean> = {};
 let keyEventHandler: ((event: KeyboardEvent) => boolean) | null = null;
@@ -29,6 +29,7 @@ vi.mock('@xterm/addon-web-links', () => ({
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 
 import { createShellTerminal } from './createShellTerminal';
+import { CLIPBOARD_COPIED_EVENT } from './clipboardEvents';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 
 function keydown(overrides: Partial<KeyboardEvent> = {}): KeyboardEvent {
@@ -48,12 +49,25 @@ async function flushMicrotasksAndTimers() {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function listenForClipboardToast() {
+  const spy = vi.fn();
+  window.addEventListener(CLIPBOARD_COPIED_EVENT, spy);
+  return spy;
+}
+
 describe('createShellTerminal', () => {
+  let clipboardToastSpy: ReturnType<typeof vi.fn>;
+
   beforeEach(() => {
     vi.clearAllMocks();
     delete oscHandlers[52];
     keyEventHandler = null;
     Object.assign(navigator, { clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
+    clipboardToastSpy = listenForClipboardToast();
+  });
+
+  afterEach(() => {
+    window.removeEventListener(CLIPBOARD_COPIED_EVENT, clipboardToastSpy);
   });
 
   it('loads the web links addon so URLs printed by a shell become clickable', () => {
@@ -80,6 +94,23 @@ describe('createShellTerminal', () => {
       expect(navigator.clipboard.writeText).toHaveBeenCalledWith('https://claude.ai/login?code=abc123');
     });
 
+    it('dispatches a clipboard-copied event once the write actually succeeds, so the UI can toast it', async () => {
+      createShellTerminal({ allowOscClipboardWrite: true });
+      const payload = Buffer.from('https://claude.ai/login?code=abc123', 'utf-8').toString('base64');
+      oscHandlers[52](`c;${payload}`);
+      await flushMicrotasksAndTimers();
+      expect(clipboardToastSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT dispatch a clipboard-copied event when the write is rejected — no false "Copied" toast', async () => {
+      Object.assign(navigator, { clipboard: { writeText: vi.fn().mockRejectedValue(new Error('NotAllowedError')) } });
+      createShellTerminal({ allowOscClipboardWrite: true });
+      const payload = Buffer.from('hello', 'utf-8').toString('base64');
+      oscHandlers[52](`c;${payload}`);
+      await flushMicrotasksAndTimers();
+      expect(clipboardToastSpy).not.toHaveBeenCalled();
+    });
+
     it('decodes multi-byte UTF-8 OSC 52 payloads correctly', () => {
       createShellTerminal({ allowOscClipboardWrite: true });
       const payload = Buffer.from('café ✅', 'utf-8').toString('base64');
@@ -91,12 +122,14 @@ describe('createShellTerminal', () => {
       createShellTerminal({ allowOscClipboardWrite: true });
       oscHandlers[52]('c;?');
       expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+      expect(clipboardToastSpy).not.toHaveBeenCalled();
     });
 
     it('ignores malformed OSC 52 payloads instead of throwing', () => {
       createShellTerminal({ allowOscClipboardWrite: true });
       expect(() => oscHandlers[52]('c;not-valid-base64!!!')).not.toThrow();
       expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+      expect(clipboardToastSpy).not.toHaveBeenCalled();
     });
 
     it('ignores oversized payloads instead of blindly writing them to the clipboard', () => {
@@ -104,6 +137,7 @@ describe('createShellTerminal', () => {
       const hugePayload = Buffer.from('a'.repeat(200_000), 'utf-8').toString('base64');
       oscHandlers[52](`c;${hugePayload}`);
       expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+      expect(clipboardToastSpy).not.toHaveBeenCalled();
     });
 
     it('does not leave an unhandled promise rejection if the clipboard write is rejected', async () => {
@@ -135,6 +169,29 @@ describe('createShellTerminal', () => {
       expect(handled).toBe(false);
     });
 
+    it('dispatches a clipboard-copied event once the copy actually succeeds, so the UI can toast it', async () => {
+      createShellTerminal();
+      mockTerminal.hasSelection.mockReturnValue(true);
+      mockTerminal.getSelection.mockReturnValue('selected text');
+
+      keyEventHandler!(keydown({ ctrlKey: true }));
+      await flushMicrotasksAndTimers();
+
+      expect(clipboardToastSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT dispatch a clipboard-copied event when the copy write is rejected', async () => {
+      Object.assign(navigator, { clipboard: { writeText: vi.fn().mockRejectedValue(new Error('NotAllowedError')) } });
+      createShellTerminal();
+      mockTerminal.hasSelection.mockReturnValue(true);
+      mockTerminal.getSelection.mockReturnValue('selected text');
+
+      keyEventHandler!(keydown({ ctrlKey: true }));
+      await flushMicrotasksAndTimers();
+
+      expect(clipboardToastSpy).not.toHaveBeenCalled();
+    });
+
     it('copies the selection on Cmd+C (metaKey) when text is selected', () => {
       createShellTerminal();
       mockTerminal.hasSelection.mockReturnValue(true);
@@ -154,6 +211,7 @@ describe('createShellTerminal', () => {
 
       expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
       expect(mockTerminal.clearSelection).not.toHaveBeenCalled();
+      expect(clipboardToastSpy).not.toHaveBeenCalled();
       expect(handled).toBe(true);
     });
 
