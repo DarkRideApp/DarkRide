@@ -9,6 +9,7 @@ import { AuthProvider, useAuth } from '@darkrideapp/plugin-sdk/react';
 import { AuthGuard } from './components/auth/AuthGuard';
 import { AppLayout } from './components/layout/AppLayout';
 import { StartupScreen } from './components/StartupScreen';
+import { ClipboardToastBridge } from './components/terminal/ClipboardToastBridge';
 import { Dashboard } from './pages/Dashboard';
 import { Devices } from './pages/Devices';
 import { DeviceView } from './pages/DeviceView';
@@ -252,6 +253,7 @@ function AuthenticatedApp() {
         </div>
       )}
       <WsToastBridge setOnApiError={wsManager.setOnApiError} />
+      <ClipboardToastBridge />
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Navigate to="/ui/" replace />} />

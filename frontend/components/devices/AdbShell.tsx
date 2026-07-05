@@ -1,8 +1,8 @@
 import React, { useEffect, useRef } from 'react';
-import { Terminal } from '@xterm/xterm';
+import type { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import '@xterm/xterm/css/xterm.css';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
+import { createShellTerminal } from '../terminal/createShellTerminal';
 
 interface AdbShellProps {
   deviceId: string;
@@ -20,16 +20,7 @@ export function AdbShell({ deviceId, onClose }: AdbShellProps) {
     const container = containerRef.current;
     if (!container) return;
 
-    const terminal = new Terminal({
-      cursorBlink: true,
-      fontSize: 13,
-      fontFamily: "'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace",
-      theme: {
-        background: '#1e293b',
-        foreground: '#e2e8f0',
-        cursor: '#e2e8f0',
-      },
-    });
+    const terminal = createShellTerminal();
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
     terminal.open(container);

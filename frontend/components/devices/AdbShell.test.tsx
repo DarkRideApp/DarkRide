@@ -18,6 +18,12 @@ const mockTerminal = {
   write: vi.fn(),
   onData: vi.fn().mockReturnValue({ dispose: vi.fn() }),
   dispose: vi.fn(),
+  parser: {
+    registerOscHandler: vi.fn(),
+  },
+  attachCustomKeyEventHandler: vi.fn(),
+  hasSelection: vi.fn().mockReturnValue(false),
+  getSelection: vi.fn().mockReturnValue(''),
   cols: 80,
   rows: 24,
 };
@@ -30,6 +36,10 @@ vi.mock('@xterm/addon-fit', () => ({
   FitAddon: vi.fn(() => ({
     fit: vi.fn(),
   })),
+}));
+
+vi.mock('@xterm/addon-web-links', () => ({
+  WebLinksAddon: vi.fn(() => ({ name: 'web-links' })),
 }));
 
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
@@ -107,5 +117,10 @@ describe('AdbShell', () => {
     const subscribedTypes = (mockWs.subscribe as any).mock.calls.map((c: any[]) => c[0]);
     expect(subscribedTypes).toContain('adb-shell/output');
     expect(subscribedTypes).toContain('adb-shell/exit');
+  });
+
+  it('does NOT allow OSC 52 clipboard auto-copy (a connected device is untrusted output)', () => {
+    renderAdbShell();
+    expect(mockTerminal.parser.registerOscHandler).not.toHaveBeenCalled();
   });
 });
