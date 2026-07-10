@@ -6,7 +6,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import AdmZip from 'adm-zip';
 import { registerEndpoint } from './api-service';
-import { trackedApps, apkVersions, analysisJobs, apkContents, apkDiffReports, apkNotes, devices, appSources, injectedApks } from '../db/schema';
+import { trackedApps, apkVersions, analysisJobs, apkContents, apkDiffReports, apkNotes, devices, appSources, injectedApks, cloudFiles } from '../db/schema';
 import { and } from 'drizzle-orm';
 import { ensureAppSources } from '../services/apk-sources';
 import { sourceLabel, type RemoteApkSource } from '../services/apk-sources/types';
@@ -961,15 +961,14 @@ export function registerAppEndpoints(
     }
   }, { requires: ['core.apk:manage'] });
 
-  // DELETE /v1/apps/track/:id — Stop tracking.
-  // NOTE: this discards the app's DB records — versions, analysis jobs, stored
-  // contents, diff reports, and user-written apk_notes. The raw .apk binaries on
-  // disk are left in place, but with no tracked_apps/apk_versions rows they
-  // become unmanaged (invisible to cloud sync + retention) and their decompiled
-  // analysis dirs are swept by cleanupStaleAnalysisDirs on the next restart.
-  // Preserving analysis across untrack would need apk_versions.tracked_app_id to
-  // be nullable (see the launch-review follow-up) — out of scope for the FK fix.
-  registerEndpoint('DELETE', '/v1/apps/track/:id', (req, res) => {
+  // DELETE /v1/apps/track/:id — Stop tracking and DISCARD EVERYTHING for the app.
+  // Removes all DB records (versions, analysis jobs, stored contents, diff
+  // reports, user-written apk_notes) plus the on-disk APK store
+  // (data/apks/<pkg>/: APKs, split APKs, decompiled analysis dirs, icons) and any
+  // cloud copies. injected_apks (a Frida cache with its own 3-day TTL, stored
+  // outside the package dir) is disassociated, not deleted. Nothing is left
+  // orphaned — no reliance on the restart-time stale-analysis-dir sweep.
+  registerEndpoint('DELETE', '/v1/apps/track/:id', async (req, res) => {
     const id = parseInt(req.params.id as string, 10);
     if (isNaN(id)) {
       res.status(400).json({ success: false, error: 'Invalid id' });
@@ -1020,6 +1019,31 @@ export function registerAppEndpoints(
       tx.update(injectedApks).set({ trackedAppId: null }).where(eq(injectedApks.trackedAppId, id)).run();
       tx.delete(trackedApps).where(eq(trackedApps.id, id)).run();
     });
+
+    // Discard the app's files too. Every cloud key and local file for an app
+    // lives under the `apks/<packageName>/` prefix, so remove each tracked cloud
+    // file (drops the cloud object + local copy + cloud_files row), then rm the
+    // whole package dir to catch anything not cloud-tracked (analysis dirs,
+    // icons). Best-effort: a file-cleanup failure never fails the untrack — the
+    // DB teardown already succeeded.
+    if (fileSync) {
+      const prefix = `apks/${existing.packageName}/`;
+      const keys = db.select({ cloudKey: cloudFiles.cloudKey }).from(cloudFiles).all()
+        .map(r => r.cloudKey)
+        .filter(k => k.startsWith(prefix));
+      for (const key of keys) {
+        try {
+          await fileSync.removeFile(key);
+        } catch (err: any) {
+          error(`untrack ${existing.packageName}: cloud removeFile ${key} failed: ${err.message}`);
+        }
+      }
+    }
+    try {
+      fs.rmSync(packageDir(existing.packageName), { recursive: true, force: true });
+    } catch (err: any) {
+      error(`untrack ${existing.packageName}: failed to remove package dir: ${err.message}`);
+    }
 
     res.json({ success: true });
   }, { requires: ['core.apk:manage'] });

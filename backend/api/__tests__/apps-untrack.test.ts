@@ -1,6 +1,9 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, beforeAll, afterAll, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { eq, sql } from 'drizzle-orm';
 import * as schema from '../../db/schema';
 import type { AppDatabase } from '../../db/index';
@@ -8,15 +11,15 @@ import { createTestDb } from '../../test-utils/create-test-db';
 import { registerAppEndpoints } from '../apps';
 import { getApiRouter, clearEndpoints } from '../api-service';
 
-const { trackedApps, apkVersions, analysisJobs, apkContents, apkDiffReports, apkNotes, injectedApks } = schema;
+const { trackedApps, apkVersions, analysisJobs, apkContents, apkDiffReports, apkNotes, injectedApks, cloudFiles } = schema;
 
 // registerAppEndpoints only touches deviceManager on device routes, not on the
 // untrack path — a bare stub is enough.
 const stubDeviceManager = {} as any;
 
-function makeApp(db: AppDatabase) {
+function makeApp(db: AppDatabase, fileSync?: any) {
   clearEndpoints();
-  registerAppEndpoints(stubDeviceManager, db);
+  registerAppEndpoints(stubDeviceManager, db, undefined, undefined, fileSync);
   const app = express();
   app.use(express.json());
   app.use(getApiRouter());
@@ -26,6 +29,22 @@ function makeApp(db: AppDatabase) {
 describe('DELETE /v1/apps/track/:id (untrack)', () => {
   let db: AppDatabase;
   let app: express.Express;
+  let dataRoot: string;
+  let prevDataRoot: string | undefined;
+
+  beforeAll(() => {
+    // Sandbox DATA_ROOT so the handler's fs.rmSync(packageDir(...)) can never
+    // touch real data/ — every test in this file gets a throwaway data root.
+    prevDataRoot = process.env.DATA_ROOT;
+    dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'darkride-untrack-'));
+    process.env.DATA_ROOT = dataRoot;
+  });
+
+  afterAll(() => {
+    if (prevDataRoot === undefined) delete process.env.DATA_ROOT;
+    else process.env.DATA_ROOT = prevDataRoot;
+    fs.rmSync(dataRoot, { recursive: true, force: true });
+  });
 
   beforeEach(() => {
     // foreignKeys ON so the delete-order bug reproduces exactly as in prod.
@@ -109,6 +128,42 @@ describe('DELETE /v1/apps/track/:id (untrack)', () => {
     const rows = db.all<{ id: number; apk_version_id: number | null }>(sql`SELECT id, apk_version_id FROM map_versions ORDER BY id`);
     expect(rows).toHaveLength(2);
     expect(rows.every(r => r.apk_version_id === null)).toBe(true);
+  });
+
+  it('removes the on-disk package directory (APKs + analysis dirs + icons)', async () => {
+    db.insert(trackedApps).values({ id: 5, packageName: 'com.example.fs', createdAt: new Date() }).run();
+    // Lay down a package dir with an APK, an icon, and a decompiled analysis dir.
+    const pkgDir = path.join(dataRoot, 'apks', 'com.example.fs');
+    fs.mkdirSync(path.join(pkgDir, 'analysis', '100'), { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'v100.apk'), 'apk');
+    fs.writeFileSync(path.join(pkgDir, 'icon.png'), 'png');
+    fs.writeFileSync(path.join(pkgDir, 'analysis', '100', 'source.db'), 'db');
+
+    const res = await request(app).delete('/v1/apps/track/5');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true });
+    expect(fs.existsSync(pkgDir)).toBe(false);
+  });
+
+  it('removes only this app cloud files (prefix-scoped), leaving other apps intact', async () => {
+    const removeFile = vi.fn().mockResolvedValue(undefined);
+    app = makeApp(db, { removeFile });
+
+    db.insert(trackedApps).values({ id: 6, packageName: 'com.example.cloud', createdAt: new Date() }).run();
+    const seed = (cloudKey: string) => db.insert(cloudFiles).values({
+      cloudKey, relativePath: cloudKey, fileType: 'apk', fileSize: 1, syncState: 'synced', lastAccessed: new Date(), createdAt: new Date(),
+    }).run();
+    seed('apks/com.example.cloud/v1.apk');
+    seed('apks/com.example.cloud/analysis/1/source.db');
+    seed('apks/com.example.other/v1.apk'); // must NOT be touched
+
+    const res = await request(app).delete('/v1/apps/track/6');
+
+    expect(res.status).toBe(200);
+    const called = removeFile.mock.calls.map(c => c[0]).sort();
+    expect(called).toEqual(['apks/com.example.cloud/analysis/1/source.db', 'apks/com.example.cloud/v1.apk']);
+    expect(removeFile).not.toHaveBeenCalledWith('apks/com.example.other/v1.apk');
   });
 
   it('returns 404 for an unknown id', async () => {
