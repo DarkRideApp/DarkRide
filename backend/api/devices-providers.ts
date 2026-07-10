@@ -4,6 +4,8 @@ import type { DeviceInstancesRepo } from '../services/device-instances-repo';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { forgetDeviceRow } from '../services/forget-device';
+import { devices } from '../db/schema';
+import { eq } from 'drizzle-orm';
 import { adbCommand } from '../services/device-manager';
 import { createLoggers } from '../logs';
 
@@ -279,28 +281,46 @@ export function registerDevicesProvidersEndpoints(
     }
     try {
       await p.deleteInstance(row.runtimeId);
-      repo.delete(row.id);
-      // The container is gone, so any adb-discovered `devices` row that
-      // was tracking this instance's serial is now stale. Drop it so the
-      // user doesn't end up with an unactionable "online" device card
-      // (lastSeen is still recent for ~2 minutes after the container dies,
-      // which suppresses the Forget button on the device card).
-      // Disconnect the adb endpoint BEFORE forgetting the row: the device
-      // poller upserts every entry `adb devices` reports, so a still-connected
-      // (now "offline") endpoint would otherwise be re-inserted as an orphan
-      // moments after we delete it — reappearing as a phantom adb device.
-      await dropAdbEndpoint(row.serial);
-      if (row.serial && db) {
-        try {
-          if (forgetDeviceRow(db, row.serial)) {
-            dpLog(`Cleaned up devices row ${row.serial} after instance ${row.id} delete`);
-          }
-        } catch (e: any) {
-          // Don't fail the whole request — the instance IS gone; an
-          // orphaned device row is recoverable via the Forget button.
-          dpLog(`Failed to clean up devices row ${row.serial}: ${e?.message ?? e}`);
+      // The container is gone, so any adb-discovered `devices` row that was
+      // tracking this instance is now stale. Drop it so the user doesn't end up
+      // with an unactionable "online" device card (lastSeen stays recent for
+      // ~2 minutes after the container dies, which suppresses the Forget button).
+      // This MUST happen before repo.delete below: devices.instance_id
+      // references device_instances.id with no ON DELETE clause, so deleting the
+      // instance while a devices row still points at it trips foreign_keys=ON
+      // and aborts the whole delete.
+      // Key the devices lookup on instance_id, NOT the instance's `serial`:
+      // stopping an emulator nulls device_instances.serial (repo.updateSerial(id,
+      // null)) while the devices row keeps its instance_id, so a serial-keyed
+      // cleanup would skip the row on a stop-then-delete and the FK would throw.
+      const serials = new Set<string>();
+      if (row.serial) serials.add(row.serial);
+      if (db) {
+        for (const d of db.select({ id: devices.id }).from(devices).where(eq(devices.instanceId, row.id)).all()) {
+          serials.add(d.id);
         }
       }
+      for (const serial of serials) {
+        // Disconnect the adb endpoint FIRST — this is an adb-server concern, done
+        // regardless of whether we have a DB handle. The device poller upserts
+        // every entry `adb devices` reports, so a still-connected (now "offline")
+        // endpoint would otherwise be re-inserted as an orphan moments after we
+        // delete it, reappearing as a phantom adb device.
+        await dropAdbEndpoint(serial);
+        // Then forget the devices row (needs db) so repo.delete's FK is clear.
+        if (db) {
+          try {
+            if (forgetDeviceRow(db, serial)) {
+              dpLog(`Cleaned up devices row ${serial} after instance ${row.id} delete`);
+            }
+          } catch (e: any) {
+            // Don't fail the whole request — the instance IS gone; an orphaned
+            // device row is recoverable via the Forget button.
+            dpLog(`Failed to clean up devices row ${serial}: ${e?.message ?? e}`);
+          }
+        }
+      }
+      repo.delete(row.id);
       // Broadcast so the Devices page (or any other WS client) drops the
       // row from its UI without a full refresh. `provider-instance-updated`
       // doesn't cover deletes — the row no longer exists to send — so we

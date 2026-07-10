@@ -244,7 +244,15 @@ export function registerAutomationEndpoints(
     }
 
     scheduler.removeSchedule(id);
-    db.delete(automations).where(eq(automations.id, id)).run();
+    // automation_sessions.automation_id references automations.id with no
+    // ON DELETE clause — null it first (preserving run history) so the delete
+    // doesn't trip foreign_keys=ON for any automation that has ever run. Mirrors
+    // the managed-automation reconciler's teardown. Wrapped in a transaction so
+    // the null-out and the delete can't half-apply.
+    db.transaction((tx) => {
+      tx.update(automationSessions).set({ automationId: null }).where(eq(automationSessions.automationId, id)).run();
+      tx.delete(automations).where(eq(automations.id, id)).run();
+    });
 
     if (existing.isCaptureRule) {
       reloadCaptureRules();

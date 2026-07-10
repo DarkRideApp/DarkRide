@@ -6,7 +6,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import AdmZip from 'adm-zip';
 import { registerEndpoint } from './api-service';
-import { trackedApps, apkVersions, analysisJobs, apkContents, apkDiffReports, devices, appSources } from '../db/schema';
+import { trackedApps, apkVersions, analysisJobs, apkContents, apkDiffReports, apkNotes, devices, appSources, injectedApks, cloudFiles } from '../db/schema';
 import { and } from 'drizzle-orm';
 import { ensureAppSources } from '../services/apk-sources';
 import { sourceLabel, type RemoteApkSource } from '../services/apk-sources/types';
@@ -961,8 +961,14 @@ export function registerAppEndpoints(
     }
   }, { requires: ['core.apk:manage'] });
 
-  // DELETE /v1/apps/track/:id — Stop tracking (keeps archived APKs)
-  registerEndpoint('DELETE', '/v1/apps/track/:id', (req, res) => {
+  // DELETE /v1/apps/track/:id — Stop tracking and DISCARD EVERYTHING for the app.
+  // Removes all DB records (versions, analysis jobs, stored contents, diff
+  // reports, user-written apk_notes) plus the on-disk APK store
+  // (data/apks/<pkg>/: APKs, split APKs, decompiled analysis dirs, icons) and any
+  // cloud copies. injected_apks (a Frida cache with its own 3-day TTL, stored
+  // outside the package dir) is disassociated, not deleted. Nothing is left
+  // orphaned — no reliance on the restart-time stale-analysis-dir sweep.
+  registerEndpoint('DELETE', '/v1/apps/track/:id', async (req, res) => {
     const id = parseInt(req.params.id as string, 10);
     if (isNaN(id)) {
       res.status(400).json({ success: false, error: 'Invalid id' });
@@ -978,9 +984,66 @@ export function registerAppEndpoints(
       return;
     }
 
-    // Delete version records first (FK constraint)
-    db.delete(apkVersions).where(eq(apkVersions.trackedAppId, id)).run();
-    db.delete(trackedApps).where(eq(trackedApps.id, id)).run();
+    // Tear down bottom-up in one transaction so an FK further down the tree
+    // can't abort the delete and leave the app half-untracked. Previously this
+    // only deleted apkVersions + trackedApps, so any app that had been analysed
+    // (analysis_jobs / apk_contents), diffed (apk_diff_reports), or injected
+    // (injected_apks) threw a FOREIGN KEY error — the tracked_apps row survived
+    // and the app kept showing after refresh, even though the UI toasted success.
+    const versionIds = db.select({ id: apkVersions.id }).from(apkVersions)
+      .where(eq(apkVersions.trackedAppId, id))
+      .all()
+      .map(v => v.id);
+
+    db.transaction((tx) => {
+      if (versionIds.length > 0) {
+        // Rows that FK-reference each apkVersion without ON DELETE CASCADE.
+        tx.delete(analysisJobs).where(inArray(analysisJobs.apkVersionId, versionIds)).run();
+        tx.delete(apkContents).where(inArray(apkContents.apkVersionId, versionIds)).run();
+        tx.delete(apkDiffReports).where(inArray(apkDiffReports.apkVersionId, versionIds)).run();
+        tx.delete(apkDiffReports).where(inArray(apkDiffReports.compareVersionId, versionIds)).run();
+        // apk_notes FK-references apk_versions with ON DELETE CASCADE, but delete
+        // it explicitly rather than lean on the cascade — the teardown stays
+        // self-contained and doesn't silently depend on the DB-level clause.
+        tx.delete(apkNotes).where(inArray(apkNotes.versionId, versionIds)).run();
+        // map_versions has a nullable FK into apk_versions and lives in an
+        // optional plugin table — null it out rather than delete the map version.
+        try {
+          (tx as any).run(sql`UPDATE map_versions SET apk_version_id = NULL WHERE apk_version_id IN (${sql.join(versionIds, sql`, `)})`);
+        } catch { /* maps plugin table may not exist */ }
+      }
+      // app_sources FK-cascades on the trackedApps delete.
+      tx.delete(apkVersions).where(eq(apkVersions.trackedAppId, id)).run();
+      // injected_apks references tracked_apps with a nullable, non-cascading FK.
+      // Null it so the Frida-injected artifact record survives untracking.
+      tx.update(injectedApks).set({ trackedAppId: null }).where(eq(injectedApks.trackedAppId, id)).run();
+      tx.delete(trackedApps).where(eq(trackedApps.id, id)).run();
+    });
+
+    // Discard the app's files too. Every cloud key and local file for an app
+    // lives under the `apks/<packageName>/` prefix, so remove each tracked cloud
+    // file (drops the cloud object + local copy + cloud_files row), then rm the
+    // whole package dir to catch anything not cloud-tracked (analysis dirs,
+    // icons). Best-effort: a file-cleanup failure never fails the untrack — the
+    // DB teardown already succeeded.
+    if (fileSync) {
+      const prefix = `apks/${existing.packageName}/`;
+      const keys = db.select({ cloudKey: cloudFiles.cloudKey }).from(cloudFiles).all()
+        .map(r => r.cloudKey)
+        .filter(k => k.startsWith(prefix));
+      for (const key of keys) {
+        try {
+          await fileSync.removeFile(key);
+        } catch (err: any) {
+          error(`untrack ${existing.packageName}: cloud removeFile ${key} failed: ${err.message}`);
+        }
+      }
+    }
+    try {
+      fs.rmSync(packageDir(existing.packageName), { recursive: true, force: true });
+    } catch (err: any) {
+      error(`untrack ${existing.packageName}: failed to remove package dir: ${err.message}`);
+    }
 
     res.json({ success: true });
   }, { requires: ['core.apk:manage'] });
@@ -1023,19 +1086,24 @@ export function registerAppEndpoints(
       await fileSync.removeFile(cloudKey);
     }
 
-    // Delete related rows that FK-reference this apkVersion
-    db.delete(analysisJobs).where(eq(analysisJobs.apkVersionId, versionId)).run();
-    db.delete(apkContents).where(eq(apkContents.apkVersionId, versionId)).run();
-    db.delete(apkDiffReports).where(eq(apkDiffReports.apkVersionId, versionId)).run();
-    db.delete(apkDiffReports).where(eq(apkDiffReports.compareVersionId, versionId)).run();
-    // mapVersions has a nullable FK — null it out rather than delete the map version
-    // Use raw SQL since the maps plugin table may not exist
-    try {
-      (db as any).run(sql`UPDATE map_versions SET apk_version_id = NULL WHERE apk_version_id = ${versionId}`);
-    } catch { /* maps plugin table may not exist */ }
-
-    // Delete DB record
-    db.delete(apkVersions).where(eq(apkVersions.id, versionId)).run();
+    // Delete related rows that FK-reference this apkVersion, then the version
+    // itself — in one transaction so an FK further down can't leave the row set
+    // half-deleted (same guarantee the untrack handler gives).
+    db.transaction((tx) => {
+      tx.delete(analysisJobs).where(eq(analysisJobs.apkVersionId, versionId)).run();
+      tx.delete(apkContents).where(eq(apkContents.apkVersionId, versionId)).run();
+      tx.delete(apkDiffReports).where(eq(apkDiffReports.apkVersionId, versionId)).run();
+      tx.delete(apkDiffReports).where(eq(apkDiffReports.compareVersionId, versionId)).run();
+      // apk_notes cascades on the version delete, but delete it explicitly so the
+      // teardown doesn't silently depend on the DB-level ON DELETE clause.
+      tx.delete(apkNotes).where(eq(apkNotes.versionId, versionId)).run();
+      // mapVersions has a nullable FK — null it out rather than delete the map version.
+      // Use raw SQL since the maps plugin table may not exist.
+      try {
+        (tx as any).run(sql`UPDATE map_versions SET apk_version_id = NULL WHERE apk_version_id = ${versionId}`);
+      } catch { /* maps plugin table may not exist */ }
+      tx.delete(apkVersions).where(eq(apkVersions.id, versionId)).run();
+    });
 
     log(`Deleted APK version ${versionId}${tracked ? ` (${tracked.packageName} v${version.versionCode})` : ''}`);
     res.json({ success: true });
