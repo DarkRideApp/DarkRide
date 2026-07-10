@@ -102,9 +102,25 @@ export async function pruneOldData(
     db.delete(apiEndpointSessions).where(eq(apiEndpointSessions.sessionId, sid)).run();
   }
 
-  db.delete(automationSessions).where(
-    and(lt(automationSessions.startedAt, cutoffDate), not(eq(automationSessions.isPinned, true))),
-  ).run();
+  // A child artifact with a newer timestamp than the cutoff survives the
+  // time-window deletes above while its parent session is deleted by startedAt
+  // (long-lived capture-rule sessions do exactly this). Mop up every remaining
+  // child of the exact sessions being removed so the session delete below can't
+  // trip foreign_keys=ON. Subquery form avoids the SQLite bound-variable limit.
+  const deletedSessionCondition = and(lt(automationSessions.startedAt, cutoffDate), not(eq(automationSessions.isPinned, true)));
+  const sessionsBeingDeleted = () => db.select({ id: automationSessions.id }).from(automationSessions).where(deletedSessionCondition);
+  db.delete(screenshots).where(inArray(screenshots.sessionId, sessionsBeingDeleted())).run();
+  db.delete(websocketMessages).where(inArray(websocketMessages.sessionId, sessionsBeingDeleted())).run();
+  // A WS frame can carry sessionId=NULL (the capture context wasn't resolved at
+  // frame time) yet still reference — via trafficId — a captured_traffic row
+  // owned by a doomed session. The sessionId sweep above misses those, so delete
+  // them by trafficId against the traffic about to go (mirroring the timestamp
+  // path's safety net above) before removing the traffic they point at.
+  const trafficBeingDeleted = db.select({ id: capturedTraffic.id }).from(capturedTraffic).where(inArray(capturedTraffic.sessionId, sessionsBeingDeleted()));
+  db.delete(websocketMessages).where(inArray(websocketMessages.trafficId, trafficBeingDeleted)).run();
+  db.delete(capturedTraffic).where(inArray(capturedTraffic.sessionId, sessionsBeingDeleted())).run();
+
+  db.delete(automationSessions).where(deletedSessionCondition).run();
 
   // Prune old AI conversations
   db.delete(aiConversations).where(lt(aiConversations.updatedAt, cutoffDate)).run();

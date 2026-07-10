@@ -127,7 +127,15 @@ export function registerNotificationEndpoints(db: AppDatabase, notificationServi
       res.status(404).json({ success: false, error: 'Channel not found' });
       return;
     }
-    db.delete(notificationChannels).where(eq(notificationChannels.id, id)).run();
+    // notification_history.channel_id references notificationChannels.id with
+    // no ON DELETE clause — null it first (the row keeps channelName, so the
+    // audit trail stays readable) so deleting a channel that has ever fired a
+    // notification doesn't trip foreign_keys=ON. Transaction so the null-out and
+    // the delete can't half-apply.
+    db.transaction((tx) => {
+      tx.update(notificationHistory).set({ channelId: null }).where(eq(notificationHistory.channelId, id)).run();
+      tx.delete(notificationChannels).where(eq(notificationChannels.id, id)).run();
+    });
     res.json({ success: true });
   }, { requires: ['core.settings:write'] });
 
