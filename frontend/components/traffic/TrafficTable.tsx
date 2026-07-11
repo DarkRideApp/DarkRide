@@ -8,7 +8,7 @@
  */
 
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
-import { Filter, X, ChevronUp, ChevronDown, SlidersHorizontal } from 'lucide-react';
+import { Filter, X, ChevronUp, ChevronDown, SlidersHorizontal, Search, Save } from 'lucide-react';
 import { TrafficDetailPanel } from './TrafficDetailPanel';
 import { parseHostname, useTrafficReplay } from './TrafficEntryRow';
 import type { TrafficEntry } from './TrafficEntryRow';
@@ -16,16 +16,34 @@ import type { WebSocketMessageEntry } from '../../../shared/types/api';
 import {
   METHOD_BADGE_COLORS,
   METHOD_FILTERS,
+  CONTENT_TYPE_FILTERS,
+  SIZE_FILTERS,
   getMethodLabel,
   getContentType,
   getResponseSize,
   getStatusColor,
   applyClientFilters,
   createDefaultFilters,
+  filtersToPreset,
+  presetToFilters,
+  loadFilterPresets,
+  saveFilterPresets,
+  BUILTIN_PRESETS,
   type TrafficFilters,
   type MethodFilterState,
   type StatusGroupFilter,
+  type SizeFilter,
+  type FilterPreset,
 } from './trafficUtils';
+
+/** Slugifies a preset name into a stable data-testid / DOM key. */
+function slugify(name: string): string {
+  return name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+}
+
+const ALL_STATUS_GROUPS: StatusGroupFilter[] = ['2xx', '3xx', '4xx', '5xx'];
+
+const SEARCH_DEBOUNCE_MS = 300;
 
 // ---------------------------------------------------------------------------
 // Props
@@ -190,9 +208,13 @@ export function TrafficTable({
     for (const [, state] of filters.methodFilters) {
       if (state !== undefined) count++;
     }
-    if (filters.status !== '') count++;
+    count += filters.status.size;
+    count += filters.exactStatuses.size;
+    count += filters.contentTypes.size;
+    if (filters.size) count++;
+    if (filters.search) count++;
     return count;
-  }, [filters.methodFilters, filters.status]);
+  }, [filters.methodFilters, filters.status, filters.exactStatuses, filters.contentTypes, filters.size, filters.search]);
 
   // Internal selection state — used when caller is uncontrolled
   const [internalSelectedId, setInternalSelectedId] = useState<number | null>(null);
@@ -218,12 +240,8 @@ export function TrafficTable({
   }, [isControlled, onSelectEntry]);
 
   const updateFilters = useCallback((patch: Partial<TrafficFilters>) => {
-    setFilters(prev => {
-      const next = { ...prev, ...patch };
-      onFilterChange?.(next);
-      return next;
-    });
-  }, [onFilterChange]);
+    setFilters(prev => ({ ...prev, ...patch }));
+  }, []);
 
   // Sort handling — used when onSortChange is provided (server-side sort)
   const handleHeaderSort = useCallback((column: string) => {
@@ -238,22 +256,132 @@ export function TrafficTable({
       const next = new Map(prev.methodFilters);
       if (next.get(key) === 'include') next.delete(key);
       else next.set(key, 'include');
-      const updated = { ...prev, methodFilters: next };
-      onFilterChange?.(updated);
-      return updated;
+      return { ...prev, methodFilters: next };
     });
-  }, [onFilterChange]);
+  }, []);
 
   const toggleMethodExclude = useCallback((key: string) => {
     setFilters(prev => {
       const next = new Map(prev.methodFilters);
       if (next.get(key) === 'exclude') next.delete(key);
       else next.set(key, 'exclude');
-      const updated = { ...prev, methodFilters: next };
-      onFilterChange?.(updated);
-      return updated;
+      return { ...prev, methodFilters: next };
     });
-  }, [onFilterChange]);
+  }, []);
+
+  // Status-group pills are multi-select (OR). Clicking "ALL" clears the set.
+  const toggleStatusGroup = useCallback((value: StatusGroupFilter) => {
+    setFilters(prev => {
+      const next = new Set(prev.status);
+      if (next.has(value)) next.delete(value);
+      else next.add(value);
+      return { ...prev, status: next };
+    });
+  }, []);
+
+  const toggleContentType = useCallback((key: string) => {
+    setFilters(prev => {
+      const next = new Set(prev.contentTypes);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return { ...prev, contentTypes: next };
+    });
+  }, []);
+
+  // Exact status codes — free-text entry, Enter to add, chip to remove
+  const [exactStatusInput, setExactStatusInput] = useState('');
+
+  const addExactStatus = useCallback((code: string) => {
+    const trimmed = code.trim();
+    if (!trimmed) return;
+    setFilters(prev => {
+      const next = new Set(prev.exactStatuses);
+      next.add(trimmed);
+      return { ...prev, exactStatuses: next };
+    });
+  }, []);
+
+  const removeExactStatus = useCallback((code: string) => {
+    setFilters(prev => {
+      const next = new Set(prev.exactStatuses);
+      next.delete(code);
+      return { ...prev, exactStatuses: next };
+    });
+  }, []);
+
+  // "Search all" — debounced so we don't push a server refetch on every keystroke
+  const [searchInput, setSearchInput] = useState('');
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleSearchInputChange = useCallback((value: string) => {
+    setSearchInput(value);
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => {
+      updateFilters({ search: value });
+    }, SEARCH_DEBOUNCE_MS);
+  }, [updateFilters]);
+
+  useEffect(() => () => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+  }, []);
+
+  // Saved filter presets — user-saved ones persist to localStorage; built-ins are static.
+  const [userPresets, setUserPresets] = useState<FilterPreset[]>(() => loadFilterPresets());
+  const allPresets = useMemo(() => [...BUILTIN_PRESETS, ...userPresets], [userPresets]);
+
+  const [showSavePresetForm, setShowSavePresetForm] = useState(false);
+  const [presetNameInput, setPresetNameInput] = useState('');
+
+  const applyPreset = useCallback((preset: FilterPreset) => {
+    const restored = presetToFilters(preset);
+    setSearchInput(restored.search);
+    setExactStatusInput('');
+    setFilters(restored);
+  }, []);
+
+  const handleSavePreset = useCallback(() => {
+    const name = presetNameInput.trim();
+    if (!name) return;
+    setFilters(prev => {
+      const preset = filtersToPreset(name, prev);
+      setUserPresets(prevPresets => {
+        const next = [...prevPresets.filter(p => p.name !== name), preset];
+        saveFilterPresets(next);
+        return next;
+      });
+      return prev;
+    });
+    setPresetNameInput('');
+    setShowSavePresetForm(false);
+  }, [presetNameInput]);
+
+  // "Clear all" (from the active-filter chip bar) resets everything, including
+  // the default method excludes (DNS/CONNECT/TLS Fail) — a full blank slate,
+  // distinct from createDefaultFilters() which is the app's starting point.
+  const clearAllFilters = useCallback(() => {
+    const cleared: TrafficFilters = {
+      methodFilters: new Map(),
+      status: new Set(),
+      exactStatuses: new Set(),
+      text: '',
+      search: '',
+      contentTypes: new Set(),
+      size: '',
+    };
+    setSearchInput('');
+    setExactStatusInput('');
+    setFilters(cleared);
+  }, []);
+
+  // Notify the caller whenever the (settled) filter state changes. Centralising
+  // this in an effect — rather than calling onFilterChange inline from inside
+  // every setFilters updater above — avoids "Cannot update a component while
+  // rendering a different component" warnings when a consumer's onFilterChange
+  // itself triggers state updates (e.g. Traffic.tsx re-deriving server params).
+  useEffect(() => {
+    onFilterChange?.(filters);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters]);
 
   // Apply client-side filters when enabled, then hide hostnames
   const displayEntries = useMemo(() => {
@@ -271,28 +399,93 @@ export function TrafficTable({
     ? displayEntries.find(e => e.id === selectedId) ?? entries.find(e => e.id === selectedId)
     : null;
 
+  // Selection stability: a filter change should NOT blindly clear the
+  // selected row. Keep it selected as long as it still appears in the
+  // (post-filter) displayEntries; only clear it once it drops out.
+  useEffect(() => {
+    if (selectedId == null) return;
+    const stillPresent = displayEntries.some(e => e.id === selectedId);
+    if (!stillPresent) {
+      handleClose();
+    }
+    // Only re-check when the filtered set changes — handleClose/selectedId
+    // are stable-enough refs pulled fresh each render via closures.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayEntries]);
+
   // Auto-scroll to bottom when new entries arrive (live mode)
   useEffect(() => {
     if (!liveMode || !autoScroll || !tableWrapRef.current) return;
     tableWrapRef.current.scrollTop = tableWrapRef.current.scrollHeight;
   }, [displayEntries, autoScroll, liveMode]);
 
+  // Active-filter chips — one per active filter dimension, mirroring the
+  // hidden-hostname chip pattern. Lets the user see and clear filters
+  // individually without opening the collapsed panel.
+  interface ActiveChip { id: string; label: string; onRemove: () => void }
+  const activeChips = useMemo((): ActiveChip[] => {
+    const chips: ActiveChip[] = [];
+    for (const [key, state] of filters.methodFilters) {
+      const def = METHOD_FILTERS.find(mf => mf.key === key);
+      const label = def?.label ?? key;
+      chips.push({
+        id: `method-${key}-${state}`,
+        label: state === 'include' ? `${label}` : `¬${label}`,
+        onRemove: () => (state === 'include' ? toggleMethodInclude(key) : toggleMethodExclude(key)),
+      });
+    }
+    for (const value of filters.status) {
+      chips.push({ id: `status-${value}`, label: `Status ${value}`, onRemove: () => toggleStatusGroup(value) });
+    }
+    for (const code of filters.exactStatuses) {
+      chips.push({ id: `exact-status-${code}`, label: `= ${code}`, onRemove: () => removeExactStatus(code) });
+    }
+    for (const key of filters.contentTypes) {
+      const def = CONTENT_TYPE_FILTERS.find(d => d.key === key);
+      chips.push({ id: `contenttype-${key}`, label: def?.label ?? key, onRemove: () => toggleContentType(key) });
+    }
+    if (filters.size) {
+      const def = SIZE_FILTERS.find(s => s.key === filters.size);
+      chips.push({ id: 'size', label: def?.label ?? filters.size, onRemove: () => updateFilters({ size: '' }) });
+    }
+    if (filters.search) {
+      chips.push({ id: 'search', label: `Search: ${filters.search}`, onRemove: () => { setSearchInput(''); updateFilters({ search: '' }); } });
+    }
+    if (filters.text) {
+      chips.push({ id: 'text', label: `Host: ${filters.text}`, onRemove: () => updateFilters({ text: '' }) });
+    }
+    return chips;
+  }, [filters, toggleMethodInclude, toggleMethodExclude, toggleStatusGroup, removeExactStatus, toggleContentType, updateFilters]);
+
   return (
     <div className={`traffic-table-container${className ? ` ${className}` : ''}`}>
       {/* Filter bar */}
       {showFilterBar && (
         <div className="traffic-filter-bar">
-          {/* Always-visible row: search + filter toggle + live controls */}
+          {/* Always-visible row: host filter + search-all + filter toggle + live controls */}
           <div className="traffic-filter-bar-main">
-            <div className="traffic-filter-text">
-              <Filter size={14} className="traffic-filter-text-icon" />
-              <input
-                type="text"
-                className="traffic-filter-text-input"
-                placeholder="Filter by host or regex..."
-                value={filters.text}
-                onChange={e => updateFilters({ text: e.target.value })}
-              />
+            <div className="traffic-filter-inputs">
+              <div className="traffic-filter-text" title="Fast client-side filter: matches the request URL (host + path) as plain text or a regex">
+                <Filter size={14} className="traffic-filter-text-icon" />
+                <input
+                  type="text"
+                  className="traffic-filter-text-input"
+                  placeholder="Filter by host or regex..."
+                  value={filters.text}
+                  onChange={e => updateFilters({ text: e.target.value })}
+                />
+              </div>
+              <div className="traffic-filter-search" title="Search across the full request/response — URL, body, and headers">
+                <Search size={14} className="traffic-filter-search-icon" />
+                <input
+                  type="text"
+                  className="traffic-filter-text-input"
+                  placeholder="Search all (URL, body, headers)..."
+                  value={searchInput}
+                  onChange={e => handleSearchInputChange(e.target.value)}
+                  data-testid="traffic-search-all-input"
+                />
+              </div>
             </div>
             <button
               className={`traffic-filter-toggle${filtersExpanded ? ' active' : ''}${activeFilterCount > 0 ? ' has-filters' : ''}`}
@@ -370,29 +563,165 @@ export function TrafficTable({
                 </div>
               </div>
 
-              {/* Status pills */}
+              {/* Status pills — multi-select (OR); ALL clears the set */}
               <div className="traffic-filter-group">
                 <span className="traffic-filter-label">Status</span>
                 <div className="traffic-status-pills">
-                  {([
-                    ['', 'ALL'],
-                    ['2xx', '2xx'],
-                    ['3xx', '3xx'],
-                    ['4xx', '4xx'],
-                    ['5xx', '5xx'],
-                  ] as [StatusGroupFilter, string][]).map(([value, label]) => (
+                  <button
+                    className={`traffic-status-pill${filters.status.size === 0 ? ' active' : ''} status-all`}
+                    onClick={() => updateFilters({ status: new Set() })}
+                  >
+                    ALL
+                  </button>
+                  {ALL_STATUS_GROUPS.map(value => (
                     <button
                       key={value}
-                      className={`traffic-status-pill${filters.status === value ? ' active' : ''} status-${value || 'all'}`}
-                      onClick={() => updateFilters({ status: value })}
+                      className={`traffic-status-pill${filters.status.has(value) ? ' active' : ''} status-${value}`}
+                      onClick={() => toggleStatusGroup(value)}
+                    >
+                      {value}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Exact status codes — supplements the century pills above */}
+              <div className="traffic-filter-group">
+                <span className="traffic-filter-label">Exact status</span>
+                <div className="traffic-exact-status">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    className="traffic-exact-status-input"
+                    placeholder="e.g. 404"
+                    value={exactStatusInput}
+                    data-testid="filter-exact-status-input"
+                    onChange={e => setExactStatusInput(e.target.value.replace(/[^0-9]/g, '').slice(0, 3))}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && exactStatusInput) {
+                        addExactStatus(exactStatusInput);
+                        setExactStatusInput('');
+                      }
+                    }}
+                  />
+                  {Array.from(filters.exactStatuses).map(code => (
+                    <span key={code} className="traffic-exact-status-chip" data-testid={`exact-status-chip-${code}`}>
+                      {code}
+                      <button onClick={() => removeExactStatus(code)} title={`Remove ${code}`}>
+                        <X size={10} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              {/* Content-type pills */}
+              <div className="traffic-filter-group">
+                <span className="traffic-filter-label">Type</span>
+                <div className="traffic-content-type-pills">
+                  {CONTENT_TYPE_FILTERS.map(ct => (
+                    <button
+                      key={ct.key}
+                      className={`traffic-content-type-pill${filters.contentTypes.has(ct.key) ? ' active' : ''}`}
+                      data-testid={`filter-contenttype-${ct.key}`}
+                      onClick={() => toggleContentType(ct.key)}
+                    >
+                      {ct.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Response-size quick filters */}
+              <div className="traffic-filter-group">
+                <span className="traffic-filter-label">Size</span>
+                <div className="traffic-size-pills">
+                  {SIZE_FILTERS.map(({ key, label }) => (
+                    <button
+                      key={key || 'any'}
+                      className={`traffic-size-pill${filters.size === key ? ' active' : ''}`}
+                      data-testid={`filter-size-${key || 'any'}`}
+                      onClick={() => updateFilters({ size: key as SizeFilter })}
                     >
                       {label}
                     </button>
                   ))}
                 </div>
               </div>
+
+              {/* Saved filter presets */}
+              <div className="traffic-filter-group traffic-filter-presets">
+                <span className="traffic-filter-label">Presets</span>
+                <div className="traffic-preset-pills">
+                  {allPresets.map(preset => (
+                    <button
+                      key={preset.name}
+                      className="traffic-preset-pill"
+                      data-testid={`preset-${slugify(preset.name)}`}
+                      onClick={() => applyPreset(preset)}
+                      title={`Apply "${preset.name}"`}
+                    >
+                      {preset.name}
+                    </button>
+                  ))}
+                  {!showSavePresetForm ? (
+                    <button
+                      className="traffic-preset-save-btn"
+                      data-testid="preset-save-btn"
+                      onClick={() => setShowSavePresetForm(true)}
+                      title="Save current filters as a preset"
+                    >
+                      <Save size={11} /> Save current
+                    </button>
+                  ) : (
+                    <span className="traffic-preset-save-form">
+                      <input
+                        type="text"
+                        className="traffic-preset-save-input"
+                        placeholder="Preset name..."
+                        value={presetNameInput}
+                        data-testid="preset-name-input"
+                        onChange={e => setPresetNameInput(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') handleSavePreset(); }}
+                        autoFocus
+                      />
+                      <button
+                        className="traffic-preset-save-confirm"
+                        data-testid="preset-save-confirm"
+                        onClick={handleSavePreset}
+                      >
+                        Save
+                      </button>
+                    </span>
+                  )}
+                </div>
+              </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Active-filter chips — visible whenever any filter is active, independent
+          of whether the collapsible panel is expanded, so filters stay legible
+          and individually removable at a glance. */}
+      {activeChips.length > 0 && (
+        <div className="traffic-active-filters-bar" data-testid="active-filters-bar">
+          <span className="traffic-active-filters-label">Active:</span>
+          {activeChips.map(chip => (
+            <span key={chip.id} className="traffic-active-filter-chip" data-testid={`active-filter-chip-${chip.id}`}>
+              {chip.label}
+              <button onClick={chip.onRemove} title="Remove filter">
+                <X size={10} />
+              </button>
+            </span>
+          ))}
+          <button
+            className="traffic-active-filters-clear"
+            onClick={clearAllFilters}
+            data-testid="active-filters-clear-all"
+          >
+            Clear all
+          </button>
         </div>
       )}
 
