@@ -249,6 +249,121 @@ export function translateCoordinates(
   };
 }
 
+/**
+ * A canvas-drag gesture being streamed to the device via a persistent
+ * `adb shell` as `input motionevent` lines. This is the touch path for
+ * non-rooted Android 12+ devices, where minitouch cannot open /dev/input
+ * (SELinux denies the shell domain). The `input` command spawns a JVM per
+ * call (~70ms), so we (a) hold one shell open per gesture to avoid the adb
+ * round-trip, and (b) throttle MOVE events to `MIN_MOVE_INTERVAL_MS` and only
+ * send the latest coordinate, so slow `input` calls can't queue up unbounded.
+ */
+interface AdbGesture {
+  deviceId: string;
+  proc: ChildProcess;
+  lastMoveAt: number;
+  pendingMove: { x: number; y: number } | null;
+  moveTimer: NodeJS.Timeout | null;
+  lastX: number;
+  lastY: number;
+  /** Last two raw (unthrottled) move samples, for release-velocity → fling. */
+  samples: { x: number; y: number; t: number }[];
+}
+
+/** Min spacing between MOVE motionevents; the on-device `input` JVM costs
+ *  ~70ms, so faster than this just backs up. ~14 moves/s — steppy but scrolls
+ *  and follows direction changes (minitouch is smoother but needs root here). */
+const MIN_MOVE_INTERVAL_MS = 70;
+/** Release speed (device px/s) above which we inject a fling on `up`. */
+const FLING_MIN_SPEED = 1200;
+
+/** Start a persistent adb shell for a drag gesture and send the initial DOWN. */
+function startAdbGesture(deviceId: string, x: number, y: number): AdbGesture {
+  const proc = spawn('adb', ['-s', deviceId, 'shell']);
+  proc.on('error', (err) => error(`adb gesture shell error for ${deviceId}: ${err.message}`));
+  const g: AdbGesture = {
+    deviceId, proc, lastMoveAt: 0, pendingMove: null, moveTimer: null,
+    lastX: x, lastY: y, samples: [{ x, y, t: Date.now() }],
+  };
+  writeMotionEvent(g, 'DOWN', x, y);
+  return g;
+}
+
+/** Throttled MOVE: coalesce to the latest coordinate, emit at most one per
+ *  MIN_MOVE_INTERVAL_MS so slow on-device `input` calls don't queue. Every raw
+ *  sample is recorded (for release velocity) even when the wire event is
+ *  throttled away. */
+function feedAdbGesture(g: AdbGesture, x: number, y: number): void {
+  g.samples.push({ x, y, t: Date.now() });
+  if (g.samples.length > 4) g.samples.shift();
+  g.pendingMove = { x, y };
+  const since = Date.now() - g.lastMoveAt;
+  if (since >= MIN_MOVE_INTERVAL_MS) {
+    flushAdbMove(g);
+  } else if (!g.moveTimer) {
+    g.moveTimer = setTimeout(() => { g.moveTimer = null; flushAdbMove(g); }, MIN_MOVE_INTERVAL_MS - since);
+  }
+}
+
+function flushAdbMove(g: AdbGesture): void {
+  if (!g.pendingMove) return;
+  const { x, y } = g.pendingMove;
+  g.pendingMove = null;
+  g.lastMoveAt = Date.now();
+  writeMotionEvent(g, 'MOVE', x, y);
+}
+
+/**
+ * End the gesture. If the finger was moving fast at release, inject a fling:
+ * our throttled MOVE stream flattens the release velocity so Android never
+ * sees a flick, so we replay the recent motion vector as a short, fast
+ * `input swipe` (confirmed on-device to trigger momentum). A slow/precise drag
+ * just gets a plain UP so it settles exactly where released.
+ */
+function endAdbGesture(g: AdbGesture, x: number, y: number): void {
+  if (g.moveTimer) { clearTimeout(g.moveTimer); g.moveTimer = null; }
+  const upX = Number.isFinite(x) ? x : g.lastX;
+  const upY = Number.isFinite(y) ? y : g.lastY;
+
+  // Release velocity from the last two raw samples.
+  const s = g.samples;
+  let speed = 0, vx = 0, vy = 0;
+  if (s.length >= 2) {
+    const a = s[s.length - 2], b = s[s.length - 1];
+    const dt = Math.max(1, b.t - a.t) / 1000;
+    vx = (b.x - a.x) / dt; vy = (b.y - a.y) / dt;
+    speed = Math.hypot(vx, vy);
+  }
+  const willFling = speed >= FLING_MIN_SPEED;
+  log(`adb gesture release ${g.deviceId}: speed=${Math.round(speed)}px/s fling=${willFling}`);
+
+  // End the drag contact cleanly.
+  writeMotionEvent(g, 'UP', upX, upY);
+  try { g.proc.stdin?.end('exit\n'); } catch { /* closing */ }
+
+  // Fling: injected `input motionevent` MOVEs run ~70ms apart (JVM spawn per
+  // call), so Android's velocity tracker never sees a fast flick from them — it
+  // only flings from the native `input swipe` primitive (confirmed on-device).
+  // So on a fast release, throw a short `input swipe` along the release vector.
+  // The drag scroll already positioned the content; this swipe adds momentum
+  // from where the finger lifted. Slow/precise drags skip it and settle exactly.
+  if (willFling) {
+    const throwMs = 50; // short = fast = Android reads it as a flick
+    const endX = Math.round(upX + vx * 0.10);
+    const endY = Math.round(upY + vy * 0.10);
+    execAsync(
+      `adb -s ${g.deviceId} shell input swipe ${Math.round(upX)} ${Math.round(upY)} ${endX} ${endY} ${throwMs}`,
+      { timeout: 5000 },
+    ).catch((err: any) => error(`ADB fling swipe failed for ${g.deviceId}: ${err.message}`));
+  }
+}
+
+function writeMotionEvent(g: AdbGesture, action: 'DOWN' | 'MOVE' | 'UP', x: number, y: number): void {
+  g.lastX = x; g.lastY = y;
+  try { g.proc.stdin?.write(`input motionevent ${action} ${Math.round(x)} ${Math.round(y)}\n`); }
+  catch { /* shell gone — gesture aborted */ }
+}
+
 interface DeviceStream {
   deviceId: string;
   minicapProcess: ChildProcess | null;
@@ -263,6 +378,13 @@ interface DeviceStream {
    *  SurfaceCapture.CaptureListener) and dies if a RESET_VIDEO arrives before
    *  capture is live. A fresh start emits its own initial IDR anyway. */
   captureReady: boolean;
+  /** Persistent `adb shell` for streaming a canvas-drag gesture as
+   *  `input motionevent` DOWN/MOVE/UP lines, used when minitouch is
+   *  unavailable (non-rooted Android 12+ where SELinux blocks the shell
+   *  domain from /dev/input). One shell per in-progress gesture keeps latency
+   *  to the ~70ms `input` JVM spawn instead of a full adb round-trip per event.
+   *  See startAdbGesture / feedAdbGesture / endAdbGesture. */
+  adbGesture: AdbGesture | null;
   scrcpyPort: number;
   hasLiveVideo: boolean;
   screenWidth: number;
@@ -1151,6 +1273,7 @@ async function startDeviceStream(deviceId: string, deviceManager: DeviceManager)
     scrcpyProcess: null,
     broadcaster: null,
     captureReady: false,
+    adbGesture: null,
     scrcpyPort: 0,
     hasLiveVideo: false,
     screenWidth: props.screenWidth,
@@ -1315,6 +1438,14 @@ function stopStream(deviceId: string): void {
   if (stream.pollTimer) {
     clearInterval(stream.pollTimer);
     stream.pollTimer = null;
+  }
+
+  // Tear down any in-progress ADB-input drag gesture (persistent shell).
+  if (stream.adbGesture) {
+    if (stream.adbGesture.moveTimer) clearTimeout(stream.adbGesture.moveTimer);
+    try { stream.adbGesture.proc.stdin?.end('exit\n'); } catch { /* already gone */ }
+    try { stream.adbGesture.proc.kill(); } catch { /* already gone */ }
+    stream.adbGesture = null;
   }
 
   stream.minicapSocket?.destroy();
@@ -1770,15 +1901,23 @@ export function registerLiveStreamEndpoints(deviceManager: DeviceManager, iosDev
       // Minitouch available — coordinates are already device pixels
       const cmd = buildMinitouchCommand(eventType, x, y);
       stream.minitouchSocket.write(cmd);
-    } else if (eventType === 'down') {
-      // ADB tap fallback (only fire on 'down' to avoid duplicate taps)
-      try {
-        await execAsync(
-          `adb -s ${deviceId} shell input tap ${Math.round(x)} ${Math.round(y)}`,
-          { timeout: 5000 },
-        );
-      } catch (err: any) {
-        error(`ADB tap failed for ${deviceId}: ${err.message}`);
+    } else if (stream) {
+      // ADB input fallback for devices without minitouch (non-rooted Android
+      // 12+ where SELinux blocks the shell from /dev/input). Stream the drag as
+      // `input motionevent` DOWN/MOVE/UP over a persistent shell so it scrolls
+      // continuously and follows direction changes — not just a tap at the
+      // start point (the old behavior) or a single straight swipe.
+      if (eventType === 'down') {
+        // A stray second down without an up — clean up the old gesture first.
+        if (stream.adbGesture) endAdbGesture(stream.adbGesture, x, y);
+        stream.adbGesture = startAdbGesture(deviceId, x, y);
+      } else if (eventType === 'move') {
+        if (stream.adbGesture) feedAdbGesture(stream.adbGesture, x, y);
+      } else if (eventType === 'up') {
+        if (stream.adbGesture) {
+          endAdbGesture(stream.adbGesture, x, y);
+          stream.adbGesture = null;
+        }
       }
     }
   }, { requires: ['core.devices:manage'] });
