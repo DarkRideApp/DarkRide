@@ -128,6 +128,10 @@ export interface TrafficEntryMessage {
     matchedRules?: any[];
     responseContentType?: string | null;
     hasImage?: boolean;
+    /** End-to-end latency in ms (request start → response end). Null when unknown. */
+    durationMs?: number | null;
+    /** Timing breakdown (dns/connect/tls/ttfb/download in ms), when available. */
+    timings?: import('./api').TrafficTimings | null;
   };
 }
 

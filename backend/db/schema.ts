@@ -182,6 +182,11 @@ export const capturedTraffic = sqliteTable('captured_traffic', {
   wsMessageCount: integer('ws_message_count').default(0),
   capturedAt: integer('captured_at', { mode: 'timestamp' }).notNull(),
   matchedRules: text('matched_rules'),
+  // Per-request latency (ms, request start → response end). Null for
+  // synthetic/DNS/TLS-fail entries and pre-timing rows.
+  durationMs: integer('duration_ms'),
+  // Timing breakdown JSON: {dns,connect,tls,ttfb,download} in ms (each nullable).
+  timings: text('timings'),
 });
 
 export const websocketMessages = sqliteTable('websocket_messages', {

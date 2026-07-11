@@ -8,6 +8,7 @@
 
 import { detectGraphQL } from '../../../shared/lib/graphql-detect';
 import { detectProtobuf } from '../../../shared/lib/protobuf-detect';
+import type { TrafficTimings } from '../../../shared/types/api';
 import type { TrafficEntry } from './TrafficEntryRow';
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,70 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
+
+// ---------------------------------------------------------------------------
+// Per-request duration formatting + colour (Duration column + waterfall)
+// ---------------------------------------------------------------------------
+
+/**
+ * Format a request duration in ms compactly: `142ms`, `1.2s`, `12s`.
+ * Null/undefined (no timing captured — DNS/synthetic/legacy rows) → `—`.
+ */
+export function formatDuration(durationMs: number | null | undefined): string {
+  if (durationMs == null || !Number.isFinite(durationMs)) return '—';
+  if (durationMs < 0) return '—';
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  const secs = durationMs / 1000;
+  if (secs < 10) return `${secs.toFixed(1)}s`;
+  return `${Math.round(secs)}s`;
+}
+
+/**
+ * Colour a duration like Charles/DevTools: slow requests stand out.
+ * >3s red, >1s amber, otherwise a neutral readable colour. Returns undefined
+ * for missing timing so the cell can render the em-dash in the muted default.
+ */
+export function getDurationColor(durationMs: number | null | undefined): string | undefined {
+  if (durationMs == null || durationMs < 0) return undefined;
+  if (durationMs > 3000) return '#fca5a5'; // red — matches status 5xx
+  if (durationMs > 1000) return '#ffb95f'; // amber — matches status 3xx
+  return '#8b95b0'; // neutral, readable on the dark theme
+}
+
+/**
+ * Normalise a timings value (JSON string from REST, object from WS, or null)
+ * into a TrafficTimings object, or null if there is no usable breakdown.
+ */
+export function normalizeTimings(
+  timings: TrafficTimings | string | null | undefined,
+): TrafficTimings | null {
+  if (timings == null) return null;
+  let obj: any = timings;
+  if (typeof timings === 'string') {
+    try { obj = JSON.parse(timings); } catch { return null; }
+  }
+  if (!obj || typeof obj !== 'object') return null;
+  const num = (v: any): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const result: TrafficTimings = {
+    dns: num(obj.dns),
+    connect: num(obj.connect),
+    tls: num(obj.tls),
+    ttfb: num(obj.ttfb),
+    download: num(obj.download),
+  };
+  // Only meaningful if at least one segment is a real (>=0) number.
+  const hasAny = Object.values(result).some((v) => v != null && v >= 0);
+  return hasAny ? result : null;
+}
+
+/** Ordered segment metadata for the timing waterfall (label + colour). */
+export const TIMING_SEGMENTS: Array<{ key: keyof TrafficTimings; label: string; color: string }> = [
+  { key: 'dns',      label: 'DNS',      color: '#0ea5e9' },
+  { key: 'connect',  label: 'Connect',  color: '#22c55e' },
+  { key: 'tls',      label: 'TLS',      color: '#a855f7' },
+  { key: 'ttfb',     label: 'Wait',     color: '#f59e0b' },
+  { key: 'download', label: 'Download', color: '#3b82f6' },
+];
 
 // ---------------------------------------------------------------------------
 // Returns a CSS colour string for a HTTP status code

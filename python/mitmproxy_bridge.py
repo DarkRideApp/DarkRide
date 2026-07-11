@@ -238,6 +238,64 @@ def _activate_proxy(proxy_url):
     _patch_applied = True
 
 
+def _extract_timings(flow):
+    """Compute per-request duration + a best-effort timing breakdown from a
+    completed mitmproxy HTTP flow.
+
+    Returns a (duration_ms, timings) tuple:
+      - duration_ms: int milliseconds from request start to response end, or
+        None when either timestamp is missing.
+      - timings: dict with dns/connect/tls/ttfb/download segment durations in
+        ms (each None when it can't be computed), or None when there is no
+        usable timing data at all.
+
+    Defensive by design: a missing attribute yields None for that piece and
+    never raises. Reused (keep-alive) connections routinely lack the TCP/TLS
+    setup timestamps, so those segments come back None. Synthetic flows (DNS,
+    TLS_FAIL) have no real flow.response and are handled by their own callers,
+    which never invoke this helper.
+    """
+    try:
+        req = getattr(flow, "request", None)
+        resp = getattr(flow, "response", None)
+        req_start = getattr(req, "timestamp_start", None) if req is not None else None
+        req_end = getattr(req, "timestamp_end", None) if req is not None else None
+        resp_start = getattr(resp, "timestamp_start", None) if resp is not None else None
+        resp_end = getattr(resp, "timestamp_end", None) if resp is not None else None
+
+        duration_ms = None
+        if req_start is not None and resp_end is not None:
+            duration_ms = round((resp_end - req_start) * 1000)
+
+        server_conn = getattr(flow, "server_conn", None)
+        conn_start = getattr(server_conn, "timestamp_start", None) if server_conn is not None else None
+        tcp_setup = getattr(server_conn, "timestamp_tcp_setup", None) if server_conn is not None else None
+        tls_setup = getattr(server_conn, "timestamp_tls_setup", None) if server_conn is not None else None
+
+        def seg(a, b):
+            """Duration a->b in ms, or None if either endpoint missing/negative."""
+            if a is None or b is None:
+                return None
+            ms = round((b - a) * 1000)
+            return ms if ms >= 0 else None
+
+        timings = {
+            # mitmproxy does not expose DNS resolution timing on the flow.
+            "dns": None,
+            "connect": seg(conn_start, tcp_setup),
+            "tls": seg(tcp_setup, tls_setup),
+            "ttfb": seg(req_end, resp_start),
+            "download": seg(resp_start, resp_end),
+        }
+
+        # Nothing useful to report — keep the payload clean.
+        if duration_ms is None and all(v is None for v in timings.values()):
+            return None, None
+        return duration_ms, timings
+    except Exception:
+        return None, None
+
+
 def _truncate_body(body: str | None, content_type: str | None) -> str | None:
     """Truncate or skip body based on size and content type."""
     if body is None:
@@ -1091,6 +1149,14 @@ class DarkRideAddon:
                 "contentType": resp_content_type,
             },
         }
+
+        # Per-request timing — forward the mitmproxy flow timestamps so the
+        # backend can persist a real Duration + timing waterfall. Fully
+        # best-effort: never breaks ingest if timestamps are missing.
+        duration_ms, timings = _extract_timings(flow)
+        data["durationMs"] = duration_ms
+        if timings is not None:
+            data["timings"] = timings
 
         if device_id:
             data["deviceId"] = device_id

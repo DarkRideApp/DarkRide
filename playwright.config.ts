@@ -33,6 +33,7 @@ export default defineConfig({
       DARKRIDE_BOOTSTRAP_ADMIN_USERNAME: 'e2e-admin',
       DARKRIDE_BOOTSTRAP_ADMIN_PASSWORD: 'e2e-test-password-123',
       PORT: '3199',
+      WEBSOCKET_ALLOWED_ORIGINS: 'http://localhost:5199',
     },
   },
 });

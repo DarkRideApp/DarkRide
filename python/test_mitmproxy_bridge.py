@@ -24,7 +24,9 @@ from mitmproxy_bridge import (
     _CHROME_SIGALGS,
     _OKHTTP_TLS12_CIPHERS,
     TLS_PROFILES,
+    _extract_timings,
 )
+from types import SimpleNamespace
 
 
 # Expected cipher names in order: 3 TLS 1.3 + 12 TLS 1.2 = 15 total (Chrome 120 Android)
@@ -1383,3 +1385,88 @@ class TestTlsStartServerClientCert:
         assert find_calls[0] == ("api.example.com", None)
         # No error logged
         mock_ctx.log.error.assert_not_called()
+
+
+class TestExtractTimings:
+    """Tests for _extract_timings() — per-request duration + timing breakdown."""
+
+    def _flow(self, req_start=None, req_end=None, resp_start=None, resp_end=None,
+              conn_start=None, tcp_setup=None, tls_setup=None, with_server_conn=True):
+        request = SimpleNamespace(timestamp_start=req_start, timestamp_end=req_end)
+        response = SimpleNamespace(timestamp_start=resp_start, timestamp_end=resp_end)
+        server_conn = None
+        if with_server_conn:
+            server_conn = SimpleNamespace(
+                timestamp_start=conn_start,
+                timestamp_tcp_setup=tcp_setup,
+                timestamp_tls_setup=tls_setup,
+            )
+        return SimpleNamespace(request=request, response=response, server_conn=server_conn)
+
+    def test_full_timestamps_present(self):
+        # A fresh connection: conn @1000.0, tcp @1000.05, tls @1000.15,
+        # request sent-end @1000.20, first response byte @1000.50, done @1000.60
+        flow = self._flow(
+            req_start=1000.0, req_end=1000.20,
+            resp_start=1000.50, resp_end=1000.60,
+            conn_start=1000.0, tcp_setup=1000.05, tls_setup=1000.15,
+        )
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms == 600  # (1000.60 - 1000.0) * 1000
+        assert timings is not None
+        assert timings["connect"] == 50    # tcp - conn
+        assert timings["tls"] == 100       # tls - tcp
+        assert timings["ttfb"] == 300      # resp_start - req_end
+        assert timings["download"] == 100  # resp_end - resp_start
+        assert timings["dns"] is None      # mitmproxy exposes no DNS timing
+
+    def test_reused_connection_missing_setup(self):
+        # Reused (keep-alive) connection: no tcp/tls setup timestamps, but
+        # request/response timing is still present.
+        flow = self._flow(
+            req_start=2000.0, req_end=2000.1,
+            resp_start=2000.4, resp_end=2000.5,
+            conn_start=None, tcp_setup=None, tls_setup=None,
+        )
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms == 500
+        assert timings["connect"] is None
+        assert timings["tls"] is None
+        assert timings["ttfb"] == 300
+        assert timings["download"] == 100
+
+    def test_missing_response_end_yields_null_duration(self):
+        flow = self._flow(req_start=5.0, req_end=5.1, resp_start=5.2, resp_end=None)
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms is None
+        # ttfb still computable, download not
+        assert timings["ttfb"] == 100
+        assert timings["download"] is None
+
+    def test_no_data_returns_none_none(self):
+        flow = self._flow(with_server_conn=False)
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms is None
+        assert timings is None
+
+    def test_negative_segment_clamped_to_none(self):
+        # Clock skew / reordered timestamps must never produce negatives.
+        flow = self._flow(
+            req_start=10.0, req_end=10.5,
+            resp_start=10.4, resp_end=10.6,  # resp_start < req_end → ttfb negative
+            conn_start=10.0, tcp_setup=10.05, tls_setup=10.15,
+        )
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms == 600
+        assert timings["ttfb"] is None  # negative clamped
+
+    def test_never_raises_on_garbage_flow(self):
+        # A flow with non-numeric timestamps must be swallowed, not raise.
+        bad = SimpleNamespace(
+            request=SimpleNamespace(timestamp_start="oops", timestamp_end=None),
+            response=SimpleNamespace(timestamp_start=None, timestamp_end="nope"),
+            server_conn=None,
+        )
+        duration_ms, timings = _extract_timings(bad)
+        assert duration_ms is None
+        assert timings is None

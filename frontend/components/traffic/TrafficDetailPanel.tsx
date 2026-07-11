@@ -10,6 +10,10 @@ import {
   isBodyTruncated,
   generateCurl,
   generateFetch,
+  formatDuration,
+  getDurationColor,
+  normalizeTimings,
+  TIMING_SEGMENTS,
 } from './trafficUtils';
 
 type InspectorTab = 'headers' | 'payload' | 'preview' | 'cookies' | 'frames';
@@ -144,6 +148,72 @@ function ActionButton({
       {icon}
       <span>{feedback ? copiedLabel : label}</span>
     </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Timing waterfall — compact segmented bar (dns/connect/tls/ttfb/download)
+// ---------------------------------------------------------------------------
+
+function TimingWaterfall({ entry }: { entry: TrafficEntry }) {
+  const timings = useMemo(() => normalizeTimings(entry.timings), [entry.timings]);
+  const durationMs = entry.durationMs;
+
+  // Nothing to show at all — no total and no breakdown.
+  if ((durationMs == null || durationMs < 0) && !timings) return null;
+
+  const segments = timings
+    ? TIMING_SEGMENTS
+        .map(s => ({ ...s, value: timings[s.key] }))
+        .filter(s => s.value != null && (s.value as number) >= 0)
+    : [];
+  const knownTotal = segments.reduce((sum, s) => sum + (s.value as number), 0);
+
+  return (
+    <div className="timing-waterfall" data-testid="timing-waterfall">
+      <div className="timing-waterfall-header">
+        <span className="detail-panel-section-title">Timing</span>
+        <span
+          className="timing-waterfall-total"
+          style={{ color: getDurationColor(durationMs) }}
+          data-testid="timing-waterfall-total"
+        >
+          {formatDuration(durationMs)}
+        </span>
+      </div>
+
+      {segments.length > 0 && knownTotal > 0 ? (
+        <>
+          <div className="timing-waterfall-bar" data-testid="timing-waterfall-bar">
+            {segments.map(s => (
+              <div
+                key={s.key}
+                className="timing-waterfall-seg"
+                style={{
+                  width: `${((s.value as number) / knownTotal) * 100}%`,
+                  background: s.color,
+                }}
+                title={`${s.label}: ${formatDuration(s.value as number)}`}
+                data-testid={`timing-seg-${s.key}`}
+              />
+            ))}
+          </div>
+          <div className="timing-waterfall-legend">
+            {segments.map(s => (
+              <span key={s.key} className="timing-waterfall-legend-item">
+                <span className="timing-waterfall-dot" style={{ background: s.color }} />
+                {s.label}
+                <span className="timing-waterfall-legend-ms">{formatDuration(s.value as number)}</span>
+              </span>
+            ))}
+          </div>
+        </>
+      ) : (
+        <div className="timing-waterfall-total-only" data-testid="timing-waterfall-total-only">
+          Total latency (no per-segment breakdown available)
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -298,10 +368,13 @@ export function TrafficDetailPanel({
       {/* Tab content */}
       <div className="traffic-detail-content">
         {activeTab === 'headers' && (
-          <div className="traffic-detail-headers-grid">
-            <HeaderDisplay headers={requestHeaders} title="Request Headers" titleColor="var(--accent)" />
-            <HeaderDisplay headers={responseHeaders} title="Response Headers" titleColor="var(--warning)" />
-          </div>
+          <>
+            {!isWs && <TimingWaterfall entry={entry} />}
+            <div className="traffic-detail-headers-grid">
+              <HeaderDisplay headers={requestHeaders} title="Request Headers" titleColor="var(--accent)" />
+              <HeaderDisplay headers={responseHeaders} title="Response Headers" titleColor="var(--warning)" />
+            </div>
+          </>
         )}
 
         {activeTab === 'payload' && (
