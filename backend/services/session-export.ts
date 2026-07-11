@@ -39,13 +39,49 @@ interface HarEntry {
     bodySize: number;
   };
   cache: {};
-  timings: { send: number; wait: number; receive: number };
+  timings: {
+    blocked: number;
+    dns: number;
+    connect: number;
+    ssl: number;
+    send: number;
+    wait: number;
+    receive: number;
+  };
   _webSocketMessages?: Array<{
     type: 'send' | 'receive';
     time: number;
     opcode: number;
     data: string;
   }>;
+}
+
+/**
+ * Map a stored timing breakdown ({dns,connect,tls,ttfb,download} in ms, each
+ * nullable) onto HAR 1.2 `timings`. HAR uses -1 to mean "does not apply /
+ * unknown"; segments we never measure (blocked, send) and any null segment
+ * become -1. `ssl` in HAR is the TLS-handshake portion (our `tls`).
+ */
+function buildHarTimings(timingsJson: string | null): HarEntry['timings'] {
+  let t: Record<string, number | null> | null = null;
+  if (timingsJson) {
+    try {
+      const parsed = JSON.parse(timingsJson);
+      if (parsed && typeof parsed === 'object') t = parsed;
+    } catch {
+      // ignore malformed timing JSON — fall back to all -1
+    }
+  }
+  const ms = (v: number | null | undefined): number => (typeof v === 'number' ? v : -1);
+  return {
+    blocked: -1,
+    dns: t ? ms(t.dns) : -1,
+    connect: t ? ms(t.connect) : -1,
+    ssl: t ? ms(t.tls) : -1,
+    send: -1,
+    wait: t ? ms(t.ttfb) : -1,
+    receive: t ? ms(t.download) : -1,
+  };
 }
 
 function parseHeadersToHar(headersJson: string | null): HarHeader[] {
@@ -92,7 +128,7 @@ export function buildHarJson(
     const bodyText = t.responseBody || '';
     const entry: HarEntry = {
       startedDateTime: new Date(t.capturedAt).toISOString(),
-      time: 0,
+      time: t.durationMs ?? 0,
       request: {
         method: t.requestMethod,
         url: t.requestUrl,
@@ -122,7 +158,7 @@ export function buildHarJson(
         bodySize: bodyText.length,
       },
       cache: {},
-      timings: { send: 0, wait: 0, receive: 0 },
+      timings: buildHarTimings(t.timings),
     };
 
     if (t.type === 'websocket') {

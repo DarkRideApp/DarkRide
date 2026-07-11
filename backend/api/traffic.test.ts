@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { eq } from 'drizzle-orm';
 import request from 'supertest';
 import express from 'express';
 import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
@@ -186,6 +187,44 @@ describe('Traffic API Endpoints', () => {
       expect(mockBroadcastToAll).not.toHaveBeenCalled();
     });
 
+    it('should persist durationMs + timings and broadcast durationMs', async () => {
+      const timings = { dns: null, connect: 50, tls: 100, ttfb: 300, download: 100 };
+      await request(app)
+        .post('/v1/traffic/ingest')
+        .send({
+          request: { method: 'GET', url: 'https://api.example.com/timed', headers: {} },
+          response: { status: 200, body: '{}' },
+          durationMs: 600,
+          timings,
+        });
+
+      const traffic = db.select().from(capturedTraffic).all();
+      expect(traffic).toHaveLength(1);
+      expect(traffic[0].durationMs).toBe(600);
+      expect(JSON.parse(traffic[0].timings as string)).toEqual(timings);
+
+      expect(mockBroadcastToAll).toHaveBeenCalledOnce();
+      const msg = mockBroadcastToAll.mock.calls[0][0];
+      expect(msg.entry.durationMs).toBe(600);
+      expect(msg.entry.timings).toEqual(timings);
+    });
+
+    it('should persist null durationMs + timings when omitted (DNS/synthetic/reused)', async () => {
+      await request(app)
+        .post('/v1/traffic/ingest')
+        .send({
+          request: { method: 'GET', url: 'https://api.example.com/no-timing', headers: {} },
+          response: { status: 200, body: '{}' },
+        });
+
+      const traffic = db.select().from(capturedTraffic).all();
+      expect(traffic[0].durationMs).toBeNull();
+      expect(traffic[0].timings).toBeNull();
+
+      const msg = mockBroadcastToAll.mock.calls[0][0];
+      expect(msg.entry.durationMs).toBeNull();
+    });
+
     it('should not filter traffic that does not match rules', async () => {
       await request(app)
         .post('/v1/traffic/rules')
@@ -294,6 +333,20 @@ describe('Traffic API Endpoints', () => {
       const firstBodyLen = res.body.data.items[0].responseBody ? res.body.data.items[0].responseBody.length : 0;
       const lastBodyLen = res.body.data.items[2].responseBody ? res.body.data.items[2].responseBody.length : 0;
       expect(firstBodyLen).toBeGreaterThanOrEqual(lastBodyLen);
+    });
+
+    it('should sort by durationMs server-side (desc then asc)', async () => {
+      // Give the three seeded rows distinct durations
+      const rows = db.select().from(capturedTraffic).all();
+      db.update(capturedTraffic).set({ durationMs: 30 }).where(eq(capturedTraffic.id, rows[0].id)).run();
+      db.update(capturedTraffic).set({ durationMs: 3000 }).where(eq(capturedTraffic.id, rows[1].id)).run();
+      db.update(capturedTraffic).set({ durationMs: 300 }).where(eq(capturedTraffic.id, rows[2].id)).run();
+
+      const desc = await request(app).get('/v1/traffic/list?sortBy=durationMs&sortDir=desc');
+      expect(desc.body.data.items.map((i: any) => i.durationMs)).toEqual([3000, 300, 30]);
+
+      const asc = await request(app).get('/v1/traffic/list?sortBy=durationMs&sortDir=asc');
+      expect(asc.body.data.items.map((i: any) => i.durationMs)).toEqual([30, 300, 3000]);
     });
   });
 

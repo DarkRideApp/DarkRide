@@ -311,3 +311,36 @@ describe('TrafficTable — active-filter chips', () => {
     expect(screen.getByRole('button', { name: /^filters$/i })).toBeInTheDocument();
   });
 });
+
+describe('TrafficTable — Duration column', () => {
+  it('renders a compact duration for an entry with timing', () => {
+    render(<TrafficTable entries={[makeEntry({ id: 5, durationMs: 142 })]} showFilterBar={false} />);
+    expect(screen.getByTestId('traffic-duration-5')).toHaveTextContent('142ms');
+  });
+
+  it('formats durations over a second as seconds', () => {
+    render(<TrafficTable entries={[makeEntry({ id: 6, durationMs: 1200 })]} showFilterBar={false} />);
+    expect(screen.getByTestId('traffic-duration-6')).toHaveTextContent('1.2s');
+  });
+
+  it('shows an em-dash when duration is missing', () => {
+    render(<TrafficTable entries={[makeEntry({ id: 7, durationMs: null })]} showFilterBar={false} />);
+    expect(screen.getByTestId('traffic-duration-7')).toHaveTextContent('—');
+  });
+
+  it('renders a sortable Duration header and calls onSortChange with durationMs', () => {
+    const onSortChange = vi.fn();
+    render(
+      <TrafficTable
+        entries={[makeEntry({ id: 8, durationMs: 500 })]}
+        showFilterBar={false}
+        onSortChange={onSortChange}
+        sortBy="capturedAt"
+        sortDir="desc"
+      />,
+    );
+    const header = screen.getByTestId('traffic-header-duration');
+    fireEvent.click(header);
+    expect(onSortChange).toHaveBeenCalledWith('durationMs', 'desc');
+  });
+});

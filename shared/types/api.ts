@@ -188,6 +188,20 @@ export interface SessionListQuery {
 
 // ---- Traffic types ----
 
+/**
+ * Per-request timing breakdown (all values in milliseconds, best-effort).
+ * Each segment is null when it can't be derived from the mitmproxy flow
+ * (e.g. reused keep-alive connections have no TCP/TLS setup timing; DNS
+ * resolution timing is never exposed by mitmproxy).
+ */
+export interface TrafficTimings {
+  dns: number | null;
+  connect: number | null;
+  tls: number | null;
+  ttfb: number | null;
+  download: number | null;
+}
+
 export interface CapturedTrafficEntry {
   id: number;
   sessionId: number | null;
@@ -207,6 +221,10 @@ export interface CapturedTrafficEntry {
   matchedRules?: Array<{ id: number; name: string; phase: string; actionsApplied: string[] }> | null;
   responseContentType?: string | null;
   hasImage?: boolean;
+  /** End-to-end latency in ms (request start → response end). Null for synthetic/DNS/TLS-fail entries. */
+  durationMs?: number | null;
+  /** Timing breakdown JSON. Stored as text in the DB; parsed to TrafficTimings on read. */
+  timings?: TrafficTimings | string | null;
 }
 
 export interface WebSocketMessageEntry {

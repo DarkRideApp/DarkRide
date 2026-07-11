@@ -22,6 +22,8 @@ import {
   getContentType,
   getResponseSize,
   getStatusColor,
+  formatDuration,
+  getDurationColor,
   applyClientFilters,
   createDefaultFilters,
   filtersToPreset,
@@ -809,6 +811,18 @@ export function TrafficTable({
                         <th style={{ width: 90 }}>Type</th>
                         <th style={{ width: 80 }}>Size</th>
                         <th
+                          style={{ width: 76, textAlign: 'right', cursor: 'pointer', userSelect: 'none' }}
+                          onClick={() => handleHeaderSort('durationMs')}
+                          data-testid="traffic-header-duration"
+                        >
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2, justifyContent: 'flex-end' }}>
+                            Duration
+                            {controlledSortBy === 'durationMs'
+                              ? (controlledSortDir === 'asc' ? <ChevronUp size={12} /> : <ChevronDown size={12} />)
+                              : <ChevronDown size={12} style={{ opacity: 0.3 }} />}
+                          </span>
+                        </th>
+                        <th
                           style={{ width: 72, textAlign: 'right', cursor: 'pointer', userSelect: 'none' }}
                           onClick={() => handleHeaderSort('capturedAt')}
                         >
@@ -827,6 +841,7 @@ export function TrafficTable({
                         <th style={{ width: 64 }}>Status</th>
                         <th style={{ width: 90 }}>Type</th>
                         <th style={{ width: 80 }}>Size</th>
+                        <th style={{ width: 76, textAlign: 'right' }}>Duration</th>
                         <th style={{ width: 72, textAlign: 'right' }}>Time</th>
                       </>
                     )}
@@ -899,6 +914,13 @@ export function TrafficTable({
                         </td>
                         <td className="traffic-cell-type">{contentType}</td>
                         <td className="traffic-cell-size">{size}</td>
+                        <td
+                          className="traffic-cell-duration"
+                          style={{ textAlign: 'right', color: getDurationColor(entry.durationMs) }}
+                          data-testid={`traffic-duration-${entry.id}`}
+                        >
+                          {isWs ? '—' : formatDuration(entry.durationMs)}
+                        </td>
                         <td className="traffic-cell-time">{time}</td>
                       </tr>
                     );

@@ -251,6 +251,8 @@ export function Traffic() {
         matchedRules: e.matchedRules ?? null,
         responseContentType: e.responseContentType ?? null,
         hasImage: e.hasImage ?? false,
+        durationMs: e.durationMs ?? null,
+        timings: e.timings ?? null,
       };
       if (page === 0 && activeTab === 'live') {
         setEntries(prev => {

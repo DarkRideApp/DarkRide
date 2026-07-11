@@ -6286,6 +6286,75 @@ body.live-log-open .ai-chat-fab {
 .traffic-detail-content::-webkit-scrollbar-track { background: transparent; }
 .traffic-detail-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
 
+/* Timing waterfall (detail panel Headers tab) */
+.timing-waterfall {
+  margin-bottom: 20px;
+  padding: 12px 14px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+.timing-waterfall-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.timing-waterfall-total {
+  font-weight: 700;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.timing-waterfall-bar {
+  display: flex;
+  width: 100%;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
+}
+.timing-waterfall-seg {
+  height: 100%;
+  min-width: 2px;
+  transition: opacity 0.1s;
+}
+.timing-waterfall-seg:hover {
+  opacity: 0.8;
+}
+.timing-waterfall-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 10px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.timing-waterfall-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.timing-waterfall-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.timing-waterfall-legend-ms {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.timing-waterfall-total-only {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: italic;
+}
+.traffic-cell-duration {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* Two-column headers grid */
 .traffic-detail-headers-grid {
   display: grid;

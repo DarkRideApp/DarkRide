@@ -41,6 +41,14 @@ export interface TrafficEntry {
   matchedRules?: Array<{ id: number; name: string; phase: string; actionsApplied: string[] }> | null;
   responseContentType?: string | null;
   hasImage?: boolean;
+  /** End-to-end latency in ms (request start → response end). Null when unknown. */
+  durationMs?: number | null;
+  /**
+   * Timing breakdown. Arrives from the WS broadcast as an object, and from the
+   * REST list/view as a JSON string (raw DB column). Both are accepted; the
+   * detail panel normalises before rendering.
+   */
+  timings?: import('../../../shared/types/api').TrafficTimings | string | null;
 }
 
 interface TrafficEntryRowProps {

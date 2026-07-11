@@ -252,6 +252,9 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
     const responseBody = resData?.body || null;
     const responseBodyBase64 = resData?.bodyBase64 || null;
     const responseContentType = resData?.contentType || null;
+    const durationMs = typeof req.body.durationMs === 'number' ? req.body.durationMs : null;
+    const timingsObj = req.body.timings && typeof req.body.timings === 'object' ? req.body.timings : null;
+    const timings = timingsObj ? JSON.stringify(timingsObj) : null;
     const capturedAt = new Date();
     const matchedRulesRaw = req.body.matchedRules;
     const matchedRules = (Array.isArray(matchedRulesRaw) && matchedRulesRaw.length > 0)
@@ -281,6 +284,8 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
         responseBodyBinary,
         responseContentType,
         matchedRules,
+        durationMs,
+        timings,
         capturedAt,
       })
       .run();
@@ -319,6 +324,8 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
         matchedRules: matchedRulesRaw && matchedRulesRaw.length > 0 ? matchedRulesRaw : undefined,
         responseContentType,
         hasImage: !!responseBodyBinary,
+        durationMs,
+        timings: timingsObj ?? null,
       },
     };
     broadcastToAll(trafficMessage);
@@ -407,7 +414,9 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
             ? dirFn(capturedTraffic.requestUrl)
             : sortBy === 'responseStatus'
               ? dirFn(capturedTraffic.responseStatus)
-              : dirFn(capturedTraffic.capturedAt);
+              : sortBy === 'durationMs'
+                ? dirFn(capturedTraffic.durationMs)
+                : dirFn(capturedTraffic.capturedAt);
 
       const dataQuery = db.select().from(capturedTraffic);
       const results = (whereClause ? dataQuery.where(whereClause) : dataQuery)
@@ -468,6 +477,8 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
       results.sort((a, b) => dirMul * (a.requestUrl ?? '').localeCompare(b.requestUrl ?? ''));
     } else if (sortBy === 'responseStatus') {
       results.sort((a, b) => dirMul * ((a.responseStatus ?? 0) - (b.responseStatus ?? 0)));
+    } else if (sortBy === 'durationMs') {
+      results.sort((a, b) => dirMul * ((a.durationMs ?? 0) - (b.durationMs ?? 0)));
     } else {
       results.sort((a, b) => {
         const timeA = a.capturedAt ? new Date(a.capturedAt).getTime() : 0;
