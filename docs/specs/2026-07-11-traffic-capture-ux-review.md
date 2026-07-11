@@ -56,9 +56,10 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
   send back through the capture session's egress + TLS profile. **Needs a short design pass on how
   to route "as device" (upstream egress + TLS profile vs true on-device injection) before build —
   do not implement blind.**
-- `[~]` **Real per-request timing.** *(In progress — Wave 2, Opus: Duration column + waterfall +
-  real HAR timings, adds `durationMs`/`timings` columns via migration.)* No latency is captured
-  anywhere today — `CapturedTrafficEntry`
+- `[x]` **Real per-request timing.** *(Landed on `feat/traffic-capture-ux`: forwarded mitmproxy
+  timestamps, `durationMs`/`timings` columns via migration 0097, sortable Duration column,
+  detail-panel timing waterfall, and real HAR timings replacing the zeroed ones.)* No latency was
+  captured before — `CapturedTrafficEntry`
   (`shared/types/api.ts:191`) has no duration field and HAR export hardcodes `time:0` /
   zeroed `timings` (`backend/services/session-export.ts`). mitmproxy flows already carry
   `timestamp_start`/`timestamp_end`; forward them. Add `durationMs` (+ DNS/connect/TLS/TTFB if

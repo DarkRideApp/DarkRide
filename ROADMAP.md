@@ -164,14 +164,14 @@ live in **`docs/specs/2026-07-11-traffic-capture-ux-review.md`** — that doc is
 
 Headline items:
 
-- **P0 — Interactive interception ("breakpoints")** *(in progress)* — pause a matching
-  request/response in-flight, edit, forward or drop. Closes the biggest gap vs Burp/Charles; today's
-  intercept is rule-based auto-modify only.
-- **P0 — In-place, tunnel-routed replay** — replay in place with original-vs-new response diff, sent
-  back through the capture session's egress + TLS profile (not the server-side proxy path). Needs a
-  short design pass on how to route "as device" before build.
-- **P0 — Real per-request timing** *(queued)* — no latency is captured anywhere today; forward
-  mitmproxy's timestamps, add a Duration column + timing waterfall, fix zeroed HAR timings.
+- **P0 — Interactive interception ("breakpoints")** *(landed on `feat/traffic-capture-ux`)* — pause a
+  matching request/response in-flight, edit, forward or drop. Closes the biggest gap vs Burp/Charles;
+  the old intercept was rule-based auto-modify only.
+- **P0 — Real per-request timing** *(landed on `feat/traffic-capture-ux`)* — forwarded mitmproxy
+  timestamps, Duration column + timing waterfall, real HAR timings (were zeroed).
+- **P0 — In-place, tunnel-routed replay** *(next)* — replay in place with original-vs-new response
+  diff, sent back through the capture session's egress + TLS profile (not the server-side proxy path).
+  Needs a short design pass on how to route "as device" before build.
 - **P1** — deep filter/search *(in progress)*, host/path tree view, unify the five nav surfaces into
   one workspace, virtualize the list + fix live-append past page 0.
 - **P2** — raw wire view, in-body search + JSON tree + hex, auto-load-full-body, HTML render.
