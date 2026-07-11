@@ -33,8 +33,8 @@ function validateProxiedRequest(body: any): { valid: true; request: ProxiedHttpR
   }
 
   const { proxy } = body;
-  if (!proxy.type || !['proxyId', 'nordvpn', 'inline', 'direct'].includes(proxy.type)) {
-    return { valid: false, error: 'proxy.type must be one of: proxyId, nordvpn, inline, direct' };
+  if (!proxy.type || !['proxyId', 'nordvpn', 'inline', 'direct', 'captureSession'].includes(proxy.type)) {
+    return { valid: false, error: 'proxy.type must be one of: proxyId, nordvpn, inline, direct, captureSession' };
   }
 
   if (proxy.type === 'proxyId') {
@@ -57,6 +57,16 @@ function validateProxiedRequest(body: any): { valid: true; request: ProxiedHttpR
     } catch {
       return { valid: false, error: 'proxy.url is not a valid URL' };
     }
+  } else if (proxy.type === 'captureSession') {
+    if (!proxy.deviceId || typeof proxy.deviceId !== 'string') {
+      return { valid: false, error: 'proxy.deviceId is required for captureSession type' };
+    }
+  }
+
+  // tlsProfile is optional for every source. captureSession auto-derives it from
+  // the session when omitted; any source may set it explicitly.
+  if (body.tlsProfile !== undefined && !['chrome', 'okhttp', 'default'].includes(body.tlsProfile)) {
+    return { valid: false, error: "tlsProfile must be one of: chrome, okhttp, default" };
   }
 
   return {
@@ -70,6 +80,7 @@ function validateProxiedRequest(body: any): { valid: true; request: ProxiedHttpR
       followRedirects: body.followRedirects,
       maxRedirects: body.maxRedirects,
       proxy: body.proxy,
+      tlsProfile: body.tlsProfile,
     },
   };
 }
