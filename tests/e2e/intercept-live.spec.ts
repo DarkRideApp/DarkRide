@@ -56,7 +56,8 @@ test.describe('Interactive intercept (breakpoints)', () => {
     await expect(page.getByTestId('traffic-page')).toBeVisible();
 
     // The existing subheader affordances must still be present (additive change).
-    await expect(page.getByRole('button', { name: 'Clear' })).toBeVisible();
+    // Use exact match: the filter bar also renders a "Clear all" button.
+    await expect(page.getByRole('button', { name: 'Clear', exact: true })).toBeVisible();
 
     // Arm interception from the subheader toggle.
     await ensureArmed(page);
