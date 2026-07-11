@@ -47,15 +47,13 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
   `intercept-live` API + `InterceptHoldPanel`; long-poll hold, fail-open, addon-visible armed
   config, no migration. Rule-based intercept untouched. Follow-up: relabel the passive "Live
   Intercepting" header pill now that real interception exists.)*
-- `[ ]` **In-place, tunnel-routed replay (Repeater).** Two problems: (1) "Repeat/Replay" navigates
-  to a different page (`RequestBuilder`) via `sessionStorage`, losing context, with an ephemeral
-  20-item history; (2) replay routes through `backend/services/proxied-request-service.ts` — the
-  server-side proxy path — **not** the capturing device's tunnel/TLS-profile, so a replayed request
-  egresses with none of the device context and can silently behave differently from what the app
-  did. Fix: in-place request/response editor with original-vs-new response diff, and an option to
-  send back through the capture session's egress + TLS profile. **Needs a short design pass on how
-  to route "as device" (upstream egress + TLS profile vs true on-device injection) before build —
-  do not implement blind.**
+- `[x]` **In-place, tunnel-routed replay (Repeater).** *(Landed on `feat/traffic-capture-ux`:
+  `ReplayDrawer` slide-over + `response-diff` util; backend `captureSession` proxy source + ported
+  `shared/lib/tls-profiles.ts`; `ActiveCapture.getEgress`. Replaces the navigate-away flow, shows an
+  original-vs-new status/header/body diff, and routes replays through the capture session's egress +
+  a replicated cipher profile — Option 1 in the design contract below. `normal`-proxy-mode sessions
+  fall back to direct egress with an explicit note since the rotating proxy isn't recorded.)*
+  Deferred: byte-exact emulator routing (Option A) and on-device Frida replay (Option C).
 - `[x]` **Real per-request timing.** *(Landed on `feat/traffic-capture-ux`: forwarded mitmproxy
   timestamps, `durationMs`/`timings` columns via migration 0097, sortable Duration column,
   detail-panel timing waterfall, and real HAR timings replacing the zeroed ones.)* No latency was

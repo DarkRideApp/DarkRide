@@ -169,7 +169,7 @@ Headline items:
   the old intercept was rule-based auto-modify only.
 - **P0 — Real per-request timing** *(landed on `feat/traffic-capture-ux`)* — forwarded mitmproxy
   timestamps, Duration column + timing waterfall, real HAR timings (were zeroed).
-- **P0 — In-place, tunnel-routed replay** *(in progress; design locked — see spec)* — in-context
+- **P0 — In-place, tunnel-routed replay** *(landed on `feat/traffic-capture-ux`)* — in-context
   Repeater drawer with original-vs-new response diff, sent through the capture session's egress + a
   replicated TLS profile (uniform across physical devices and emulators). Byte-exact emulator routing
   and on-device Frida replay are deferred fidelity upgrades.
