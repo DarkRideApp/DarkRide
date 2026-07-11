@@ -40,10 +40,13 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
 
 ### P0 — closes the biggest gaps vs Burp/Charles
 
-- `[~]` **Interactive interception ("breakpoints").** Pause a matching request/response in-flight,
+- `[x]` **Interactive interception ("breakpoints").** Pause a matching request/response in-flight,
   edit it, forward or drop. Today's "Intercept" is rule-based auto-modify only; the header even
   mislabels passive capture as "Live Intercepting". This is the #1 functional gap.
-  Design contract below. *(In progress — Wave 1, Opus.)*
+  Design contract below. *(Landed on `feat/traffic-capture-ux`: `intercept-hold-store` +
+  `intercept-live` API + `InterceptHoldPanel`; long-poll hold, fail-open, addon-visible armed
+  config, no migration. Rule-based intercept untouched. Follow-up: relabel the passive "Live
+  Intercepting" header pill now that real interception exists.)*
 - `[ ]` **In-place, tunnel-routed replay (Repeater).** Two problems: (1) "Repeat/Replay" navigates
   to a different page (`RequestBuilder`) via `sessionStorage`, losing context, with an ephemeral
   20-item history; (2) replay routes through `backend/services/proxied-request-service.ts` — the
@@ -53,7 +56,9 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
   send back through the capture session's egress + TLS profile. **Needs a short design pass on how
   to route "as device" (upstream egress + TLS profile vs true on-device injection) before build —
   do not implement blind.**
-- `[ ]` **Real per-request timing.** No latency is captured anywhere — `CapturedTrafficEntry`
+- `[~]` **Real per-request timing.** *(In progress — Wave 2, Opus: Duration column + waterfall +
+  real HAR timings, adds `durationMs`/`timings` columns via migration.)* No latency is captured
+  anywhere today — `CapturedTrafficEntry`
   (`shared/types/api.ts:191`) has no duration field and HAR export hardcodes `time:0` /
   zeroed `timings` (`backend/services/session-export.ts`). mitmproxy flows already carry
   `timestamp_start`/`timestamp_end`; forward them. Add `durationMs` (+ DNS/connect/TLS/TTFB if
@@ -62,11 +67,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
 
 ### P1 — high value, medium effort
 
-- `[~]` **Deep filter + search.** Backend `/v1/traffic/list` already supports `search`
+- `[x]` **Deep filter + search.** Backend `/v1/traffic/list` already supports `search`
   (LIKE over URL+headers+body), `hostname`/`path` regex, `method`, `status`, `type` — the UI only
-  exposes a client-side host regex + method toggles + status groups. Surface full-text search,
-  content-type filter, size/has-body filters, exact status codes, saved filter presets, and keep
-  selection across filter changes. *(In progress — Wave 1, Sonnet.)*
+  exposed a client-side host regex + method toggles + status groups. *(Landed on
+  `feat/traffic-capture-ux`: full-text server search, content-type/size/exact-status filters, saved
+  presets, active-filter chips, selection survives filter changes. Also fixed the Host/URL box being
+  a no-op on the global page. Follow-up: client-side filters (content-type/size/multi-group status)
+  narrow only the fetched 50-row page — push those predicates server-side.)*
+- `[x]` **E2E infra fix (found en route).** WS origin allowlist only accepted Vite 5173 but E2E runs
+  on 5199, so every WS-dependent Playwright spec hung and timed out. Fixed in `playwright.config.ts`.
 - `[ ]` **Host/path tree view.** Charles's tree (endpoints grouped by domain) is a top RE feature
   and DarkRide is flat-table-only. Add a collapsible host → path tree alongside the table.
   (Partially served by the separate API Catalogue page — consider unifying.)
