@@ -115,6 +115,9 @@ import { PluginVerifier } from './services/plugin-verifier';
 import { registerPluginSettings } from './api/settings';
 import { registerPluginNotificationEvents } from './services/notification-service';
 import { registerInterceptRuleEndpoints } from './api/intercept-rules';
+import { registerInterceptLiveEndpoints } from './api/intercept-live';
+import { getArmed } from './services/intercept-hold-store';
+import { writeHoldConfig } from './services/intercept-hold-config-writer';
 import { registerClientCertEndpoints } from './api/client-certs';
 import { onBroadcast } from './websocket/index';
 import { registerToolApiEndpoints } from './api/tool-api';
@@ -750,6 +753,11 @@ pluginSourceManager.fetchAll(true).catch(err => {
 });
 registerJobEndpoints(jobRegistry);
 registerInterceptRuleEndpoints(db, (msg) => broadcastToAll(msg));
+// Interactive intercept ("breakpoints") — separate from the rule-based feature above.
+registerInterceptLiveEndpoints((msg) => broadcastToAll(msg), (config) => writeHoldConfig(config));
+// Reflect the (disarmed by default) armed state to the addon-visible file on boot,
+// so a stale file from a prior run never leaves interception silently armed.
+writeHoldConfig(getArmed());
 registerClientCertEndpoints(db, (msg) => broadcastToAll(msg));
 
 // Attach WebSocket server to HTTP server
