@@ -98,6 +98,40 @@ let nextPort = STREAM_PORT_START;
 const SCRCPY_MAX_FPS = 30;
 
 /**
+ * GOP length in seconds — how often scrcpy's encoder emits a full IDR keyframe.
+ * IDRs are large and expensive; forcing one every 2s hammered the Pixel 7 Pro's
+ * Exynos encoder under sustained heavy motion, stalling its output to ~0 fps for
+ * seconds (a multi-second on-screen freeze that repeated as long as the motion
+ * lasted). A longer GOP lets the encoder spend its budget on the motion instead
+ * of frequent keyframes. Late-joining viewers no longer need a short GOP: we
+ * send an on-demand RESET_VIDEO (IDR) when a viewer joins, so they still get a
+ * decodable frame immediately without paying the keyframe cost stream-wide.
+ */
+const SCRCPY_IFRAME_INTERVAL_S = 10;
+
+/**
+ * Cap the encoded frame's longer/– shorter dimension. The Pixel 7 Pro's Exynos
+ * H.264 encoder saturates at full 1080-wide resolution under sustained heavy
+ * motion, stalling its output for seconds. Encoding fewer pixels frees encoder
+ * headroom; 900 keeps the device screen crisp while cutting ~30% of the pixel
+ * load versus 1080. Raise toward 1080 on devices whose encoder keeps up.
+ */
+const SCRCPY_MAX_SIZE = 900;
+
+/**
+ * Minimum spacing between RESET_VIDEO writes to scrcpy (keyframe-coordinator
+ * rate limit). On scrcpy 3.3.4 / Android 16 a RESET_VIDEO triggers a full
+ * "Video capture reset" that takes ~2s and briefly stalls the encoder — it is
+ * NOT the cheap "emit one IDR" it was on older builds. At the old 500ms limit,
+ * a client whose watchdog fired repeatedly during a momentary encoder dip could
+ * stack capture resets faster than the device recovered, spiralling into a hard
+ * multi-second freeze (each reset re-starved the viewer → another reset). 3s
+ * spacing keeps a single recovery keyframe useful while making that spiral
+ * impossible — resets can never outpace the device's own reset-recovery time.
+ */
+const KEYFRAME_MIN_INTERVAL_MS = 3000;
+
+/**
  * Auto bitrate up-step opportunistically raises quality after a healthy window,
  * but bitrate can only change by respawning scrcpy — a multi-second dropout
  * every ~90s. Disabled for seamlessness: the stream holds its tier and only
@@ -759,6 +793,16 @@ export function attachScrcpyH264Pipeline(stream: DeviceStream, scrcpySocket: Soc
       log(`scrcpy: first H.264 data received for ${stream.deviceId} (${chunk.length} bytes)`);
       // Capture is live — safe to honor join-time RESET_VIDEO from here on.
       stream.captureReady = true;
+      // If a screencap polling fallback was started while scrcpy was down/
+      // restarting, tear it down now that live H.264 is flowing again.
+      // Otherwise the 2 fps JPEG poller keeps broadcasting stale full-screen
+      // frames on the same `device-frame` channel, which paint over the smooth
+      // H.264 video and cause a visible ~2 fps glitch under motion.
+      if (stream.pollTimer) {
+        log(`scrcpy live again for ${stream.deviceId} — stopping redundant adb polling fallback`);
+        clearInterval(stream.pollTimer);
+        stream.pollTimer = null;
+      }
     }
     h264BytesReceived += chunk.length;
     stream.broadcaster?.ingest(chunk);
@@ -842,7 +886,7 @@ async function tryStartScrcpy(deviceId: string, stream: DeviceStream, props: Dev
     }
 
     const scrcpyJar = getScrcpyServerJar();
-    const maxSize = Math.min(props.screenWidth, props.screenHeight, 1080);
+    const maxSize = Math.min(props.screenWidth, props.screenHeight, SCRCPY_MAX_SIZE);
 
     await pushIfNeeded(deviceId, scrcpyJar, '/data/local/tmp/scrcpy-server.jar');
 
@@ -854,7 +898,7 @@ async function tryStartScrcpy(deviceId: string, stream: DeviceStream, props: Dev
 
     // Start scrcpy-server on device
     const bitrate = bitrateForTier(stream.bitrateState.tier);
-    log(`Starting scrcpy-server on ${deviceId} (port ${scrcpyPort}, max_size=${maxSize}, max_fps=${SCRCPY_MAX_FPS}, tier=${stream.bitrateState.tier}, bitrate=${bitrate})`);
+    log(`Starting scrcpy-server on ${deviceId} (port ${scrcpyPort}, max_size=${maxSize}, max_fps=${SCRCPY_MAX_FPS}, iframe=${SCRCPY_IFRAME_INTERVAL_S}s, tier=${stream.bitrateState.tier}, bitrate=${bitrate})`);
     const scrcpyProcess = spawn('adb', [
       '-s', deviceId, 'shell',
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar',
@@ -869,7 +913,7 @@ async function tryStartScrcpy(deviceId: string, stream: DeviceStream, props: Dev
       `max_size=${maxSize}`,
       `max_fps=${SCRCPY_MAX_FPS}`,
       `video_bit_rate=${bitrateForTier(stream.bitrateState.tier)}`,
-      'video_codec_options=i-frame-interval=2',
+      `video_codec_options=i-frame-interval=${SCRCPY_IFRAME_INTERVAL_S}`,
     ]);
 
     let scrcpyStderr = '';
@@ -1144,7 +1188,7 @@ async function startDeviceStream(deviceId: string, deviceManager: DeviceManager)
       sock.write(Buffer.from([RESET_VIDEO_BYTE]));
       stream.keyframeStats.requestsSent++;
     }
-  });
+  }, KEYFRAME_MIN_INTERVAL_MS);
 
   // Start minitouch and minicap in parallel — minitouch is independent
   const _tryStartMinicap = _startStreamOverrides?.tryStartMinicap ?? tryStartMinicap;

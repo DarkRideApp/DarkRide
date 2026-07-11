@@ -701,4 +701,30 @@ describe('join keyframe gating (capture-ready)', () => {
     stream.broadcaster.addViewer('v3', { readyState: 1, send: vi.fn() } as any);
     expect(control.writes.length).toBe(0);
   });
+
+  it('stops a leftover polling fallback once live H.264 resumes', () => {
+    // When scrcpy dies, a 2fps adb-screencap poller starts and broadcasts JPEG
+    // `device-frame` messages. If scrcpy recovers, that poller must be torn down
+    // — otherwise its stale full-screen frames paint over the smooth H.264 and
+    // cause a ~2fps glitch under motion. On the first H.264 chunk, the pipeline
+    // must clear stream.pollTimer.
+    const { stream, dataHandlers, fakeVideoSocket } = buildJoinStream();
+    // Simulate an active polling fallback from a prior scrcpy death.
+    let cleared = false;
+    stream.pollTimer = setInterval(() => {}, 500);
+    const origClear = globalThis.clearInterval;
+    // Track that our timer is the one cleared, then really clear it.
+    (globalThis as any).clearInterval = (h: any) => { if (h === stream.pollTimer) cleared = true; origClear(h); };
+    try {
+      attachScrcpyH264Pipeline(stream, fakeVideoSocket);
+      expect(stream.pollTimer).not.toBeNull();
+      // First live H.264 chunk arrives → poller must be stopped.
+      dataHandlers.forEach((h) => h(Buffer.from([0, 0, 0, 1, 0x67])));
+      expect(cleared).toBe(true);
+      expect(stream.pollTimer).toBeNull();
+    } finally {
+      (globalThis as any).clearInterval = origClear;
+      if (stream.pollTimer) origClear(stream.pollTimer);
+    }
+  });
 });
