@@ -169,9 +169,10 @@ Headline items:
   the old intercept was rule-based auto-modify only.
 - **P0 — Real per-request timing** *(landed on `feat/traffic-capture-ux`)* — forwarded mitmproxy
   timestamps, Duration column + timing waterfall, real HAR timings (were zeroed).
-- **P0 — In-place, tunnel-routed replay** *(next)* — replay in place with original-vs-new response
-  diff, sent back through the capture session's egress + TLS profile (not the server-side proxy path).
-  Needs a short design pass on how to route "as device" before build.
+- **P0 — In-place, tunnel-routed replay** *(in progress; design locked — see spec)* — in-context
+  Repeater drawer with original-vs-new response diff, sent through the capture session's egress + a
+  replicated TLS profile (uniform across physical devices and emulators). Byte-exact emulator routing
+  and on-device Frida replay are deferred fidelity upgrades.
 - **P1** — deep filter/search *(in progress)*, host/path tree view, unify the five nav surfaces into
   one workspace, virtualize the list + fix live-append past page 0.
 - **P2** — raw wire view, in-body search + JSON tree + hex, auto-load-full-body, HTML render.

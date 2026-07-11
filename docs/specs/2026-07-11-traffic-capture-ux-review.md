@@ -110,6 +110,53 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
 
 ## Design contracts for the in-flight items
 
+### In-place, tunnel-routed replay (P0) — design locked 2026-07-11
+
+Design pass done (grounded in a codebase investigation of the replay/egress/TLS plumbing).
+Two parts:
+
+**Part 1 — In-place Repeater UI (no architectural fork).** Replace the "navigate to RequestBuilder via
+sessionStorage" replay flow with an in-context **slide-over Repeater drawer** opened by the existing
+Replay/Repeat buttons. Keeps the captured original visible; edit method/url/headers/body; Send;
+show the new response beside the original with an **original-vs-new diff** (status / headers / body).
+Surface the server-side replay history (`proxied-request-service` already keeps 200 entries) instead
+of RequestBuilder's volatile 20-item in-session list. Keep RequestBuilder as the standalone ad-hoc
+page. Build the Repeater as a self-contained component; touch `TrafficDetailPanel`/`TrafficTable`
+minimally (only the replay-trigger handler) to stay decoupled from the timing/filter changes.
+
+**Part 2 — "Replay via capture session" routing (chosen: Option 1, uniform).** The investigation
+found: replay today goes through `proxied-request-service` (server-side proxy pool, no device
+context, plain Node OpenSSL JA3); per-session egress (`proxyMode`/`proxyCountry`/`tlsProfile`) is
+NOT persisted or retained (only in the spawned mitmdump args); physical devices use WireGuard mode
+with **no proxy port** to route through (so routing through the live mitmproxy only works for
+docker-android emulators); and mitmproxy's own TLS spoof is **cipher-list-level** via pyOpenSSL, not
+byte-exact JA3.
+
+Decision: replicate the session's egress + TLS profile in the server request path — uniform across
+physical devices and emulators, and matching the fidelity capture itself achieves. Steps:
+1. Surface egress: add `proxyMode`/`proxyCountry`/`tlsProfile` (+ resolved SOCKS target) to
+   `ActiveCapture` in `capture-session-manager.ts` at start-time (cheap, in-memory) and a
+   `getEgress(deviceId)` accessor. The `activeSessions` map is keyed by `deviceId` — a captured
+   entry carries `deviceId`, so the lookup is direct.
+2. Extend `ProxiedHttpRequest` (type + validator in `backend/api/proxied-requests.ts`) with a new
+   proxy source `{ type: 'captureSession', deviceId }` and a `tlsProfile` field.
+3. In `proxied-request-service.resolveProxy`, handle `captureSession`: look up the device's live
+   egress and build the same agent (reuse the nordvpn/proxyId/inline logic already there).
+4. Apply the TLS profile in `doSingleRequest`: port the chrome/okhttp cipher lists from
+   `python/mitmproxy_bridge.py` into a shared TS constants module and set `ciphers`/`sigalgs`/
+   `ecdhCurve`/ALPN on the `https.request` options. Document the caveat: cipher-list parity, not
+   byte-exact JA3 (Node/OpenSSL can't control GREASE/extension order) — same limitation the capture
+   session has.
+5. UI default: when the entry's device is actively capturing, default "Send via" to
+   `Capture session (device egress + TLS)`, else Direct.
+
+Deferred: **Option A** (route through the live mitmproxy proxy port — byte-exact, emulators only) can
+layer on later as a fidelity upgrade when an emulator proxy port is available (requires persisting
+that port, which is currently discarded). **Option C** (on-device Frida injection — app's genuine TLS
+stack + signing + pinning) is the highest-fidelity path but needs per-target scripts and is a much
+larger build; future work. The `/v1/frida/spawn/:deviceId` injection channel exists; a replay script
+does not.
+
 ### Interactive interception (P0)
 
 Transport: **long-poll hold, no new sockets, no polling.**
