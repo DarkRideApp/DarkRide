@@ -5607,6 +5607,7 @@ body.live-log-open .ai-chat-fab {
   align-items: center;
   gap: 8px;
   padding: 8px 16px;
+  flex-wrap: wrap;
 }
 .traffic-filter-toggle {
   display: flex;
@@ -5816,6 +5817,243 @@ body.live-log-open .ai-chat-fab {
 }
 .traffic-filter-text-input::placeholder {
   color: rgba(139, 149, 176, 0.4);
+}
+
+/* Host/URL filter + "Search all" sit side-by-side in the always-visible bar,
+   each with its own icon so the two intents stay visually distinct. */
+.traffic-filter-inputs {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+  min-width: 260px;
+  flex-wrap: wrap;
+}
+.traffic-filter-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 150px;
+  border-left: 1px solid var(--border-color);
+  padding-left: 14px;
+}
+.traffic-filter-search-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+/* Exact status-code entry — text input + removable chips, mirrors the
+   hidden-hostname chip pattern below. */
+.traffic-exact-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.traffic-exact-status-input {
+  width: 64px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 11px;
+  padding: 2px 6px;
+  outline: none;
+}
+.traffic-exact-status-input:focus {
+  border-color: var(--accent);
+}
+.traffic-exact-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: rgba(251, 113, 133, 0.12);
+  border: 1px solid rgba(251, 113, 133, 0.4);
+  color: #fb7185;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+}
+.traffic-exact-status-chip button {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  opacity: 0.7;
+}
+.traffic-exact-status-chip button:hover {
+  opacity: 1;
+}
+
+/* Content-type category pills */
+.traffic-content-type-pills,
+.traffic-size-pills {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.traffic-content-type-pill,
+.traffic-size-pill {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  border: 1px solid rgba(66, 71, 84, 0.3);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.15s;
+  color: var(--text-secondary);
+}
+.traffic-content-type-pill:hover,
+.traffic-size-pill:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.traffic-content-type-pill.active,
+.traffic-size-pill.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(173, 198, 255, 0.1);
+}
+
+/* Saved filter presets */
+.traffic-filter-presets {
+  flex-wrap: wrap;
+}
+.traffic-preset-pills {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.traffic-preset-pill {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid rgba(66, 71, 84, 0.3);
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.15s;
+  color: var(--text-secondary);
+}
+.traffic-preset-pill:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(173, 198, 255, 0.1);
+}
+.traffic-preset-save-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px dashed var(--border-color);
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: all 0.15s;
+}
+.traffic-preset-save-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.traffic-preset-save-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.traffic-preset-save-input {
+  width: 120px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 11px;
+  padding: 2px 6px;
+  outline: none;
+}
+.traffic-preset-save-input:focus {
+  border-color: var(--accent);
+}
+.traffic-preset-save-confirm {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  border: none;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #002e6a;
+  cursor: pointer;
+}
+.traffic-preset-save-confirm:hover {
+  opacity: 0.9;
+}
+
+/* ── Active-filter chip bar — always visible when any filter is on,
+   independent of the collapsed/expanded panel state. Mirrors the
+   hidden-hostname chip bar below it. ─────────────────────────────── */
+.traffic-active-filters-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary, #1e1e2e);
+  flex-wrap: wrap;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.traffic-active-filters-label {
+  color: var(--text-muted);
+  margin-right: 2px;
+  font-weight: 600;
+}
+.traffic-active-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--bg-primary, #121220);
+  border: 1px solid var(--border-color);
+  font-size: 11px;
+  color: var(--text-primary);
+}
+.traffic-active-filter-chip button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  line-height: 1;
+  transition: color 0.15s;
+}
+.traffic-active-filter-chip button:hover {
+  color: #ef4444;
+}
+.traffic-active-filters-clear {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  text-decoration: underline;
+  padding: 0;
+  margin-left: 4px;
+  transition: color 0.15s;
+}
+.traffic-active-filters-clear:hover {
+  color: var(--text-primary);
 }
 
 /* Live-mode controls (auto-scroll + clear) */

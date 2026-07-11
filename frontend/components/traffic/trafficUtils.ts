@@ -112,20 +112,30 @@ export function getContentType(entry: Pick<TrafficEntry, 'type' | 'requestMethod
 
 export function getResponseSize(responseBody: string | null | undefined): string {
   if (!responseBody) return '—';
+  return formatBytes(getResponseSizeBytes(responseBody));
+}
+
+/**
+ * Returns the raw byte count for a response body, used by the "> 100 KB" /
+ * "has body" / "empty" quick filters. Mirrors the placeholder-parsing logic
+ * in getResponseSize but returns a number instead of a formatted string.
+ */
+export function getResponseSizeBytes(responseBody: string | null | undefined): number {
+  if (!responseBody) return 0;
 
   // Binary content is replaced by mitmproxy with "[binary image/jpeg, 12345 chars]"
   const binaryMatch = responseBody.match(/^\[binary .+?, (\d+) chars\]$/);
   if (binaryMatch) {
-    return formatBytes(parseInt(binaryMatch[1], 10));
+    return parseInt(binaryMatch[1], 10);
   }
 
   // Truncated text ends with "…[truncated, 12345 total]"
   const truncMatch = responseBody.match(/\[truncated, (\d+) total\]$/);
   if (truncMatch) {
-    return formatBytes(parseInt(truncMatch[1], 10));
+    return parseInt(truncMatch[1], 10);
   }
 
-  return formatBytes(new Blob([responseBody]).size);
+  return new Blob([responseBody]).size;
 }
 
 function formatBytes(bytes: number): string {
@@ -153,20 +163,70 @@ export function getStatusColor(status: number | null | undefined): string {
 // ---------------------------------------------------------------------------
 
 export type MethodFilterState = 'include' | 'exclude';
-export type StatusGroupFilter = '' | '2xx' | '3xx' | '4xx' | '5xx';
+export type StatusGroupFilter = '2xx' | '3xx' | '4xx' | '5xx';
+export type SizeFilter = '' | 'gt100kb' | 'hasBody' | 'empty';
+
+/** Response-size quick filters shown in the filter panel. */
+export const SIZE_FILTERS: { key: SizeFilter; label: string }[] = [
+  { key: '', label: 'Any' },
+  { key: 'gt100kb', label: '> 100 KB' },
+  { key: 'hasBody', label: 'Has body' },
+  { key: 'empty', label: 'Empty' },
+];
+
+/**
+ * Content-type category definitions, built on top of getContentType()'s
+ * output. `match` takes the already-resolved content-type string (e.g.
+ * 'json', 'document', 'websocket') and returns whether it belongs to the
+ * category. 'other' is a catch-all for anything not otherwise categorised.
+ */
+export interface ContentTypeFilterDef {
+  key: string;
+  label: string;
+  match: (contentType: string) => boolean;
+}
+
+const CATEGORISED_CONTENT_TYPES = new Set(['json', 'document', 'script', 'stylesheet', 'image', 'font', 'xml']);
+
+export const CONTENT_TYPE_FILTERS: ContentTypeFilterDef[] = [
+  { key: 'json',  label: 'JSON', match: ct => ct === 'json' },
+  { key: 'html',  label: 'HTML', match: ct => ct === 'document' },
+  { key: 'js',    label: 'JS',   match: ct => ct === 'script' },
+  { key: 'css',   label: 'CSS',  match: ct => ct === 'stylesheet' },
+  { key: 'image', label: 'Image', match: ct => ct === 'image' },
+  { key: 'font',  label: 'Font', match: ct => ct === 'font' },
+  { key: 'xml',   label: 'XML',  match: ct => ct === 'xml' },
+  { key: 'other', label: 'Other', match: ct => !CATEGORISED_CONTENT_TYPES.has(ct) },
+];
 
 export interface TrafficFilters {
   /** Tri-state method filters. Keys match METHOD_FILTERS[].key. Missing = neutral. */
   methodFilters: Map<string, MethodFilterState>;
-  status: StatusGroupFilter;
+  /** Status-group pills. Multi-select (OR). Empty set = ALL. */
+  status: Set<StatusGroupFilter>;
+  /** Exact status codes (e.g. "404", "429"). Non-empty takes priority over `status`. */
+  exactStatuses: Set<string>;
+  /** Fast client-side host/URL regex filter (unchanged from the original filter bar). */
   text: string;
+  /** "Search all" — matches URL + request/response body + headers. Sent to the
+   * server as the `search` param by consumers that do server-side fetching;
+   * also applied client-side as a fallback for consumers that don't. */
+  search: string;
+  /** Selected content-type category keys (CONTENT_TYPE_FILTERS[].key). Empty = all. */
+  contentTypes: Set<string>;
+  /** Response-size quick filter. '' = no filter. */
+  size: SizeFilter;
 }
 
 export function createDefaultFilters(): TrafficFilters {
   return {
     methodFilters: new Map(DEFAULT_METHOD_EXCLUDES.map(k => [k, 'exclude' as MethodFilterState])),
-    status: '',
+    status: new Set(),
+    exactStatuses: new Set(),
     text: '',
+    search: '',
+    contentTypes: new Set(),
+    size: '',
   };
 }
 
@@ -192,16 +252,42 @@ export function applyClientFilters(entries: TrafficEntry[], filters: TrafficFilt
     }
   }
 
-  // Status group filter
-  if (filters.status) {
-    const century = parseInt(filters.status[0], 10);
+  // Status filter — exact codes take priority over the status-group pills
+  // when any exact code is set; otherwise the group pills apply (multi-select OR).
+  if (filters.exactStatuses.size > 0) {
+    result = result.filter(e => e.responseStatus != null && filters.exactStatuses.has(String(e.responseStatus)));
+  } else if (filters.status.size > 0) {
     result = result.filter(e => {
       if (e.responseStatus == null) return false;
-      return Math.floor(e.responseStatus / 100) === century;
+      const century = `${Math.floor(e.responseStatus / 100)}xx` as StatusGroupFilter;
+      return filters.status.has(century);
     });
   }
 
-  // Text / regex filter on URL
+  // Content-type filter — OR across selected categories
+  if (filters.contentTypes.size > 0) {
+    result = result.filter(e => {
+      const ct = getContentType(e);
+      for (const key of filters.contentTypes) {
+        const def = CONTENT_TYPE_FILTERS.find(d => d.key === key);
+        if (def && def.match(ct)) return true;
+      }
+      return false;
+    });
+  }
+
+  // Response-size quick filter
+  if (filters.size) {
+    result = result.filter(e => {
+      const bytes = getResponseSizeBytes(e.responseBody);
+      if (filters.size === 'gt100kb') return bytes > 100 * 1024;
+      if (filters.size === 'hasBody') return bytes > 0;
+      if (filters.size === 'empty') return bytes === 0;
+      return true;
+    });
+  }
+
+  // Text / regex filter on URL — the fast "Host / URL" filter
   if (filters.text) {
     try {
       const re = new RegExp(filters.text, 'i');
@@ -212,8 +298,154 @@ export function applyClientFilters(entries: TrafficEntry[], filters: TrafficFilt
     }
   }
 
+  // "Search all" — client-side fallback for consumers that don't push
+  // `search` down to the server (e.g. TrafficInspector, ApiExplorer).
+  // Matches URL + request/response body + headers, case-insensitively.
+  if (filters.search) {
+    const q = filters.search.toLowerCase();
+    result = result.filter(e =>
+      e.requestUrl.toLowerCase().includes(q) ||
+      (e.requestBody ?? '').toLowerCase().includes(q) ||
+      (e.responseBody ?? '').toLowerCase().includes(q) ||
+      (e.requestHeaders ?? '').toLowerCase().includes(q) ||
+      (e.responseHeaders ?? '').toLowerCase().includes(q)
+    );
+  }
+
   return result;
 }
+
+/**
+ * Derives the `status` query param (a century string like '400') to send to
+ * GET /v1/traffic/list from the current filters. The server only supports a
+ * single century band per request (see backend/api/traffic.ts), so:
+ *  - one or more exact status codes that all share a century: use it
+ *  - exact codes spanning multiple centuries: no server-side narrowing
+ *    (client-side filtering still applies to whatever page comes back)
+ *  - otherwise, a single selected status-group pill maps directly
+ *  - zero or 2+ status groups selected: no server-side narrowing
+ */
+export function deriveServerStatusCentury(filters: Pick<TrafficFilters, 'status' | 'exactStatuses'>): string {
+  const centuryOf = (code: number) => `${Math.floor(code / 100)}00`;
+
+  if (filters.exactStatuses.size > 0) {
+    const codes = Array.from(filters.exactStatuses)
+      .map(c => parseInt(c, 10))
+      .filter(n => !isNaN(n));
+    if (codes.length === 0) return '';
+    const century = centuryOf(codes[0]);
+    return codes.every(c => centuryOf(c) === century) ? century : '';
+  }
+
+  if (filters.status.size === 1) {
+    const group = Array.from(filters.status)[0];
+    const map: Record<StatusGroupFilter, string> = { '2xx': '200', '3xx': '300', '4xx': '400', '5xx': '500' };
+    return map[group];
+  }
+
+  return '';
+}
+
+// ---------------------------------------------------------------------------
+// Saved filter presets — persisted to localStorage, namespaced per-app.
+// Maps/Sets don't survive JSON.stringify, so presets store plain
+// arrays/tuples and get converted back to TrafficFilters on load.
+// ---------------------------------------------------------------------------
+
+export interface SerializedTrafficFilters {
+  methodFilters: [string, MethodFilterState][];
+  status: StatusGroupFilter[];
+  exactStatuses: string[];
+  text: string;
+  search: string;
+  contentTypes: string[];
+  size: SizeFilter;
+}
+
+export interface FilterPreset {
+  name: string;
+  filters: SerializedTrafficFilters;
+}
+
+export function filtersToPreset(name: string, filters: TrafficFilters): FilterPreset {
+  return {
+    name,
+    filters: {
+      methodFilters: Array.from(filters.methodFilters.entries()),
+      status: Array.from(filters.status),
+      exactStatuses: Array.from(filters.exactStatuses),
+      text: filters.text,
+      search: filters.search,
+      contentTypes: Array.from(filters.contentTypes),
+      size: filters.size,
+    },
+  };
+}
+
+export function presetToFilters(preset: FilterPreset): TrafficFilters {
+  return {
+    methodFilters: new Map(preset.filters.methodFilters),
+    status: new Set(preset.filters.status),
+    exactStatuses: new Set(preset.filters.exactStatuses),
+    text: preset.filters.text,
+    search: preset.filters.search,
+    contentTypes: new Set(preset.filters.contentTypes),
+    size: preset.filters.size,
+  };
+}
+
+const PRESETS_STORAGE_KEY = 'darkride:traffic-filters';
+
+/** Loads saved presets from localStorage. Returns [] if none, or on corrupt data. */
+export function loadFilterPresets(): FilterPreset[] {
+  if (typeof localStorage === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(PRESETS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Persists the full preset list to localStorage. */
+export function saveFilterPresets(presets: FilterPreset[]): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(PRESETS_STORAGE_KEY, JSON.stringify(presets));
+  } catch {
+    /* localStorage unavailable/full — presets simply won't persist */
+  }
+}
+
+/** Built-in presets offered alongside any user-saved ones. Not persisted to localStorage. */
+export const BUILTIN_PRESETS: FilterPreset[] = [
+  {
+    name: 'Errors only',
+    filters: {
+      methodFilters: DEFAULT_METHOD_EXCLUDES.map(k => [k, 'exclude' as MethodFilterState]),
+      status: ['4xx', '5xx'],
+      exactStatuses: [],
+      text: '',
+      search: '',
+      contentTypes: [],
+      size: '',
+    },
+  },
+  {
+    name: 'APIs only',
+    filters: {
+      methodFilters: DEFAULT_METHOD_EXCLUDES.map(k => [k, 'exclude' as MethodFilterState]),
+      status: [],
+      exactStatuses: [],
+      text: '',
+      search: '',
+      contentTypes: ['json'],
+      size: '',
+    },
+  },
+];
 
 // ---------------------------------------------------------------------------
 // Shared helper functions (used by TrafficDetailPanel & TrafficEntryRow)
