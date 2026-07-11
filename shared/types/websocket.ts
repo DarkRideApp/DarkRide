@@ -167,6 +167,58 @@ export interface WebSocketConnectionClosedMessage {
   messageCount: number;
 }
 
+// ---- Interactive intercept ("breakpoints") ----
+// Separate from the rule-based Intercept feature. These messages keep every
+// connected UI in sync about flows paused in-flight awaiting a manual verdict.
+
+/** A flow paused in-flight, awaiting a manual resolve. */
+export interface HeldFlow {
+  flowId: string;
+  phase: 'request' | 'response';
+  deviceId: string | null;
+  sessionId: number | null;
+  method: string;
+  url: string;
+  /** Header object (request headers in request phase, response headers in response phase). */
+  headers: Record<string, string>;
+  /** Body text (request body in request phase, response body in response phase). May be a truncation marker. */
+  body: string | null;
+  /** Present in response phase only. */
+  statusCode?: number | null;
+  /** ms since epoch when the flow was held. */
+  createdAt: number;
+}
+
+/** Armed configuration for interactive interception. */
+export interface InterceptArmedConfig {
+  enabled: boolean;
+  matchHostname?: string | null;
+  matchPath?: string | null;
+  matchMethod?: string | null;
+  phases: ('request' | 'response')[];
+}
+
+/** Broadcast when a flow is paused in-flight and needs a manual verdict. */
+export interface InterceptHeldMessage {
+  type: 'intercept-held';
+  flowId: string;
+  phase: 'request' | 'response';
+  flow: HeldFlow;
+}
+
+/** Broadcast when a held flow is resolved (by a user, a timeout, or capture stop). */
+export interface InterceptResolvedMessage {
+  type: 'intercept-resolved';
+  flowId: string;
+  action: 'forward' | 'drop';
+}
+
+/** Broadcast when the armed config changes so every UI reflects the same state. */
+export interface InterceptArmedChangedMessage {
+  type: 'intercept-armed-changed';
+  config: InterceptArmedConfig;
+}
+
 /** Per-subsystem status during capture startup */
 export interface CaptureSubsystemStatus {
   mitmproxy: 'pending' | 'ok' | 'error';
@@ -476,4 +528,7 @@ export type ServerMessage =
   | AdbShellStartedMessage
   | AdbShellOutputMessage
   | AdbShellExitMessage
+  | InterceptHeldMessage
+  | InterceptResolvedMessage
+  | InterceptArmedChangedMessage
   | AiServerEvent;

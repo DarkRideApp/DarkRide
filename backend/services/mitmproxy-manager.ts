@@ -10,6 +10,8 @@ import { getBlocklistPath } from './blocklist-writer';
 import { getHiddenlistPath } from './hiddenlist-writer';
 import { SocksProxyServer } from './socks-proxy-server';
 import { syncInterceptConfig, getInterceptConfigPath } from './intercept-config-writer';
+import { writeHoldConfig, getInterceptHoldConfigPath } from './intercept-hold-config-writer';
+import { getArmed, dropAllHeld } from './intercept-hold-store';
 import { clearWsFlowMap } from '../api/traffic';
 import { resolveVenvBin } from './venv-bin';
 import type { AppDatabase } from '../db';
@@ -132,6 +134,11 @@ export class MitmproxyManager {
       syncInterceptConfig(this.db);
       mitmdumpArgs.push('--set', `intercept_config_file=${getInterceptConfigPath()}`);
     }
+
+    // Interactive-intercept armed config file (breakpoints). Written fresh so
+    // the addon reads the current armed state at launch, then reloads by mtime.
+    writeHoldConfig(getArmed());
+    mitmdumpArgs.push('--set', `intercept_hold_config_file=${getInterceptHoldConfigPath()}`);
 
     // Pass device/session context to the Python bridge
     if (options?.deviceId) {
@@ -327,6 +334,8 @@ export class MitmproxyManager {
       syncInterceptConfig(this.db);
       mitmdumpArgs.push('--set', `intercept_config_file=${getInterceptConfigPath()}`);
     }
+    writeHoldConfig(getArmed());
+    mitmdumpArgs.push('--set', `intercept_hold_config_file=${getInterceptHoldConfigPath()}`);
     if (options?.deviceId) mitmdumpArgs.push('--set', `device_id=${options.deviceId}`);
     if (options?.sessionId != null) mitmdumpArgs.push('--set', `session_id=${options.sessionId}`);
     if (options?.tlsProfile) mitmdumpArgs.push('--set', `tls_profile=${options.tlsProfile}`);
@@ -415,6 +424,10 @@ export class MitmproxyManager {
 
     // Clean up any tracked WebSocket flows for this device
     clearWsFlowMap(deviceId);
+
+    // Fail open any flows held for interactive intercept — capture is stopping,
+    // so nothing will ever resolve them; forward them all instead of dangling.
+    dropAllHeld();
 
     // Stop the local SOCKS5-to-HTTP bridge if one was running
     const proxyServer = this.socksProxies.get(deviceId);

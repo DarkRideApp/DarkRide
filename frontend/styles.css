@@ -7533,3 +7533,135 @@ body.live-log-open .ai-chat-fab {
 }
 .app-row:hover { background: var(--bg-hover); }
 .app-row:focus-visible { outline: 2px solid var(--border-focus); outline-offset: -2px; }
+
+/* ---------------------------------------------------------------------------
+   Interactive intercept ("breakpoints") — arm control + hold panel.
+   Reuses host tokens so it tracks light/dark themes automatically.
+   --------------------------------------------------------------------------- */
+.intercept-arm-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+.intercept-arm-dot-on {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 25%, transparent);
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+.traffic-action-btn.intercept-arm-btn-active {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.intercept-held-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 4px;
+  border-radius: 9px;
+  background: var(--danger);
+  color: #1a0606;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.intercept-hold-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  overflow-y: auto;
+}
+.intercept-hold-modal {
+  width: min(860px, 100%);
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 96px);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.intercept-hold-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--danger) 7%, var(--bg-secondary));
+}
+.intercept-hold-title { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.intercept-hold-phase {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--danger);
+}
+.intercept-hold-url {
+  font-size: 13px;
+  color: var(--text-primary);
+  font-family: var(--font-mono, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.intercept-hold-queue {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: right;
+  flex-shrink: 0;
+}
+.intercept-hold-queue-tabs { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.intercept-hold-queue-tab {
+  padding: 2px 8px;
+  font-size: 11px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.intercept-hold-queue-tab.active { border-color: var(--accent); color: var(--text-primary); background: var(--bg-tertiary); }
+
+.intercept-hold-body {
+  padding: 16px 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.intercept-hold-row { display: flex; align-items: center; gap: 8px; }
+.intercept-hold-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.intercept-hold-section { display: flex; flex-direction: column; gap: 8px; }
+.intercept-hold-section-head { display: flex; align-items: center; gap: 8px; }
+.intercept-hold-section-head h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.intercept-hold-empty { font-size: 12px; color: var(--text-muted); }
+.intercept-hold-header-rows { display: flex; flex-direction: column; gap: 4px; }
+.intercept-hold-header-row { display: flex; align-items: center; gap: 4px; }
+
+.intercept-hold-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-primary);
+}

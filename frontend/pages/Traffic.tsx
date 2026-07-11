@@ -13,6 +13,7 @@ import type { TrafficFilters } from '../components/traffic/trafficUtils';
 import { METHOD_FILTERS, deriveServerStatusCentury } from '../components/traffic/trafficUtils';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
+import { InterceptHoldPanel, InterceptArmControl } from '../components/intercept/InterceptHoldPanel';
 
 // ---------------------------------------------------------------------------
 // Saved Traffic tab
@@ -376,6 +377,8 @@ export function Traffic() {
 
   return (
     <div data-testid="traffic-page" className="traffic-page page-full-bleed">
+      {/* Interactive intercept ("breakpoints") — modal appears only when a flow is held. */}
+      <InterceptHoldPanel />
       {/* Action sub-header */}
       <div className="traffic-subheader">
         <div className="traffic-subheader-left">
@@ -428,6 +431,7 @@ export function Traffic() {
           </div>
         </div>
         <div className="traffic-subheader-actions">
+          <InterceptArmControl />
           <button className="traffic-action-btn" onClick={handleClear}>
             <Trash2 size={14} />
             Clear
