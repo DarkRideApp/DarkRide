@@ -671,7 +671,12 @@ registerEndpoint('GET', '/v1/system/disk-space', async (_req, res) => {
 });
 
 registerToolEndpoints(toolManager);
-const proxiedRequestService = new ProxiedRequestService(db, { maxConcurrency: 5 });
+const proxiedRequestService = new ProxiedRequestService(db, {
+  maxConcurrency: 5,
+  // Lets `captureSession` replays resolve a device's live egress (proxy + TLS
+  // profile) so a resent request goes out looking like the app's own traffic.
+  egressResolver: captureManager,
+});
 registerProxiedRequestEndpoints(db, proxiedRequestService);
 
 // Job registry — unified view of all scheduled jobs

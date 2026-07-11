@@ -2,8 +2,8 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import { SkeletonTable } from '@darkrideapp/plugin-sdk/react';
-import { useTrafficReplay } from '../components/traffic/TrafficEntryRow';
 import { TrafficTable } from '../components/traffic/TrafficTable';
+import { ReplayDrawer } from '../components/traffic/ReplayDrawer';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Trash2, Repeat } from 'lucide-react';
 import { ConfirmDialog } from '@darkrideapp/plugin-sdk/react';
@@ -159,7 +159,10 @@ export function Traffic() {
   useDocumentTitle('Traffic');
   const auth = useAuthOptional();
   const ws = useWebSocket();
-  const handleReplay = useTrafficReplay();
+  // In-place Repeater: replay opens a drawer over the Traffic view (keeps
+  // context) instead of navigating away to the Request Builder.
+  const [replayEntry, setReplayEntry] = useState<TrafficEntry | null>(null);
+  const handleReplay = useCallback((entry: TrafficEntry) => setReplayEntry(entry), []);
   const [searchParams, setSearchParams] = useSearchParams();
 
   const tabParam = searchParams.get('tab') as TrafficTab | null;
@@ -381,6 +384,8 @@ export function Traffic() {
     <div data-testid="traffic-page" className="traffic-page page-full-bleed">
       {/* Interactive intercept ("breakpoints") — modal appears only when a flow is held. */}
       <InterceptHoldPanel />
+      {/* In-place Repeater — replaces the navigate-away replay flow on this view. */}
+      <ReplayDrawer entry={replayEntry} onClose={() => setReplayEntry(null)} />
       {/* Action sub-header */}
       <div className="traffic-subheader">
         <div className="traffic-subheader-left">

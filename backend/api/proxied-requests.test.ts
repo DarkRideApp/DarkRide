@@ -162,6 +162,56 @@ describe('Proxied Request API Endpoints', () => {
       expect(res.body.error).toContain('proxy.url is not a valid URL');
     });
 
+    it('should reject captureSession type without deviceId', async () => {
+      const res = await request(app)
+        .post('/v1/proxied-request')
+        .send({ url: 'http://example.com', proxy: { type: 'captureSession' } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('proxy.deviceId is required');
+    });
+
+    it('should accept captureSession type and fall back to direct when not capturing', async () => {
+      // No egress resolver wired on the service → device is "not capturing" →
+      // the request still runs (direct) and reaches the echo server.
+      const res = await request(app)
+        .post('/v1/proxied-request')
+        .send({
+          url: `http://127.0.0.1:${echoPort}/echo`,
+          proxy: { type: 'captureSession', deviceId: 'DEV001' },
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.status).toBe(200);
+    });
+
+    it('should reject an invalid tlsProfile value', async () => {
+      const res = await request(app)
+        .post('/v1/proxied-request')
+        .send({
+          url: 'http://example.com',
+          proxy: { type: 'direct' },
+          tlsProfile: 'safari',
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('tlsProfile');
+    });
+
+    it('should accept a valid tlsProfile value', async () => {
+      const res = await request(app)
+        .post('/v1/proxied-request')
+        .send({
+          url: `http://127.0.0.1:${echoPort}/echo`,
+          proxy: { type: 'direct' },
+          tlsProfile: 'chrome',
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+
     it('should return 502 on proxy/network error (sync)', async () => {
       const res = await request(app)
         .post('/v1/proxied-request')

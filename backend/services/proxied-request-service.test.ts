@@ -5,6 +5,14 @@ import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { ProxiedRequestService } from './proxied-request-service';
 import { createTestDb } from '../test-utils/create-test-db';
+import type { CaptureEgress } from '../../shared/types/api';
+import {
+  CHROME_TLS12_CIPHERS,
+  OKHTTP_TLS12_CIPHERS,
+  SHARED_GROUPS,
+  SHARED_SIGALGS,
+  SHARED_ALPN,
+} from '../../shared/lib/tls-profiles';
 
 const { proxies, settings, clientCerts } = schema;
 
@@ -633,6 +641,148 @@ describe('ProxiedRequestService', () => {
       const result = (service as any).findClientCertForHostname('api.example.com');
       expect(result).not.toBeNull();
       expect(result.certPem).toBe('CERT1');
+    });
+  });
+
+  // ---- Replay via capture session egress ----------------------------------
+
+  describe('resolveProxy — captureSession', () => {
+    function serviceWithEgress(egress: CaptureEgress | null): ProxiedRequestService {
+      const svc = new ProxiedRequestService(db as any, {
+        maxConcurrency: 3,
+        egressResolver: { getEgress: () => egress },
+      });
+      svc.start();
+      return svc;
+    }
+
+    it('reuses the NordVPN agent and derives the session TLS profile', () => {
+      db.insert(settings).values({ key: 'nordvpn_username', value: 'testuser' }).run();
+      db.insert(settings).values({ key: 'nordvpn_password', value: 'testpass' }).run();
+
+      const svc = serviceWithEgress({
+        deviceId: 'DEV001', proxyMode: 'nordvpn', proxyCountry: 'us', tlsProfile: 'chrome',
+      });
+
+      const result = svc.resolveProxy({ type: 'captureSession', deviceId: 'DEV001' });
+      expect(result.agent).toBeDefined(); // SOCKS agent, same as a plain nordvpn source
+      expect(result.proxyUrl).toContain('capture session');
+      expect(result.proxyUrl).toContain('nordvpn:us');
+      expect(result.proxyUrl).toContain('chrome');
+      expect(result.tlsProfile).toBe('chrome');
+      svc.stop();
+    });
+
+    it('resolves direct egress (proxyMode none) but still carries the TLS profile', () => {
+      const svc = serviceWithEgress({
+        deviceId: 'DEV001', proxyMode: 'none', tlsProfile: 'okhttp',
+      });
+
+      const result = svc.resolveProxy({ type: 'captureSession', deviceId: 'DEV001' });
+      expect(result.agent).toBeUndefined(); // direct — no proxy agent
+      expect(result.proxyUrl).toContain('capture session');
+      expect(result.tlsProfile).toBe('okhttp');
+      svc.stop();
+    });
+
+    it('falls back to direct and flags it when the device is not capturing', () => {
+      const svc = serviceWithEgress(null);
+
+      const result = svc.resolveProxy({ type: 'captureSession', deviceId: 'DEV404' });
+      expect(result.agent).toBeUndefined();
+      expect(result.proxyUrl.toLowerCase()).toContain('not capturing');
+      expect(result.tlsProfile).toBeUndefined();
+      svc.stop();
+    });
+
+    it('falls back to direct when no egress resolver is wired at all', () => {
+      // Default service in beforeEach has no egressResolver.
+      const result = service.resolveProxy({ type: 'captureSession', deviceId: 'DEV001' });
+      expect(result.agent).toBeUndefined();
+      expect(result.proxyUrl.toLowerCase()).toContain('not capturing');
+    });
+
+    it('does not reproduce the rotating "normal" upstream proxy — direct with a note', () => {
+      const svc = serviceWithEgress({
+        deviceId: 'DEV001', proxyMode: 'normal', tlsProfile: 'chrome',
+      });
+
+      const result = svc.resolveProxy({ type: 'captureSession', deviceId: 'DEV001' });
+      expect(result.agent).toBeUndefined();
+      expect(result.proxyUrl.toLowerCase()).toContain('normal');
+      expect(result.tlsProfile).toBe('chrome');
+      svc.stop();
+    });
+  });
+
+  describe('buildRequestOptions — TLS profile application', () => {
+    const directProxy = { agent: undefined, proxyUrl: 'direct' };
+
+    it('sets ciphers/ecdhCurve/sigalgs/ALPN on https requests when a profile is given', () => {
+      const { options } = (service as any).buildRequestOptions(
+        'https://example.com/x', 'GET', {}, null, directProxy, 'chrome',
+      );
+      expect(options.ciphers).toBe(CHROME_TLS12_CIPHERS);
+      expect(options.ecdhCurve).toBe(SHARED_GROUPS);
+      expect(options.sigalgs).toBe(SHARED_SIGALGS);
+      expect(options.ALPNProtocols).toEqual(SHARED_ALPN);
+    });
+
+    it('applies the narrower okhttp cipher list', () => {
+      const { options } = (service as any).buildRequestOptions(
+        'https://example.com/x', 'GET', {}, null, directProxy, 'okhttp',
+      );
+      expect(options.ciphers).toBe(OKHTTP_TLS12_CIPHERS);
+    });
+
+    it('leaves TLS options untouched for profile "default" / undefined', () => {
+      const def = (service as any).buildRequestOptions(
+        'https://example.com/x', 'GET', {}, null, directProxy, 'default',
+      ).options;
+      const none = (service as any).buildRequestOptions(
+        'https://example.com/y', 'GET', {}, null, directProxy, undefined,
+      ).options;
+      expect(def.ciphers).toBeUndefined();
+      expect(none.ciphers).toBeUndefined();
+    });
+
+    it('never sets ciphers on a plain http request even with a profile', () => {
+      const { options, isHttps } = (service as any).buildRequestOptions(
+        'http://example.com/x', 'GET', {}, null, directProxy, 'chrome',
+      );
+      expect(isHttps).toBe(false);
+      expect(options.ciphers).toBeUndefined();
+    });
+  });
+
+  describe('makeRequest — TLS profile threading', () => {
+    it('derives the effective profile from the resolved capture-session egress', async () => {
+      const spy = vi.spyOn(service as any, 'doSingleRequest').mockResolvedValue({
+        statusCode: 200, headers: { 'content-type': 'application/json' }, body: Buffer.from('{}'),
+      });
+
+      await service.makeRequest(
+        { url: 'https://example.com/x', proxy: { type: 'captureSession', deviceId: 'DEV001' } },
+        { agent: undefined, proxyUrl: 'capture session (direct, chrome)', tlsProfile: 'chrome' },
+      );
+
+      // 7th positional arg is the tls profile.
+      expect(spy.mock.calls[0][6]).toBe('chrome');
+      spy.mockRestore();
+    });
+
+    it('lets an explicit request tlsProfile override the resolved one', async () => {
+      const spy = vi.spyOn(service as any, 'doSingleRequest').mockResolvedValue({
+        statusCode: 200, headers: {}, body: Buffer.from(''),
+      });
+
+      await service.makeRequest(
+        { url: 'https://example.com/x', tlsProfile: 'okhttp', proxy: { type: 'direct' } },
+        { agent: undefined, proxyUrl: 'direct', tlsProfile: 'chrome' },
+      );
+
+      expect(spy.mock.calls[0][6]).toBe('okhttp');
+      spy.mockRestore();
     });
   });
 });

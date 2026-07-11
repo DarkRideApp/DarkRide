@@ -10,6 +10,7 @@ import type { IosDeviceManager } from './ios-device-manager';
 import type { AutomationRunner } from './automation-runner';
 import type { TrafficHookRegistry } from './traffic-hook-registry';
 import type { CaptureStatusMessage, CaptureSubsystemStatus } from '../../shared/types/websocket';
+import type { CaptureEgress } from '../../shared/types/api';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
 import type { CaptureModeRegistry } from './capture-mode-registry';
 import type { ProviderRegistry } from './providers';
@@ -21,6 +22,12 @@ interface ActiveCapture {
   deviceId: string;
   tunnelActivated: boolean;
   subsystems?: CaptureSubsystemStatus;
+  // Egress fingerprint — how this session's traffic leaves the machine. Read by
+  // the replay path (ProxiedRequestService) to reproduce the same proxy + TLS
+  // profile when a captured request is resent server-side.
+  proxyMode: 'none' | 'normal' | 'nordvpn';
+  proxyCountry?: string;
+  tlsProfile?: 'chrome' | 'okhttp' | 'default';
 }
 
 export class CaptureSessionManager {
@@ -215,7 +222,18 @@ export class CaptureSessionManager {
       tunnelActivated = result.tunnelActivated;
       const emuHttpProxy = result.emuHttpProxy;
 
-      this.activeSessions.set(deviceId, { sessionId, deviceId, tunnelActivated, subsystems });
+      this.activeSessions.set(deviceId, {
+        sessionId,
+        deviceId,
+        tunnelActivated,
+        subsystems,
+        // Egress fingerprint for the replay path. proxyOptions/tlsProfile are
+        // the exact same inputs mitmproxy was configured with above, so a
+        // replay reproduces this session's proxy + TLS cipher profile.
+        proxyMode: proxyOptions?.mode ?? 'none',
+        proxyCountry: proxyOptions?.country,
+        tlsProfile: tlsProfile as 'chrome' | 'okhttp' | 'default' | undefined,
+      });
 
       // NOTE: no extra "final" broadcast here. Each capture handler ends by
       // calling ctx.setSubsystem on its terminal subsystem (connectivity),
@@ -335,6 +353,22 @@ export class CaptureSessionManager {
 
   getCapturingDeviceIds(): string[] {
     return Array.from(this.activeSessions.keys());
+  }
+
+  /**
+   * Egress fingerprint for a device's active capture, or null if it isn't
+   * capturing. The replay path (ProxiedRequestService) uses this to send a
+   * resent request out through the same proxy + TLS profile the app used.
+   */
+  getEgress(deviceId: string): CaptureEgress | null {
+    const capture = this.activeSessions.get(deviceId);
+    if (!capture) return null;
+    return {
+      deviceId,
+      proxyMode: capture.proxyMode,
+      proxyCountry: capture.proxyCountry,
+      tlsProfile: capture.tlsProfile,
+    };
   }
 
   async stopAll(): Promise<void> {

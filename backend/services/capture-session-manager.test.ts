@@ -551,6 +551,55 @@ describe('CaptureSessionManager', () => {
     });
   });
 
+  describe('getEgress', () => {
+    it('returns null when the device is not capturing', () => {
+      expect(manager.getEgress('DEV001')).toBeNull();
+    });
+
+    it('returns direct-mode egress for a plain capture (no proxy, no tls profile)', async () => {
+      await manager.startCapture('DEV001');
+
+      expect(manager.getEgress('DEV001')).toEqual({
+        deviceId: 'DEV001',
+        proxyMode: 'none',
+        proxyCountry: undefined,
+        tlsProfile: undefined,
+      });
+    });
+
+    it('captures the NordVPN country and TLS profile from the session', async () => {
+      db.insert(schema.settings).values({ key: 'nordvpn_username', value: 'u' }).run();
+      db.insert(schema.settings).values({ key: 'nordvpn_password', value: 'p' }).run();
+
+      await manager.startCapture('DEV001', { mode: 'nordvpn', country: 'us' }, 'chrome');
+
+      expect(manager.getEgress('DEV001')).toEqual({
+        deviceId: 'DEV001',
+        proxyMode: 'nordvpn',
+        proxyCountry: 'us',
+        tlsProfile: 'chrome',
+      });
+    });
+
+    it('records normal upstream-proxy mode', async () => {
+      await manager.startCapture('DEV001', { mode: 'normal' }, 'okhttp');
+
+      expect(manager.getEgress('DEV001')).toMatchObject({
+        deviceId: 'DEV001',
+        proxyMode: 'normal',
+        tlsProfile: 'okhttp',
+      });
+    });
+
+    it('returns null again after the session is stopped', async () => {
+      await manager.startCapture('DEV001');
+      expect(manager.getEgress('DEV001')).not.toBeNull();
+
+      await manager.stopCapture('DEV001');
+      expect(manager.getEgress('DEV001')).toBeNull();
+    });
+  });
+
   describe('hookBus lifecycle hooks', () => {
     it('emits session:created after session row is inserted', async () => {
       const bus = { define: vi.fn(), on: vi.fn(), off: vi.fn(), emit: vi.fn() };
