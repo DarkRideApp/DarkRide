@@ -108,18 +108,42 @@ pluginRegistry.registerCommands('my-plugin', [
 
 ## registerDecoders
 
-Traffic decoders contribute to the Traffic / Capture inspectors. Each decoder declares which raw protocols it can decode and provides a `decode(frame)` implementation. See `packages/plugin-sdk/src/react/plugin-registry/decoder-types.ts` for the full type surface.
+Protocol decoders contribute to the WebSocket **Frames** tab in the traffic detail panel (`TrafficDetailPanel.tsx`'s `WsFramesPanel`). For a given WS connection, the host calls `detect(headers)` on every registered decoder (using the connection's handshake request headers) and uses the first one that returns `true`. If a decoder matches, its `decodeFrames(frames)` is called with all of that connection's raw frames and the panel shows a "Decoded" view (with a raw-frames fallback toggle) instead of plain base64. See `packages/plugin-sdk/src/react/plugin-registry/decoder-types.ts` for the full type surface (`RawFrame`, `DecodedMessage`, `ProtocolDecoder`).
 
 ```typescript
 pluginRegistry.registerDecoders('my-plugin', [
   {
     id: 'my-binary-protocol',
-    label: 'My Binary Protocol',
-    accepts: (frame) => frame.payload[0] === 0x4d && frame.payload[1] === 0x59,
-    decode: (frame) => ({ type: 'mybin', fields: { … } }),
+    name: 'My Binary Protocol',
+    // headers is the WS handshake's request headers (Record<string, string>).
+    // Do a case-insensitive lookup — header casing isn't guaranteed.
+    detect: (headers) => {
+      for (const [key, value] of Object.entries(headers)) {
+        if (key.toLowerCase() === 'sec-websocket-protocol') {
+          return value.toLowerCase().includes('my-binary-protocol');
+        }
+      }
+      return false;
+    },
+    // Called once per connection with every captured frame; return one
+    // DecodedMessage per logical message (frames may need reassembling).
+    decodeFrames: (frames) => frames.map((f, i) => ({
+      messageNumber: i,
+      type: 'request',
+      typeLabel: 'REQ',
+      direction: f.direction,
+      properties: {},
+      body: f.payload,
+      bodySize: f.payloadSize,
+      timestamp: f.timestamp,
+      flags: [],
+      rawFrameIds: [f.id],
+    })),
   },
 ]);
 ```
+
+See `plugins/kitchen-sink/frontend/plugin.ts` for a minimal working example, and `plugins/blip-decoder/` for a complete real-world decoder (BLIP/Couchbase Sync Gateway) including frame reassembly and streaming decompression.
 
 ## UI slot contributions
 
