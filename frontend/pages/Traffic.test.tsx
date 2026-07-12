@@ -104,7 +104,7 @@ describe('Traffic page — server filter wiring', () => {
   });
 
   it('keeps the selected row selected across a filter change when it still matches', async () => {
-    const ws = renderPage();
+    renderPage();
     await waitFor(() => screen.getByTestId('traffic-row-1'));
 
     fireEvent.click(screen.getByTestId('traffic-row-1'));

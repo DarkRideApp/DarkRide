@@ -10,7 +10,7 @@ import { ConfirmDialog } from '@darkrideapp/plugin-sdk/react';
 import type { CapturedTrafficEntry, WebSocketMessageEntry } from '../../shared/types/api';
 import type { TrafficEntry } from '../components/traffic/TrafficEntryRow';
 import type { TrafficFilters } from '../components/traffic/trafficUtils';
-import { METHOD_FILTERS, deriveServerStatusCentury } from '../components/traffic/trafficUtils';
+import { deriveServerStatusCentury } from '../components/traffic/trafficUtils';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
 import { InterceptHoldPanel, InterceptArmControl } from '../components/intercept/InterceptHoldPanel';
