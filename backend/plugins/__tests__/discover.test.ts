@@ -40,6 +40,32 @@ describe('discoverPlugins', () => {
     expect(result).toEqual([]);
   });
 
+  // ── Follow symlinked / junctioned plugin directories ─────────────
+
+  it('should discover a plugin symlinked into plugins/', async () => {
+    // readdir reports a symlink (Linux/macOS) / junction (Windows) as a
+    // non-directory dirent, so a plugin linked in for local dev — the
+    // documented workflow — used to be silently skipped. Regression test.
+    fs.mkdirSync(tmpPluginsDir, { recursive: true });
+    const realDir = path.join(tmpDir, 'external', 'linked-plugin');
+    fs.mkdirSync(realDir, { recursive: true });
+    fs.writeFileSync(path.join(realDir, 'darkride-plugin.js'), `
+      module.exports = {
+        name: 'linked-plugin',
+        version: '2.0.0',
+        dependencies: [],
+        optionalDependencies: [],
+        aiScopes: [],
+        register: function(ctx) {},
+      };
+    `);
+    // type 'junction' is honoured on Windows and ignored (plain symlink) elsewhere.
+    fs.symlinkSync(realDir, path.join(tmpPluginsDir, 'linked-plugin'), 'junction');
+
+    const result = await discoverPlugins([tmpPluginsDir]);
+    expect(result.map(p => p.name)).toContain('linked-plugin');
+  });
+
   // ── Skip directories without entry file ──────────────────────────
 
   it('should skip directories without a darkride-plugin entry file', async () => {
