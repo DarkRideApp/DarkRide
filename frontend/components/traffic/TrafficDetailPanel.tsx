@@ -4,6 +4,8 @@ import type { TrafficEntry } from './TrafficEntryRow';
 import { parseHostname } from './TrafficEntryRow';
 import { detectGraphQL, formatGraphQLQuery } from '../../../shared/lib/graphql-detect';
 import { detectProtobuf, decodeProtobufSchemaless, formatProtobufTree } from '../../../shared/lib/protobuf-detect';
+import { detectProtocol } from '../../lib/protocol-decoders';
+import type { RawFrame } from '../../lib/protocol-decoders';
 import type { WebSocketMessageEntry } from '../../../shared/types/api';
 import {
   parseHeadersObject,
@@ -539,6 +541,27 @@ function ImagePreview({ entryId, contentType }: { entryId: number; contentType: 
 
 function WsFramesPanel({ entry, frames }: { entry: TrafficEntry; frames: WebSocketMessageEntry[] }) {
   const [dirFilter, setDirFilter] = useState<string>('All');
+  const [expandedMsg, setExpandedMsg] = useState<number | null>(null);
+
+  // Look up a plugin-registered ProtocolDecoder (e.g. BLIP) matching this
+  // connection's handshake headers. Falls back to the raw frame list below
+  // when no decoder is registered or none matches.
+  const decoder = useMemo(() => detectProtocol(entry.requestHeaders), [entry.requestHeaders]);
+  const [viewMode, setViewMode] = useState<'decoded' | 'raw'>(decoder ? 'decoded' : 'raw');
+
+  const decodedMessages = useMemo(() => {
+    if (!decoder || viewMode !== 'decoded' || frames.length === 0) return null;
+    const rawFrames: RawFrame[] = frames.map(f => ({
+      id: f.id,
+      direction: f.direction,
+      opcode: f.opcode,
+      payload: f.payload,
+      isBinary: f.isBinary,
+      payloadSize: f.payloadSize,
+      timestamp: f.timestamp,
+    }));
+    return decoder.decodeFrames(rawFrames);
+  }, [decoder, frames, viewMode]);
 
   const filtered = useMemo(() => {
     if (dirFilter === 'All') return frames;
@@ -557,44 +580,114 @@ function WsFramesPanel({ entry, frames }: { entry: TrafficEntry; frames: WebSock
     <div className="detail-panel-section">
       <div className="detail-ws-toolbar">
         <span className="detail-panel-section-title">
-          Frames ({frames.length})
+          {viewMode === 'decoded' && decodedMessages ? `Messages (${decodedMessages.length})` : `Frames (${frames.length})`}
         </span>
-        <div className="detail-ws-dir-filters">
-          {(['All', 'send', 'receive'] as const).map(d => (
-            <button
-              key={d}
-              className={`detail-ws-dir-btn${dirFilter === d ? ' active' : ''}`}
-              onClick={() => setDirFilter(d)}
-            >
-              {d === 'send' ? '\u2191 Sent' : d === 'receive' ? '\u2193 Received' : 'All'}
-            </button>
-          ))}
-          {dirFilter !== 'All' && (
-            <span className="detail-ws-count">{filtered.length} / {frames.length}</span>
-          )}
-        </div>
-      </div>
-      <div className="detail-ws-frame-list">
-        {filtered.length === 0 ? (
-          <div className="traffic-detail-empty">No frames match filter</div>
-        ) : (
-          filtered.map((f, i) => (
-            <div key={f.id || i} className="detail-ws-frame-row">
-              <span className={`detail-ws-dir ${f.direction === 'send' ? 'send' : 'receive'}`}>
-                {f.direction === 'send' ? '\u2191' : '\u2193'}
-              </span>
-              {f.isBinary && (
-                <span className="detail-ws-binary-tag">binary</span>
-              )}
-              <span className="detail-ws-payload">
-                {f.payload ? (f.payload.length > 200 ? f.payload.slice(0, 200) + '\u2026' : f.payload) : '(empty)'}
-              </span>
-              <span className="detail-ws-size">{formatBytes(f.payloadSize)}</span>
-              <span className="detail-ws-time">{new Date(f.timestamp).toLocaleTimeString()}</span>
+        {decoder && (
+          <>
+            <span className="detail-ws-protocol-badge">{decoder.name}</span>
+            <div className="detail-ws-view-toggle">
+              <button
+                className={`detail-ws-view-btn${viewMode === 'decoded' ? ' active' : ''}`}
+                onClick={() => setViewMode('decoded')}
+              >
+                Decoded
+              </button>
+              <button
+                className={`detail-ws-view-btn${viewMode === 'raw' ? ' active' : ''}`}
+                onClick={() => setViewMode('raw')}
+              >
+                Raw Frames
+              </button>
             </div>
-          ))
+          </>
+        )}
+        {viewMode === 'raw' && (
+          <div className="detail-ws-dir-filters">
+            {(['All', 'send', 'receive'] as const).map(d => (
+              <button
+                key={d}
+                className={`detail-ws-dir-btn${dirFilter === d ? ' active' : ''}`}
+                onClick={() => setDirFilter(d)}
+              >
+                {d === 'send' ? '\u2191 Sent' : d === 'receive' ? '\u2193 Received' : 'All'}
+              </button>
+            ))}
+            {dirFilter !== 'All' && (
+              <span className="detail-ws-count">{filtered.length} / {frames.length}</span>
+            )}
+          </div>
         )}
       </div>
+
+      {viewMode === 'decoded' && decodedMessages ? (
+        <div className="detail-ws-message-list">
+          {decodedMessages.map((m, i) => {
+            const profile = m.properties.Profile || m.properties.profile;
+            const errorInfo = m.properties['Error-Code'] || m.properties['Error-Domain'];
+            const isExpanded = expandedMsg === i;
+            return (
+              <div key={i} className="detail-ws-message">
+                <div className="detail-ws-message-header" onClick={() => setExpandedMsg(isExpanded ? null : i)}>
+                  <span className={`detail-ws-dir ${m.direction === 'send' ? 'send' : 'receive'}`}>
+                    {m.direction === 'send' ? '\u2191' : '\u2193'}
+                  </span>
+                  <span className={`detail-ws-message-type type-${m.typeLabel.toLowerCase()}`}>{m.typeLabel}</span>
+                  <span className="detail-ws-message-num">#{m.messageNumber}</span>
+                  {profile && <span className="detail-ws-message-profile">{profile}</span>}
+                  {errorInfo && (
+                    <span className="detail-ws-message-error">
+                      Error: {m.properties['Error-Code']} {m.properties['Error-Domain'] || ''}
+                    </span>
+                  )}
+                  <span className="detail-ws-message-preview">
+                    {m.body && !m.body.startsWith('[') ? (m.body.length > 80 ? m.body.slice(0, 80) + '\u2026' : m.body) : ''}
+                  </span>
+                  {m.bodySize > 0 && <span className="detail-ws-size">{formatBytes(m.bodySize)}</span>}
+                  <span className="detail-ws-time">{new Date(m.timestamp).toLocaleTimeString()}</span>
+                </div>
+                {isExpanded && (
+                  <div className="detail-ws-message-detail">
+                    {Object.keys(m.properties).length > 0 && (
+                      <div className="detail-ws-message-detail-section">
+                        <strong>Properties:</strong>
+                        <pre>{Object.entries(m.properties).map(([k, v]) => `${k}: ${v}`).join('\n')}</pre>
+                      </div>
+                    )}
+                    {m.body && (
+                      <div className="detail-ws-message-detail-section">
+                        <strong>Body:</strong>
+                        <pre>{tryPrettyJson(m.body)}</pre>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="detail-ws-frame-list">
+          {filtered.length === 0 ? (
+            <div className="traffic-detail-empty">No frames match filter</div>
+          ) : (
+            filtered.map((f, i) => (
+              <div key={f.id || i} className="detail-ws-frame-row">
+                <span className={`detail-ws-dir ${f.direction === 'send' ? 'send' : 'receive'}`}>
+                  {f.direction === 'send' ? '\u2191' : '\u2193'}
+                </span>
+                {f.isBinary && (
+                  <span className="detail-ws-binary-tag">binary</span>
+                )}
+                <span className="detail-ws-payload">
+                  {f.payload ? (f.payload.length > 200 ? f.payload.slice(0, 200) + '\u2026' : f.payload) : '(empty)'}
+                </span>
+                <span className="detail-ws-size">{formatBytes(f.payloadSize)}</span>
+                <span className="detail-ws-time">{new Date(f.timestamp).toLocaleTimeString()}</span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
     </div>
   );
 }
