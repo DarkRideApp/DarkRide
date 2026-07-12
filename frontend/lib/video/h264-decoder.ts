@@ -124,6 +124,13 @@ export class H264Decoder {
     this.opts.onResetRequested?.();
   }
 
+  /** How many chunks are queued in the underlying decoder awaiting output.
+   *  A rising value means decode can't keep up with arrivals (latency will
+   *  grow). 0 when no decoder is configured. */
+  get decodeQueueSize(): number {
+    return this.decoder?.decodeQueueSize ?? 0;
+  }
+
   close(): void {
     if (this.decoder && this.decoder.state !== 'closed') {
       try { this.decoder.close(); } catch { /* ignore */ }
@@ -160,7 +167,18 @@ export class H264Decoder {
     }
 
     try {
-      this.decoder.configure({ codec: codecString, optimizeForLatency: true });
+      // hardwareAcceleration: 'prefer-software' — the Pixel 7 Pro's Exynos
+      // hardware H.264 decoder wedges under a sustained delta stream: its output
+      // callback keeps firing at ~30fps but emits the SAME stale frame, so the
+      // picture freezes on-screen while every health metric (fps, decodeQueue,
+      // no errors) stays green (confirmed via canvas pixel-diff telemetry — real
+      // wedges dropped from ~20/3min on hardware to 0 on software). Software
+      // decode avoids that buggy path entirely; the browser confirms it honors
+      // the hint (isConfigSupported reports prefer-software, supported=true), and
+      // for one 900px/30fps stream the CPU cost is negligible.
+      // optimizeForLatency is intentionally omitted — it made the HW wedge worse
+      // and buys ~0 perceptible latency here (measured 1-2ms).
+      this.decoder.configure({ codec: codecString, hardwareAcceleration: 'prefer-software' });
     } catch (e: any) {
       this.opts.onError(e);
       // The decoder is unusable (typically closed). Drop our reference so

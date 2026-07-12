@@ -7,7 +7,7 @@ import type { WebSocket } from 'ws';
 import { registerWebsocketEndpoint } from './handlers';
 import { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
-import { ensureMinicap, ensureMinitouch, getScrcpyServerJar } from '../services/vendor-manager';
+import { ensureMinicap, ensureMinitouch, getScrcpyServerJar, SCRCPY_VERSION } from '../services/vendor-manager';
 import { createLoggers } from '../logs';
 import { StreamBroadcaster } from './h264/stream-broadcaster';
 import { newAdapterState, onReset, onTick, bitrateForTier, AdapterState } from './h264/bitrate-adapter';
@@ -82,6 +82,62 @@ async function pushIfNeeded(deviceId: string, localPath: string, remotePath: str
 const STREAM_PORT_START = 9200;
 const STREAM_PORT_END = 9399;
 let nextPort = STREAM_PORT_START;
+
+/**
+ * Cap scrcpy's capture/encode rate. High-refresh devices (the Pixel 7 Pro here
+ * is 120 Hz) burst to 100+ fps under motion, which (a) overruns a ~60 Hz client
+ * — frames pile up in the decoder queue and latency climbs to seconds — and
+ * (b) keeps the device's display-capture + H.264 encoder pinned, which on this
+ * hardware correlates with the ADB/USB link degrading (ingest sagging to a few
+ * fps) and occasionally dropping the device off the bus entirely.
+ *
+ * 30 fps is smooth for device viewing/control, halves the encode + USB + client
+ * decode load versus 60, and trades peak fluidity for stability. Raise back to
+ * 60 on a setup with a rock-solid USB connection and a fast client.
+ */
+const SCRCPY_MAX_FPS = 30;
+
+/**
+ * GOP length in seconds — how often scrcpy's encoder emits a full IDR keyframe.
+ * IDRs are large and expensive; forcing one every 2s hammered the Pixel 7 Pro's
+ * Exynos encoder under sustained heavy motion, stalling its output to ~0 fps for
+ * seconds (a multi-second on-screen freeze that repeated as long as the motion
+ * lasted). A longer GOP lets the encoder spend its budget on the motion instead
+ * of frequent keyframes. Late-joining viewers no longer need a short GOP: we
+ * send an on-demand RESET_VIDEO (IDR) when a viewer joins, so they still get a
+ * decodable frame immediately without paying the keyframe cost stream-wide.
+ */
+const SCRCPY_IFRAME_INTERVAL_S = 10;
+
+/**
+ * Cap the encoded frame's longer/– shorter dimension. The Pixel 7 Pro's Exynos
+ * H.264 encoder saturates at full 1080-wide resolution under sustained heavy
+ * motion, stalling its output for seconds. Encoding fewer pixels frees encoder
+ * headroom; 900 keeps the device screen crisp while cutting ~30% of the pixel
+ * load versus 1080. Raise toward 1080 on devices whose encoder keeps up.
+ */
+const SCRCPY_MAX_SIZE = 900;
+
+/**
+ * Minimum spacing between RESET_VIDEO writes to scrcpy (keyframe-coordinator
+ * rate limit). On scrcpy 3.3.4 / Android 16 a RESET_VIDEO triggers a full
+ * "Video capture reset" that takes ~2s and briefly stalls the encoder — it is
+ * NOT the cheap "emit one IDR" it was on older builds. At the old 500ms limit,
+ * a client whose watchdog fired repeatedly during a momentary encoder dip could
+ * stack capture resets faster than the device recovered, spiralling into a hard
+ * multi-second freeze (each reset re-starved the viewer → another reset). 3s
+ * spacing keeps a single recovery keyframe useful while making that spiral
+ * impossible — resets can never outpace the device's own reset-recovery time.
+ */
+const KEYFRAME_MIN_INTERVAL_MS = 3000;
+
+/**
+ * Auto bitrate up-step opportunistically raises quality after a healthy window,
+ * but bitrate can only change by respawning scrcpy — a multi-second dropout
+ * every ~90s. Disabled for seamlessness: the stream holds its tier and only
+ * ever steps *down* on real congestion (which is a genuine recovery, not
+ * gratuitous). Users can still pin a higher tier manually. */
+const AUTO_BITRATE_UPSTEP = false;
 
 /**
  * Poll interval for the adb-screencap fallback stream. ADB exec-out
@@ -193,6 +249,121 @@ export function translateCoordinates(
   };
 }
 
+/**
+ * A canvas-drag gesture being streamed to the device via a persistent
+ * `adb shell` as `input motionevent` lines. This is the touch path for
+ * non-rooted Android 12+ devices, where minitouch cannot open /dev/input
+ * (SELinux denies the shell domain). The `input` command spawns a JVM per
+ * call (~70ms), so we (a) hold one shell open per gesture to avoid the adb
+ * round-trip, and (b) throttle MOVE events to `MIN_MOVE_INTERVAL_MS` and only
+ * send the latest coordinate, so slow `input` calls can't queue up unbounded.
+ */
+interface AdbGesture {
+  deviceId: string;
+  proc: ChildProcess;
+  lastMoveAt: number;
+  pendingMove: { x: number; y: number } | null;
+  moveTimer: NodeJS.Timeout | null;
+  lastX: number;
+  lastY: number;
+  /** Last two raw (unthrottled) move samples, for release-velocity → fling. */
+  samples: { x: number; y: number; t: number }[];
+}
+
+/** Min spacing between MOVE motionevents; the on-device `input` JVM costs
+ *  ~70ms, so faster than this just backs up. ~14 moves/s — steppy but scrolls
+ *  and follows direction changes (minitouch is smoother but needs root here). */
+const MIN_MOVE_INTERVAL_MS = 70;
+/** Release speed (device px/s) above which we inject a fling on `up`. */
+const FLING_MIN_SPEED = 1200;
+
+/** Start a persistent adb shell for a drag gesture and send the initial DOWN. */
+function startAdbGesture(deviceId: string, x: number, y: number): AdbGesture {
+  const proc = spawn('adb', ['-s', deviceId, 'shell']);
+  proc.on('error', (err) => error(`adb gesture shell error for ${deviceId}: ${err.message}`));
+  const g: AdbGesture = {
+    deviceId, proc, lastMoveAt: 0, pendingMove: null, moveTimer: null,
+    lastX: x, lastY: y, samples: [{ x, y, t: Date.now() }],
+  };
+  writeMotionEvent(g, 'DOWN', x, y);
+  return g;
+}
+
+/** Throttled MOVE: coalesce to the latest coordinate, emit at most one per
+ *  MIN_MOVE_INTERVAL_MS so slow on-device `input` calls don't queue. Every raw
+ *  sample is recorded (for release velocity) even when the wire event is
+ *  throttled away. */
+function feedAdbGesture(g: AdbGesture, x: number, y: number): void {
+  g.samples.push({ x, y, t: Date.now() });
+  if (g.samples.length > 4) g.samples.shift();
+  g.pendingMove = { x, y };
+  const since = Date.now() - g.lastMoveAt;
+  if (since >= MIN_MOVE_INTERVAL_MS) {
+    flushAdbMove(g);
+  } else if (!g.moveTimer) {
+    g.moveTimer = setTimeout(() => { g.moveTimer = null; flushAdbMove(g); }, MIN_MOVE_INTERVAL_MS - since);
+  }
+}
+
+function flushAdbMove(g: AdbGesture): void {
+  if (!g.pendingMove) return;
+  const { x, y } = g.pendingMove;
+  g.pendingMove = null;
+  g.lastMoveAt = Date.now();
+  writeMotionEvent(g, 'MOVE', x, y);
+}
+
+/**
+ * End the gesture. If the finger was moving fast at release, inject a fling:
+ * our throttled MOVE stream flattens the release velocity so Android never
+ * sees a flick, so we replay the recent motion vector as a short, fast
+ * `input swipe` (confirmed on-device to trigger momentum). A slow/precise drag
+ * just gets a plain UP so it settles exactly where released.
+ */
+function endAdbGesture(g: AdbGesture, x: number, y: number): void {
+  if (g.moveTimer) { clearTimeout(g.moveTimer); g.moveTimer = null; }
+  const upX = Number.isFinite(x) ? x : g.lastX;
+  const upY = Number.isFinite(y) ? y : g.lastY;
+
+  // Release velocity from the last two raw samples.
+  const s = g.samples;
+  let speed = 0, vx = 0, vy = 0;
+  if (s.length >= 2) {
+    const a = s[s.length - 2], b = s[s.length - 1];
+    const dt = Math.max(1, b.t - a.t) / 1000;
+    vx = (b.x - a.x) / dt; vy = (b.y - a.y) / dt;
+    speed = Math.hypot(vx, vy);
+  }
+  const willFling = speed >= FLING_MIN_SPEED;
+  log(`adb gesture release ${g.deviceId}: speed=${Math.round(speed)}px/s fling=${willFling}`);
+
+  // End the drag contact cleanly.
+  writeMotionEvent(g, 'UP', upX, upY);
+  try { g.proc.stdin?.end('exit\n'); } catch { /* closing */ }
+
+  // Fling: injected `input motionevent` MOVEs run ~70ms apart (JVM spawn per
+  // call), so Android's velocity tracker never sees a fast flick from them — it
+  // only flings from the native `input swipe` primitive (confirmed on-device).
+  // So on a fast release, throw a short `input swipe` along the release vector.
+  // The drag scroll already positioned the content; this swipe adds momentum
+  // from where the finger lifted. Slow/precise drags skip it and settle exactly.
+  if (willFling) {
+    const throwMs = 50; // short = fast = Android reads it as a flick
+    const endX = Math.round(upX + vx * 0.10);
+    const endY = Math.round(upY + vy * 0.10);
+    execAsync(
+      `adb -s ${g.deviceId} shell input swipe ${Math.round(upX)} ${Math.round(upY)} ${endX} ${endY} ${throwMs}`,
+      { timeout: 5000 },
+    ).catch((err: any) => error(`ADB fling swipe failed for ${g.deviceId}: ${err.message}`));
+  }
+}
+
+function writeMotionEvent(g: AdbGesture, action: 'DOWN' | 'MOVE' | 'UP', x: number, y: number): void {
+  g.lastX = x; g.lastY = y;
+  try { g.proc.stdin?.write(`input motionevent ${action} ${Math.round(x)} ${Math.round(y)}\n`); }
+  catch { /* shell gone — gesture aborted */ }
+}
+
 interface DeviceStream {
   deviceId: string;
   minicapProcess: ChildProcess | null;
@@ -201,6 +372,19 @@ interface DeviceStream {
   minitouchSocket: Socket | null;
   scrcpyProcess: ChildProcess | null;
   broadcaster: StreamBroadcaster | null;
+  /** True once the current scrcpy capture has produced >=1 H.264 frame.
+   *  Reset to false on every (re)attach of the scrcpy pipeline. Used to gate
+   *  the join-time RESET_VIDEO: scrcpy 3.3.4 throws an NPE (null
+   *  SurfaceCapture.CaptureListener) and dies if a RESET_VIDEO arrives before
+   *  capture is live. A fresh start emits its own initial IDR anyway. */
+  captureReady: boolean;
+  /** Persistent `adb shell` for streaming a canvas-drag gesture as
+   *  `input motionevent` DOWN/MOVE/UP lines, used when minitouch is
+   *  unavailable (non-rooted Android 12+ where SELinux blocks the shell
+   *  domain from /dev/input). One shell per in-progress gesture keeps latency
+   *  to the ~70ms `input` JVM spawn instead of a full adb round-trip per event.
+   *  See startAdbGesture / feedAdbGesture / endAdbGesture. */
+  adbGesture: AdbGesture | null;
   scrcpyPort: number;
   hasLiveVideo: boolean;
   screenWidth: number;
@@ -689,11 +873,33 @@ function attachScrcpyExitHandler(deviceId: string, stream: DeviceStream, proc: C
  * and pipes raw Annex-B H.264 data from the socket into the broadcaster.
  */
 export function attachScrcpyH264Pipeline(stream: DeviceStream, scrcpySocket: Socket): void {
+  // Fresh capture: the join-keyframe gate stays closed until the first frame.
+  stream.captureReady = false;
   if (!stream.broadcaster) {
     stream.broadcaster = new StreamBroadcaster(() => Date.now(), {
       onResetRequested: (viewerId) => {
         log(`Viewer ${viewerId} requested reset due to backpressure on ${stream.deviceId}`);
         triggerStreamReset(stream, 'congestion');
+      },
+      onKeyframeWanted: (viewerId) => {
+        // A viewer just joined — ask scrcpy for an immediate IDR so its first
+        // decodable frame lands within the coordinator's rate-limit window
+        // instead of waiting up to a full GOP. Coalesced across rapid joins.
+        //
+        // But only once capture is live: scrcpy 3.3.4 dereferences a still-null
+        // SurfaceCapture.CaptureListener if a RESET_VIDEO lands before the first
+        // frame (fresh start or mid-restart), throwing an NPE that kills the
+        // server (SIGKILL / exit 137). A fresh start emits its own initial IDR,
+        // so a viewer joining before then loses nothing by us skipping this.
+        if (!stream.captureReady) {
+          log(`keyframe-request ${stream.deviceId} viewer=${viewerId} reason=join action=skipped (capture not ready)`);
+          return;
+        }
+        const action = stream.keyframeCoordinator.request();
+        log(`keyframe-request ${stream.deviceId} viewer=${viewerId} reason=join action=${action}`);
+      },
+      onIngestStats: (info) => {
+        log(`scrcpy ingest fps for ${stream.deviceId}: ${info.fps.toFixed(1)} (${info.frames} frames / 2s)`);
       },
     });
   }
@@ -707,6 +913,18 @@ export function attachScrcpyH264Pipeline(stream: DeviceStream, scrcpySocket: Soc
   scrcpySocket.on('data', (chunk: Buffer) => {
     if (h264BytesReceived === 0) {
       log(`scrcpy: first H.264 data received for ${stream.deviceId} (${chunk.length} bytes)`);
+      // Capture is live — safe to honor join-time RESET_VIDEO from here on.
+      stream.captureReady = true;
+      // If a screencap polling fallback was started while scrcpy was down/
+      // restarting, tear it down now that live H.264 is flowing again.
+      // Otherwise the 2 fps JPEG poller keeps broadcasting stale full-screen
+      // frames on the same `device-frame` channel, which paint over the smooth
+      // H.264 video and cause a visible ~2 fps glitch under motion.
+      if (stream.pollTimer) {
+        log(`scrcpy live again for ${stream.deviceId} — stopping redundant adb polling fallback`);
+        clearInterval(stream.pollTimer);
+        stream.pollTimer = null;
+      }
     }
     h264BytesReceived += chunk.length;
     stream.broadcaster?.ingest(chunk);
@@ -752,6 +970,7 @@ function triggerStreamReset(stream: DeviceStream, reason: 'congestion' | 'manual
 }
 
 function startBitrateUpstepTimer(stream: DeviceStream): void {
+  if (!AUTO_BITRATE_UPSTEP) return;  // seamless: never respawn scrcpy just to raise bitrate
   if (stream.bitrateUpstepTimer) return;
   stream.bitrateUpstepTimer = setInterval(() => {
     if (!stream.broadcaster) return;
@@ -789,7 +1008,7 @@ async function tryStartScrcpy(deviceId: string, stream: DeviceStream, props: Dev
     }
 
     const scrcpyJar = getScrcpyServerJar();
-    const maxSize = Math.min(props.screenWidth, props.screenHeight, 1080);
+    const maxSize = Math.min(props.screenWidth, props.screenHeight, SCRCPY_MAX_SIZE);
 
     await pushIfNeeded(deviceId, scrcpyJar, '/data/local/tmp/scrcpy-server.jar');
 
@@ -801,11 +1020,11 @@ async function tryStartScrcpy(deviceId: string, stream: DeviceStream, props: Dev
 
     // Start scrcpy-server on device
     const bitrate = bitrateForTier(stream.bitrateState.tier);
-    log(`Starting scrcpy-server on ${deviceId} (port ${scrcpyPort}, max_size=${maxSize}, tier=${stream.bitrateState.tier}, bitrate=${bitrate})`);
+    log(`Starting scrcpy-server on ${deviceId} (port ${scrcpyPort}, max_size=${maxSize}, max_fps=${SCRCPY_MAX_FPS}, iframe=${SCRCPY_IFRAME_INTERVAL_S}s, tier=${stream.bitrateState.tier}, bitrate=${bitrate})`);
     const scrcpyProcess = spawn('adb', [
       '-s', deviceId, 'shell',
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar',
-      'app_process', '/', 'com.genymobile.scrcpy.Server', '3.3.1',
+      'app_process', '/', 'com.genymobile.scrcpy.Server', SCRCPY_VERSION,
       'tunnel_forward=true',
       'audio=false',
       'control=true',
@@ -814,8 +1033,9 @@ async function tryStartScrcpy(deviceId: string, stream: DeviceStream, props: Dev
       'stay_awake=true',
       'power_off_on_close=false',
       `max_size=${maxSize}`,
+      `max_fps=${SCRCPY_MAX_FPS}`,
       `video_bit_rate=${bitrateForTier(stream.bitrateState.tier)}`,
-      'video_codec_options=i-frame-interval=2',
+      `video_codec_options=i-frame-interval=${SCRCPY_IFRAME_INTERVAL_S}`,
     ]);
 
     let scrcpyStderr = '';
@@ -1052,6 +1272,8 @@ async function startDeviceStream(deviceId: string, deviceManager: DeviceManager)
     minitouchSocket: null,
     scrcpyProcess: null,
     broadcaster: null,
+    captureReady: false,
+    adbGesture: null,
     scrcpyPort: 0,
     hasLiveVideo: false,
     screenWidth: props.screenWidth,
@@ -1089,7 +1311,7 @@ async function startDeviceStream(deviceId: string, deviceManager: DeviceManager)
       sock.write(Buffer.from([RESET_VIDEO_BYTE]));
       stream.keyframeStats.requestsSent++;
     }
-  });
+  }, KEYFRAME_MIN_INTERVAL_MS);
 
   // Start minitouch and minicap in parallel — minitouch is independent
   const _tryStartMinicap = _startStreamOverrides?.tryStartMinicap ?? tryStartMinicap;
@@ -1216,6 +1438,14 @@ function stopStream(deviceId: string): void {
   if (stream.pollTimer) {
     clearInterval(stream.pollTimer);
     stream.pollTimer = null;
+  }
+
+  // Tear down any in-progress ADB-input drag gesture (persistent shell).
+  if (stream.adbGesture) {
+    if (stream.adbGesture.moveTimer) clearTimeout(stream.adbGesture.moveTimer);
+    try { stream.adbGesture.proc.stdin?.end('exit\n'); } catch { /* already gone */ }
+    try { stream.adbGesture.proc.kill(); } catch { /* already gone */ }
+    stream.adbGesture = null;
   }
 
   stream.minicapSocket?.destroy();
@@ -1671,15 +1901,23 @@ export function registerLiveStreamEndpoints(deviceManager: DeviceManager, iosDev
       // Minitouch available — coordinates are already device pixels
       const cmd = buildMinitouchCommand(eventType, x, y);
       stream.minitouchSocket.write(cmd);
-    } else if (eventType === 'down') {
-      // ADB tap fallback (only fire on 'down' to avoid duplicate taps)
-      try {
-        await execAsync(
-          `adb -s ${deviceId} shell input tap ${Math.round(x)} ${Math.round(y)}`,
-          { timeout: 5000 },
-        );
-      } catch (err: any) {
-        error(`ADB tap failed for ${deviceId}: ${err.message}`);
+    } else if (stream) {
+      // ADB input fallback for devices without minitouch (non-rooted Android
+      // 12+ where SELinux blocks the shell from /dev/input). Stream the drag as
+      // `input motionevent` DOWN/MOVE/UP over a persistent shell so it scrolls
+      // continuously and follows direction changes — not just a tap at the
+      // start point (the old behavior) or a single straight swipe.
+      if (eventType === 'down') {
+        // A stray second down without an up — clean up the old gesture first.
+        if (stream.adbGesture) endAdbGesture(stream.adbGesture, x, y);
+        stream.adbGesture = startAdbGesture(deviceId, x, y);
+      } else if (eventType === 'move') {
+        if (stream.adbGesture) feedAdbGesture(stream.adbGesture, x, y);
+      } else if (eventType === 'up') {
+        if (stream.adbGesture) {
+          endAdbGesture(stream.adbGesture, x, y);
+          stream.adbGesture = null;
+        }
       }
     }
   }, { requires: ['core.devices:manage'] });

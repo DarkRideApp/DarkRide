@@ -9,10 +9,11 @@ import { ButtonList } from '@darkrideapp/plugin-sdk/react';
 import type { ButtonListItem } from '@darkrideapp/plugin-sdk/react';
 import { pluginRegistry } from '@darkrideapp/plugin-sdk/react';
 import { DeviceNavButtons } from './DeviceNavButtons';
-import { decodeFrame, FrameMsgType, WireVersionMismatchError } from '../../lib/video/wire-format';
-import { H264Decoder } from '../../lib/video/h264-decoder';
-import { GapDetector } from '../../lib/video/gap-detector';
-import { KeyframeTrigger } from '../../lib/video/keyframe-trigger';
+import { StreamController, type StreamSample } from '../../lib/video/stream-controller';
+import { createCanvasRenderer } from '../../lib/video/canvas-renderer';
+import { createStreamWorkerClient } from '../../lib/video/stream-worker-client';
+import type { KeyframeReason } from '../../lib/video/keyframe-trigger';
+import { streamWorkerEnabled, supportsOffscreenWorker } from '../../lib/video/worker-support';
 import { VideoHealthIndicator, HealthState } from './VideoHealthIndicator';
 import { VideoQualitySelector } from './VideoQualitySelector';
 import { EmulatorVideo, type EmulatorVideoHandle } from '../../lib/video/EmulatorVideo';
@@ -127,6 +128,26 @@ export interface DeviceAction {
   onClick: () => void | Promise<void>;
   disabled?: boolean;
   placement?: 'primary' | 'overflow';
+}
+
+/** A stream sink drains WebSocket frames into a decoder+renderer. Two impls:
+ *  the main-thread StreamController, or the Worker client (decode off-thread). */
+interface StreamSink {
+  feedBinary(data: ArrayBuffer): void;
+  /** Present only for the Worker sink, which owns the (transferred) canvas and
+   *  therefore must paint polling/minicap JPEG stills too. */
+  feedJpeg?(data: ArrayBuffer): void;
+  reset(): void;
+  close(): void;
+}
+
+function base64ToArrayBuffer(b64: string): ArrayBuffer | null {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
+  } catch { return null; }
 }
 
 export interface DeviceViewerProps {
@@ -304,6 +325,15 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
     if (isEmulator) return;
     return ws.subscribe('device-frame', (msg: any) => {
       if (msg.deviceId !== deviceId) return;
+      // Worker mode owns the (transferred) canvas — hand it the JPEG bytes so
+      // it decodes and paints them; the main thread can't touch the canvas.
+      const sink = sinkRef.current;
+      if (sink?.feedJpeg) {
+        const bytes = base64ToArrayBuffer(msg.frame);
+        if (bytes) sink.feedJpeg(bytes);
+        return;
+      }
+      // Main-thread mode: draw directly to the 2D canvas.
       const canvas = canvasRef.current;
       if (!canvas) return;
       const ctx = canvas.getContext('2d');
@@ -323,114 +353,109 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
     });
   }, [ws, deviceId, isEmulator]);
 
-  // scrcpy H.264 path via WebCodecs — only active when browser supports VideoDecoder.
-  // Tracks observed frameId gaps for the lifetime of this effect; the detector
-  // is reset when the user (or backend) intentionally resets the stream.
-  const gapDetectorRef = useRef<GapDetector | null>(null);
-  const triggerRef = useRef<KeyframeTrigger | null>(null);
-  const lastKeyframeAtRef = useRef<number>(Date.now());
-  const gapStatsRef = useRef({ totalGaps: 0, totalMissed: 0, regressions: 0, wraps: 0, keyframeRequests: 0, watchdogFires: 0 });
+  // scrcpy H.264 path via WebCodecs. Frames drain into a StreamSink: by default
+  // a Worker that decodes and paints on an OffscreenCanvas (so React re-renders
+  // can't stutter the video), or the main-thread StreamController when the
+  // worker is unsupported, opted out ('darkride:stream-worker'='0'), or fell back.
+  const sinkRef = useRef<StreamSink | null>(null);
+  // Set once when the worker path is abandoned (init threw, or it produced no
+  // frames). Forces subsequent runs onto the main thread for this component.
+  const workerDisabledRef = useRef(false);
+  const workerRenderedRef = useRef(false);
+  // Bumped to remount the <canvas> (fresh element) when falling back from a
+  // worker: transferControlToOffscreen is irreversible, so the old canvas is
+  // spent and the main-thread path needs a new one.
+  const [canvasGen, setCanvasGen] = useState(0);
+
   useEffect(() => {
     if (isEmulator) return;
     if (!supported) return;
-    // Effect re-runs on deviceId change carry the ref's stale value from
-    // the previous device. Reset so the new device gets a fresh 8s window
-    // before the watchdog can fire.
-    lastKeyframeAtRef.current = Date.now();
 
-    const trigger = new KeyframeTrigger((reason) => {
-      gapStatsRef.current.keyframeRequests += 1;
+    const requestKeyframe = (reason: KeyframeReason) => {
       ws.sendMessage('device-stream-request-keyframe', { deviceId, viewerId, reason });
-    });
-    triggerRef.current = trigger;
+    };
 
-    const decoder = new H264Decoder({
-      onFrame: (frame) => {
-        const canvas = canvasRef.current;
-        if (!canvas) { frame.close(); return; }
-        const ctx = canvas.getContext('2d');
-        if (!ctx) { frame.close(); return; }
-        if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
-        if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
-        ctx.drawImage(frame, 0, 0);
-        frame.close();
-      },
-      onError: (e) => { console.error('[DeviceViewer] decode error', { deviceId, error: e?.message ?? String(e) }); },
-      onResetRequested: () => { trigger.maybeFire('decode-error'); },
-    });
+    const logStats = (path: 'worker' | 'main', s: StreamSample) => {
+      console.info('[DeviceViewer] stream stats', {
+        deviceId, path,
+        fps: Math.round(s.fps),
+        avgLatencyMs: Math.round(s.avgLatencyMs),
+        maxLatencyMs: Math.round(s.maxLatencyMs),
+        decodeQueue: s.decodeQueueSize,
+        msSinceLastFrame: s.msSinceLastFrame,
+      });
+    };
 
-    const gapDetector = new GapDetector();
-    gapDetectorRef.current = gapDetector;
+    let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+    let renderCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const unsub = ws.subscribeBinary((data: ArrayBuffer) => {
-      let frame;
+    const makeMainThreadSink = (): StreamSink => {
+      const renderer = createCanvasRenderer(() => canvasRef.current);
+      const controller = new StreamController(renderer, {
+        requestKeyframe,
+        onConfig: () => setReconnecting(false),
+        onError: (e) => console.error('[DeviceViewer] decode error', { deviceId, error: e?.message ?? String(e) }),
+        onGap: (info) => console.warn('[DeviceViewer] frame gap', { deviceId, ...info }),
+        onRegression: (info) => console.warn('[DeviceViewer] frame counter regression', { deviceId, ...info }),
+        onWireVersionMismatch: (info) => console.error('[DeviceViewer] wire version mismatch — backend/frontend out of sync', { deviceId, ...info }),
+        onStats: (s) => logStats('main', s),
+      });
+      watchdogTimer = setInterval(() => controller.tick(), 1000);
+      return {
+        feedBinary: (d) => controller.feedBinary(d),
+        reset: () => controller.reset(),
+        close: () => controller.close(),
+      };
+    };
+
+    const useWorker = streamWorkerEnabled() && supportsOffscreenWorker() && !workerDisabledRef.current;
+    let sink: StreamSink;
+    if (useWorker && canvasRef.current) {
       try {
-        frame = decodeFrame(data);
+        workerRenderedRef.current = false;
+        console.info('[DeviceViewer] video decode path: worker (OffscreenCanvas)', { deviceId });
+        sink = createStreamWorkerClient(canvasRef.current, {
+          onKeyframe: (reason) => requestKeyframe(reason),
+          onConfig: () => setReconnecting(false),
+          onRendered: () => {
+            workerRenderedRef.current = true;
+            console.info('[DeviceViewer] stream worker painted first frame', { deviceId });
+          },
+          onStats: (s) => logStats('worker', s),
+        });
+        // Self-heal: if the worker never paints a frame, abandon it and remount
+        // onto the main-thread path so the user is never left on a black canvas.
+        renderCheckTimer = setTimeout(() => {
+          if (!workerRenderedRef.current) {
+            console.error('[DeviceViewer] stream worker produced no frames — falling back to main thread', { deviceId });
+            workerDisabledRef.current = true;
+            setCanvasGen((g) => g + 1);
+          }
+        }, 5000);
       } catch (e) {
-        if (e instanceof WireVersionMismatchError) {
-          console.error('[DeviceViewer] wire version mismatch — backend/frontend out of sync', {
-            deviceId, received: e.received, expected: e.expected,
-          });
-        } else {
-          console.error('[DeviceViewer] frame decode failed', { deviceId, error: (e as Error)?.message });
-        }
-        return;
+        console.error('[DeviceViewer] stream worker init failed — using main thread', { deviceId, error: (e as Error)?.message });
+        workerDisabledRef.current = true;
+        sink = makeMainThreadSink();
       }
+    } else {
+      const reason = !streamWorkerEnabled() ? 'disabled'
+        : !supportsOffscreenWorker() ? 'unsupported'
+        : workerDisabledRef.current ? 'fell-back' : 'no-canvas';
+      console.info('[DeviceViewer] video decode path: main thread', { deviceId, reason });
+      sink = makeMainThreadSink();
+    }
+    sinkRef.current = sink;
 
-      const result = gapDetector.feed(frame.frameId);
-      if (!result.firstFrame) {
-        if (result.gap > 0) {
-          gapStatsRef.current.totalGaps += 1;
-          gapStatsRef.current.totalMissed += result.gap;
-          if (result.wrapped) gapStatsRef.current.wraps += 1;
-          // Step 2: ask the device for a keyframe when the gap is large
-          // enough to plausibly corrupt the reference chain. Trigger
-          // enforces gap >= 2 + 250ms debounce.
-          trigger.maybeFire('gap', result.gap);
-          console.warn('[DeviceViewer] frame gap', {
-            deviceId,
-            gap: result.gap,
-            frameId: frame.frameId,
-            msgType: FrameMsgType[frame.msgType],
-            wrapped: result.wrapped,
-            totalGaps: gapStatsRef.current.totalGaps,
-            totalMissed: gapStatsRef.current.totalMissed,
-          });
-        } else if (result.gap < 0) {
-          // Counter went backwards without a wrap — usually means the backend
-          // restarted the stream's per-viewer counter without our 'video-reset'
-          // signal, or genuine reordering. Either way, treat the next frame as
-          // a fresh reference point.
-          gapStatsRef.current.regressions += 1;
-          console.warn('[DeviceViewer] frame counter regression', {
-            deviceId,
-            previous: gapDetector.last,
-            received: frame.frameId,
-            regressions: gapStatsRef.current.regressions,
-          });
-        }
-      }
-
-      if (frame.msgType === FrameMsgType.CONFIG) setReconnecting(false);
-      if (frame.msgType === FrameMsgType.KEYFRAME) lastKeyframeAtRef.current = Date.now();
-      decoder.push(frame);
-    });
-
-    const watchdogTimer = setInterval(() => {
-      if (Date.now() - lastKeyframeAtRef.current > 8000 && triggerRef.current) {
-        gapStatsRef.current.watchdogFires += 1;
-        triggerRef.current.maybeFire('watchdog');
-      }
-    }, 1000);
+    const unsub = ws.subscribeBinary((data: ArrayBuffer) => sink.feedBinary(data));
 
     return () => {
-      clearInterval(watchdogTimer);
+      if (watchdogTimer) clearInterval(watchdogTimer);
+      if (renderCheckTimer) clearTimeout(renderCheckTimer);
       unsub();
-      decoder.close();
-      gapDetectorRef.current = null;
-      triggerRef.current = null;
+      sink.close();
+      sinkRef.current = null;
     };
-  }, [ws, supported, deviceId, isEmulator]);
+  }, [ws, supported, deviceId, viewerId, isEmulator, canvasGen]);
 
   useEffect(() => {
     if (isEmulator) return;
@@ -465,13 +490,10 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
       if (msg.deviceId !== deviceId) return;
       setReconnecting(true);
       // The backend is intentionally restarting the stream — its per-viewer
-      // counter is about to start over. Reset our detector so the next frame
-      // is a fresh reference and we don't fire a regression warning. Also
-      // clear the trigger debounce so a real post-reset gap fires promptly,
-      // and bump the watchdog clock so the post-reset window starts fresh.
-      gapDetectorRef.current?.reset();
-      triggerRef.current?.reset();
-      lastKeyframeAtRef.current = Date.now();
+      // counter is about to start over. Reset the sink so gap detection, the
+      // keyframe-request debounce, and the watchdog clock all start fresh and
+      // the next frame is treated as a new reference.
+      sinkRef.current?.reset();
     });
   }, [ws, deviceId, isEmulator]);
 
@@ -587,6 +609,7 @@ export function DeviceViewer({ deviceId, onStreamReady, onError, className, extr
               </div>
             )}
             <canvas
+              key={canvasGen}
               ref={canvasRef}
               style={{
                 maxWidth: '100%', maxHeight: 'calc(100vh - 200px)', cursor: 'pointer', display: 'block',

@@ -75,14 +75,18 @@ describe('StreamBroadcaster', () => {
     expect(ws.send).not.toHaveBeenCalled();
   });
 
-  it('emits onResetRequested when a viewer hits hard cap', () => {
+  it('drops (never resets the stream) for a viewer buried past hard cap', () => {
+    // A single slow viewer must not restart the shared encoder — it just gets
+    // its frames dropped until it catches up and resyncs on a keyframe.
     const onReset = vi.fn();
     const bc = new StreamBroadcaster(() => 1000, { onResetRequested: onReset });
-    const ws = makeWS(9 * 1024 * 1024); // above HARD_CAP
+    const ws = makeWS(9 * 1024 * 1024); // way above HARD_CAP
     bc.addViewer('v1', ws as any);
+    ws.send.mockClear();
 
     bc.ingest(Buffer.concat([sc4, nalHeader(1), Buffer.from([0xdd])]));
-    expect(onReset).toHaveBeenCalledWith('v1');
+    expect(onReset).not.toHaveBeenCalled();
+    expect(ws.send).not.toHaveBeenCalled();
   });
 
   it('removeViewer stops sending to that viewer', () => {
@@ -117,6 +121,66 @@ describe('StreamBroadcaster', () => {
     const bc = new StreamBroadcaster(() => 1000);
     bc.addViewer('v1', makeWS() as any);
     expect(bc.isHealthy()).toBe(true);
+  });
+
+  describe('ingest stats', () => {
+    it('reports ingested video-frame fps via onIngestStats about once per interval', () => {
+      let t = 0;
+      const onIngestStats = vi.fn();
+      const bc = new StreamBroadcaster(() => t, { onIngestStats });
+
+      // Two video frames (IDR + delta) inside the first window.
+      bc.ingest(Buffer.concat([sc4, nalHeader(5), Buffer.from([0xaa])])); // IDR
+      bc.ingest(Buffer.concat([sc4, nalHeader(1), Buffer.from([0xbb])])); // delta
+      expect(onIngestStats).not.toHaveBeenCalled();
+
+      t = 2001;
+      bc.ingest(Buffer.concat([sc4, nalHeader(1), Buffer.from([0xcc])])); // delta → crosses window
+      expect(onIngestStats).toHaveBeenCalledTimes(1);
+      const info = onIngestStats.mock.calls[0][0];
+      expect(info.frames).toBe(3);
+      expect(info.fps).toBeGreaterThan(0);
+    });
+
+    it('does not count SPS/PPS/SEI as video frames', () => {
+      let t = 0;
+      const onIngestStats = vi.fn();
+      const bc = new StreamBroadcaster(() => t, { onIngestStats });
+      bc.ingest(Buffer.concat([
+        sc4, nalHeader(7), Buffer.from([0xaa]), // SPS
+        sc4, nalHeader(8), Buffer.from([0xbb]), // PPS
+        sc4, nalHeader(5), Buffer.from([0xcc]), // IDR (counts)
+      ]));
+      t = 2001;
+      bc.ingest(Buffer.concat([sc4, nalHeader(1), Buffer.from([0xdd])])); // delta (counts) → fires
+      expect(onIngestStats.mock.calls[0][0].frames).toBe(2);
+    });
+  });
+
+  describe('join keyframe', () => {
+    it('invokes onKeyframeWanted with the viewer id when a viewer joins', () => {
+      const onKeyframeWanted = vi.fn();
+      const bc = new StreamBroadcaster(() => 1000, { onKeyframeWanted });
+      bc.addViewer('v1', makeWS() as any);
+      expect(onKeyframeWanted).toHaveBeenCalledWith('v1');
+    });
+
+    it('requests a join keyframe even before any SPS/PPS is cached', () => {
+      // A viewer joining a just-started stream (no config cached yet) should
+      // still trigger a keyframe request so the first decodable frame lands
+      // fast rather than waiting a full GOP.
+      const onKeyframeWanted = vi.fn();
+      const bc = new StreamBroadcaster(() => 1000, { onKeyframeWanted });
+      const ws = makeWS();
+      bc.addViewer('v1', ws as any);
+      expect(ws.send).not.toHaveBeenCalled(); // no cached config
+      expect(onKeyframeWanted).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not throw when onKeyframeWanted is not provided', () => {
+      const bc = new StreamBroadcaster(() => 1000);
+      expect(() => bc.addViewer('v1', makeWS() as any)).not.toThrow();
+    });
   });
 
   describe('frameId', () => {

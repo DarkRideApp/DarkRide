@@ -261,12 +261,15 @@ scrcpy
   Copyright 2018 Genymobile
   Copyright 2018-2025 Romain Vimont
   https://github.com/Genymobile/scrcpy
-  License: Apache-2.0 (verified for tags v1.20 through v3.3.1 + v4.0)
+  License: Apache-2.0 (verified for tags v1.20 through v3.3.4 + v4.0)
   scrcpy-server jars are bundled inside the @u4/minicap-prebuilt npm
   package, covering versions v1.20, v1.24, v1.25, v2.0, v2.1, v2.1.1,
   v2.2, v2.3, v2.3.1, v2.4, v2.5, v2.6, v2.6.1, v2.7, v3.0, v3.0.1,
-  v3.0.2, v3.1, v3.2, v3.3, v3.3.1. Used for H.264 device screen
-  streaming and remote control.
+  v3.0.2, v3.1, v3.2, v3.3, v3.3.1. The v3.3.4 server jar is vendored
+  directly in this repo at backend/vendor/scrcpy/ (unmodified official
+  release asset, SHA-256 verified) because @u4/minicap-prebuilt does not
+  ship a version >= 3.3.3, which is required for Android 16 / API 36
+  compatibility. Used for H.264 device screen streaming and remote control.
 
 jadx, apktool, mobsfscan, blutter
   Downloaded on demand from upstream releases (jadx: Apache-2.0,
