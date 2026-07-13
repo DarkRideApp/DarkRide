@@ -100,6 +100,52 @@ describe('session-export', () => {
       expect(entry1.response.status).toBe(301);
     });
 
+    it('maps real durationMs + timings into HAR time + timings', () => {
+      const session = insertSession();
+      db.insert(schema.capturedTraffic)
+        .values({
+          sessionId: session.id,
+          deviceId: 'DEV001',
+          requestMethod: 'GET',
+          requestUrl: 'https://api.example.com/timed',
+          responseStatus: 200,
+          responseBody: '{"ok":true}',
+          durationMs: 600,
+          timings: JSON.stringify({ dns: null, connect: 50, tls: 100, ttfb: 300, download: 100 }),
+          capturedAt: new Date(),
+        })
+        .run();
+
+      const entry = buildHarJson(db, session.id)!.har.log.entries[0];
+      expect(entry.time).toBe(600);
+      expect(entry.timings.connect).toBe(50);
+      expect(entry.timings.ssl).toBe(100);
+      expect(entry.timings.wait).toBe(300);
+      expect(entry.timings.receive).toBe(100);
+      // dns null in our data → HAR "does not apply" = -1
+      expect(entry.timings.dns).toBe(-1);
+    });
+
+    it('uses HAR -1 sentinels + time 0 when no timing data (legacy rows)', () => {
+      const session = insertSession();
+      db.insert(schema.capturedTraffic)
+        .values({
+          sessionId: session.id,
+          deviceId: 'DEV001',
+          requestMethod: 'GET',
+          requestUrl: 'https://api.example.com/legacy',
+          responseStatus: 200,
+          capturedAt: new Date(),
+        })
+        .run();
+
+      const entry = buildHarJson(db, session.id)!.har.log.entries[0];
+      expect(entry.time).toBe(0);
+      expect(entry.timings.connect).toBe(-1);
+      expect(entry.timings.wait).toBe(-1);
+      expect(entry.timings.receive).toBe(-1);
+    });
+
     it('handles request headers in array format', () => {
       const session = insertSession();
       const now = new Date();

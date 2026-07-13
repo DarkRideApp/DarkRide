@@ -1,6 +1,6 @@
 # DarkRide Roadmap
 
-*Last updated: 2026-05-17*
+*Last updated: 2026-07-11*
 
 ---
 
@@ -151,10 +151,32 @@ The built-in password provider ships. Next is the plugin provider interface so e
 
 ### Traffic Analysis Enhancements
 
-- **Protobuf auto-detection** — detect `application/x-protobuf`, extract `.proto` from APK, decode captured payloads
-- **GraphQL support** — detect GraphQL requests, parse query/mutation structure, extract introspection schema
-- **Live intercept rules** — UI-managed rules that modify traffic in real-time (replace response body, inject headers, rewrite URLs, simulate errors)
-- **Traffic replay / request builder** — right-click any captured request → edit → resend → view response, chain requests with JSONPath extraction
+Shipped: protobuf/gRPC auto-detection + schemaless decode, GraphQL detect + pretty-print,
+rule-based live intercept (UI-managed match+action rules), and a Request Builder replay target.
+
+Still open (protobuf `.proto` extraction from APK, GraphQL introspection schema, request chaining
+with JSONPath extraction) folds into the Traffic Capture UX work below.
+
+### Traffic Capture UX
+
+Full review 2026-07-11 against Charles / Burp / HTTPToolkit. Prioritized backlog + design contracts
+live in **`docs/specs/2026-07-11-traffic-capture-ux-review.md`** — that doc is canonical.
+
+Headline items:
+
+- **P0 — Interactive interception ("breakpoints")** *(landed on `feat/traffic-capture-ux`)* — pause a
+  matching request/response in-flight, edit, forward or drop. Closes the biggest gap vs Burp/Charles;
+  the old intercept was rule-based auto-modify only.
+- **P0 — Real per-request timing** *(landed on `feat/traffic-capture-ux`)* — forwarded mitmproxy
+  timestamps, Duration column + timing waterfall, real HAR timings (were zeroed).
+- **P0 — In-place, tunnel-routed replay** *(landed on `feat/traffic-capture-ux`)* — in-context
+  Repeater drawer with original-vs-new response diff, sent through the capture session's egress + a
+  replicated TLS profile (uniform across physical devices and emulators). Byte-exact emulator routing
+  and on-device Frida replay are deferred fidelity upgrades.
+- **P1** — deep filter/search *(in progress)*, host/path tree view, unify the five nav surfaces into
+  one workspace, virtualize the list + fix live-append past page 0.
+- **P2** — raw wire view, in-body search + JSON tree + hex, auto-load-full-body, HTML render.
+- **P3** — honest "Clear", visible blocklist, UI "save request", TLS-profile discoverability, column customization.
 
 ### Raw TCP Stream Capture
 

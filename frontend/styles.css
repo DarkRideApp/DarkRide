@@ -5607,6 +5607,7 @@ body.live-log-open .ai-chat-fab {
   align-items: center;
   gap: 8px;
   padding: 8px 16px;
+  flex-wrap: wrap;
 }
 .traffic-filter-toggle {
   display: flex;
@@ -5816,6 +5817,243 @@ body.live-log-open .ai-chat-fab {
 }
 .traffic-filter-text-input::placeholder {
   color: rgba(139, 149, 176, 0.4);
+}
+
+/* Host/URL filter + "Search all" sit side-by-side in the always-visible bar,
+   each with its own icon so the two intents stay visually distinct. */
+.traffic-filter-inputs {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+  min-width: 260px;
+  flex-wrap: wrap;
+}
+.traffic-filter-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 150px;
+  border-left: 1px solid var(--border-color);
+  padding-left: 14px;
+}
+.traffic-filter-search-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+/* Exact status-code entry — text input + removable chips, mirrors the
+   hidden-hostname chip pattern below. */
+.traffic-exact-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.traffic-exact-status-input {
+  width: 64px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 11px;
+  padding: 2px 6px;
+  outline: none;
+}
+.traffic-exact-status-input:focus {
+  border-color: var(--accent);
+}
+.traffic-exact-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: rgba(251, 113, 133, 0.12);
+  border: 1px solid rgba(251, 113, 133, 0.4);
+  color: #fb7185;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+}
+.traffic-exact-status-chip button {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  opacity: 0.7;
+}
+.traffic-exact-status-chip button:hover {
+  opacity: 1;
+}
+
+/* Content-type category pills */
+.traffic-content-type-pills,
+.traffic-size-pills {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.traffic-content-type-pill,
+.traffic-size-pill {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  border: 1px solid rgba(66, 71, 84, 0.3);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.15s;
+  color: var(--text-secondary);
+}
+.traffic-content-type-pill:hover,
+.traffic-size-pill:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.traffic-content-type-pill.active,
+.traffic-size-pill.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(173, 198, 255, 0.1);
+}
+
+/* Saved filter presets */
+.traffic-filter-presets {
+  flex-wrap: wrap;
+}
+.traffic-preset-pills {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.traffic-preset-pill {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid rgba(66, 71, 84, 0.3);
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.15s;
+  color: var(--text-secondary);
+}
+.traffic-preset-pill:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(173, 198, 255, 0.1);
+}
+.traffic-preset-save-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px dashed var(--border-color);
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: all 0.15s;
+}
+.traffic-preset-save-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.traffic-preset-save-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.traffic-preset-save-input {
+  width: 120px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 11px;
+  padding: 2px 6px;
+  outline: none;
+}
+.traffic-preset-save-input:focus {
+  border-color: var(--accent);
+}
+.traffic-preset-save-confirm {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  border: none;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #002e6a;
+  cursor: pointer;
+}
+.traffic-preset-save-confirm:hover {
+  opacity: 0.9;
+}
+
+/* ── Active-filter chip bar — always visible when any filter is on,
+   independent of the collapsed/expanded panel state. Mirrors the
+   hidden-hostname chip bar below it. ─────────────────────────────── */
+.traffic-active-filters-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary, #1e1e2e);
+  flex-wrap: wrap;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.traffic-active-filters-label {
+  color: var(--text-muted);
+  margin-right: 2px;
+  font-weight: 600;
+}
+.traffic-active-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--bg-primary, #121220);
+  border: 1px solid var(--border-color);
+  font-size: 11px;
+  color: var(--text-primary);
+}
+.traffic-active-filter-chip button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  line-height: 1;
+  transition: color 0.15s;
+}
+.traffic-active-filter-chip button:hover {
+  color: #ef4444;
+}
+.traffic-active-filters-clear {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  text-decoration: underline;
+  padding: 0;
+  margin-left: 4px;
+  transition: color 0.15s;
+}
+.traffic-active-filters-clear:hover {
+  color: var(--text-primary);
 }
 
 /* Live-mode controls (auto-scroll + clear) */
@@ -6047,6 +6285,75 @@ body.live-log-open .ai-chat-fab {
 .traffic-detail-content::-webkit-scrollbar { width: 6px; }
 .traffic-detail-content::-webkit-scrollbar-track { background: transparent; }
 .traffic-detail-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
+
+/* Timing waterfall (detail panel Headers tab) */
+.timing-waterfall {
+  margin-bottom: 20px;
+  padding: 12px 14px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+.timing-waterfall-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.timing-waterfall-total {
+  font-weight: 700;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.timing-waterfall-bar {
+  display: flex;
+  width: 100%;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
+}
+.timing-waterfall-seg {
+  height: 100%;
+  min-width: 2px;
+  transition: opacity 0.1s;
+}
+.timing-waterfall-seg:hover {
+  opacity: 0.8;
+}
+.timing-waterfall-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 10px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.timing-waterfall-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.timing-waterfall-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.timing-waterfall-legend-ms {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.timing-waterfall-total-only {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: italic;
+}
+.traffic-cell-duration {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 
 /* Two-column headers grid */
 .traffic-detail-headers-grid {
@@ -7410,3 +7717,302 @@ body.live-log-open .ai-chat-fab {
 }
 .app-row:hover { background: var(--bg-hover); }
 .app-row:focus-visible { outline: 2px solid var(--border-focus); outline-offset: -2px; }
+
+/* ---------------------------------------------------------------------------
+   Interactive intercept ("breakpoints") — arm control + hold panel.
+   Reuses host tokens so it tracks light/dark themes automatically.
+   --------------------------------------------------------------------------- */
+.intercept-arm-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+.intercept-arm-dot-on {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 25%, transparent);
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+.traffic-action-btn.intercept-arm-btn-active {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.intercept-held-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 4px;
+  border-radius: 9px;
+  background: var(--danger);
+  color: #1a0606;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.intercept-hold-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  overflow-y: auto;
+}
+.intercept-hold-modal {
+  width: min(860px, 100%);
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 96px);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.intercept-hold-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--danger) 7%, var(--bg-secondary));
+}
+.intercept-hold-title { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.intercept-hold-phase {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--danger);
+}
+.intercept-hold-url {
+  font-size: 13px;
+  color: var(--text-primary);
+  font-family: var(--font-mono, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.intercept-hold-queue {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: right;
+  flex-shrink: 0;
+}
+.intercept-hold-queue-tabs { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.intercept-hold-queue-tab {
+  padding: 2px 8px;
+  font-size: 11px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.intercept-hold-queue-tab.active { border-color: var(--accent); color: var(--text-primary); background: var(--bg-tertiary); }
+
+.intercept-hold-body {
+  padding: 16px 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.intercept-hold-row { display: flex; align-items: center; gap: 8px; }
+.intercept-hold-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.intercept-hold-section { display: flex; flex-direction: column; gap: 8px; }
+.intercept-hold-section-head { display: flex; align-items: center; gap: 8px; }
+.intercept-hold-section-head h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.intercept-hold-empty { font-size: 12px; color: var(--text-muted); }
+.intercept-hold-header-rows { display: flex; flex-direction: column; gap: 4px; }
+.intercept-hold-header-row { display: flex; align-items: center; gap: 4px; }
+
+.intercept-hold-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-primary);
+}
+
+/* ============================================================================
+   Replay / Repeater drawer — in-place request replay with original-vs-new diff
+   (frontend/components/traffic/ReplayDrawer.tsx). Reuses host tokens/classes;
+   ships no colours the theme doesn't already define.
+   ========================================================================== */
+.replay-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  justify-content: flex-end;
+}
+.replay-drawer {
+  width: min(1040px, 96vw);
+  height: 100%;
+  background: var(--bg-primary);
+  border-left: 1px solid var(--border-color);
+  box-shadow: -12px 0 32px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  animation: replay-drawer-in 0.16s ease-out;
+}
+@keyframes replay-drawer-in {
+  from { transform: translateX(24px); opacity: 0.4; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+.replay-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+.replay-drawer-host {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.replay-drawer-close {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: inline-flex;
+}
+.replay-drawer-close:hover { background: var(--bg-tertiary); color: var(--text-primary, #fff); }
+.replay-drawer-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+  gap: 0;
+  overflow: hidden;
+}
+@media (max-width: 780px) {
+  .replay-drawer-body { grid-template-columns: 1fr; }
+}
+.replay-panel {
+  padding: 12px 16px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.replay-panel-response {
+  border-left: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+.replay-url-row { display: flex; gap: 8px; }
+.replay-sendvia-row { display: flex; align-items: center; gap: 8px; }
+.replay-section { display: flex; flex-direction: column; gap: 6px; }
+.replay-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.replay-empty, .replay-error {
+  padding: 24px 16px;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: center;
+}
+.replay-error { color: var(--status-error, #ef4444); }
+.replay-status-row { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.replay-status-label { font-size: 12px; color: var(--text-muted); margin-right: 4px; }
+.replay-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+}
+.replay-badge-changed {
+  background: color-mix(in srgb, #ffb95f 22%, transparent);
+  color: #ffb95f;
+}
+.replay-routed {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+.replay-routed code {
+  color: var(--accent);
+  font-family: var(--font-mono, monospace);
+}
+.replay-diff-box {
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  max-height: 220px;
+  overflow: auto;
+}
+.replay-body-diff-box { max-height: 340px; }
+.replay-hdr {
+  display: flex;
+  gap: 6px;
+  padding: 2px 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.replay-hdr-mark { width: 10px; flex-shrink: 0; text-align: center; color: var(--text-muted); }
+.replay-hdr-key { color: var(--text-secondary); flex-shrink: 0; }
+.replay-hdr-val { color: var(--text-primary, #e2e8f0); }
+.replay-hdr-added   { background: color-mix(in srgb, #4ade80 12%, transparent); }
+.replay-hdr-added   .replay-hdr-mark { color: #4ade80; }
+.replay-hdr-removed { background: color-mix(in srgb, #fca5a5 12%, transparent); }
+.replay-hdr-removed .replay-hdr-mark { color: #fca5a5; }
+.replay-hdr-changed { background: color-mix(in srgb, #ffb95f 12%, transparent); }
+.replay-hdr-changed .replay-hdr-mark { color: #ffb95f; }
+.replay-hdr-unchanged .replay-hdr-key,
+.replay-hdr-unchanged .replay-hdr-val { color: var(--text-muted); }
+.replay-diff-line {
+  display: flex;
+  gap: 6px;
+  padding: 0 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.replay-diff-gutter { width: 10px; flex-shrink: 0; text-align: center; color: var(--text-muted); user-select: none; }
+.replay-diff-text { flex: 1; }
+.replay-diff-equal  { color: var(--text-secondary); }
+.replay-diff-add    { background: color-mix(in srgb, #4ade80 14%, transparent); color: #b9f5cf; }
+.replay-diff-add    .replay-diff-gutter { color: #4ade80; }
+.replay-diff-remove { background: color-mix(in srgb, #fca5a5 14%, transparent); color: #f6c9c9; }
+.replay-diff-remove .replay-diff-gutter { color: #fca5a5; }
+.replay-history-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+.replay-history-row:hover { background: var(--bg-tertiary); }

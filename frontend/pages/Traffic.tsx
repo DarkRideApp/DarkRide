@@ -2,17 +2,18 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import { SkeletonTable } from '@darkrideapp/plugin-sdk/react';
-import { useTrafficReplay } from '../components/traffic/TrafficEntryRow';
 import { TrafficTable } from '../components/traffic/TrafficTable';
+import { ReplayDrawer } from '../components/traffic/ReplayDrawer';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Trash2, Repeat } from 'lucide-react';
 import { ConfirmDialog } from '@darkrideapp/plugin-sdk/react';
 import type { CapturedTrafficEntry, WebSocketMessageEntry } from '../../shared/types/api';
 import type { TrafficEntry } from '../components/traffic/TrafficEntryRow';
 import type { TrafficFilters } from '../components/traffic/trafficUtils';
-import { METHOD_FILTERS } from '../components/traffic/trafficUtils';
+import { deriveServerStatusCentury } from '../components/traffic/trafficUtils';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
+import { InterceptHoldPanel, InterceptArmControl } from '../components/intercept/InterceptHoldPanel';
 
 // ---------------------------------------------------------------------------
 // Saved Traffic tab
@@ -158,7 +159,10 @@ export function Traffic() {
   useDocumentTitle('Traffic');
   const auth = useAuthOptional();
   const ws = useWebSocket();
-  const handleReplay = useTrafficReplay();
+  // In-place Repeater: replay opens a drawer over the Traffic view (keeps
+  // context) instead of navigating away to the Request Builder.
+  const [replayEntry, setReplayEntry] = useState<TrafficEntry | null>(null);
+  const handleReplay = useCallback((entry: TrafficEntry) => setReplayEntry(entry), []);
   const [searchParams, setSearchParams] = useSearchParams();
 
   const tabParam = searchParams.get('tab') as TrafficTab | null;
@@ -174,22 +178,26 @@ export function Traffic() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [wsFrames, setWsFrames] = useState<Map<number, WebSocketMessageEntry[]>>(new Map());
 
-  // Server-side filter state (derived from TrafficFilters; text is handled client-side in TrafficTable)
+  // Server-side filter state (derived from TrafficFilters in handleFilterChange below).
+  // - serverType/serverMethod: derived from the tri-state method picks (unchanged).
+  // - serverStatusCentury: a single century string ('200'/'300'/'400'/'500') derived
+  //   via deriveServerStatusCentury() from the (now multi-select) status pills +
+  //   exact status codes. The API only supports one century band per request, so
+  //   when 0 or 2+ groups are active this stays '' and the deep filters (content
+  //   type, size, exact status, multi-group status, search-fallback) are applied
+  //   client-side on top of whatever page comes back — see clientSideFilter below.
+  // - serverSearch: the "Search all" field, sent as the server `search` param
+  //   (matches URL + body + headers per backend/api/traffic.ts).
   const [serverType, setServerType] = useState('');
-  const [serverStatus, setServerStatus] = useState('');
+  const [serverStatusCentury, setServerStatusCentury] = useState('');
   const [serverMethod, setServerMethod] = useState('');
+  const [serverSearch, setServerSearch] = useState('');
 
   // Server-side sort state
   const [sortBy, setSortBy] = useState('capturedAt');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
 
   const LIMIT = 50;
-
-  const statusFilter = serverStatus === '2xx' ? '200'
-    : serverStatus === '3xx' ? '300'
-    : serverStatus === '4xx' ? '400'
-    : serverStatus === '5xx' ? '500'
-    : '';
 
   const fetchTraffic = useCallback(async () => {
     setLoading(true);
@@ -199,7 +207,8 @@ export function Traffic() {
       params.set('offset', String(page * LIMIT));
       if (serverType) params.set('type', serverType);
       if (serverMethod) params.set('method', serverMethod);
-      if (statusFilter) params.set('status', statusFilter);
+      if (serverStatusCentury) params.set('status', serverStatusCentury);
+      if (serverSearch) params.set('search', serverSearch);
       params.set('sortBy', sortBy);
       params.set('sortDir', sortDir);
 
@@ -217,7 +226,7 @@ export function Traffic() {
     } finally {
       setLoading(false);
     }
-  }, [ws, page, serverType, serverMethod, statusFilter, sortBy, sortDir]);
+  }, [ws, page, serverType, serverMethod, serverStatusCentury, serverSearch, sortBy, sortDir]);
 
   useEffect(() => {
     if (ws.connected && activeTab === 'live') fetchTraffic();
@@ -245,6 +254,8 @@ export function Traffic() {
         matchedRules: e.matchedRules ?? null,
         responseContentType: e.responseContentType ?? null,
         hasImage: e.hasImage ?? false,
+        durationMs: e.durationMs ?? null,
+        timings: e.timings ?? null,
       };
       if (page === 0 && activeTab === 'live') {
         setEntries(prev => {
@@ -307,9 +318,13 @@ export function Traffic() {
     }
     setServerType(type);
     setServerMethod(method);
-    setServerStatus(filters.status);
+    setServerStatusCentury(deriveServerStatusCentury(filters));
+    setServerSearch(filters.search);
     setPage(0);
-    setSelectedId(null);
+    // NOTE: selection is intentionally NOT force-cleared here. TrafficTable
+    // clears it itself (via its own effect) once the previously-selected row
+    // no longer appears in the filtered set — otherwise every filter tweak
+    // during triage would kick the user out of the row they're inspecting.
   }, []);
 
   const handleSortChange = useCallback((newSortBy: string, newSortDir: 'asc' | 'desc') => {
@@ -367,6 +382,10 @@ export function Traffic() {
 
   return (
     <div data-testid="traffic-page" className="traffic-page page-full-bleed">
+      {/* Interactive intercept ("breakpoints") — modal appears only when a flow is held. */}
+      <InterceptHoldPanel />
+      {/* In-place Repeater — replaces the navigate-away replay flow on this view. */}
+      <ReplayDrawer entry={replayEntry} onClose={() => setReplayEntry(null)} />
       {/* Action sub-header */}
       <div className="traffic-subheader">
         <div className="traffic-subheader-left">
@@ -419,6 +438,7 @@ export function Traffic() {
           </div>
         </div>
         <div className="traffic-subheader-actions">
+          <InterceptArmControl />
           <button className="traffic-action-btn" onClick={handleClear}>
             <Trash2 size={14} />
             Clear
@@ -452,7 +472,17 @@ export function Traffic() {
           wsFrames={wsFrames}
           selectedId={selectedId}
           onSelectEntry={setSelectedId}
-          clientSideFilter={false}
+          // Client-side filtering runs on top of whatever the server already
+          // narrowed down (type/method/status-century/search). This is what
+          // makes the Host/URL text filter, content-type pills, size quick
+          // filters, exact-status chips, and multi-group status selection
+          // actually take effect on this page — previously this was false,
+          // which silently made the "Filter by host or regex" box a no-op.
+          // Known trade-off: filters that can't be pushed server-side only
+          // narrow the currently-fetched page, not the full result set
+          // across pages (the API has no OR-across-century or content-type
+          // params). Acceptable for a 50-row page; documented for reviewers.
+          clientSideFilter={true}
           footer={pagination}
           onSortChange={handleSortChange}
           sortBy={sortBy}

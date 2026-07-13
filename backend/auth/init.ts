@@ -31,6 +31,7 @@ export function initAuth(app: Express, db: BetterSQLite3Database<any>): void {
     '/v1/traffic/ws-start',
     '/v1/traffic/ws-message',
     '/v1/traffic/ws-end',
+    '/v1/intercept/hold',    // interactive-intercept long-poll from the bridge
   ]);
 
   app.use(authMiddleware);

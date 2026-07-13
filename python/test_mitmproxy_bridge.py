@@ -6,6 +6,7 @@ Run: .venv/bin/python3 -m pytest python/test_mitmproxy_bridge.py -v
 
 import json
 import pytest
+import asyncio
 from unittest.mock import MagicMock, patch
 from OpenSSL import SSL
 from OpenSSL._util import lib as _ssl_lib
@@ -24,7 +25,9 @@ from mitmproxy_bridge import (
     _CHROME_SIGALGS,
     _OKHTTP_TLS12_CIPHERS,
     TLS_PROFILES,
+    _extract_timings,
 )
+from types import SimpleNamespace
 
 
 # Expected cipher names in order: 3 TLS 1.3 + 12 TLS 1.2 = 15 total (Chrome 120 Android)
@@ -525,7 +528,7 @@ class TestNotifyRequestStarted:
         flow.request.pretty_url = "https://example.com/test"
         flow.response = None
 
-        addon.request(flow)
+        asyncio.run(addon.request(flow))
 
         addon._notify_request_started.assert_called_once_with(flow)
 
@@ -548,7 +551,7 @@ class TestNotifyRequestStarted:
         flow.request.pretty_url = "https://blocked.com/api"
         flow.response = None
 
-        addon.request(flow)
+        asyncio.run(addon.request(flow))
 
         addon._notify_request_started.assert_not_called()
 
@@ -582,7 +585,7 @@ class TestResponseHook:
         flow.request.pretty_url = "https://sync.example.com/ws"
         flow.request.headers = {"Upgrade": "websocket"}
 
-        addon.response(flow)
+        asyncio.run(addon.response(flow))
 
         # Should NOT post to regular webhook
         addon._post_to_webhook.assert_not_called()
@@ -614,8 +617,8 @@ class TestResponseHook:
         flow.request.pretty_url = "https://sync.example.com/ws"
         flow.request.headers = {}
 
-        addon.response(flow)
-        addon.response(flow)  # second call
+        asyncio.run(addon.response(flow))
+        asyncio.run(addon.response(flow))  # second call
 
         # Should only post once
         assert addon._post_to_ws_webhook.call_count == 1
@@ -674,7 +677,7 @@ class TestResponseHook:
         flow.response.headers = {"content-type": "application/json"}
         flow.response.get_text.return_value = '{"ok":true}'
 
-        addon.response(flow)
+        asyncio.run(addon.response(flow))
 
         addon._post_to_webhook.assert_called_once()
 
@@ -1383,3 +1386,268 @@ class TestTlsStartServerClientCert:
         assert find_calls[0] == ("api.example.com", None)
         # No error logged
         mock_ctx.log.error.assert_not_called()
+
+
+class TestInterceptHold:
+    """Tests for interactive intercept ("breakpoints") — the hold decision,
+    fail-open round-trip, and flow mutation helpers."""
+
+    def _make_addon(self):
+        import mitmproxy_bridge
+        return mitmproxy_bridge.DarkRideAddon()
+
+    def _make_flow(self, host="api.example.com", pretty_host="api.example.com",
+                   path="/v1/data", method="GET"):
+        flow = MagicMock()
+        flow.request.host = host
+        flow.request.pretty_host = pretty_host
+        flow.request.path = path
+        flow.request.method = method
+        return flow
+
+    # ---- _hold_matches ----
+
+    def test_disarmed_never_matches(self):
+        addon = self._make_addon()
+        addon._hold_config = {"enabled": False, "phases": ["request", "response"]}
+        assert addon._hold_matches(self._make_flow(), "request") is False
+
+    def test_armed_no_filters_matches(self):
+        addon = self._make_addon()
+        addon._hold_config = {"enabled": True, "phases": ["request", "response"]}
+        assert addon._hold_matches(self._make_flow(), "request") is True
+
+    def test_phase_filter(self):
+        addon = self._make_addon()
+        addon._hold_config = {"enabled": True, "phases": ["response"]}
+        assert addon._hold_matches(self._make_flow(), "request") is False
+        assert addon._hold_matches(self._make_flow(), "response") is True
+
+    def test_hostname_glob(self):
+        addon = self._make_addon()
+        addon._hold_config = {"enabled": True, "phases": ["request"], "matchHostname": "*.example.com"}
+        assert addon._hold_matches(self._make_flow(host="api.example.com"), "request") is True
+        assert addon._hold_matches(self._make_flow(host="other.com", pretty_host="other.com"), "request") is False
+
+    def test_hostname_falls_back_to_pretty_host(self):
+        addon = self._make_addon()
+        addon._hold_config = {"enabled": True, "phases": ["request"], "matchHostname": "api.example.com"}
+        # WireGuard mode: host is an IP, pretty_host carries the name
+        flow = self._make_flow(host="203.0.113.5", pretty_host="api.example.com")
+        assert addon._hold_matches(flow, "request") is True
+
+    def test_path_glob(self):
+        addon = self._make_addon()
+        addon._hold_config = {"enabled": True, "phases": ["request"], "matchPath": "/v1/*"}
+        assert addon._hold_matches(self._make_flow(path="/v1/data"), "request") is True
+        assert addon._hold_matches(self._make_flow(path="/v2/data"), "request") is False
+
+    def test_method_filter_case_insensitive(self):
+        addon = self._make_addon()
+        addon._hold_config = {"enabled": True, "phases": ["request"], "matchMethod": "post"}
+        assert addon._hold_matches(self._make_flow(method="POST"), "request") is True
+        assert addon._hold_matches(self._make_flow(method="GET"), "request") is False
+
+    # ---- _post_to_hold (fail-open) ----
+
+    @patch("mitmproxy_bridge.ctx")
+    def test_post_to_hold_fails_open_on_error(self, mock_ctx):
+        mock_ctx.options.node_webhook = "http://localhost:1/v1/traffic/ingest"
+        addon = self._make_addon()
+        result = addon._post_to_hold({"flowId": "x", "phase": "request"})
+        assert result == {"action": "forward"}
+
+    @patch("mitmproxy_bridge.ctx")
+    def test_post_to_hold_returns_resolution(self, mock_ctx):
+        mock_ctx.options.node_webhook = "http://localhost:3000/v1/traffic/ingest"
+        addon = self._make_addon()
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = json.dumps(
+            {"action": "forward", "modified": {"url": "https://x/"}}
+        ).encode("utf-8")
+        with patch("mitmproxy_bridge.urllib.request.urlopen", return_value=fake_resp) as uo:
+            result = addon._post_to_hold({"flowId": "x", "phase": "request"})
+        assert result == {"action": "forward", "modified": {"url": "https://x/"}}
+        # Posts to the /intercept/hold endpoint derived from node_webhook
+        posted_url = uo.call_args.args[0].full_url
+        assert posted_url == "http://localhost:3000/v1/intercept/hold"
+
+    @patch("mitmproxy_bridge.ctx")
+    def test_post_to_hold_rejects_unknown_action(self, mock_ctx):
+        mock_ctx.options.node_webhook = "http://localhost:3000/v1/traffic/ingest"
+        addon = self._make_addon()
+        fake_resp = MagicMock()
+        fake_resp.read.return_value = json.dumps({"action": "explode"}).encode("utf-8")
+        with patch("mitmproxy_bridge.urllib.request.urlopen", return_value=fake_resp):
+            result = addon._post_to_hold({"flowId": "x", "phase": "request"})
+        assert result == {"action": "forward"}
+
+    # ---- _apply_hold_request ----
+
+    def test_apply_hold_request_drop_sets_444(self):
+        addon = self._make_addon()
+        flow = MagicMock()
+        flow.response = None
+        addon._apply_hold_request(flow, {"action": "drop"})
+        assert flow.response is not None
+        assert flow.response.status_code == 444
+
+    def test_apply_hold_request_modifies_method_url_headers_body(self):
+        addon = self._make_addon()
+        flow = MagicMock()
+        flow.request.headers = {}
+        addon._apply_hold_request(flow, {
+            "action": "forward",
+            "modified": {
+                "method": "POST",
+                "url": "https://new.example.com/x",
+                "headers": {"X-Test": "1"},
+                "body": "hello",
+            },
+        })
+        assert flow.request.method == "POST"
+        assert flow.request.url == "https://new.example.com/x"
+        assert flow.request.headers["X-Test"] == "1"
+        flow.request.set_text.assert_called_with("hello")
+
+    def test_apply_hold_request_forward_no_modified_is_noop(self):
+        addon = self._make_addon()
+        flow = MagicMock()
+        flow.response = None
+        addon._apply_hold_request(flow, {"action": "forward"})
+        # No response injected — flow forwards unmodified
+        assert flow.response is None
+        flow.request.set_text.assert_not_called()
+
+    # ---- _apply_hold_response ----
+
+    def test_apply_hold_response_drop_sets_444(self):
+        addon = self._make_addon()
+        flow = MagicMock()
+        addon._apply_hold_response(flow, {"action": "drop"})
+        assert flow.response.status_code == 444
+
+    def test_apply_hold_response_modifies_status_headers_body(self):
+        addon = self._make_addon()
+        flow = MagicMock()
+        flow.response.headers = {}
+        addon._apply_hold_response(flow, {
+            "action": "forward",
+            "modified": {"statusCode": 503, "headers": {"X-R": "2"}, "body": "err"},
+        })
+        assert flow.response.status_code == 503
+        assert flow.response.headers["X-R"] == "2"
+        flow.response.set_text.assert_called_with("err")
+
+    # ---- option registration ----
+
+    def test_hold_config_option_registered(self):
+        import mitmproxy_bridge
+        loader = MagicMock()
+        mitmproxy_bridge.load(loader)
+        names = [c.kwargs.get("name") for c in loader.add_option.call_args_list]
+        assert "intercept_hold_config_file" in names
+
+    # ---- _reload_hold_config ----
+
+    @patch("mitmproxy_bridge.ctx")
+    def test_reload_hold_config_reads_file(self, mock_ctx, tmp_path):
+        config_file = tmp_path / "hold.json"
+        config_file.write_text(json.dumps({"enabled": True, "phases": ["request"]}))
+        mock_ctx.options.intercept_hold_config_file = str(config_file)
+        addon = self._make_addon()
+        addon._reload_hold_config()
+        assert addon._hold_config["enabled"] is True
+        assert addon._hold_config["phases"] == ["request"]
+
+    @patch("mitmproxy_bridge.ctx")
+    def test_reload_hold_config_empty_path_skips(self, mock_ctx):
+        mock_ctx.options.intercept_hold_config_file = ""
+        addon = self._make_addon()
+        addon._reload_hold_config()
+        assert addon._hold_config["enabled"] is False
+
+
+class TestExtractTimings:
+    """Tests for _extract_timings() — per-request duration + timing breakdown."""
+
+    def _flow(self, req_start=None, req_end=None, resp_start=None, resp_end=None,
+              conn_start=None, tcp_setup=None, tls_setup=None, with_server_conn=True):
+        request = SimpleNamespace(timestamp_start=req_start, timestamp_end=req_end)
+        response = SimpleNamespace(timestamp_start=resp_start, timestamp_end=resp_end)
+        server_conn = None
+        if with_server_conn:
+            server_conn = SimpleNamespace(
+                timestamp_start=conn_start,
+                timestamp_tcp_setup=tcp_setup,
+                timestamp_tls_setup=tls_setup,
+            )
+        return SimpleNamespace(request=request, response=response, server_conn=server_conn)
+
+    def test_full_timestamps_present(self):
+        # A fresh connection: conn @1000.0, tcp @1000.05, tls @1000.15,
+        # request sent-end @1000.20, first response byte @1000.50, done @1000.60
+        flow = self._flow(
+            req_start=1000.0, req_end=1000.20,
+            resp_start=1000.50, resp_end=1000.60,
+            conn_start=1000.0, tcp_setup=1000.05, tls_setup=1000.15,
+        )
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms == 600  # (1000.60 - 1000.0) * 1000
+        assert timings is not None
+        assert timings["connect"] == 50    # tcp - conn
+        assert timings["tls"] == 100       # tls - tcp
+        assert timings["ttfb"] == 300      # resp_start - req_end
+        assert timings["download"] == 100  # resp_end - resp_start
+        assert timings["dns"] is None      # mitmproxy exposes no DNS timing
+
+    def test_reused_connection_missing_setup(self):
+        # Reused (keep-alive) connection: no tcp/tls setup timestamps, but
+        # request/response timing is still present.
+        flow = self._flow(
+            req_start=2000.0, req_end=2000.1,
+            resp_start=2000.4, resp_end=2000.5,
+            conn_start=None, tcp_setup=None, tls_setup=None,
+        )
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms == 500
+        assert timings["connect"] is None
+        assert timings["tls"] is None
+        assert timings["ttfb"] == 300
+        assert timings["download"] == 100
+
+    def test_missing_response_end_yields_null_duration(self):
+        flow = self._flow(req_start=5.0, req_end=5.1, resp_start=5.2, resp_end=None)
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms is None
+        # ttfb still computable, download not
+        assert timings["ttfb"] == 100
+        assert timings["download"] is None
+
+    def test_no_data_returns_none_none(self):
+        flow = self._flow(with_server_conn=False)
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms is None
+        assert timings is None
+
+    def test_negative_segment_clamped_to_none(self):
+        # Clock skew / reordered timestamps must never produce negatives.
+        flow = self._flow(
+            req_start=10.0, req_end=10.5,
+            resp_start=10.4, resp_end=10.6,  # resp_start < req_end → ttfb negative
+            conn_start=10.0, tcp_setup=10.05, tls_setup=10.15,
+        )
+        duration_ms, timings = _extract_timings(flow)
+        assert duration_ms == 600
+        assert timings["ttfb"] is None  # negative clamped
+
+    def test_never_raises_on_garbage_flow(self):
+        # A flow with non-numeric timestamps must be swallowed, not raise.
+        bad = SimpleNamespace(
+            request=SimpleNamespace(timestamp_start="oops", timestamp_end=None),
+            response=SimpleNamespace(timestamp_start=None, timestamp_end="nope"),
+            server_conn=None,
+        )
+        duration_ms, timings = _extract_timings(bad)
+        assert duration_ms is None
+        assert timings is None

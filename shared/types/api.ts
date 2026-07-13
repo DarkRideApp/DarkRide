@@ -188,6 +188,20 @@ export interface SessionListQuery {
 
 // ---- Traffic types ----
 
+/**
+ * Per-request timing breakdown (all values in milliseconds, best-effort).
+ * Each segment is null when it can't be derived from the mitmproxy flow
+ * (e.g. reused keep-alive connections have no TCP/TLS setup timing; DNS
+ * resolution timing is never exposed by mitmproxy).
+ */
+export interface TrafficTimings {
+  dns: number | null;
+  connect: number | null;
+  tls: number | null;
+  ttfb: number | null;
+  download: number | null;
+}
+
 export interface CapturedTrafficEntry {
   id: number;
   sessionId: number | null;
@@ -207,6 +221,10 @@ export interface CapturedTrafficEntry {
   matchedRules?: Array<{ id: number; name: string; phase: string; actionsApplied: string[] }> | null;
   responseContentType?: string | null;
   hasImage?: boolean;
+  /** End-to-end latency in ms (request start → response end). Null for synthetic/DNS/TLS-fail entries. */
+  durationMs?: number | null;
+  /** Timing breakdown JSON. Stored as text in the DB; parsed to TrafficTimings on read. */
+  timings?: TrafficTimings | string | null;
 }
 
 export interface WebSocketMessageEntry {
@@ -340,11 +358,18 @@ export interface AnalysisMetadata {
 
 // ---- Proxied request types ----
 
+export type TlsProfileName = 'chrome' | 'okhttp' | 'default';
+
 export type ProxySource =
   | { type: 'proxyId'; proxyId: number }
   | { type: 'nordvpn'; country: string }
   | { type: 'inline'; url: string }
-  | { type: 'direct' };
+  | { type: 'direct' }
+  // Replay through a capturing device's egress: the server replicates that
+  // session's proxy (NordVPN country / direct) AND its TLS cipher profile, so
+  // the replayed request goes out looking like what the app actually sent.
+  // Falls back to direct if the device is not currently capturing.
+  | { type: 'captureSession'; deviceId: string };
 
 export interface ProxiedHttpRequest {
   url: string;
@@ -355,6 +380,24 @@ export interface ProxiedHttpRequest {
   followRedirects?: boolean;
   maxRedirects?: number;
   proxy: ProxySource;
+  /**
+   * Client TLS cipher profile to pose as. Auto-derived from the capture session
+   * when proxy.type === 'captureSession'; may also be set explicitly for any
+   * source. Omitted / 'default' means Node's stock TLS (no spoofing).
+   */
+  tlsProfile?: TlsProfileName;
+}
+
+/**
+ * The egress fingerprint of an active capture session — enough for the replay
+ * path to reproduce how that device's traffic leaves the machine. Held
+ * in-memory by CaptureSessionManager and read by ProxiedRequestService.
+ */
+export interface CaptureEgress {
+  deviceId: string;
+  proxyMode: 'none' | 'normal' | 'nordvpn';
+  proxyCountry?: string;
+  tlsProfile?: TlsProfileName;
 }
 
 export interface ProxiedHttpResponse {

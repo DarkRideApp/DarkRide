@@ -238,6 +238,64 @@ def _activate_proxy(proxy_url):
     _patch_applied = True
 
 
+def _extract_timings(flow):
+    """Compute per-request duration + a best-effort timing breakdown from a
+    completed mitmproxy HTTP flow.
+
+    Returns a (duration_ms, timings) tuple:
+      - duration_ms: int milliseconds from request start to response end, or
+        None when either timestamp is missing.
+      - timings: dict with dns/connect/tls/ttfb/download segment durations in
+        ms (each None when it can't be computed), or None when there is no
+        usable timing data at all.
+
+    Defensive by design: a missing attribute yields None for that piece and
+    never raises. Reused (keep-alive) connections routinely lack the TCP/TLS
+    setup timestamps, so those segments come back None. Synthetic flows (DNS,
+    TLS_FAIL) have no real flow.response and are handled by their own callers,
+    which never invoke this helper.
+    """
+    try:
+        req = getattr(flow, "request", None)
+        resp = getattr(flow, "response", None)
+        req_start = getattr(req, "timestamp_start", None) if req is not None else None
+        req_end = getattr(req, "timestamp_end", None) if req is not None else None
+        resp_start = getattr(resp, "timestamp_start", None) if resp is not None else None
+        resp_end = getattr(resp, "timestamp_end", None) if resp is not None else None
+
+        duration_ms = None
+        if req_start is not None and resp_end is not None:
+            duration_ms = round((resp_end - req_start) * 1000)
+
+        server_conn = getattr(flow, "server_conn", None)
+        conn_start = getattr(server_conn, "timestamp_start", None) if server_conn is not None else None
+        tcp_setup = getattr(server_conn, "timestamp_tcp_setup", None) if server_conn is not None else None
+        tls_setup = getattr(server_conn, "timestamp_tls_setup", None) if server_conn is not None else None
+
+        def seg(a, b):
+            """Duration a->b in ms, or None if either endpoint missing/negative."""
+            if a is None or b is None:
+                return None
+            ms = round((b - a) * 1000)
+            return ms if ms >= 0 else None
+
+        timings = {
+            # mitmproxy does not expose DNS resolution timing on the flow.
+            "dns": None,
+            "connect": seg(conn_start, tcp_setup),
+            "tls": seg(tcp_setup, tls_setup),
+            "ttfb": seg(req_end, resp_start),
+            "download": seg(resp_start, resp_end),
+        }
+
+        # Nothing useful to report — keep the payload clean.
+        if duration_ms is None and all(v is None for v in timings.values()):
+            return None, None
+        return duration_ms, timings
+    except Exception:
+        return None, None
+
+
 def _truncate_body(body: str | None, content_type: str | None) -> str | None:
     """Truncate or skip body based on size and content type."""
     if body is None:
@@ -270,6 +328,10 @@ class DarkRideAddon:
         self._client_certs: list = []
         self._intercept_config_path: str = ""
         self._intercept_config_mtime: float = 0.0
+        # Interactive intercept ("breakpoints") — armed config reloaded by mtime.
+        self._hold_config: dict = {"enabled": False, "phases": ["request", "response"]}
+        self._hold_config_path: str = ""
+        self._hold_config_mtime: float = 0.0
 
     def _reload_blocklist(self):
         """Reload the blocklist JSON file if it has changed on disk."""
@@ -380,6 +442,193 @@ class DarkRideAddon:
             )
         except Exception as e:
             ctx.log.error(f"[DarkRide] Failed to read intercept config: {e}")
+
+    def _reload_hold_config(self):
+        """Reload the interactive-intercept armed config if it changed on disk."""
+        try:
+            file_path = ctx.options.intercept_hold_config_file
+        except Exception:
+            return
+        if not file_path:
+            return
+        if file_path != self._hold_config_path:
+            self._hold_config_path = file_path
+            self._hold_config_mtime = 0.0
+        try:
+            mtime = os.path.getmtime(file_path)
+        except OSError:
+            return
+        if mtime == self._hold_config_mtime:
+            return
+        self._hold_config_mtime = mtime
+        try:
+            with open(file_path, "r") as f:
+                config = json.load(f)
+            if isinstance(config, dict):
+                self._hold_config = config
+            else:
+                self._hold_config = {"enabled": False, "phases": ["request", "response"]}
+            ctx.log.info(
+                f"[DarkRide] Interactive intercept "
+                f"{'ARMED' if self._hold_config.get('enabled') else 'disarmed'}"
+            )
+        except Exception as e:
+            ctx.log.error(f"[DarkRide] Failed to read hold config: {e}")
+
+    def _hold_matches(self, flow, phase: str) -> bool:
+        """Decide locally whether this flow should be held for a manual verdict.
+
+        Runs on the hot path for every request/response, so it must stay cheap
+        and never do I/O. Only when it returns True does the addon make the
+        blocking POST /intercept/hold round-trip.
+        """
+        cfg = self._hold_config
+        if not cfg or not cfg.get("enabled"):
+            return False
+        phases = cfg.get("phases") or ["request", "response"]
+        if phase not in phases:
+            return False
+        # Hostname glob — check host (may be IP in WireGuard mode) then pretty_host.
+        match_hostname = cfg.get("matchHostname")
+        if match_hostname:
+            host = getattr(flow.request, "host", "") or ""
+            pretty = getattr(flow.request, "pretty_host", "") or ""
+            if not (fnmatch.fnmatch(host, match_hostname) or fnmatch.fnmatch(pretty, match_hostname)):
+                return False
+        # Path glob (strip query string).
+        match_path = cfg.get("matchPath")
+        if match_path:
+            raw_path = getattr(flow.request, "path", "") or ""
+            path_no_qs = raw_path.split("?")[0]
+            if not fnmatch.fnmatch(path_no_qs, match_path):
+                return False
+        # Method (case-insensitive).
+        match_method = cfg.get("matchMethod")
+        if match_method:
+            req_method = getattr(flow.request, "method", "") or ""
+            if req_method.upper() != str(match_method).upper():
+                return False
+        return True
+
+    def _post_to_hold(self, data: dict) -> dict:
+        """Blocking long-poll to Node for a held-flow verdict.
+
+        Fails OPEN (forward unmodified) on ANY error or timeout so a device's
+        traffic is never permanently stuck. Called via run_in_executor so the
+        asyncio loop keeps serving other flows while this one suspends.
+        """
+        # The hold endpoint lives at /v1/intercept/hold (its own namespace, not
+        # under /v1/traffic/). Derive it from the webhook's scheme+host origin.
+        webhook_url = ctx.options.node_webhook
+        parsed = urlparse(webhook_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        url = origin + "/v1/intercept/hold"
+        try:
+            payload = json.dumps(data).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            # Generous ceiling; Node resolves sooner via its own shorter timeout.
+            resp = urllib.request.urlopen(req, timeout=300)
+            result = json.loads(resp.read().decode("utf-8"))
+            if isinstance(result, dict) and result.get("action") in ("forward", "drop"):
+                return result
+            return {"action": "forward"}
+        except Exception as e:
+            ctx.log.error(f"[DarkRide] Hold POST failed (failing open to forward): {e}")
+            return {"action": "forward"}
+
+    def _apply_hold_request(self, flow, resolution: dict):
+        """Apply a held-request verdict to the flow (request phase)."""
+        action = resolution.get("action", "forward")
+        if action == "drop":
+            # Per project memory flow.kill() is unreliable in WireGuard mode.
+            flow.response = http.Response.make(444, b"Dropped by DarkRide intercept")
+            return
+        modified = resolution.get("modified")
+        if not modified:
+            return
+        if "method" in modified and modified["method"]:
+            flow.request.method = modified["method"]
+        if "url" in modified and modified["url"]:
+            flow.request.url = modified["url"]
+        if "headers" in modified and isinstance(modified["headers"], dict):
+            flow.request.headers.clear()
+            for k, v in modified["headers"].items():
+                flow.request.headers[k] = v
+        if "body" in modified:
+            body = modified["body"]
+            if body is not None:
+                flow.request.set_text(body)
+            else:
+                flow.request.content = b""
+
+    def _apply_hold_response(self, flow, resolution: dict):
+        """Apply a held-response verdict to the flow (response phase)."""
+        action = resolution.get("action", "forward")
+        if action == "drop":
+            flow.response = http.Response.make(444, b"Dropped by DarkRide intercept")
+            return
+        modified = resolution.get("modified")
+        if not modified or flow.response is None:
+            return
+        if "statusCode" in modified and modified["statusCode"] is not None:
+            flow.response.status_code = int(modified["statusCode"])
+        if "headers" in modified and isinstance(modified["headers"], dict):
+            flow.response.headers.clear()
+            for k, v in modified["headers"].items():
+                flow.response.headers[k] = v
+        if "body" in modified:
+            body = modified["body"]
+            if body is not None:
+                flow.response.set_text(body)
+            else:
+                flow.response.content = b""
+
+    async def _run_hold(self, flow, phase: str):
+        """Suspend just this flow's coroutine on a blocking hold round-trip.
+
+        Uses run_in_executor so the mitmproxy asyncio loop keeps serving every
+        other flow while this one waits for a manual verdict.
+        """
+        try:
+            device_id, session_id = self._get_context()
+            if phase == "request":
+                try:
+                    body = flow.request.get_text()
+                except Exception:
+                    body = None
+                headers = dict(flow.request.headers)
+                status_code = None
+            else:
+                try:
+                    body = flow.response.get_text() if flow.response else None
+                except Exception:
+                    body = None
+                headers = dict(flow.response.headers) if flow.response else {}
+                status_code = flow.response.status_code if flow.response else None
+            data = {
+                "flowId": flow.id,
+                "phase": phase,
+                "deviceId": device_id or None,
+                "sessionId": session_id,
+                "method": flow.request.method,
+                "url": flow.request.pretty_url,
+                "headers": headers,
+                "body": body,
+                "statusCode": status_code,
+            }
+            loop = asyncio.get_running_loop()
+            resolution = await loop.run_in_executor(None, self._post_to_hold, data)
+            if phase == "request":
+                self._apply_hold_request(flow, resolution)
+            else:
+                self._apply_hold_response(flow, resolution)
+        except Exception as e:
+            ctx.log.error(f"[DarkRide] _run_hold error (forwarding unmodified): {e}")
 
     def _match_rules(self, flow, phase: str) -> list:
         """Return rules matching this flow/phase (preserving config order = priority order)."""
@@ -626,12 +875,13 @@ class DarkRideAddon:
         except Exception as e:
             ctx.log.error(f"[DarkRide] _notify_request_started error: {e}")
 
-    def request(self, flow: http.HTTPFlow):
+    async def request(self, flow: http.HTTPFlow):
         """Block requests to domains in the blocklist, then run intercept hooks."""
         try:
             self._reload_blocklist()
             self._reload_hiddenlist()
             self._reload_intercept_config()
+            self._reload_hold_config()
             host = flow.request.host
             url = flow.request.pretty_url
             blocked = self._is_blocked(host) or self._is_blocked_by_url(url)
@@ -677,6 +927,17 @@ class DarkRideAddon:
                 result = self._post_to_intercept(intercept_data)
                 if self._apply_request_modifications(flow, result):
                     return  # blocked
+
+            # Interactive intercept ("breakpoints") — pause this flow in-flight
+            # for a manual verdict. Only suspends this coroutine; other flows
+            # keep flowing. Skipped for hidden domains.
+            if (
+                flow.response is None
+                and not self._is_hidden(host)
+                and not self._is_hidden_by_url(url)
+                and self._hold_matches(flow, "request")
+            ):
+                await self._run_hold(flow, "request")
         except Exception as e:
             ctx.log.error(f"[DarkRide] request hook error: {e}")
 
@@ -982,7 +1243,7 @@ class DarkRideAddon:
         except Exception as e:
             ctx.log.error(f"[DarkRide] WebSocket registration error: {e}")
 
-    def response(self, flow: http.HTTPFlow):
+    async def response(self, flow: http.HTTPFlow):
         """Called when a response is received from the server."""
         if flow.response is None:
             return
@@ -995,6 +1256,7 @@ class DarkRideAddon:
         # Safety net: reload and check blocklist here too, in case request() failed
         self._reload_blocklist()
         self._reload_hiddenlist()
+        self._reload_hold_config()
         host = flow.request.host
         url = flow.request.pretty_url
         if self._is_blocked(host) or self._is_blocked_by_url(url):
@@ -1034,6 +1296,11 @@ class DarkRideAddon:
                     return  # blocked — skip capture
             except Exception as e:
                 ctx.log.error(f"[DarkRide] response intercept hook error: {e}")
+
+        # Interactive intercept ("breakpoints") — pause the response in-flight
+        # for a manual verdict before it is captured/forwarded.
+        if self._hold_matches(flow, "response"):
+            await self._run_hold(flow, "response")
 
         # Apply intercept rules
         matched = self._match_rules(flow, "response")
@@ -1091,6 +1358,14 @@ class DarkRideAddon:
                 "contentType": resp_content_type,
             },
         }
+
+        # Per-request timing — forward the mitmproxy flow timestamps so the
+        # backend can persist a real Duration + timing waterfall. Fully
+        # best-effort: never breaks ingest if timestamps are missing.
+        duration_ms, timings = _extract_timings(flow)
+        data["durationMs"] = duration_ms
+        if timings is not None:
+            data["timings"] = timings
 
         if device_id:
             data["deviceId"] = device_id
@@ -1237,6 +1512,12 @@ def load(loader):
         typespec=str,
         default="",
         help="Path to intercept config JSON file containing rules and client certs",
+    )
+    loader.add_option(
+        name="intercept_hold_config_file",
+        typespec=str,
+        default="",
+        help="Path to interactive-intercept ('breakpoints') armed config JSON file",
     )
 
 

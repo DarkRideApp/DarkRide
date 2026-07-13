@@ -13,7 +13,10 @@ import type {
   ProxiedHttpResponse,
   ProxiedJob,
   ProxiedJobStatus,
+  CaptureEgress,
+  TlsProfileName,
 } from '../../shared/types/api';
+import { getTlsProfile, tlsProfileToNodeOptions } from '../../shared/lib/tls-profiles';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
 
@@ -21,9 +24,24 @@ const { log, error: logError } = createLoggers('proxied-request');
 
 const MAX_RESPONSE_SIZE = 50 * 1024 * 1024; // 50MB
 
+/**
+ * Read-only view of active capture egress. CaptureSessionManager implements
+ * this; the replay path uses it to reproduce a capturing device's proxy + TLS
+ * profile. Kept as a narrow interface so the service stays testable with a
+ * plain stub and doesn't depend on the whole manager.
+ */
+export interface EgressResolver {
+  getEgress(deviceId: string): CaptureEgress | null;
+}
+
 interface ResolvedProxy {
   agent: http.Agent | undefined;
   proxyUrl: string;
+  /**
+   * TLS cipher profile to pose as, when the source implies one (captureSession
+   * derives it from the session). undefined = Node's stock TLS.
+   */
+  tlsProfile?: TlsProfileName;
 }
 
 interface PoolEntry {
@@ -62,6 +80,8 @@ interface QueueItem {
 
 export interface ProxiedRequestServiceOptions {
   maxConcurrency?: number;
+  /** Wired to CaptureSessionManager so `captureSession` replays can resolve egress. */
+  egressResolver?: EgressResolver;
 }
 
 export class ProxiedRequestService {
@@ -82,11 +102,14 @@ export class ProxiedRequestService {
   private readonly POOL_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
   private readonly POOL_SWEEP_MS = 5 * 60 * 1000;     // sweep every 5 min
 
+  private egressResolver?: EgressResolver;
+
   constructor(
     private db: AppDatabase,
     options?: ProxiedRequestServiceOptions,
   ) {
     this.maxConcurrency = options?.maxConcurrency ?? 5;
+    this.egressResolver = options?.egressResolver;
   }
 
   start(): void {
@@ -182,6 +205,7 @@ export class ProxiedRequestService {
       case 'nordvpn': return `NordVPN ${proxy.country}`;
       case 'inline': return proxy.url;
       case 'direct': return 'Direct';
+      case 'captureSession': return `Capture session (${proxy.deviceId})`;
     }
   }
 
@@ -247,6 +271,43 @@ export class ProxiedRequestService {
       }
       case 'direct':
         return { agent: undefined, proxyUrl: 'direct' };
+      case 'captureSession': {
+        // Reproduce the capturing device's egress: same proxy + TLS profile the
+        // app's own traffic used. If the device isn't capturing (or no resolver
+        // is wired) we can't know its egress — fall back to direct and say so in
+        // proxyUsed rather than fail the replay.
+        const egress = this.egressResolver?.getEgress(source.deviceId) ?? null;
+        if (!egress) {
+          return {
+            agent: undefined,
+            proxyUrl: `capture session (device ${source.deviceId} not capturing — direct)`,
+          };
+        }
+        const profileTag = egress.tlsProfile && egress.tlsProfile !== 'default'
+          ? `, ${egress.tlsProfile}`
+          : '';
+        if (egress.proxyMode === 'nordvpn' && egress.proxyCountry) {
+          // Reuse the exact NordVPN branch (credential lookup + SOCKS agent pool).
+          const inner = this.resolveProxy({ type: 'nordvpn', country: egress.proxyCountry });
+          return {
+            agent: inner.agent,
+            proxyUrl: `capture session (nordvpn:${egress.proxyCountry}${profileTag})`,
+            tlsProfile: egress.tlsProfile,
+          };
+        }
+        // 'normal' upstream mode picks a proxy from the rotating pool per
+        // mitmproxy process — that exact selection isn't recorded in egress, so
+        // it can't be reproduced deterministically here. Both 'none' and
+        // 'normal' therefore egress directly; the label distinguishes them.
+        const modeNote = egress.proxyMode === 'normal'
+          ? 'normal upstream not reproducible — direct'
+          : 'direct';
+        return {
+          agent: undefined,
+          proxyUrl: `capture session (${modeNote}${profileTag})`,
+          tlsProfile: egress.tlsProfile,
+        };
+      }
       default:
         throw new Error(`Unknown proxy source type: ${(source as any).type}`);
     }
@@ -267,6 +328,11 @@ export class ProxiedRequestService {
     let currentBody = req.body ?? null;
     let redirectCount = 0;
 
+    // Effective TLS profile: an explicit request-level profile wins; otherwise
+    // inherit whatever the resolved proxy implied (captureSession derives it
+    // from the session). undefined = Node's stock TLS.
+    const tlsProfile: TlsProfileName | undefined = req.tlsProfile ?? proxy.tlsProfile;
+
     while (true) {
       const result = await this.doSingleRequest(
         currentUrl,
@@ -275,6 +341,7 @@ export class ProxiedRequestService {
         currentBody,
         timeout,
         proxy,
+        tlsProfile,
       );
 
       if (
@@ -411,6 +478,57 @@ export class ProxiedRequestService {
     return null;
   }
 
+  /**
+   * Build the Node request options for a single hop. Extracted from
+   * doSingleRequest so the TLS-profile / client-cert wiring is unit-testable
+   * without spying on the (non-configurable) https.request namespace binding.
+   */
+  private buildRequestOptions(
+    url: string,
+    method: string,
+    headers: Record<string, string>,
+    body: string | null,
+    proxy: ResolvedProxy,
+    tlsProfile?: TlsProfileName,
+  ): { options: http.RequestOptions; isHttps: boolean } {
+    const parsed = new URL(url);
+    const isHttps = parsed.protocol === 'https:';
+
+    const reqHeaders = { ...headers };
+    if (body && !reqHeaders['content-length']) {
+      reqHeaders['content-length'] = Buffer.byteLength(body).toString();
+    }
+
+    const options: http.RequestOptions = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method,
+      headers: reqHeaders,
+      agent: proxy.agent,
+    };
+
+    if (isHttps && parsed.hostname) {
+      const clientCert = this.findClientCertForHostname(parsed.hostname);
+      if (clientCert) {
+        (options as any).cert = clientCert.certPem;
+        (options as any).key = clientCert.keyPem;
+      }
+
+      // Pose the requested client TLS cipher profile (chrome/okhttp). This is
+      // cipher-list parity, NOT byte-exact JA3 — Node/OpenSSL can't control
+      // GREASE or extension ordering, and exposes no per-request TLS 1.3
+      // ciphersuite option. Same fidelity limit the capture session itself has
+      // (mitmproxy's spoof is also cipher-list-level). Only applies to https.
+      const profile = getTlsProfile(tlsProfile);
+      if (profile) {
+        Object.assign(options, tlsProfileToNodeOptions(profile));
+      }
+    }
+
+    return { options, isHttps };
+  }
+
   private doSingleRequest(
     url: string,
     method: string,
@@ -418,33 +536,11 @@ export class ProxiedRequestService {
     body: string | null,
     timeout: number,
     proxy: ResolvedProxy,
+    tlsProfile?: TlsProfileName,
   ): Promise<{ statusCode: number | undefined; headers: Record<string, string>; body: Buffer }> {
     return new Promise((resolve, reject) => {
-      const parsed = new URL(url);
-      const isHttps = parsed.protocol === 'https:';
+      const { options, isHttps } = this.buildRequestOptions(url, method, headers, body, proxy, tlsProfile);
       const requestFn = isHttps ? https.request : http.request;
-
-      const reqHeaders = { ...headers };
-      if (body && !reqHeaders['content-length']) {
-        reqHeaders['content-length'] = Buffer.byteLength(body).toString();
-      }
-
-      const options: http.RequestOptions = {
-        hostname: parsed.hostname,
-        port: parsed.port || (isHttps ? 443 : 80),
-        path: parsed.pathname + parsed.search,
-        method,
-        headers: reqHeaders,
-        agent: proxy.agent,
-      };
-
-      if (isHttps && parsed.hostname) {
-        const clientCert = this.findClientCertForHostname(parsed.hostname);
-        if (clientCert) {
-          (options as any).cert = clientCert.certPem;
-          (options as any).key = clientCert.keyPem;
-        }
-      }
 
       const req = requestFn(options, (res) => {
         const chunks: Buffer[] = [];

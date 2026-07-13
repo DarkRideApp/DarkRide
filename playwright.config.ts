@@ -33,6 +33,12 @@ export default defineConfig({
       DARKRIDE_BOOTSTRAP_ADMIN_USERNAME: 'e2e-admin',
       DARKRIDE_BOOTSTRAP_ADMIN_PASSWORD: 'e2e-test-password-123',
       PORT: '3199',
+      // The E2E Vite server runs on 5199, but the WS origin allowlist only
+      // auto-includes the backend port + the standard Vite port 5173
+      // (backend/websocket/origin-check.ts:buildDefaultAllowedOrigins). Without
+      // this, every WS-dependent spec hangs on "Connecting to server..." and
+      // times out (403 on the WS upgrade). Allow the E2E dev origin explicitly.
+      WEBSOCKET_ALLOWED_ORIGINS: 'http://localhost:5199',
     },
   },
 });

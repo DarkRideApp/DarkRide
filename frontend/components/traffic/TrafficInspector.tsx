@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
-import { useTrafficReplay } from './TrafficEntryRow';
 import { TrafficTable } from './TrafficTable';
+import { ReplayDrawer } from './ReplayDrawer';
 import type { TrafficEntry } from './TrafficEntryRow';
 import type { WebSocketMessageEntry } from '../../../shared/types/api';
 import type { TrafficEntryMessage, TrafficRequestStartedMessage, WebSocketFrameMessage, WebSocketConnectionClosedMessage } from '../../../shared/types/websocket';
@@ -21,7 +21,10 @@ interface TrafficInspectorProps {
  */
 export function TrafficInspector({ deviceId, sessionId, mode = 'live' }: TrafficInspectorProps) {
   const ws = useWebSocket();
-  const handleReplay = useTrafficReplay();
+  // In-place Repeater — replay opens a drawer over the inspector rather than
+  // navigating away to the Request Builder.
+  const [replayEntry, setReplayEntry] = useState<TrafficEntry | null>(null);
+  const handleReplay = useCallback((entry: TrafficEntry) => setReplayEntry(entry), []);
   const [entries, setEntries] = useState<TrafficEntry[]>([]);
   const [wsFrames, setWsFrames] = useState<Map<number, WebSocketMessageEntry[]>>(new Map());
   const [staticLoading, setStaticLoading] = useState(mode === 'static');
@@ -152,6 +155,8 @@ export function TrafficInspector({ deviceId, sessionId, mode = 'live' }: Traffic
         : 'No entries match filters';
 
   return (
+    <>
+    <ReplayDrawer entry={replayEntry} onClose={() => setReplayEntry(null)} />
     <TrafficTable
       entries={entries}
       loading={mode === 'static' && staticLoading}
@@ -180,5 +185,6 @@ export function TrafficInspector({ deviceId, sessionId, mode = 'live' }: Traffic
         </div>
       }
     />
+    </>
   );
 }
