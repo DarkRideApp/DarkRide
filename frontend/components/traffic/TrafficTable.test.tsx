@@ -360,6 +360,30 @@ describe('TrafficTable — Duration column', () => {
   });
 });
 
+describe('TrafficTable — column customization', () => {
+  beforeEach(() => localStorage.clear());
+
+  it('hides a column via the Columns menu', () => {
+    render(<TrafficTable entries={[makeEntry({ id: 1 })]} showFilterBar={true} />);
+    expect(screen.getByRole('columnheader', { name: /size/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('traffic-columns-btn'));
+    fireEvent.click(screen.getByTestId('traffic-column-toggle-size'));
+    expect(screen.queryByRole('columnheader', { name: /size/i })).not.toBeInTheDocument();
+  });
+
+  it('does not allow hiding the Host/Path column', () => {
+    render(<TrafficTable entries={[makeEntry({ id: 1 })]} showFilterBar={true} />);
+    fireEvent.click(screen.getByTestId('traffic-columns-btn'));
+    expect(screen.getByTestId('traffic-column-toggle-path')).toBeDisabled();
+  });
+
+  it('restores hidden columns from localStorage on mount', () => {
+    localStorage.setItem('darkride:traffic-columns', JSON.stringify(['method', 'path', 'status', 'type', 'duration', 'time']));
+    render(<TrafficTable entries={[makeEntry({ id: 1 })]} showFilterBar={true} />);
+    expect(screen.queryByRole('columnheader', { name: /size/i })).not.toBeInTheDocument();
+  });
+});
+
 describe('TrafficTable — virtualization', () => {
   const makeN = (n: number): TrafficEntry[] =>
     Array.from({ length: n }, (_, i) => makeEntry({ id: i + 1, requestUrl: `https://h.example/${i}` }));
