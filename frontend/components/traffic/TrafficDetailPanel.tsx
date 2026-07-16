@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { Copy, X, Repeat, Link, Terminal, Code, FileText, Download, EyeOff, ShieldBan, Image as ImageIcon } from 'lucide-react';
+import { Copy, X, Repeat, Save, Link, Terminal, Code, FileText, Download, EyeOff, ShieldBan, Image as ImageIcon } from 'lucide-react';
 import type { TrafficEntry } from './TrafficEntryRow';
 import { parseHostname } from './TrafficEntryRow';
 import { detectGraphQL, formatGraphQLQuery } from '../../../shared/lib/graphql-detect';
@@ -24,6 +24,7 @@ interface TrafficDetailPanelProps {
   entry: TrafficEntry;
   onClose: () => void;
   onReplay?: (entry: TrafficEntry) => void;
+  onSave?: (entry: TrafficEntry) => void;
   onLoadFullBody?: (id: number) => void;
   wsFrames?: WebSocketMessageEntry[];
   onLoadWsFrames?: (id: number) => void;
@@ -227,6 +228,7 @@ export function TrafficDetailPanel({
   entry,
   onClose,
   onReplay,
+  onSave,
   onLoadFullBody,
   wsFrames,
   onLoadWsFrames,
@@ -348,6 +350,14 @@ export function TrafficDetailPanel({
             label="Replay"
             onClick={() => onReplay(entry)}
             variant="primary"
+          />
+        )}
+        {onSave && (
+          <ActionButton
+            icon={<Save size={12} />}
+            label="Save"
+            copiedLabel="Saved"
+            onClick={() => onSave(entry)}
           />
         )}
         {hostname && onHideHostname && (
