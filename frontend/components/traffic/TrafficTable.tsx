@@ -83,6 +83,8 @@ export interface TrafficTableProps {
 
   /** Called when user triggers a replay action */
   onReplay?: (entry: TrafficEntry) => void;
+  /** Persist the entry to Saved traffic (POST /v1/traffic/saved). */
+  onSave?: (entry: TrafficEntry) => void;
 
   /** WebSocket frame data keyed by entry id, for WS entries */
   wsFrames?: Map<number, WebSocketMessageEntry[]>;
@@ -141,6 +143,7 @@ export function TrafficTable({
   clientSideFilter = true,
   onLoadFullBody,
   onReplay: onReplayProp,
+  onSave,
   wsFrames,
   onLoadWsFrames,
   footer,
@@ -986,6 +989,7 @@ export function TrafficTable({
                 entry={selectedEntry}
                 onClose={handleClose}
                 onReplay={handleReplay}
+                onSave={onSave}
                 onLoadFullBody={onLoadFullBody}
                 wsFrames={wsFrames?.get(selectedEntry.id)}
                 onLoadWsFrames={onLoadWsFrames}

@@ -370,6 +370,10 @@ export function Traffic() {
     ws.sendRestApi('POST', '/v1/blocklist/add', { domain: hostname }).catch(() => {});
   }, [ws]);
 
+  const handleSave = useCallback((entry: TrafficEntry) => {
+    ws.sendRestApi('POST', '/v1/traffic/saved', { id: entry.id }).catch(() => {});
+  }, [ws]);
+
   const handleClear = useCallback(() => {
     setEntries([]);
     setTotal(0);
@@ -506,6 +510,7 @@ export function Traffic() {
           onLoadWsFrames={handleLoadWsFrames}
           onBlockHostname={handleBlockHostname}
           onReplay={handleReplay}
+          onSave={handleSave}
           wsFrames={wsFrames}
           selectedId={selectedId}
           onSelectEntry={setSelectedId}
