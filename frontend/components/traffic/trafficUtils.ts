@@ -574,3 +574,48 @@ export function generateFetch(entry: Pick<TrafficEntry, 'requestMethod' | 'reque
   }
   return `fetch('${entry.requestUrl}', {\n${opts.join(',\n')}\n})`;
 }
+
+// ---------------------------------------------------------------------------
+// Column visibility preferences
+// ---------------------------------------------------------------------------
+
+export type ColumnKey = 'method' | 'path' | 'status' | 'type' | 'size' | 'duration' | 'time';
+
+export const COLUMNS: Array<{ key: ColumnKey; label: string; alwaysOn?: boolean }> = [
+  { key: 'method', label: 'Method' },
+  { key: 'path', label: 'Host / Path', alwaysOn: true },
+  { key: 'status', label: 'Status' },
+  { key: 'type', label: 'Type' },
+  { key: 'size', label: 'Size' },
+  { key: 'duration', label: 'Duration' },
+  { key: 'time', label: 'Time' },
+];
+
+const COLUMN_PREFS_KEY = 'darkride:traffic-columns';
+
+/** Load the set of visible column keys. Defaults to all; always-on columns are
+ *  force-included even if a saved set omits them. */
+export function loadColumnPrefs(): Set<ColumnKey> {
+  const all = new Set<ColumnKey>(COLUMNS.map(c => c.key));
+  try {
+    const raw = localStorage.getItem(COLUMN_PREFS_KEY);
+    if (!raw) return all;
+    const keys = JSON.parse(raw) as ColumnKey[];
+    const set = new Set<ColumnKey>(keys.filter(k => COLUMNS.some(c => c.key === k)));
+    COLUMNS.filter(c => c.alwaysOn).forEach(c => set.add(c.key));
+    return set.size ? set : all;
+  } catch {
+    return all;
+  }
+}
+
+/** Persist visible column keys (always-on columns are kept regardless). */
+export function saveColumnPrefs(set: Set<ColumnKey>): void {
+  const withAlways = new Set<ColumnKey>(set);
+  COLUMNS.filter(c => c.alwaysOn).forEach(c => withAlways.add(c.key));
+  try {
+    localStorage.setItem(COLUMN_PREFS_KEY, JSON.stringify([...withAlways]));
+  } catch {
+    // ignore storage failures (private mode, quota)
+  }
+}

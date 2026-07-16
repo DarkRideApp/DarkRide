@@ -9,7 +9,7 @@
 
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Filter, X, ChevronUp, ChevronDown, SlidersHorizontal, Search, Save } from 'lucide-react';
+import { Filter, X, ChevronUp, ChevronDown, SlidersHorizontal, Search, Save, Columns3 } from 'lucide-react';
 import { TrafficDetailPanel } from './TrafficDetailPanel';
 import { parseHostname, useTrafficReplay } from './TrafficEntryRow';
 import type { TrafficEntry } from './TrafficEntryRow';
@@ -32,6 +32,10 @@ import {
   loadFilterPresets,
   saveFilterPresets,
   BUILTIN_PRESETS,
+  COLUMNS,
+  loadColumnPrefs,
+  saveColumnPrefs,
+  type ColumnKey,
   type TrafficFilters,
   type MethodFilterState,
   type StatusGroupFilter,
@@ -409,6 +413,20 @@ export function TrafficTable({
   // Rows are uniform single-line height, so one fixed size drives the whole
   // list. Measure the first rendered row once (exact height incl. font/zoom)
   // and fall back to 39px (td padding 10px*2 + ~18px line) before first paint.
+  // Column visibility (show/hide, persisted). Host/Path is always-on.
+  const [visibleColumns, setVisibleColumns] = useState<Set<ColumnKey>>(() => loadColumnPrefs());
+  const [columnsMenuOpen, setColumnsMenuOpen] = useState(false);
+  const toggleColumn = useCallback((key: ColumnKey) => {
+    if (COLUMNS.find(c => c.key === key)?.alwaysOn) return;
+    setVisibleColumns(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      saveColumnPrefs(next);
+      return next;
+    });
+  }, []);
+  const colCount = visibleColumns.size;
+
   const [rowHeight, setRowHeight] = useState(39);
   const measureRowRef = useCallback((el: HTMLTableRowElement | null) => {
     if (!el) return;
@@ -527,6 +545,7 @@ export function TrafficTable({
         onClick={() => handleSelect(entry.id)}
         data-testid={`traffic-row-${entry.id}`}
       >
+        {visibleColumns.has('method') && (
         <td>
           <span
             className="traffic-method-badge"
@@ -535,12 +554,16 @@ export function TrafficTable({
             {methodLabel}
           </span>
         </td>
+        )}
+        {visibleColumns.has('path') && (
         <td className="traffic-cell-path">
           <span className="traffic-hostname">{hostname}</span>
           <span className="traffic-path">
             {path.length > 80 ? path.slice(0, 80) + '…' : path}
           </span>
         </td>
+        )}
+        {visibleColumns.has('status') && (
         <td>
           <span
             className="traffic-status"
@@ -558,8 +581,10 @@ export function TrafficTable({
                   : (entry.responseStatus ?? '—')}
           </span>
         </td>
-        <td className="traffic-cell-type">{contentType}</td>
-        <td className="traffic-cell-size">{size}</td>
+        )}
+        {visibleColumns.has('type') && <td className="traffic-cell-type">{contentType}</td>}
+        {visibleColumns.has('size') && <td className="traffic-cell-size">{size}</td>}
+        {visibleColumns.has('duration') && (
         <td
           className="traffic-cell-duration"
           style={{ textAlign: 'right', color: getDurationColor(entry.durationMs) }}
@@ -567,7 +592,8 @@ export function TrafficTable({
         >
           {isWs ? '—' : formatDuration(entry.durationMs)}
         </td>
-        <td className="traffic-cell-time">{time}</td>
+        )}
+        {visibleColumns.has('time') && <td className="traffic-cell-time">{time}</td>}
       </tr>
     );
   };
@@ -609,6 +635,33 @@ export function TrafficTable({
               <SlidersHorizontal size={14} />
               Filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
             </button>
+            {/* Column show/hide menu */}
+            <div className="traffic-columns-menu" style={{ position: 'relative' }}>
+              <button
+                className={`traffic-filter-toggle${columnsMenuOpen ? ' active' : ''}`}
+                data-testid="traffic-columns-btn"
+                onClick={() => setColumnsMenuOpen(prev => !prev)}
+              >
+                <Columns3 size={14} />
+                Columns
+              </button>
+              {columnsMenuOpen && (
+                <div className="traffic-columns-dropdown" data-testid="traffic-columns-dropdown">
+                  {COLUMNS.map(c => (
+                    <label key={c.key} className="traffic-columns-item">
+                      <input
+                        type="checkbox"
+                        data-testid={`traffic-column-toggle-${c.key}`}
+                        checked={visibleColumns.has(c.key)}
+                        disabled={c.alwaysOn}
+                        onChange={() => toggleColumn(c.key)}
+                      />
+                      {c.label}
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
             {/* Live mode controls */}
             {liveMode && (
               <div className="traffic-live-controls">
@@ -623,8 +676,9 @@ export function TrafficTable({
                   <button
                     className="traffic-live-btn"
                     onClick={onClear}
+                    title="Clears the current view only. Captured traffic stays in the database."
                   >
-                    Clear
+                    Clear view
                   </button>
                 )}
               </div>
@@ -888,6 +942,7 @@ export function TrafficTable({
                   <tr>
                     {onSortChange ? (
                       <>
+                        {visibleColumns.has('method') && (
                         <th
                           style={{ width: 80, cursor: 'pointer', userSelect: 'none' }}
                           onClick={() => handleHeaderSort('requestMethod')}
@@ -899,6 +954,8 @@ export function TrafficTable({
                               : <ChevronDown size={12} style={{ opacity: 0.3 }} />}
                           </span>
                         </th>
+                        )}
+                        {visibleColumns.has('path') && (
                         <th
                           style={{ cursor: 'pointer', userSelect: 'none' }}
                           onClick={() => handleHeaderSort('requestUrl')}
@@ -910,6 +967,8 @@ export function TrafficTable({
                               : <ChevronDown size={12} style={{ opacity: 0.3 }} />}
                           </span>
                         </th>
+                        )}
+                        {visibleColumns.has('status') && (
                         <th
                           style={{ width: 64, cursor: 'pointer', userSelect: 'none' }}
                           onClick={() => handleHeaderSort('responseStatus')}
@@ -921,8 +980,10 @@ export function TrafficTable({
                               : <ChevronDown size={12} style={{ opacity: 0.3 }} />}
                           </span>
                         </th>
-                        <th style={{ width: 90 }}>Type</th>
-                        <th style={{ width: 80 }}>Size</th>
+                        )}
+                        {visibleColumns.has('type') && <th style={{ width: 90 }}>Type</th>}
+                        {visibleColumns.has('size') && <th style={{ width: 80 }}>Size</th>}
+                        {visibleColumns.has('duration') && (
                         <th
                           style={{ width: 76, textAlign: 'right', cursor: 'pointer', userSelect: 'none' }}
                           onClick={() => handleHeaderSort('durationMs')}
@@ -935,6 +996,8 @@ export function TrafficTable({
                               : <ChevronDown size={12} style={{ opacity: 0.3 }} />}
                           </span>
                         </th>
+                        )}
+                        {visibleColumns.has('time') && (
                         <th
                           style={{ width: 72, textAlign: 'right', cursor: 'pointer', userSelect: 'none' }}
                           onClick={() => handleHeaderSort('capturedAt')}
@@ -946,16 +1009,17 @@ export function TrafficTable({
                               : <ChevronDown size={12} style={{ opacity: 0.3 }} />}
                           </span>
                         </th>
+                        )}
                       </>
                     ) : (
                       <>
-                        <th style={{ width: 80 }}>Method</th>
-                        <th>Host / Path</th>
-                        <th style={{ width: 64 }}>Status</th>
-                        <th style={{ width: 90 }}>Type</th>
-                        <th style={{ width: 80 }}>Size</th>
-                        <th style={{ width: 76, textAlign: 'right' }}>Duration</th>
-                        <th style={{ width: 72, textAlign: 'right' }}>Time</th>
+                        {visibleColumns.has('method') && <th style={{ width: 80 }}>Method</th>}
+                        {visibleColumns.has('path') && <th>Host / Path</th>}
+                        {visibleColumns.has('status') && <th style={{ width: 64 }}>Status</th>}
+                        {visibleColumns.has('type') && <th style={{ width: 90 }}>Type</th>}
+                        {visibleColumns.has('size') && <th style={{ width: 80 }}>Size</th>}
+                        {visibleColumns.has('duration') && <th style={{ width: 76, textAlign: 'right' }}>Duration</th>}
+                        {visibleColumns.has('time') && <th style={{ width: 72, textAlign: 'right' }}>Time</th>}
                       </>
                     )}
                   </tr>
@@ -969,11 +1033,11 @@ export function TrafficTable({
                     return (
                       <>
                         <tr data-testid="traffic-vspacer-top" aria-hidden="true">
-                          <td colSpan={7} style={{ height: padTop, padding: 0, border: 0 }} />
+                          <td colSpan={colCount} style={{ height: padTop, padding: 0, border: 0 }} />
                         </tr>
                         {items.map((vi, i) => renderRow(displayEntries[vi.index], i === 0 ? measureRowRef : undefined))}
                         <tr data-testid="traffic-vspacer-bottom" aria-hidden="true">
-                          <td colSpan={7} style={{ height: padBottom, padding: 0, border: 0 }} />
+                          <td colSpan={colCount} style={{ height: padBottom, padding: 0, border: 0 }} />
                         </tr>
                       </>
                     );

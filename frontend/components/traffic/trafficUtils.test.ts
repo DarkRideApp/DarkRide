@@ -10,6 +10,9 @@ import {
   loadFilterPresets,
   saveFilterPresets,
   BUILTIN_PRESETS,
+  COLUMNS,
+  loadColumnPrefs,
+  saveColumnPrefs,
   deriveServerStatusCentury,
   type TrafficFilters,
 } from './trafficUtils';
@@ -260,5 +263,26 @@ describe('filter presets', () => {
 
     const apis = BUILTIN_PRESETS.find(p => p.name === 'APIs only')!;
     expect(apis.filters.contentTypes).toEqual(['json']);
+  });
+});
+
+describe('column prefs', () => {
+  beforeEach(() => localStorage.clear());
+
+  it('defaults to all columns visible', () => {
+    expect(loadColumnPrefs().size).toBe(COLUMNS.length);
+  });
+
+  it('round-trips a saved set, always keeping the always-on column', () => {
+    saveColumnPrefs(new Set(['path', 'status']));
+    const got = loadColumnPrefs();
+    expect(got.has('status')).toBe(true);
+    expect(got.has('size')).toBe(false);
+    expect(got.has('path')).toBe(true); // always-on
+  });
+
+  it('re-adds the always-on column even if a saved set omits it', () => {
+    localStorage.setItem('darkride:traffic-columns', JSON.stringify(['status']));
+    expect(loadColumnPrefs().has('path')).toBe(true);
   });
 });
