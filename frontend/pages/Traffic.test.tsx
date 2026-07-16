@@ -196,3 +196,24 @@ describe('Traffic page — jump-to-live banner', () => {
     expect(screen.queryByTestId('traffic-live-banner')).not.toBeInTheDocument();
   });
 });
+
+describe('Traffic page — P3 polish', () => {
+  it('labels the view-only clear button "Clear view"', async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId('traffic-table'));
+    expect(screen.getByRole('button', { name: /clear view/i })).toBeInTheDocument();
+  });
+
+  it('describes the TLS pill as per-device, not a global setting', async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId('traffic-tls-pill'));
+    expect(screen.getByTestId('traffic-tls-pill')).toHaveTextContent(/per device/i);
+  });
+
+  it('opens the blocklist panel from the Blocked button', async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId('traffic-blocked-btn'));
+    fireEvent.click(screen.getByTestId('traffic-blocked-btn'));
+    expect(await screen.findByTestId('blocklist-panel')).toBeInTheDocument();
+  });
+});
