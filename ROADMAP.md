@@ -177,7 +177,9 @@ Headline items:
   on `feat/traffic-list-perf`: `@tanstack/react-virtual` in TrafficTable, inspector cap 500→5000,
   jump-to-live banner)*, host/path tree view, unify the five nav surfaces into one workspace.
 - **P2** — raw wire view, in-body search + JSON tree + hex, auto-load-full-body, HTML render.
-- **P3** — honest "Clear", visible blocklist, UI "save request", TLS-profile discoverability, column customization.
+- **P3** *(landed on `feat/traffic-p3-polish`)* — honest "Clear view", visible blocklist w/ unblock, UI
+  "Save request" (+ `POST /v1/traffic/saved`), per-device TLS-pill copy, show/hide column customization.
+  Two kept conservative pending sign-off: no destructive delete-all-captured, no live TLS summary.
 
 ### Raw TCP Stream Capture
 

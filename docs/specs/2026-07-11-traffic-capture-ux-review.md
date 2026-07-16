@@ -104,14 +104,23 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
 
 ### P3 — polish / honesty / discoverability
 
-- `[ ]` **"Clear" is view-only** on the Traffic page — it wipes local React state, not the DB, with
-  no undo and no hint. Either label it or make it a real delete-with-confirm (as Saved traffic does).
-- `[ ]` **Surface the blocklist** — "Block hostname" is one-way with no visible list from this view.
-- `[ ]` **Expose "save this request" as a UI action** — Saved traffic currently requires knowing to
-  call `req.save()`/`resp.save()` in an automation hook (undiscoverable).
-- `[ ]` **Fix the TLS-spoofing discoverability** — it's a static pill whose tooltip points to another
-  tab. Make the profile visible/settable closer to where capture is watched.
-- `[ ]` **Column customization** — columns are fixed (Method, Host/Path, Status, Type, Size, Time).
+*(All five landed on `feat/traffic-p3-polish` — see `docs/specs/2026-07-16-traffic-p3-polish-design.md`.
+Two were kept intentionally conservative pending Cube's sign-off, marked `[~]`.)*
+
+- `[~]` **"Clear" is view-only** — relabeled to **"Clear view"** with a tooltip ("clears the current
+  view only, captured traffic stays in the database") on both the global page and the live inspector.
+  Deliberately did NOT add a destructive delete-all-captured endpoint (Saved traffic already has a
+  real delete-with-confirm) — flagged as a follow-up.
+- `[x]` **Surface the blocklist** — new `BlocklistPanel` popover behind a "Blocked" button lists
+  blocked hostnames with inline Unblock (existing `GET /v1/blocklist/list` + `DELETE .../remove/:id`).
+- `[x]` **Expose "save this request" as a UI action** — Save button in the detail panel, backed by a
+  new `POST /v1/traffic/saved` that copies a captured row into the SavedTrafficStore.
+- `[~]` **Fix the TLS-spoofing discoverability** — reworded the pill to "TLS spoofing · per device"
+  with an honest tooltip. Deliberately did NOT build a live per-device profile summary (no endpoint
+  lists active capture sessions with their tlsProfile) — flagged as a follow-up; a *setter* belongs
+  on the device Capture tab, not the aggregate global page.
+- `[x]` **Column customization** — show/hide menu (7 columns) persisted to `localStorage`
+  (`darkride:traffic-columns`); Host/Path is always-on. Reorder/resize deliberately out of scope.
 
 ## Design contracts for the in-flight items
 
