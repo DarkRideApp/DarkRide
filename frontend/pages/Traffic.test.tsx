@@ -22,10 +22,16 @@ const mockEntries = [
   { id: 2, requestMethod: 'POST', requestUrl: 'https://api.example.com/two', responseStatus: 404, ...baseEntry },
 ];
 
-function createMockWs(entries = mockEntries): WebSocketContextValue & { sendRestApi: ReturnType<typeof vi.fn> } {
+type MockWs = WebSocketContextValue & {
+  sendRestApi: ReturnType<typeof vi.fn>;
+  pushTrafficEntry: (entry: Record<string, unknown>) => void;
+};
+
+function createMockWs(entries = mockEntries, total = entries.length): MockWs {
+  const subs: Record<string, (msg: any) => void> = {};
   const sendRestApi = vi.fn().mockImplementation((method: string, path: string) => {
     if (path.startsWith('/v1/traffic/list')) {
-      return Promise.resolve({ type: 'restapi', id: '1', status: 200, body: { data: { items: entries, total: entries.length } } });
+      return Promise.resolve({ type: 'restapi', id: '1', status: 200, body: { data: { items: entries, total } } });
     }
     return Promise.resolve({ type: 'restapi', id: '0', status: 200, body: {} });
   });
@@ -33,8 +39,22 @@ function createMockWs(entries = mockEntries): WebSocketContextValue & { sendRest
     connected: true,
     sendMessage: vi.fn(),
     sendRestApi,
-    subscribe: vi.fn().mockReturnValue(() => {}),
+    subscribe: vi.fn().mockImplementation((evt: string, cb: (msg: any) => void) => {
+      subs[evt] = cb;
+      return () => { delete subs[evt]; };
+    }),
+    pushTrafficEntry: (entry: Record<string, unknown>) => subs['traffic-entry']?.({ entry }),
   };
+}
+
+// A few rows on the page but 120 total, so pagination (Next) is active while
+// page 0 stays under the table's virtualization threshold (keeps rows in the
+// DOM for assertions; jsdom has no layout to drive the virtualizer).
+function createPaginatedWs(): MockWs {
+  const rows = Array.from({ length: 5 }, (_, i) => ({
+    id: i + 1, requestMethod: 'GET', requestUrl: `https://api.example.com/${i}`, responseStatus: 200, ...baseEntry,
+  }));
+  return createMockWs(rows, 120);
 }
 
 function renderPage(ws?: ReturnType<typeof createMockWs>) {
@@ -134,5 +154,45 @@ describe('Traffic page — server filter wiring', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('traffic-row-1')).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('Traffic page — jump-to-live banner', () => {
+  it('buffers live entries into the banner when paged away (page > 0)', async () => {
+    const ws = renderPage(createPaginatedWs());
+    await waitFor(() => screen.getByRole('button', { name: /^next$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^next$/i }));
+    await waitFor(() => expect(screen.getByText(/page 2 of/i)).toBeInTheDocument());
+
+    act(() => ws.pushTrafficEntry({ id: 9999, deviceId: 'd', requestMethod: 'GET', requestUrl: 'https://x/y', responseStatus: 200, capturedAt: '2025-01-01T00:00:00Z' }));
+
+    const banner = await screen.findByTestId('traffic-live-banner');
+    expect(banner).toHaveTextContent(/1 new request/i);
+    // The buffered entry is NOT injected into the current page's rows.
+    expect(screen.queryByTestId('traffic-row-9999')).not.toBeInTheDocument();
+  });
+
+  it('clicking Back to live returns to page 0 and clears the banner', async () => {
+    const ws = renderPage(createPaginatedWs());
+    await waitFor(() => screen.getByRole('button', { name: /^next$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^next$/i }));
+    await waitFor(() => expect(screen.getByText(/page 2 of/i)).toBeInTheDocument());
+    act(() => ws.pushTrafficEntry({ id: 9999, deviceId: 'd', requestMethod: 'GET', requestUrl: 'https://x/y', responseStatus: 200, capturedAt: '2025-01-01T00:00:00Z' }));
+    await screen.findByTestId('traffic-live-banner');
+
+    fireEvent.click(screen.getByTestId('traffic-back-to-live'));
+
+    await waitFor(() => expect(screen.queryByTestId('traffic-live-banner')).not.toBeInTheDocument());
+    expect(screen.getByText(/page 1 of/i)).toBeInTheDocument();
+  });
+
+  it('still prepends live entries when on page 0 in default order', async () => {
+    const ws = renderPage(createPaginatedWs());
+    await waitFor(() => screen.getByTestId('traffic-table'));
+
+    act(() => ws.pushTrafficEntry({ id: 8888, deviceId: 'd', requestMethod: 'GET', requestUrl: 'https://x/z', responseStatus: 200, capturedAt: '2025-01-01T00:00:00Z' }));
+
+    expect(await screen.findByTestId('traffic-row-8888')).toBeInTheDocument();
+    expect(screen.queryByTestId('traffic-live-banner')).not.toBeInTheDocument();
   });
 });

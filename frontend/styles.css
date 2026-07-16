@@ -8016,3 +8016,16 @@ body.live-log-open .ai-chat-fab {
   border-radius: 3px;
 }
 .replay-history-row:hover { background: var(--bg-tertiary); }
+
+/* Jump-to-live banner: surfaces live entries captured while the user is
+   paged away or in a non-live sort/search, instead of dropping them. */
+.traffic-live-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 24px;
+  background: color-mix(in srgb, var(--accent, #4a9eff) 12%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent, #4a9eff) 30%, transparent);
+  font-size: 13px;
+}
