@@ -6,7 +6,10 @@ import type { TrafficEntry } from './TrafficEntryRow';
 import type { WebSocketMessageEntry } from '../../../shared/types/api';
 import type { TrafficEntryMessage, TrafficRequestStartedMessage, WebSocketFrameMessage, WebSocketConnectionClosedMessage } from '../../../shared/types/websocket';
 
-const MAX_ENTRIES = 500;
+// Retain up to 5000 rows in memory. DOM cost is now viewport-bounded by
+// TrafficTable's virtualizer, so the cap can be high; this trim is the
+// JS-heap / WS-frame-map backstop, not a render-cost limit.
+const MAX_ENTRIES = 5000;
 let pendingIdCounter = 0;
 
 interface TrafficInspectorProps {

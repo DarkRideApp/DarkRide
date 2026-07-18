@@ -177,6 +177,9 @@ export function Traffic() {
   const [page, setPage] = useState(0);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [wsFrames, setWsFrames] = useState<Map<number, WebSocketMessageEntry[]>>(new Map());
+  // Count of live entries captured while the user is paged away or in a
+  // non-live order — surfaced by the jump-to-live banner instead of dropped.
+  const [pendingLiveCount, setPendingLiveCount] = useState(0);
 
   // Server-side filter state (derived from TrafficFilters in handleFilterChange below).
   // - serverType/serverMethod: derived from the tri-state method picks (unchanged).
@@ -221,6 +224,8 @@ export function Traffic() {
         setEntries(data || []);
         setTotal(Array.isArray(data) ? data.length : 0);
       }
+      // A fresh page-0 load already includes anything the banner was buffering.
+      if (page === 0) setPendingLiveCount(0);
     } catch {
       // ignore
     } finally {
@@ -257,11 +262,20 @@ export function Traffic() {
         durationMs: e.durationMs ?? null,
         timings: e.timings ?? null,
       };
-      if (page === 0 && activeTab === 'live') {
+      if (activeTab !== 'live') return;
+      // Prepend live only when the current view IS the live head: page 0 in the
+      // default newest-first order with no active search. In any other view
+      // (paged away, custom sort, or searching) the entry doesn't belong at the
+      // top, so buffer it and let the banner offer a one-click jump back.
+      const defaultLiveOrder = sortBy === 'capturedAt' && sortDir === 'desc' && !serverSearch;
+      if (page === 0 && defaultLiveOrder) {
         setEntries(prev => {
           if (prev.some(p => p.id === entry.id)) return prev;
           return [entry, ...prev];
         });
+        setTotal(prev => prev + 1);
+      } else {
+        setPendingLiveCount(c => c + 1);
         setTotal(prev => prev + 1);
       }
     });
@@ -287,7 +301,7 @@ export function Traffic() {
     });
 
     return () => { unsubEntry(); unsubFrame(); unsubClosed(); };
-  }, [ws, page, activeTab]);
+  }, [ws, page, activeTab, sortBy, sortDir, serverSearch]);
 
   const handleFilterChange = useCallback((filters: TrafficFilters) => {
     // Derive server-side filters from the tri-state method picks. When exactly
@@ -359,6 +373,14 @@ export function Traffic() {
   const handleClear = useCallback(() => {
     setEntries([]);
     setTotal(0);
+    setSelectedId(null);
+  }, []);
+
+  const handleBackToLive = useCallback(() => {
+    setSortBy('capturedAt');
+    setSortDir('desc');
+    setPage(0);
+    setPendingLiveCount(0);
     setSelectedId(null);
   }, []);
 
@@ -460,6 +482,21 @@ export function Traffic() {
           <SavedTrafficTab />
         </div>
       ) : (
+        <>
+        {pendingLiveCount > 0 && (
+          <div className="traffic-live-banner" data-testid="traffic-live-banner">
+            <span>
+              {pendingLiveCount} new request{pendingLiveCount === 1 ? '' : 's'} captured while you were browsing.
+            </span>
+            <button
+              className="btn btn-sm btn-primary"
+              data-testid="traffic-back-to-live"
+              onClick={handleBackToLive}
+            >
+              Back to live
+            </button>
+          </div>
+        )}
         <TrafficTable
           entries={entries as TrafficEntry[]}
           loading={loading}
@@ -488,6 +525,7 @@ export function Traffic() {
           sortBy={sortBy}
           sortDir={sortDir}
         />
+        </>
       )}
     </div>
   );

@@ -8,6 +8,7 @@
  */
 
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { Filter, X, ChevronUp, ChevronDown, SlidersHorizontal, Search, Save } from 'lucide-react';
 import { TrafficDetailPanel } from './TrafficDetailPanel';
 import { parseHostname, useTrafficReplay } from './TrafficEntryRow';
@@ -397,6 +398,27 @@ export function TrafficTable({
     return result;
   }, [entries, filters, clientSideFilter, hiddenHostnames]);
 
+  // Virtualize the row list so DOM cost is bounded by the viewport, not the row
+  // count. Below the threshold we render every row (no measurement flicker on
+  // small lists, and the common 50-row page stays visually identical).
+  const VIRTUALIZE_THRESHOLD = 50;
+  const virtualizeOn = displayEntries.length > VIRTUALIZE_THRESHOLD;
+  // Rows are uniform single-line height, so one fixed size drives the whole
+  // list. Measure the first rendered row once (exact height incl. font/zoom)
+  // and fall back to 39px (td padding 10px*2 + ~18px line) before first paint.
+  const [rowHeight, setRowHeight] = useState(39);
+  const measureRowRef = useCallback((el: HTMLTableRowElement | null) => {
+    if (!el) return;
+    const h = el.getBoundingClientRect().height;
+    if (h > 0) setRowHeight(prev => (Math.abs(prev - h) > 0.5 ? h : prev));
+  }, []);
+  const rowVirtualizer = useVirtualizer({
+    count: virtualizeOn ? displayEntries.length : 0,
+    getScrollElement: () => tableWrapRef.current,
+    estimateSize: () => rowHeight,
+    overscan: 12,
+  });
+
   const selectedEntry = selectedId != null
     ? displayEntries.find(e => e.id === selectedId) ?? entries.find(e => e.id === selectedId)
     : null;
@@ -415,11 +437,15 @@ export function TrafficTable({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [displayEntries]);
 
-  // Auto-scroll to bottom when new entries arrive (live mode)
+  // Auto-scroll to the newest row (bottom) when entries arrive in live mode.
   useEffect(() => {
-    if (!liveMode || !autoScroll || !tableWrapRef.current) return;
-    tableWrapRef.current.scrollTop = tableWrapRef.current.scrollHeight;
-  }, [displayEntries, autoScroll, liveMode]);
+    if (!liveMode || !autoScroll || displayEntries.length === 0) return;
+    if (virtualizeOn) {
+      rowVirtualizer.scrollToIndex(displayEntries.length - 1, { align: 'end' });
+    } else if (tableWrapRef.current) {
+      tableWrapRef.current.scrollTop = tableWrapRef.current.scrollHeight;
+    }
+  }, [displayEntries, autoScroll, liveMode, virtualizeOn, rowVirtualizer]);
 
   // Active-filter chips — one per active filter dimension, mirroring the
   // hidden-hostname chip pattern. Lets the user see and clear filters
@@ -458,6 +484,90 @@ export function TrafficTable({
     }
     return chips;
   }, [filters, toggleMethodInclude, toggleMethodExclude, toggleStatusGroup, removeExactStatus, toggleContentType, updateFilters]);
+
+  // One data row. `measureRef` is attached to the first virtualized row so the
+  // uniform row height can be read once; the fast path omits it.
+  const renderRow = (
+    entry: TrafficEntry,
+    measureRef?: (el: HTMLTableRowElement | null) => void,
+  ) => {
+    const methodLabel = getMethodLabel(entry);
+    const badge = METHOD_BADGE_COLORS[methodLabel]
+      ?? METHOD_BADGE_COLORS[entry.requestMethod]
+      ?? { bg: 'rgba(139,149,176,0.1)', color: '#8b95b0' };
+    const hostname = parseHostname(entry.requestUrl);
+    const path = (() => {
+      try {
+        const u = new URL(entry.requestUrl);
+        return u.pathname + u.search;
+      } catch {
+        return entry.requestUrl;
+      }
+    })();
+    const isSelected = selectedId === entry.id;
+    const isWs = entry.type === 'websocket';
+    const contentType = getContentType(entry);
+    const size = getResponseSize(entry.responseBody);
+    const time = (() => {
+      try {
+        return new Date(entry.capturedAt).toLocaleTimeString('en-US', { hour12: false });
+      } catch {
+        return '';
+      }
+    })();
+
+    return (
+      <tr
+        key={entry.id}
+        ref={measureRef}
+        className={isSelected ? 'selected' : ''}
+        onClick={() => handleSelect(entry.id)}
+        data-testid={`traffic-row-${entry.id}`}
+      >
+        <td>
+          <span
+            className="traffic-method-badge"
+            style={{ background: badge.bg, color: badge.color }}
+          >
+            {methodLabel}
+          </span>
+        </td>
+        <td className="traffic-cell-path">
+          <span className="traffic-hostname">{hostname}</span>
+          <span className="traffic-path">
+            {path.length > 80 ? path.slice(0, 80) + '…' : path}
+          </span>
+        </td>
+        <td>
+          <span
+            className="traffic-status"
+            style={{
+              color: getStatusColor(entry.responseStatus),
+              fontWeight: 700,
+            }}
+          >
+            {isWs
+              ? `${entry.wsMessageCount ?? 0}f`
+              : entry.pending
+                ? '…'
+                : entry.responseStatus === 0
+                  ? 'TLS'
+                  : (entry.responseStatus ?? '—')}
+          </span>
+        </td>
+        <td className="traffic-cell-type">{contentType}</td>
+        <td className="traffic-cell-size">{size}</td>
+        <td
+          className="traffic-cell-duration"
+          style={{ textAlign: 'right', color: getDurationColor(entry.durationMs) }}
+          data-testid={`traffic-duration-${entry.id}`}
+        >
+          {isWs ? '—' : formatDuration(entry.durationMs)}
+        </td>
+        <td className="traffic-cell-time">{time}</td>
+      </tr>
+    );
+  };
 
   return (
     <div className={`traffic-table-container${className ? ` ${className}` : ''}`}>
@@ -848,83 +958,25 @@ export function TrafficTable({
                   </tr>
                 </thead>
                 <tbody>
-                  {displayEntries.map(entry => {
-                    const methodLabel = getMethodLabel(entry);
-                    const badge = METHOD_BADGE_COLORS[methodLabel]
-                      ?? METHOD_BADGE_COLORS[entry.requestMethod]
-                      ?? { bg: 'rgba(139,149,176,0.1)', color: '#8b95b0' };
-                    const hostname = parseHostname(entry.requestUrl);
-                    const path = (() => {
-                      try {
-                        const u = new URL(entry.requestUrl);
-                        return u.pathname + u.search;
-                      } catch {
-                        return entry.requestUrl;
-                      }
-                    })();
-                    const isSelected = selectedId === entry.id;
-                    const isWs = entry.type === 'websocket';
-                    const contentType = getContentType(entry);
-                    const size = getResponseSize(entry.responseBody);
-                    const time = (() => {
-                      try {
-                        return new Date(entry.capturedAt).toLocaleTimeString('en-US', { hour12: false });
-                      } catch {
-                        return '';
-                      }
-                    })();
-
+                  {virtualizeOn ? (() => {
+                    const items = rowVirtualizer.getVirtualItems();
+                    const total = rowVirtualizer.getTotalSize();
+                    const padTop = items.length ? items[0].start : 0;
+                    const padBottom = items.length ? total - items[items.length - 1].end : 0;
                     return (
-                      <tr
-                        key={entry.id}
-                        className={isSelected ? 'selected' : ''}
-                        onClick={() => handleSelect(entry.id)}
-                        data-testid={`traffic-row-${entry.id}`}
-                      >
-                        <td>
-                          <span
-                            className="traffic-method-badge"
-                            style={{ background: badge.bg, color: badge.color }}
-                          >
-                            {methodLabel}
-                          </span>
-                        </td>
-                        <td className="traffic-cell-path">
-                          <span className="traffic-hostname">{hostname}</span>
-                          <span className="traffic-path">
-                            {path.length > 80 ? path.slice(0, 80) + '…' : path}
-                          </span>
-                        </td>
-                        <td>
-                          <span
-                            className="traffic-status"
-                            style={{
-                              color: getStatusColor(entry.responseStatus),
-                              fontWeight: 700,
-                            }}
-                          >
-                            {isWs
-                              ? `${entry.wsMessageCount ?? 0}f`
-                              : entry.pending
-                                ? '…'
-                                : entry.responseStatus === 0
-                                  ? 'TLS'
-                                  : (entry.responseStatus ?? '—')}
-                          </span>
-                        </td>
-                        <td className="traffic-cell-type">{contentType}</td>
-                        <td className="traffic-cell-size">{size}</td>
-                        <td
-                          className="traffic-cell-duration"
-                          style={{ textAlign: 'right', color: getDurationColor(entry.durationMs) }}
-                          data-testid={`traffic-duration-${entry.id}`}
-                        >
-                          {isWs ? '—' : formatDuration(entry.durationMs)}
-                        </td>
-                        <td className="traffic-cell-time">{time}</td>
-                      </tr>
+                      <>
+                        <tr data-testid="traffic-vspacer-top" aria-hidden="true">
+                          <td colSpan={7} style={{ height: padTop, padding: 0, border: 0 }} />
+                        </tr>
+                        {items.map((vi, i) => renderRow(displayEntries[vi.index], i === 0 ? measureRowRef : undefined))}
+                        <tr data-testid="traffic-vspacer-bottom" aria-hidden="true">
+                          <td colSpan={7} style={{ height: padBottom, padding: 0, border: 0 }} />
+                        </tr>
+                      </>
                     );
-                  })}
+                  })() : (
+                    displayEntries.map(entry => renderRow(entry))
+                  )}
                 </tbody>
               </table>
             </div>

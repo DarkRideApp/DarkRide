@@ -173,8 +173,9 @@ Headline items:
   Repeater drawer with original-vs-new response diff, sent through the capture session's egress + a
   replicated TLS profile (uniform across physical devices and emulators). Byte-exact emulator routing
   and on-device Frida replay are deferred fidelity upgrades.
-- **P1** — deep filter/search *(in progress)*, host/path tree view, unify the five nav surfaces into
-  one workspace, virtualize the list + fix live-append past page 0.
+- **P1** — deep filter/search *(landed)*, virtualize the list + fix live-append past page 0 *(landed
+  on `feat/traffic-list-perf`: `@tanstack/react-virtual` in TrafficTable, inspector cap 500→5000,
+  jump-to-live banner)*, host/path tree view, unify the five nav surfaces into one workspace.
 - **P2** — raw wire view, in-body search + JSON tree + hex, auto-load-full-body, HTML render.
 - **P3** — honest "Clear", visible blocklist, UI "save request", TLS-profile discoverability, column customization.
 

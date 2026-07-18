@@ -10,6 +10,21 @@ vi.mock('react-router-dom', () => ({
   useNavigate: () => vi.fn(),
 }));
 
+// Wrap the real virtualizer so windowing behaves normally but scrollToIndex
+// calls are recorded (jsdom has no layout, so scrolling is a no-op anyway).
+const { scrollToIndexCalls } = vi.hoisted(() => ({ scrollToIndexCalls: [] as any[][] }));
+vi.mock('@tanstack/react-virtual', async (importOriginal) => {
+  const actual: any = await importOriginal();
+  return {
+    ...actual,
+    useVirtualizer: (opts: any) => {
+      const v = actual.useVirtualizer(opts);
+      v.scrollToIndex = (...args: any[]) => { scrollToIndexCalls.push(args); };
+      return v;
+    },
+  };
+});
+
 const makeEntry = (overrides: Partial<TrafficEntry> = {}): TrafficEntry => ({
   id: 1,
   sessionId: null,
@@ -342,5 +357,60 @@ describe('TrafficTable — Duration column', () => {
     const header = screen.getByTestId('traffic-header-duration');
     fireEvent.click(header);
     expect(onSortChange).toHaveBeenCalledWith('durationMs', 'desc');
+  });
+});
+
+describe('TrafficTable — virtualization', () => {
+  const makeN = (n: number): TrafficEntry[] =>
+    Array.from({ length: n }, (_, i) => makeEntry({ id: i + 1, requestUrl: `https://h.example/${i}` }));
+
+  // jsdom has no layout: give the scroll container a real viewport height and
+  // rows a fixed height so the virtualizer computes a bounded window.
+  let rectSpy: ReturnType<typeof vi.spyOn>;
+  let realRO: typeof ResizeObserver;
+  beforeEach(() => {
+    realRO = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      cb: ResizeObserverCallback;
+      constructor(cb: ResizeObserverCallback) { this.cb = cb; }
+      observe(el: Element) {
+        const r = el.getBoundingClientRect();
+        this.cb([{ target: el, contentRect: r, borderBoxSize: [{ inlineSize: r.width, blockSize: r.height }] }] as any, this as any);
+      }
+      unobserve() {} disconnect() {}
+    } as any;
+    rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const h = this.classList?.contains('traffic-table-wrap') ? 800 : 39;
+      return { height: h, width: 600, top: 0, left: 0, right: 600, bottom: h, x: 0, y: 0, toJSON: () => {} } as DOMRect;
+    });
+  });
+  afterEach(() => {
+    rectSpy.mockRestore();
+    globalThis.ResizeObserver = realRO;
+  });
+
+  it('renders far fewer row nodes than entries when the list is large', () => {
+    render(<TrafficTable entries={makeN(2000)} />);
+    const rows = screen.getAllByTestId(/^traffic-row-\d+$/);
+    expect(rows.length).toBeLessThan(200);
+    expect(rows.length).toBeGreaterThan(0);
+    expect(screen.getByTestId('traffic-vspacer-top')).toBeInTheDocument();
+    expect(screen.getByTestId('traffic-vspacer-bottom')).toBeInTheDocument();
+  });
+
+  it('renders all rows and no spacers for small lists (fast path)', () => {
+    render(<TrafficTable entries={makeN(20)} />);
+    expect(screen.getAllByTestId(/^traffic-row-\d+$/).length).toBe(20);
+    expect(screen.queryByTestId('traffic-vspacer-top')).not.toBeInTheDocument();
+  });
+
+  it('calls scrollToIndex(last) when a live entry arrives', () => {
+    scrollToIndexCalls.length = 0;
+    const entries = makeN(80);
+    const { rerender } = render(<TrafficTable entries={entries} liveMode={true} />);
+    rerender(<TrafficTable entries={[...entries, makeEntry({ id: 999 })]} liveMode={true} />);
+    // last call targets the final index (80 = length 81 - 1)
+    const last = scrollToIndexCalls[scrollToIndexCalls.length - 1];
+    expect(last[0]).toBe(80);
   });
 });

@@ -61,6 +61,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@node-rs/argon2": "^2.0.2",
     "@octokit/rest": "^22.0.1",
+    "@tanstack/react-virtual": "^3.14.6",
     "@types/dockerode": "^4.0.1",
     "@u4/minicap-prebuilt": "^1.1.2",
     "@xterm/addon-fit": "^0.11.0",

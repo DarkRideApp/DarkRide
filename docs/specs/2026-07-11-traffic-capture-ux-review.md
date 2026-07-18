@@ -81,9 +81,16 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
 - `[ ]` **Unify the surface.** Fold the per-device Capture live view, the global Traffic page, and
   Intercept into one workspace with a device/scope selector, so replay and interception happen
   without page hops. Five nav entries for one workflow is the root of most friction.
-- `[ ]` **Virtualize the list; raise/soften the 500-row cap** (`TrafficInspector.tsx:9` `MAX_ENTRIES`).
+- `[x]` **Virtualize the list; raise/soften the 500-row cap** (`TrafficInspector.tsx:9` `MAX_ENTRIES`).
   Also fix that the global page stops appending live entries when not on page 0
   (`Traffic.tsx:249`) — under heavy capture you lose the live feed by paging.
+  *(Landed on `feat/traffic-list-perf`: `@tanstack/react-virtual` spacer-row
+  virtualization in `TrafficTable` (uniform row height measured once; DOM rows
+  bounded to the viewport; lists ≤50 keep the plain path); inspector cap
+  500→5000; and a jump-to-live banner on the global page — live entries
+  captured while paged away / in a custom sort / during a search are buffered
+  and one-click recoverable instead of silently dropped. Gate: TrafficTable +
+  TrafficInspector + Traffic tests; E2E: `tests/e2e/traffic-list-perf.spec.ts`.)*
 
 ### P2 — detail-panel depth for RE
 
