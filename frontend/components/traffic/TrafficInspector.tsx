@@ -149,6 +149,10 @@ export function TrafficInspector({ deviceId, sessionId, mode = 'live' }: Traffic
     ws.sendRestApi('POST', '/v1/blocklist/add', { domain: hostname }).catch(() => {});
   }, [ws]);
 
+  const handleSave = useCallback((entry: TrafficEntry) => {
+    ws.sendRestApi('POST', '/v1/traffic/saved', { id: entry.id }).catch(() => {});
+  }, [ws]);
+
   const emptyMsg = mode === 'static' && staticLoading
     ? 'Loading traffic…'
     : mode === 'static' && entries.length === 0
@@ -165,6 +169,7 @@ export function TrafficInspector({ deviceId, sessionId, mode = 'live' }: Traffic
       loading={mode === 'static' && staticLoading}
       emptyMessage={emptyMsg}
       onReplay={handleReplay}
+      onSave={handleSave}
       wsFrames={wsFrames}
       onLoadWsFrames={handleLoadWsFrames}
       onLoadFullBody={handleLoadFullBody}

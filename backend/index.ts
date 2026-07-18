@@ -403,7 +403,7 @@ registerCredentialsEndpoints(db);
 registerAiCompleteEndpoints(db);
 registerAiChatApiEndpoints(db, getClaudeCliProvider);
 registerUtilsEndpoints(DATABASE_PATH, db);
-registerSavedTrafficEndpoints(savedTrafficStore);
+registerSavedTrafficEndpoints(savedTrafficStore, db);
 registerApiCatalogueEndpoints(db);
 registerChangelogEndpoints();
 refreshPatternCache(db);

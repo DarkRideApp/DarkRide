@@ -1,5 +1,5 @@
 import React from 'react';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { pluginRegistry, __resetPluginRegistry } from '@darkrideapp/plugin-sdk/react';
 import type { ProtocolDecoder, DecodedMessage } from '@darkrideapp/plugin-sdk/react';
@@ -138,5 +138,21 @@ describe('TrafficDetailPanel — WebSocket protocol decoding', () => {
 
     expect(screen.queryByText('Fake Protocol (test)')).not.toBeInTheDocument();
     expect(await screen.findByText(/RAWBASE64PAYLOADFRAMEONE/)).toBeInTheDocument();
+  });
+});
+
+describe('TrafficDetailPanel — Save action', () => {
+  const httpEntry: TrafficEntry = {
+    id: 7, sessionId: null, deviceId: null, requestMethod: 'GET',
+    requestUrl: 'https://api.test/x', requestHeaders: null, requestBody: null,
+    responseStatus: 200, responseHeaders: null, responseBody: '{"ok":true}',
+    type: 'http', capturedAt: '2026-07-16T00:00:00Z',
+  };
+
+  it('calls onSave with the entry when Save is clicked', () => {
+    const onSave = vi.fn();
+    render(<TrafficDetailPanel entry={httpEntry} onClose={() => {}} onSave={onSave} />);
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ id: 7 }));
   });
 });

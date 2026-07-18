@@ -5,7 +5,8 @@ import { SkeletonTable } from '@darkrideapp/plugin-sdk/react';
 import { TrafficTable } from '../components/traffic/TrafficTable';
 import { ReplayDrawer } from '../components/traffic/ReplayDrawer';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
-import { Trash2, Repeat } from 'lucide-react';
+import { Trash2, Repeat, ShieldBan } from 'lucide-react';
+import { BlocklistPanel } from '../components/traffic/BlocklistPanel';
 import { ConfirmDialog } from '@darkrideapp/plugin-sdk/react';
 import type { CapturedTrafficEntry, WebSocketMessageEntry } from '../../shared/types/api';
 import type { TrafficEntry } from '../components/traffic/TrafficEntryRow';
@@ -180,6 +181,7 @@ export function Traffic() {
   // Count of live entries captured while the user is paged away or in a
   // non-live order — surfaced by the jump-to-live banner instead of dropped.
   const [pendingLiveCount, setPendingLiveCount] = useState(0);
+  const [showBlocklist, setShowBlocklist] = useState(false);
 
   // Server-side filter state (derived from TrafficFilters in handleFilterChange below).
   // - serverType/serverMethod: derived from the tri-state method picks (unchanged).
@@ -370,6 +372,10 @@ export function Traffic() {
     ws.sendRestApi('POST', '/v1/blocklist/add', { domain: hostname }).catch(() => {});
   }, [ws]);
 
+  const handleSave = useCallback((entry: TrafficEntry) => {
+    ws.sendRestApi('POST', '/v1/traffic/saved', { id: entry.id }).catch(() => {});
+  }, [ws]);
+
   const handleClear = useCallback(() => {
     setEntries([]);
     setTotal(0);
@@ -425,7 +431,7 @@ export function Traffic() {
                     profile. */}
                 <span
                   data-testid="traffic-tls-pill"
-                  title="Each device can pose as Chrome 120 Android, OkHttp, or stock — set the profile on its Capture tab."
+                  title="Each device can pose as Chrome 120 Android, OkHttp, or stock. Set the profile on that device's Capture tab."
                   style={{
                     marginLeft: 12,
                     fontSize: 11,
@@ -439,7 +445,7 @@ export function Traffic() {
                     whiteSpace: 'nowrap',
                   }}
                 >
-                  TLS fingerprint spoofing
+                  TLS spoofing · per device
                 </span>
               </>
             )}
@@ -461,9 +467,26 @@ export function Traffic() {
         </div>
         <div className="traffic-subheader-actions">
           <InterceptArmControl />
-          <button className="traffic-action-btn" onClick={handleClear}>
+          <div style={{ position: 'relative' }}>
+            <button
+              className="traffic-action-btn"
+              data-testid="traffic-blocked-btn"
+              onClick={() => setShowBlocklist(v => !v)}
+            >
+              <ShieldBan size={14} />
+              Blocked
+            </button>
+            {showBlocklist && (
+              <BlocklistPanel ws={ws} onClose={() => setShowBlocklist(false)} />
+            )}
+          </div>
+          <button
+            className="traffic-action-btn"
+            onClick={handleClear}
+            title="Clears the current view only. Captured traffic stays in the database."
+          >
             <Trash2 size={14} />
-            Clear
+            Clear view
           </button>
           {selectedEntry && (
             <button
@@ -506,6 +529,7 @@ export function Traffic() {
           onLoadWsFrames={handleLoadWsFrames}
           onBlockHostname={handleBlockHostname}
           onReplay={handleReplay}
+          onSave={handleSave}
           wsFrames={wsFrames}
           selectedId={selectedId}
           onSelectEntry={setSelectedId}

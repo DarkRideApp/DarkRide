@@ -8029,3 +8029,89 @@ body.live-log-open .ai-chat-fab {
   border-bottom: 1px solid color-mix(in srgb, var(--accent, #4a9eff) 30%, transparent);
   font-size: 13px;
 }
+
+/* Blocklist popover: lists blocked hostnames with inline unblock, opened from
+   the Traffic subheader. Closes the "Block hostname is one-way" gap. */
+.blocklist-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 50;
+  min-width: 260px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--bg-secondary, #1e1e2e);
+  border: 1px solid var(--border-color, #333);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 8px;
+}
+.blocklist-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary, #aaa);
+  padding: 2px 4px 8px;
+}
+.blocklist-empty {
+  font-size: 12px;
+  color: var(--text-muted, #888);
+  padding: 8px 4px;
+}
+.blocklist-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.blocklist-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.blocklist-domain {
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-primary, #eee);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Column show/hide menu in the traffic filter bar. */
+.traffic-columns-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 50;
+  min-width: 160px;
+  background: var(--bg-secondary, #1e1e2e);
+  border: 1px solid var(--border-color, #333);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.traffic-columns-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-primary, #eee);
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.traffic-columns-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.traffic-columns-item input:disabled {
+  cursor: not-allowed;
+}
