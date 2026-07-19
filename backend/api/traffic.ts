@@ -500,6 +500,63 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
     });
   }, { requires: ['core.traffic:read'] });
 
+  // GET /v1/traffic/tree — host/path navigator for the Traffic page.
+  //  - no hostname param: distinct hostnames + request counts (SQL GROUP BY on
+  //    the indexed hostname column, covers the whole DB not just a page).
+  //  - ?hostname=<h>: paths under that host with counts + newest id, derived in
+  //    JS from up to PATH_ROW_CAP rows (paths aren't stored decomposed).
+  registerEndpoint('GET', '/v1/traffic/tree', (req, res) => {
+    const hostname = req.query.hostname as string | undefined;
+    const sessionIdRaw = req.query.sessionId as string | undefined;
+    const sessionId = sessionIdRaw !== undefined ? parseInt(sessionIdRaw, 10) : undefined;
+    const sessionCond = sessionId !== undefined && !isNaN(sessionId)
+      ? eq(capturedTraffic.sessionId, sessionId)
+      : undefined;
+
+    if (hostname === undefined) {
+      // Hosts mode. COALESCE null/'' hostnames into a single '(unknown)' bucket.
+      const bucket = sql<string>`COALESCE(NULLIF(${capturedTraffic.hostname}, ''), '(unknown)')`;
+      const rows = db
+        .select({ hostname: bucket, count: sql<number>`COUNT(*)` })
+        .from(capturedTraffic)
+        .where(sessionCond)
+        .groupBy(bucket)
+        .orderBy(desc(sql`COUNT(*)`))
+        .all();
+      res.json({ success: true, data: { hosts: rows.map(r => ({ hostname: r.hostname, count: Number(r.count) })) } });
+      return;
+    }
+
+    // Paths mode.
+    const PATH_ROW_CAP = 2000;
+    const hostCond = hostname === '(unknown)'
+      ? sql`(${capturedTraffic.hostname} IS NULL OR ${capturedTraffic.hostname} = '')`
+      : eq(capturedTraffic.hostname, hostname);
+    const rows = db
+      .select({ id: capturedTraffic.id, requestUrl: capturedTraffic.requestUrl })
+      .from(capturedTraffic)
+      .where(sessionCond ? and(hostCond, sessionCond) : hostCond)
+      .orderBy(desc(capturedTraffic.capturedAt))
+      .limit(PATH_ROW_CAP + 1)
+      .all();
+    const truncated = rows.length > PATH_ROW_CAP;
+    const consider = truncated ? rows.slice(0, PATH_ROW_CAP) : rows;
+    const byPath = new Map<string, { path: string; count: number; latestId: number }>();
+    for (const r of consider) {
+      let path: string;
+      try { path = new URL(r.requestUrl).pathname || '/'; } catch { path = r.requestUrl; }
+      const existing = byPath.get(path);
+      if (existing) {
+        existing.count++;
+        if (r.id > existing.latestId) existing.latestId = r.id;
+      } else {
+        byPath.set(path, { path, count: 1, latestId: r.id });
+      }
+    }
+    const paths = [...byPath.values()].sort((a, b) => b.count - a.count);
+    res.json({ success: true, data: { paths, truncated } });
+  }, { requires: ['core.traffic:read'] });
+
   // GET /v1/traffic/view/:id — full request/response detail
   registerEndpoint('GET', '/v1/traffic/view/:id', (req, res) => {
     const id = parseInt(req.params.id, 10);
