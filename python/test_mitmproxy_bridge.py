@@ -1448,6 +1448,32 @@ class TestInterceptHold:
         assert addon._hold_matches(self._make_flow(method="POST"), "request") is True
         assert addon._hold_matches(self._make_flow(method="GET"), "request") is False
 
+    def test_rules_match_any(self):
+        addon = self._make_addon()
+        addon._hold_config = {
+            "enabled": True, "phases": ["request"],
+            "rules": [
+                {"hostname": "*.stripe.com"},
+                {"hostname": "api.foo.com", "method": "POST"},
+            ],
+        }
+        assert addon._hold_matches(self._make_flow(host="js.stripe.com", pretty_host="js.stripe.com"), "request") is True
+        assert addon._hold_matches(self._make_flow(host="api.foo.com", pretty_host="api.foo.com", method="POST"), "request") is True
+        # host matches rule 2 but method doesn't; no other rule matches
+        assert addon._hold_matches(self._make_flow(host="api.foo.com", pretty_host="api.foo.com", method="GET"), "request") is False
+        assert addon._hold_matches(self._make_flow(host="other.com", pretty_host="other.com"), "request") is False
+
+    def test_rule_requires_all_fields(self):
+        addon = self._make_addon()
+        addon._hold_config = {"enabled": True, "phases": ["request"], "rules": [{"hostname": "a.com", "path": "/v1/*"}]}
+        assert addon._hold_matches(self._make_flow(host="a.com", pretty_host="a.com", path="/v1/x"), "request") is True
+        assert addon._hold_matches(self._make_flow(host="a.com", pretty_host="a.com", path="/v2/x"), "request") is False
+
+    def test_empty_rules_list_matches_all(self):
+        addon = self._make_addon()
+        addon._hold_config = {"enabled": True, "phases": ["request"], "rules": []}
+        assert addon._hold_matches(self._make_flow(), "request") is True
+
     # ---- _post_to_hold (fail-open) ----
 
     @patch("mitmproxy_bridge.ctx")

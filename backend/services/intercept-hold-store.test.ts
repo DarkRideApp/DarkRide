@@ -161,5 +161,33 @@ describe('intercept-hold-store', () => {
       expect(holdMatches(makeFlow({ method: 'POST' }), 'request')).toBe(true);
       expect(holdMatches(makeFlow({ method: 'GET' }), 'request')).toBe(false);
     });
+
+    it('matches when a flow satisfies ANY rule in the list', () => {
+      setArmed({ enabled: true, rules: [
+        { hostname: '*.stripe.com' },
+        { hostname: 'api.foo.com', method: 'POST' },
+      ] });
+      expect(holdMatches(makeFlow({ url: 'https://js.stripe.com/x' }), 'request')).toBe(true);
+      expect(holdMatches(makeFlow({ url: 'https://api.foo.com/x', method: 'POST' }), 'request')).toBe(true);
+      // matches host but not method of the second rule, and not the first rule at all
+      expect(holdMatches(makeFlow({ url: 'https://api.foo.com/x', method: 'GET' }), 'request')).toBe(false);
+      expect(holdMatches(makeFlow({ url: 'https://other.com/x' }), 'request')).toBe(false);
+    });
+
+    it('requires ALL set fields within a single rule (AND)', () => {
+      setArmed({ enabled: true, rules: [{ hostname: 'a.com', path: '/v1/*' }] });
+      expect(holdMatches(makeFlow({ url: 'https://a.com/v1/x' }), 'request')).toBe(true);
+      expect(holdMatches(makeFlow({ url: 'https://a.com/v2/x' }), 'request')).toBe(false);
+    });
+
+    it('treats an empty rules list as match-all', () => {
+      setArmed({ enabled: true, rules: [] });
+      expect(holdMatches(makeFlow(), 'request')).toBe(true);
+    });
+
+    it('drops rules that have no fields set on normalize', () => {
+      const cfg = setArmed({ enabled: true, rules: [{ hostname: 'a.com' }, {}, { path: null, method: '' }] });
+      expect(cfg.rules).toEqual([{ hostname: 'a.com', path: null, method: null }]);
+    });
   });
 });

@@ -12,7 +12,7 @@
  * stop the store is cleared and every pending flow is failed open to `forward`.
  */
 
-import type { HeldFlow, InterceptArmedConfig } from '../../shared/types/websocket';
+import type { HeldFlow, InterceptArmedConfig, InterceptMatchRule } from '../../shared/types/websocket';
 
 export type Phase = 'request' | 'response';
 
@@ -134,12 +134,39 @@ export function setArmed(config: Partial<InterceptArmedConfig>): InterceptArmedC
     : [];
   armed = {
     enabled: !!config.enabled,
+    rules: config.rules !== undefined ? normalizeRules(config.rules) : undefined,
     matchHostname: config.matchHostname ?? null,
     matchPath: config.matchPath ?? null,
     matchMethod: config.matchMethod ?? null,
     phases: filtered.length > 0 ? filtered : bothPhases,
   };
   return armed;
+}
+
+/** Keep only rules with at least one field set; blank/absent fields become null. */
+function normalizeRules(rules: InterceptArmedConfig['rules']): InterceptMatchRule[] {
+  if (!Array.isArray(rules)) return [];
+  return rules
+    .map(r => ({
+      hostname: (r.hostname ?? '').trim() || null,
+      path: (r.path ?? '').trim() || null,
+      method: (r.method ?? '').trim() || null,
+    }))
+    .filter(r => r.hostname || r.path || r.method);
+}
+
+/** Does a single flow satisfy one rule (all set fields must match)? */
+function ruleMatches(rule: InterceptMatchRule, hostname: string, pathname: string, method: string): boolean {
+  if (rule.hostname) {
+    if (!hostname || !globToRegExp(rule.hostname).test(hostname)) return false;
+  }
+  if (rule.path) {
+    if (!pathname || !globToRegExp(rule.path).test(pathname)) return false;
+  }
+  if (rule.method) {
+    if ((method || '').toUpperCase() !== rule.method.toUpperCase()) return false;
+  }
+  return true;
 }
 
 /** Convert a simple glob (`*` wildcard) to a full-match regex. */
@@ -166,6 +193,14 @@ export function holdMatches(flow: HeldFlow, phase: Phase): boolean {
     pathname = u.pathname;
   } catch {
     // Non-URL (e.g. WireGuard IP-only) — hostname/path filters can't apply.
+  }
+
+  // Rules take precedence: a flow is held when it matches ANY rule. An empty
+  // rule list means match-all. Fall back to the legacy single-match fields only
+  // when no `rules` array was supplied.
+  if (Array.isArray(armed.rules)) {
+    if (armed.rules.length === 0) return true;
+    return armed.rules.some(r => ruleMatches(r, hostname, pathname, flow.method || ''));
   }
 
   if (armed.matchHostname) {
