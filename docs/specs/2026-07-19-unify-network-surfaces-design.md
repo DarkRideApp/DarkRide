@@ -100,6 +100,33 @@ scope selector the whole thing hinges on.
    selector's shape.)
 4. **Phase 1 scope:** ship just the shell + scope bar + Traffic pane first, and iterate — yes?
 
-## Not started
+## DECIDED (Cube, 2026-07-19)
 
-No code. Awaiting the decision above. Phase 1 gets its own plan once you pick a direction.
+1. **Option A.**
+2. **New route `/ui/network`.** Old routes redirect in.
+3. **Capture session is a first-class scope.** Users capture a specific session, then share it with
+   another dev, export it (HAR/ZIP), or hand it to an AI agent to research one app. So the scope bar
+   must let you pick a session and act on it (export HAR/ZIP via the existing
+   `/v1/automation/session/:id/export/{har,zip}`, plus a copyable deep link
+   `/ui/network?scope=session:<id>` for sharing).
+4. **Delivery: one full PR showing the whole framework/layout**, reviewable in one go — not drip-fed
+   phases. Reuse existing surface components as panes; deeper per-pane polish is follow-up.
+
+### Build scope for the single PR
+
+- `/ui/network` → `NetworkWorkspace` shell with a `NetworkScopeContext`
+  (`{ kind: 'all' | 'device' | 'session', deviceId?, sessionId? }`, URL-synced via `?scope=`).
+- **ScopeBar**: All devices / device (from `/v1/device/list`) / session (capture sessions from
+  `/v1/automation/sessions`). When a session is picked: Export HAR, Export ZIP, and Copy share link.
+- **Panes** (tabs, `?pane=`): Traffic (scoped; reuse today's Traffic table+tree), Intercept
+  (`InterceptHoldPanel`+`ArmControl` promoted to a pane), Repeater (reuse `RequestBuilder` +
+  proxied-requests), Catalogue (reuse `ApiCatalogue`, scoped where cheap).
+- **Traffic** made scope-aware: optional `scopeDeviceId`/`scopeSessionId` props (default null = all)
+  threaded into the `/list` + `/tree` calls.
+- **Nav**: collapse the four Network entries to one "Network" → `/ui/network`. `/ui/traffic`,
+  `/ui/proxied-requests`, `/ui/request-builder`, `/ui/api-catalogue` redirect to the workspace at the
+  matching pane. Per-device Capture tab gets an "Open in Network" link scoped to its session.
+- Tests: scope context + URL sync, ScopeBar (device/session select + export actions), pane switching,
+  redirects; E2E driving the workspace (switch scope, switch panes, export appears for a session).
+
+Plan: `docs/specs/2026-07-19-unify-network-surfaces-plan.md`.
