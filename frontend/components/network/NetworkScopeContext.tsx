@@ -11,7 +11,9 @@ export function parseScopeParam(raw: string | null): NetworkScope {
   if (!raw || raw === 'all') return { kind: 'all' };
   const [kind, ...rest] = raw.split(':');
   const value = rest.join(':');
-  if (kind === 'device' && value) return { kind: 'device', deviceId: value };
+  // Allow an empty deviceId ("device:") so selecting the Device scope before a
+  // device is chosen still renders the picker instead of snapping back to All.
+  if (kind === 'device') return { kind: 'device', deviceId: value };
   if (kind === 'session') {
     const n = parseInt(value, 10);
     if (!isNaN(n)) return { kind: 'session', sessionId: n };
