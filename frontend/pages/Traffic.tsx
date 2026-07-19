@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import { SkeletonTable } from '@darkrideapp/plugin-sdk/react';
+import { interceptHost } from '../components/intercept/interceptArm';
 import { TrafficTable } from '../components/traffic/TrafficTable';
 import { ReplayDrawer } from '../components/traffic/ReplayDrawer';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
@@ -389,6 +390,10 @@ export function Traffic() {
     ws.sendRestApi('POST', '/v1/blocklist/add', { domain: hostname }).catch(() => {});
   }, [ws]);
 
+  const handleInterceptHost = useCallback((hostname: string) => {
+    interceptHost(ws, hostname).catch(() => {});
+  }, [ws]);
+
   const handleSave = useCallback((entry: TrafficEntry) => {
     ws.sendRestApi('POST', '/v1/traffic/saved', { id: entry.id }).catch(() => {});
   }, [ws]);
@@ -578,6 +583,7 @@ export function Traffic() {
           onLoadFullBody={handleLoadFullBody}
           onLoadWsFrames={handleLoadWsFrames}
           onBlockHostname={handleBlockHostname}
+          onInterceptHost={handleInterceptHost}
           onReplay={handleReplay}
           onSave={handleSave}
           wsFrames={wsFrames}

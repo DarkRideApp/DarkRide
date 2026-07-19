@@ -160,15 +160,19 @@ describe('InterceptHoldPanel', () => {
 describe('InterceptArmControl', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('reflects the armed state and toggles it', async () => {
+  it('opens the scope editor and arms with the entered rule', async () => {
     const { ws } = makeWs({ armed: false });
     const { getByTestId } = renderWith(ws, <InterceptArmControl />);
     await waitFor(() => expect(getByTestId('intercept-arm-toggle').textContent).toContain('Off'));
+    // Clicking the control opens the rules editor (no accidental firehose arm).
     fireEvent.click(getByTestId('intercept-arm-toggle'));
+    expect(getByTestId('intercept-scope-editor')).toBeTruthy();
+    fireEvent.change(getByTestId('intercept-rule-host-0'), { target: { value: '*.stripe.com' } });
+    fireEvent.click(getByTestId('intercept-arm-apply'));
     await waitFor(() =>
-      expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/intercept/armed', expect.objectContaining({ enabled: true })),
+      expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/intercept/armed',
+        expect.objectContaining({ enabled: true, rules: [{ hostname: '*.stripe.com', path: null, method: null }] })),
     );
-    expect(getByTestId('intercept-arm-toggle').textContent).toContain('On');
   });
 
   it('shows a held count badge that tracks held/resolved broadcasts', async () => {

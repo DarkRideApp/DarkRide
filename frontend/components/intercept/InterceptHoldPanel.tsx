@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import type { HeldFlow, InterceptArmedConfig } from '../../../shared/types/websocket';
+import { InterceptScopeEditor } from './InterceptScopeEditor';
+import { armedChipLabel, describeArmed } from './interceptArm';
 
 // Interactive intercept ("breakpoints"). Separate from the rule-based Intercept
 // feature under Automations > Intercept — this pauses a live flow in-flight so
@@ -26,15 +28,18 @@ function rowsToHeaders(rows: HeaderRow[]): Record<string, string> {
 // Additive to the existing subheader actions — touches nothing else.
 // ---------------------------------------------------------------------------
 
+const DEFAULT_ARMED: InterceptArmedConfig = { enabled: false, rules: [], phases: ['request', 'response'] };
+
 export function InterceptArmControl(): React.ReactElement {
   const ws = useWebSocket();
-  const [armed, setArmed] = useState(false);
+  const [config, setConfig] = useState<InterceptArmedConfig>(DEFAULT_ARMED);
   const [heldCount, setHeldCount] = useState(0);
+  const [editorOpen, setEditorOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     ws.sendRestApi('GET', '/v1/intercept/armed')
-      .then((res) => { if (!cancelled) setArmed(!!res.body?.data?.enabled); })
+      .then((res) => { if (!cancelled && res.body?.data) setConfig(res.body.data); })
       .catch(() => {});
     ws.sendRestApi('GET', '/v1/intercept/held')
       .then((res) => { if (!cancelled) setHeldCount((res.body?.data || []).length); })
@@ -44,33 +49,34 @@ export function InterceptArmControl(): React.ReactElement {
 
   useEffect(() => {
     const unsubArmed = ws.subscribe('intercept-armed-changed', (msg: { config: InterceptArmedConfig }) => {
-      setArmed(!!msg.config?.enabled);
+      if (msg.config) setConfig(msg.config);
     });
     const unsubHeld = ws.subscribe('intercept-held', () => setHeldCount((c) => c + 1));
     const unsubResolved = ws.subscribe('intercept-resolved', () => setHeldCount((c) => Math.max(0, c - 1)));
     return () => { unsubArmed(); unsubHeld(); unsubResolved(); };
   }, [ws]);
 
-  const toggle = useCallback(() => {
-    const next = !armed;
-    setArmed(next); // optimistic; the broadcast reconciles every UI
-    ws.sendRestApi('POST', '/v1/intercept/armed', { enabled: next, phases: ['request', 'response'] })
-      .catch(() => setArmed(!next));
-  }, [ws, armed]);
+  const armed = !!config.enabled;
+  const chip = armedChipLabel(config);
 
   return (
-    <button
-      className={`traffic-action-btn${armed ? ' intercept-arm-btn-active' : ''}`}
-      data-testid="intercept-arm-toggle"
-      onClick={toggle}
-      title={armed
-        ? 'Interactive intercept is armed — matching flows pause for a manual verdict. Click to disarm.'
-        : 'Arm interactive intercept — pause live requests/responses to inspect and edit them before they continue.'}
-    >
-      <span className={`intercept-arm-dot${armed ? ' intercept-arm-dot-on' : ''}`} />
-      {armed ? 'Intercept: On' : 'Intercept: Off'}
-      {heldCount > 0 && <span className="intercept-held-badge" data-testid="intercept-held-count">{heldCount}</span>}
-    </button>
+    <div className="intercept-arm-wrap" style={{ position: 'relative' }}>
+      <button
+        className={`traffic-action-btn${armed ? ' intercept-arm-btn-active' : ''}`}
+        data-testid="intercept-arm-toggle"
+        onClick={() => setEditorOpen((o) => !o)}
+        title={armed
+          ? `Interactive intercept is armed (${describeArmed(config)}). Click to change or disarm.`
+          : 'Set up interactive intercept — pause only the requests you care about, by host / path / method.'}
+      >
+        <span className={`intercept-arm-dot${armed ? ' intercept-arm-dot-on' : ''}`} />
+        {armed ? `Intercept: ${chip}` : 'Intercept: Off'}
+        {heldCount > 0 && <span className="intercept-held-badge" data-testid="intercept-held-count">{heldCount}</span>}
+      </button>
+      {editorOpen && (
+        <InterceptScopeEditor ws={ws} config={config} onClose={() => setEditorOpen(false)} />
+      )}
+    </div>
   );
 }
 

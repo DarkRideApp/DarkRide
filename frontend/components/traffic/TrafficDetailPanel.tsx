@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { Copy, X, Repeat, Save, Link, Terminal, Code, FileText, Download, EyeOff, ShieldBan, Image as ImageIcon } from 'lucide-react';
+import { Copy, X, Repeat, Save, Link, Terminal, Code, FileText, Download, EyeOff, ShieldBan, Crosshair, Image as ImageIcon } from 'lucide-react';
 import type { TrafficEntry } from './TrafficEntryRow';
 import { parseHostname } from './TrafficEntryRow';
 import { detectGraphQL, formatGraphQLQuery } from '../../../shared/lib/graphql-detect';
@@ -29,6 +29,7 @@ interface TrafficDetailPanelProps {
   wsFrames?: WebSocketMessageEntry[];
   onLoadWsFrames?: (id: number) => void;
   onBlockHostname?: (hostname: string) => void;
+  onInterceptHost?: (hostname: string) => void;
   onHideHostname?: (hostname: string) => void;
 }
 
@@ -233,6 +234,7 @@ export function TrafficDetailPanel({
   wsFrames,
   onLoadWsFrames,
   onBlockHostname,
+  onInterceptHost,
   onHideHostname,
 }: TrafficDetailPanelProps) {
   const isWs = entry.type === 'websocket';
@@ -365,6 +367,14 @@ export function TrafficDetailPanel({
             icon={<EyeOff size={12} />}
             label={`Hide ${hostname}`}
             onClick={() => onHideHostname(hostname)}
+          />
+        )}
+        {hostname && onInterceptHost && (
+          <ActionButton
+            icon={<Crosshair size={12} />}
+            label={`Intercept ${hostname}`}
+            copiedLabel="Intercepting"
+            onClick={() => onInterceptHost(hostname)}
           />
         )}
         {hostname && onBlockHostname && (

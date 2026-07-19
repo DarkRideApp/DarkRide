@@ -110,6 +110,8 @@ export interface TrafficTableProps {
 
   /** Called when user wants to block a hostname globally (API call). Only shown if provided. */
   onBlockHostname?: (hostname: string) => void;
+  /** Arm interactive intercept scoped to this hostname. */
+  onInterceptHost?: (hostname: string) => void;
 
   /** Called when user wants to hide a hostname from the current view (client-side). Only shown if provided. */
   onHideHostname?: (hostname: string) => void;
@@ -155,6 +157,7 @@ export function TrafficTable({
   selectedId: controlledSelectedId,
   onSelectEntry,
   onBlockHostname,
+  onInterceptHost,
   onHideHostname,
   liveMode = false,
   onClear,
@@ -1058,6 +1061,7 @@ export function TrafficTable({
                 wsFrames={wsFrames?.get(selectedEntry.id)}
                 onLoadWsFrames={onLoadWsFrames}
                 onBlockHostname={onBlockHostname ? handleBlockHostname : undefined}
+                onInterceptHost={onInterceptHost}
                 onHideHostname={handleHideHostname}
               />
             )}

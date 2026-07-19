@@ -1,49 +1,76 @@
 import { describe, it, expect, vi } from 'vitest';
-import { describeScope, scopeChipLabel, armIntercept, disarmIntercept } from './interceptArm';
+import { describeRule, describeArmed, armedChipLabel, armIntercept, disarmIntercept, interceptHost } from './interceptArm';
 
-describe('describeScope', () => {
-  it('describes an unscoped arm as pausing everything', () => {
-    expect(describeScope({ phases: ['request', 'response'] })).toMatch(/pause all requests & responses/i);
-  });
-
-  it('describes a host + method + request scope in plain English', () => {
-    expect(describeScope({ matchHostname: '*.stripe.com', matchMethod: 'post', phases: ['request'] }))
-      .toMatch(/pause POST requests to \*\.stripe\.com/i);
-  });
-
-  it('includes the path when set', () => {
-    expect(describeScope({ matchHostname: 'api.x.com', matchPath: '/v1/*', phases: ['request', 'response'] }))
-      .toContain('api.x.com/v1/*');
-  });
-
-  it('handles response-only phase wording', () => {
-    expect(describeScope({ matchHostname: 'a.com', phases: ['response'] })).toMatch(/responses to a\.com/i);
+describe('describeRule', () => {
+  it('renders a compact method + host + path target', () => {
+    expect(describeRule({ hostname: '*.stripe.com', method: 'post', path: '/v1/*' })).toBe('POST *.stripe.com/v1/*');
+    expect(describeRule({ hostname: 'a.com' })).toBe('a.com');
+    expect(describeRule({ method: 'get' })).toBe('GET');
+    expect(describeRule({})).toBe('anything');
   });
 });
 
-describe('scopeChipLabel', () => {
-  it('returns null when disarmed or unscoped', () => {
-    expect(scopeChipLabel({ enabled: false, phases: ['request'] })).toBeNull();
-    expect(scopeChipLabel({ enabled: true, phases: ['request'] })).toBeNull();
+describe('describeArmed', () => {
+  it('describes an empty rule list as pausing everything', () => {
+    expect(describeArmed({ enabled: true, rules: [], phases: ['request', 'response'] })).toMatch(/pause all requests & responses/i);
   });
-  it('prefers hostname, then path, then method', () => {
-    expect(scopeChipLabel({ enabled: true, matchHostname: 'a.com', matchPath: '/x', phases: ['request'] })).toBe('a.com');
-    expect(scopeChipLabel({ enabled: true, matchPath: '/x', phases: ['request'] })).toBe('/x');
-    expect(scopeChipLabel({ enabled: true, matchMethod: 'get', phases: ['request'] })).toBe('GET');
+  it('describes a single rule inline', () => {
+    expect(describeArmed({ enabled: true, rules: [{ hostname: '*.stripe.com', method: 'post' }], phases: ['request'] }))
+      .toMatch(/pause requests matching POST \*\.stripe\.com/i);
+  });
+  it('summarizes multiple rules by count', () => {
+    expect(describeArmed({ enabled: true, rules: [{ hostname: 'a.com' }, { hostname: 'b.com' }], phases: ['request', 'response'] }))
+      .toMatch(/2 rules/i);
+  });
+});
+
+describe('armedChipLabel', () => {
+  it('is null when disarmed', () => {
+    expect(armedChipLabel({ enabled: false, rules: [{ hostname: 'a.com' }], phases: ['request'] })).toBeNull();
+  });
+  it('shows the single rule target, or a count for many, or "all" for none', () => {
+    expect(armedChipLabel({ enabled: true, rules: [{ hostname: 'a.com' }], phases: ['request'] })).toBe('a.com');
+    expect(armedChipLabel({ enabled: true, rules: [{ hostname: 'a.com' }, { hostname: 'b.com' }], phases: ['request'] })).toBe('2 rules');
+    expect(armedChipLabel({ enabled: true, rules: [], phases: ['request'] })).toBe('all');
   });
 });
 
 describe('armIntercept / disarmIntercept', () => {
-  it('posts an enabled config with the scope', () => {
+  it('posts an enabled config with the rules + phases', () => {
     const ws = { sendRestApi: vi.fn().mockResolvedValue({}) };
-    armIntercept(ws as any, { matchHostname: 'a.com', phases: ['request'] });
+    armIntercept(ws as any, { rules: [{ hostname: 'a.com' }], phases: ['request'] });
     expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/intercept/armed',
-      expect.objectContaining({ enabled: true, matchHostname: 'a.com', phases: ['request'] }));
+      expect.objectContaining({ enabled: true, rules: [{ hostname: 'a.com' }], phases: ['request'] }));
   });
-  it('posts a disabled config on disarm', () => {
+  it('disarms', () => {
     const ws = { sendRestApi: vi.fn().mockResolvedValue({}) };
     disarmIntercept(ws as any);
-    expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/intercept/armed',
-      expect.objectContaining({ enabled: false }));
+    expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/intercept/armed', expect.objectContaining({ enabled: false }));
+  });
+});
+
+describe('interceptHost', () => {
+  it('appends a host rule to the existing armed config', async () => {
+    const ws = { sendRestApi: vi.fn().mockImplementation((m: string) =>
+      m === 'GET'
+        ? Promise.resolve({ body: { data: { enabled: true, rules: [{ hostname: 'a.com', path: null, method: null }], phases: ['request'] } } })
+        : Promise.resolve({})) };
+    await interceptHost(ws as any, 'b.com');
+    expect(ws.sendRestApi).toHaveBeenLastCalledWith('POST', '/v1/intercept/armed', expect.objectContaining({
+      enabled: true,
+      rules: [{ hostname: 'a.com', path: null, method: null }, { hostname: 'b.com', path: null, method: null }],
+      phases: ['request'],
+    }));
+  });
+
+  it('is idempotent for a host already covered', async () => {
+    const ws = { sendRestApi: vi.fn().mockImplementation((m: string) =>
+      m === 'GET'
+        ? Promise.resolve({ body: { data: { enabled: true, rules: [{ hostname: 'a.com', path: null, method: null }], phases: ['request', 'response'] } } })
+        : Promise.resolve({})) };
+    await interceptHost(ws as any, 'a.com');
+    expect(ws.sendRestApi).toHaveBeenLastCalledWith('POST', '/v1/intercept/armed', expect.objectContaining({
+      rules: [{ hostname: 'a.com', path: null, method: null }],
+    }));
   });
 });

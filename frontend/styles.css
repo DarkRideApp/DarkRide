@@ -8319,3 +8319,52 @@ body.live-log-open .ai-chat-fab {
   color: var(--text-muted, #888);
 }
 .traffic-tree-path-loading .spin { animation: spin 1s linear infinite; }
+/* Interactive-intercept scope editor (rules popover from the arm button). */
+.intercept-scope-editor {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  width: 420px;
+  max-width: 90vw;
+  background: var(--bg-secondary, #1e1e2e);
+  border: 1px solid var(--border-color, #333);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  padding: 12px;
+}
+.intercept-scope-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.intercept-scope-title { font-size: 13px; font-weight: 600; color: var(--text-primary, #eee); }
+.intercept-rule-list { display: flex; flex-direction: column; gap: 6px; }
+.intercept-rule-row { display: flex; align-items: center; gap: 6px; }
+.intercept-rule-method { flex: 0 0 84px; }
+.intercept-rule-host { flex: 2; min-width: 0; }
+.intercept-rule-path { flex: 1.4; min-width: 0; }
+.intercept-rule-row .form-input { font-size: 12px; padding: 5px 8px; }
+.intercept-rule-remove {
+  flex: 0 0 auto; display: inline-flex; align-items: center;
+  background: none; border: none; padding: 4px; cursor: pointer;
+  color: var(--text-muted, #888); border-radius: 4px;
+}
+.intercept-rule-remove:hover { color: var(--text-primary, #eee); background: rgba(255, 255, 255, 0.08); }
+.intercept-add-rule {
+  align-self: flex-start; display: inline-flex; align-items: center; gap: 4px;
+  margin-top: 2px; padding: 4px 8px; font-size: 12px;
+  background: none; border: 1px dashed var(--border-color, #444); border-radius: 6px;
+  color: var(--text-secondary, #aaa); cursor: pointer;
+}
+.intercept-add-rule:hover { color: var(--text-primary, #eee); border-color: var(--text-secondary, #888); }
+.intercept-phase-row { display: flex; align-items: center; gap: 14px; margin: 12px 0 8px; font-size: 12px; color: var(--text-secondary, #aaa); }
+.intercept-phase-toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.intercept-scope-summary {
+  font-size: 12px; color: var(--text-secondary, #ccc);
+  padding: 8px 10px; margin-bottom: 10px;
+  background: rgba(255, 255, 255, 0.04); border-radius: 6px;
+  border-left: 2px solid var(--accent, #4a9eff);
+}
+.intercept-scope-actions { display: flex; justify-content: flex-end; gap: 8px; }
