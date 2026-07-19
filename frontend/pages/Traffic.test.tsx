@@ -1,6 +1,6 @@
 import React from 'react';
-import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { Traffic } from './Traffic';
 import { WebSocketContext } from '@darkrideapp/plugin-sdk/react';
@@ -215,5 +215,47 @@ describe('Traffic page — P3 polish', () => {
     await waitFor(() => screen.getByTestId('traffic-blocked-btn'));
     fireEvent.click(screen.getByTestId('traffic-blocked-btn'));
     expect(await screen.findByTestId('blocklist-panel')).toBeInTheDocument();
+  });
+});
+
+describe('Traffic page — host/path tree', () => {
+  beforeEach(() => localStorage.clear());
+
+  function treeWs(): MockWs {
+    const base = createMockWs();
+    const orig = base.sendRestApi;
+    base.sendRestApi = vi.fn().mockImplementation((method: string, path: string) => {
+      if (path.startsWith('/v1/traffic/tree')) {
+        const u = new URL(path, 'http://x');
+        if (u.searchParams.get('hostname')) {
+          return Promise.resolve({ body: { data: { paths: [{ path: '/one', count: 1, latestId: 1 }], truncated: false } } });
+        }
+        return Promise.resolve({ body: { data: { hosts: [{ hostname: 'api.example.com', count: 2 }] } } });
+      }
+      return orig(method, path);
+    });
+    return base;
+  }
+
+  it('toggles the tree panel and lists hosts', async () => {
+    const ws = renderPage(treeWs());
+    await waitFor(() => screen.getByTestId('traffic-table'));
+    expect(screen.queryByTestId('traffic-tree-panel')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('traffic-tree-toggle'));
+    const panel = await screen.findByTestId('traffic-tree-panel');
+    expect(await within(panel).findByText('api.example.com')).toBeInTheDocument();
+  });
+
+  it('narrows the table to a host via a server hostname param when a host is clicked', async () => {
+    const ws = renderPage(treeWs());
+    await waitFor(() => screen.getByTestId('traffic-table'));
+    fireEvent.click(screen.getByTestId('traffic-tree-toggle'));
+    const panel = await screen.findByTestId('traffic-tree-panel');
+    fireEvent.click(await within(panel).findByText('api.example.com'));
+    await waitFor(() => {
+      const listCalls = (ws.sendRestApi as any).mock.calls.filter(([, p]: [string, string]) => p.startsWith('/v1/traffic/list'));
+      const last = listCalls[listCalls.length - 1][1] as string;
+      expect(new URLSearchParams(last.split('?')[1]).get('hostname')).toBe('api.example.com');
+    });
   });
 });

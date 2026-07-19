@@ -1,0 +1,117 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import { ChevronRight, ChevronDown, Loader2 } from 'lucide-react';
+
+interface Host { hostname: string; count: number }
+interface PathRow { path: string; count: number; latestId: number }
+
+interface TrafficTreeProps {
+  ws: { sendRestApi: (method: string, path: string) => Promise<any> };
+  /** Restrict the tree to one capture session (per-device inspector). */
+  sessionId?: number | null;
+  /** Currently-active host in the table, highlighted in the tree. */
+  activeHost?: string | null;
+  onSelectHost: (hostname: string) => void;
+  onSelectPath: (hostname: string, path: string, latestId: number) => void;
+}
+
+/**
+ * TrafficTree — a collapsible host -> path navigator beside the Traffic table
+ * (Charles/Burp style). Hosts come from GET /v1/traffic/tree (whole-DB
+ * aggregate, not just the current 50-row page); a host's paths load lazily on
+ * first expand.
+ */
+export function TrafficTree({ ws, sessionId, activeHost, onSelectHost, onSelectPath }: TrafficTreeProps) {
+  const [hosts, setHosts] = useState<Host[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [pathsByHost, setPathsByHost] = useState<Map<string, PathRow[]>>(new Map());
+  const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
+
+  const sessionQuery = sessionId != null ? `?sessionId=${sessionId}` : '';
+
+  useEffect(() => {
+    setLoading(true);
+    ws.sendRestApi('GET', `/v1/traffic/tree${sessionQuery}`)
+      .then(res => setHosts(res.body?.data?.hosts ?? []))
+      .catch(() => setHosts([]))
+      .finally(() => setLoading(false));
+  }, [ws, sessionQuery]);
+
+  const loadPaths = useCallback((hostname: string) => {
+    setLoadingPaths(prev => new Set(prev).add(hostname));
+    const sep = sessionQuery ? '&' : '?';
+    ws.sendRestApi('GET', `/v1/traffic/tree${sessionQuery}${sep}hostname=${encodeURIComponent(hostname)}`)
+      .then(res => setPathsByHost(prev => new Map(prev).set(hostname, res.body?.data?.paths ?? [])))
+      .catch(() => setPathsByHost(prev => new Map(prev).set(hostname, [])))
+      .finally(() => setLoadingPaths(prev => { const n = new Set(prev); n.delete(hostname); return n; }));
+  }, [ws, sessionQuery]);
+
+  const toggleExpand = useCallback((hostname: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(hostname)) {
+        next.delete(hostname);
+      } else {
+        next.add(hostname);
+        if (!pathsByHost.has(hostname)) loadPaths(hostname);
+      }
+      return next;
+    });
+  }, [pathsByHost, loadPaths]);
+
+  if (loading) {
+    return <div className="traffic-tree" data-testid="traffic-tree"><div className="traffic-tree-empty">Loading…</div></div>;
+  }
+  if (hosts.length === 0) {
+    return <div className="traffic-tree" data-testid="traffic-tree"><div className="traffic-tree-empty">No traffic captured yet.</div></div>;
+  }
+
+  return (
+    <div className="traffic-tree" data-testid="traffic-tree" role="tree">
+      {hosts.map(h => {
+        const isOpen = expanded.has(h.hostname);
+        const paths = pathsByHost.get(h.hostname);
+        const isLoadingPaths = loadingPaths.has(h.hostname);
+        return (
+          <div key={h.hostname} role="treeitem" aria-expanded={isOpen}>
+            <div className={`traffic-tree-host${activeHost === h.hostname ? ' active' : ''}`}>
+              <button
+                className="traffic-tree-caret"
+                aria-label={`${isOpen ? 'Collapse' : 'Expand'} ${h.hostname}`}
+                aria-expanded={isOpen}
+                onClick={() => toggleExpand(h.hostname)}
+              >
+                {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+              </button>
+              <span className="traffic-tree-hostname" onClick={() => onSelectHost(h.hostname)}>
+                {h.hostname}
+              </span>
+              <span className="traffic-tree-count">{h.count}</span>
+            </div>
+            {isOpen && (
+              <div className="traffic-tree-paths" role="group">
+                {isLoadingPaths ? (
+                  <div className="traffic-tree-path-loading"><Loader2 size={12} className="spin" /> Loading…</div>
+                ) : (paths && paths.length > 0) ? (
+                  paths.map(p => (
+                    <div
+                      key={p.path}
+                      role="treeitem"
+                      className="traffic-tree-path"
+                      onClick={() => onSelectPath(h.hostname, p.path, p.latestId)}
+                    >
+                      <span className="traffic-tree-path-label">{p.path}</span>
+                      <span className="traffic-tree-count">{p.count}</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="traffic-tree-path-loading">No paths</div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
