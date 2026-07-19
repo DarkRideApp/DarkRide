@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ChevronRight, ChevronDown, Loader2 } from 'lucide-react';
+import { ChevronRight, Loader2 } from 'lucide-react';
 
 interface Host { hostname: string; count: number }
 interface PathRow { path: string; count: number; latestId: number }
@@ -59,59 +59,67 @@ export function TrafficTree({ ws, sessionId, activeHost, onSelectHost, onSelectP
     });
   }, [pathsByHost, loadPaths]);
 
-  if (loading) {
-    return <div className="traffic-tree" data-testid="traffic-tree"><div className="traffic-tree-empty">Loading…</div></div>;
-  }
-  if (hosts.length === 0) {
-    return <div className="traffic-tree" data-testid="traffic-tree"><div className="traffic-tree-empty">No traffic captured yet.</div></div>;
-  }
-
   return (
-    <div className="traffic-tree" data-testid="traffic-tree" role="tree">
-      {hosts.map(h => {
-        const isOpen = expanded.has(h.hostname);
-        const paths = pathsByHost.get(h.hostname);
-        const isLoadingPaths = loadingPaths.has(h.hostname);
-        return (
-          <div key={h.hostname} role="treeitem" aria-expanded={isOpen}>
-            <div className={`traffic-tree-host${activeHost === h.hostname ? ' active' : ''}`}>
-              <button
-                className="traffic-tree-caret"
-                aria-label={`${isOpen ? 'Collapse' : 'Expand'} ${h.hostname}`}
-                aria-expanded={isOpen}
-                onClick={() => toggleExpand(h.hostname)}
-              >
-                {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-              </button>
-              <span className="traffic-tree-hostname" onClick={() => onSelectHost(h.hostname)}>
-                {h.hostname}
-              </span>
-              <span className="traffic-tree-count">{h.count}</span>
-            </div>
-            {isOpen && (
-              <div className="traffic-tree-paths" role="group">
-                {isLoadingPaths ? (
-                  <div className="traffic-tree-path-loading"><Loader2 size={12} className="spin" /> Loading…</div>
-                ) : (paths && paths.length > 0) ? (
-                  paths.map(p => (
-                    <div
-                      key={p.path}
-                      role="treeitem"
-                      className="traffic-tree-path"
-                      onClick={() => onSelectPath(h.hostname, p.path, p.latestId)}
-                    >
-                      <span className="traffic-tree-path-label">{p.path}</span>
-                      <span className="traffic-tree-count">{p.count}</span>
-                    </div>
-                  ))
-                ) : (
-                  <div className="traffic-tree-path-loading">No paths</div>
+    <div className="traffic-tree" data-testid="traffic-tree">
+      <div className="traffic-tree-header">
+        <span className="traffic-tree-header-title">Hosts</span>
+        {!loading && hosts.length > 0 && (
+          <span className="traffic-tree-header-count">{hosts.length}</span>
+        )}
+      </div>
+      {loading ? (
+        <div className="traffic-tree-empty">Loading…</div>
+      ) : hosts.length === 0 ? (
+        <div className="traffic-tree-empty">No traffic captured yet.</div>
+      ) : (
+        <div className="traffic-tree-list" role="tree">
+          {hosts.map(h => {
+            const isOpen = expanded.has(h.hostname);
+            const paths = pathsByHost.get(h.hostname);
+            const isLoadingPaths = loadingPaths.has(h.hostname);
+            return (
+              <div key={h.hostname} role="treeitem" aria-expanded={isOpen}>
+                <div className={`traffic-tree-host${activeHost === h.hostname ? ' active' : ''}`}>
+                  <button
+                    className={`traffic-tree-caret${isOpen ? ' open' : ''}`}
+                    aria-label={`${isOpen ? 'Collapse' : 'Expand'} ${h.hostname}`}
+                    aria-expanded={isOpen}
+                    onClick={() => toggleExpand(h.hostname)}
+                  >
+                    <ChevronRight size={12} />
+                  </button>
+                  <span className="traffic-tree-hostname" onClick={() => onSelectHost(h.hostname)} title={h.hostname}>
+                    {h.hostname}
+                  </span>
+                  <span className="traffic-tree-count">{h.count}</span>
+                </div>
+                {isOpen && (
+                  <div className="traffic-tree-paths" role="group">
+                    {isLoadingPaths ? (
+                      <div className="traffic-tree-path-loading"><Loader2 size={12} className="spin" /> Loading…</div>
+                    ) : (paths && paths.length > 0) ? (
+                      paths.map(p => (
+                        <div
+                          key={p.path}
+                          role="treeitem"
+                          className="traffic-tree-path"
+                          onClick={() => onSelectPath(h.hostname, p.path, p.latestId)}
+                          title={p.path}
+                        >
+                          <span className="traffic-tree-path-label">{p.path}</span>
+                          <span className="traffic-tree-count">{p.count}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="traffic-tree-path-loading">No paths</div>
+                    )}
+                  </div>
                 )}
               </div>
-            )}
-          </div>
-        );
-      })}
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
