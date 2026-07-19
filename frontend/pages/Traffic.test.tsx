@@ -218,6 +218,45 @@ describe('Traffic page — P3 polish', () => {
   });
 });
 
+describe('Traffic page — scope props', () => {
+  function renderScoped(props: { scopeSessionId?: number | null; scopeDeviceId?: string | null }) {
+    const mockWs = createMockWs();
+    render(
+      <WebSocketContext.Provider value={mockWs}>
+        <MemoryRouter>
+          <Traffic {...props} />
+        </MemoryRouter>
+      </WebSocketContext.Provider>
+    );
+    return mockWs;
+  }
+
+  it('passes scopeSessionId to the /list call', async () => {
+    const ws = renderScoped({ scopeSessionId: 7 });
+    await waitFor(() => {
+      const p = lastListUrl(ws);
+      expect(p.get('sessionId')).toBe('7');
+    });
+  });
+
+  it('passes scopeDeviceId to the /list call', async () => {
+    const ws = renderScoped({ scopeDeviceId: 'dev-9' });
+    await waitFor(() => {
+      const p = lastListUrl(ws);
+      expect(p.get('deviceId')).toBe('dev-9');
+    });
+  });
+
+  it('omits scope params by default', async () => {
+    const ws = renderPage();
+    await waitFor(() => {
+      const p = lastListUrl(ws);
+      expect(p.get('sessionId')).toBeNull();
+      expect(p.get('deviceId')).toBeNull();
+    });
+  });
+});
+
 describe('Traffic page — host/path tree', () => {
   beforeEach(() => localStorage.clear());
 

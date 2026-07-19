@@ -157,7 +157,14 @@ function SavedTrafficTab() {
 type TrafficTab = 'live' | 'saved';
 const TRAFFIC_TABS: TrafficTab[] = ['live', 'saved'];
 
-export function Traffic() {
+interface TrafficProps {
+  /** Restrict the view to one device (Network workspace scope). Default: all. */
+  scopeDeviceId?: string | null;
+  /** Restrict the view to one capture session. Default: all. */
+  scopeSessionId?: number | null;
+}
+
+export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: TrafficProps = {}) {
   useDocumentTitle('Traffic');
   const auth = useAuthOptional();
   const ws = useWebSocket();
@@ -231,6 +238,8 @@ export function Traffic() {
       if (serverSearch) params.set('search', serverSearch);
       if (serverHostname) params.set('hostname', serverHostname);
       if (serverPath) params.set('path', serverPath);
+      if (scopeDeviceId) params.set('deviceId', scopeDeviceId);
+      if (scopeSessionId != null) params.set('sessionId', String(scopeSessionId));
       params.set('sortBy', sortBy);
       params.set('sortDir', sortDir);
 
@@ -250,7 +259,7 @@ export function Traffic() {
     } finally {
       setLoading(false);
     }
-  }, [ws, page, serverType, serverMethod, serverStatusCentury, serverSearch, serverHostname, serverPath, sortBy, sortDir]);
+  }, [ws, page, serverType, serverMethod, serverStatusCentury, serverSearch, serverHostname, serverPath, scopeDeviceId, scopeSessionId, sortBy, sortDir]);
 
   useEffect(() => {
     if (ws.connected && activeTab === 'live') fetchTraffic();
@@ -564,6 +573,7 @@ export function Traffic() {
           <div className="traffic-tree-panel" data-testid="traffic-tree-panel">
             <TrafficTree
               ws={ws}
+              sessionId={scopeSessionId}
               activeHost={serverHostname || null}
               onSelectHost={handleSelectHost}
               onSelectPath={handleSelectPath}
