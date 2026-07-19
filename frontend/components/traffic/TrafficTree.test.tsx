@@ -57,6 +57,23 @@ describe('TrafficTree', () => {
     expect(onSelectPath).toHaveBeenCalledWith('api.foo.com', '/orders', 42);
   });
 
+  it('filters the host list by the quick filter text', async () => {
+    const ws = mockWs({ hosts: [{ hostname: 'api.foo.com', count: 3 }, { hostname: 'cdn.bar.com', count: 1 }] });
+    render(<TrafficTree ws={ws as any} onSelectHost={() => {}} onSelectPath={() => {}} />);
+    expect(await screen.findByText('api.foo.com')).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('traffic-tree-filter'), { target: { value: 'cdn' } });
+    expect(screen.queryByText('api.foo.com')).not.toBeInTheDocument();
+    expect(screen.getByText('cdn.bar.com')).toBeInTheDocument();
+  });
+
+  it('shows a no-match state when the filter excludes everything', async () => {
+    const ws = mockWs({ hosts: [{ hostname: 'api.foo.com', count: 3 }] });
+    render(<TrafficTree ws={ws as any} onSelectHost={() => {}} onSelectPath={() => {}} />);
+    await screen.findByText('api.foo.com');
+    fireEvent.change(screen.getByTestId('traffic-tree-filter'), { target: { value: 'zzz' } });
+    expect(await screen.findByText(/no hosts match/i)).toBeInTheDocument();
+  });
+
   it('shows an empty state when there is no traffic', async () => {
     const ws = mockWs({ hosts: [] });
     render(<TrafficTree ws={ws as any} onSelectHost={() => {}} onSelectPath={() => {}} />);

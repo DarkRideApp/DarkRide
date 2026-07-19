@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { ChevronRight, Loader2 } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { ChevronRight, Loader2, Search, X } from 'lucide-react';
 
 interface Host { hostname: string; count: number }
 interface PathRow { path: string; count: number; latestId: number }
@@ -26,6 +26,12 @@ export function TrafficTree({ ws, sessionId, activeHost, onSelectHost, onSelectP
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [pathsByHost, setPathsByHost] = useState<Map<string, PathRow[]>>(new Map());
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
+  const [filter, setFilter] = useState('');
+
+  const visibleHosts = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return q ? hosts.filter(h => h.hostname.toLowerCase().includes(q)) : hosts;
+  }, [hosts, filter]);
 
   const sessionQuery = sessionId != null ? `?sessionId=${sessionId}` : '';
 
@@ -62,18 +68,41 @@ export function TrafficTree({ ws, sessionId, activeHost, onSelectHost, onSelectP
   return (
     <div className="traffic-tree" data-testid="traffic-tree">
       <div className="traffic-tree-header">
-        <span className="traffic-tree-header-title">Hosts</span>
+        <div className="traffic-tree-header-row">
+          <span className="traffic-tree-header-title">Hosts</span>
+          {!loading && hosts.length > 0 && (
+            <span className="traffic-tree-header-count">
+              {filter ? `${visibleHosts.length}/${hosts.length}` : hosts.length}
+            </span>
+          )}
+        </div>
         {!loading && hosts.length > 0 && (
-          <span className="traffic-tree-header-count">{hosts.length}</span>
+          <div className="traffic-tree-filter-wrap">
+            <Search size={12} className="traffic-tree-filter-icon" />
+            <input
+              className="traffic-tree-filter"
+              data-testid="traffic-tree-filter"
+              placeholder="Filter hosts…"
+              value={filter}
+              onChange={e => setFilter(e.target.value)}
+            />
+            {filter && (
+              <button className="traffic-tree-filter-clear" aria-label="Clear host filter" onClick={() => setFilter('')}>
+                <X size={12} />
+              </button>
+            )}
+          </div>
         )}
       </div>
       {loading ? (
         <div className="traffic-tree-empty">Loading…</div>
       ) : hosts.length === 0 ? (
         <div className="traffic-tree-empty">No traffic captured yet.</div>
+      ) : visibleHosts.length === 0 ? (
+        <div className="traffic-tree-empty">No hosts match "{filter}".</div>
       ) : (
         <div className="traffic-tree-list" role="tree">
-          {hosts.map(h => {
+          {visibleHosts.map(h => {
             const isOpen = expanded.has(h.hostname);
             const paths = pathsByHost.get(h.hostname);
             const isLoadingPaths = loadingPaths.has(h.hostname);

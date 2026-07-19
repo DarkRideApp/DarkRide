@@ -8149,13 +8149,58 @@ body.live-log-open .ai-chat-fab {
   top: 0;
   z-index: 1;
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 8px;
   padding: 9px 12px;
   background: color-mix(in srgb, var(--bg-secondary, #1e1e2e) 92%, transparent);
   backdrop-filter: blur(6px);
   border-bottom: 1px solid var(--border-color, #333);
 }
+.traffic-tree-header-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* Quick host filter. */
+.traffic-tree-filter-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.traffic-tree-filter-icon {
+  position: absolute;
+  left: 8px;
+  color: var(--text-muted, #888);
+  pointer-events: none;
+}
+.traffic-tree-filter {
+  width: 100%;
+  padding: 5px 24px 5px 26px;
+  font-size: 12px;
+  color: var(--text-primary, #eee);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-color, #333);
+  border-radius: 6px;
+  outline: none;
+}
+.traffic-tree-filter:focus {
+  border-color: color-mix(in srgb, var(--accent, #4a9eff) 55%, transparent);
+  background: rgba(255, 255, 255, 0.06);
+}
+.traffic-tree-filter::placeholder { color: var(--text-muted, #888); }
+.traffic-tree-filter-clear {
+  position: absolute;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--text-muted, #888);
+  border-radius: 4px;
+}
+.traffic-tree-filter-clear:hover { color: var(--text-primary, #eee); background: rgba(255, 255, 255, 0.08); }
 .traffic-tree-header-title {
   font-size: 10px;
   font-weight: 700;
