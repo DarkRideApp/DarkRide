@@ -17,7 +17,7 @@ import { Automations } from './pages/Automations';
 import { AutomationEditor } from './pages/AutomationEditor';
 import { AutomationReviewer, SessionTimeline } from './pages/AutomationReviewer';
 import { Proxies } from './pages/Proxies';
-import { Traffic } from './pages/Traffic';
+import { NetworkWorkspace } from './pages/NetworkWorkspace';
 import { SelectorDebugger } from './pages/SelectorDebugger';
 import { Utils } from './pages/Utils';
 import { SettingsLayout } from './components/settings/SettingsLayout';
@@ -32,15 +32,12 @@ import { ChangelogPage } from './pages/settings/ChangelogPage';
 import { LicensePage } from './pages/settings/LicensePage';
 import { Credentials } from './pages/Credentials';
 import { SessionHistory } from './pages/SessionHistory';
-import { ProxiedRequests } from './pages/ProxiedRequests';
 import { AppLibrary } from './pages/AppLibrary';
 import { AppDetail } from './pages/AppDetail';
 import { ApkAnalysis } from './pages/ApkAnalysis';
 import { Frida } from './pages/Frida';
 import { CloudBrowser } from './pages/CloudBrowser';
-import { ApiCatalogue } from './pages/ApiCatalogue';
 import { ApiExplorer } from './pages/ApiExplorer';
-import { RequestBuilder } from './pages/RequestBuilder';
 import { Jobs } from './pages/Jobs';
 import { PluginManager } from './pages/PluginManager';
 import { PluginMarketplace } from './pages/PluginMarketplace';
@@ -268,9 +265,13 @@ function AuthenticatedApp() {
             <Route path="automations/:id/history" element={<AutomationReviewer />} />
             <Route path="automations/session/:sessionId" element={<SessionTimeline />} />
             <Route path="sessions" element={<SessionHistory />} />
-            <Route path="proxied-requests" element={<ProxiedRequests />} />
-            <Route path="request-builder" element={<RequestBuilder />} />
-            <Route path="traffic" element={<Traffic />} />
+            {/* Network workspace — unified home for Traffic / Intercept /
+                Repeater / Catalogue. The old routes redirect into the matching
+                pane so existing links keep working. */}
+            <Route path="network" element={<NetworkWorkspace />} />
+            <Route path="proxied-requests" element={<Navigate to="/ui/network?pane=repeater" replace />} />
+            <Route path="request-builder" element={<Navigate to="/ui/network?pane=repeater" replace />} />
+            <Route path="traffic" element={<Navigate to="/ui/network?pane=traffic" replace />} />
             <Route path="selector-debugger" element={<SelectorDebugger />} />
             <Route path="apks" element={<AppLibrary />} />
             <Route path="apps/:trackedAppId" element={<AppDetail />} />
@@ -278,7 +279,7 @@ function AuthenticatedApp() {
             <Route path="frida" element={<Frida />} />
             <Route path="marketplace" element={<PluginMarketplace />} />
             <Route path="cloud" element={<CloudBrowser />} />
-            <Route path="api-catalogue" element={<ApiCatalogue />} />
+            <Route path="api-catalogue" element={<Navigate to="/ui/network?pane=catalogue" replace />} />
             <Route path="api-catalogue/groups/:groupId/explorer" element={<ApiExplorer />} />
             <Route path="settings" element={<SettingsLayout />}>
               <Route index element={<Navigate to="/ui/settings/notifications" replace />} />

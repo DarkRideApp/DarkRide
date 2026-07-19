@@ -13,11 +13,8 @@ import {
   Smartphone,
   Zap,
   History,
-  Send,
   Activity,
   Crosshair,
-  BookOpen,
-  Play,
   Download,
   Bug,
   Package,
@@ -81,10 +78,9 @@ const CORE_NAV_GROUPS: NavGroup[] = [
   {
     label: 'Network',
     items: [
-      { to: '/ui/proxied-requests', label: 'HTTP Requests', icon: Send, requiredScope: 'core.traffic:read' },
-      { to: '/ui/request-builder', label: 'Request Builder', icon: Play },
-      { to: '/ui/traffic', label: 'Traffic', icon: Activity, requiredScope: 'core.traffic:read' },
-      { to: '/ui/api-catalogue', label: 'API Catalogue', icon: BookOpen },
+      // Unified workspace — Traffic / Intercept / Repeater / Catalogue live
+      // here behind a scope selector. The old separate entries now redirect in.
+      { to: '/ui/network', label: 'Network', icon: Activity, requiredScope: 'core.traffic:read' },
     ],
   },
   {

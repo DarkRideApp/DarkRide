@@ -58,7 +58,9 @@ describe('AppLayout', () => {
     expect(screen.getByText('Dashboard')).toBeInTheDocument();
     expect(screen.getByText('Devices')).toBeInTheDocument();
     expect(screen.getByText('Automations')).toBeInTheDocument();
-    expect(screen.getByText('Traffic')).toBeInTheDocument();
+    // "Network" is both the nav group label and the unified workspace item.
+    expect(screen.getAllByText('Network').length).toBeGreaterThan(0);
+    expect(screen.getByRole('link', { name: 'Network' })).toHaveAttribute('href', '/ui/network');
     expect(screen.getByText('Selector Debugger')).toBeInTheDocument();
     expect(screen.getByText('Settings')).toBeInTheDocument();
   });
