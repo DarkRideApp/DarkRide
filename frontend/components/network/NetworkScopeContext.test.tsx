@@ -4,6 +4,7 @@ import { parseScopeParam, scopeToParam, scopeToTrafficParams } from './NetworkSc
 describe('network scope helpers', () => {
   it('parses device and session params', () => {
     expect(parseScopeParam('device:abc')).toEqual({ kind: 'device', deviceId: 'abc' });
+    expect(parseScopeParam('device:')).toEqual({ kind: 'device', deviceId: '' });
     expect(parseScopeParam('session:5')).toEqual({ kind: 'session', sessionId: 5 });
   });
 
