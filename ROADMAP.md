@@ -175,7 +175,8 @@ Headline items:
   and on-device Frida replay are deferred fidelity upgrades.
 - **P1** — deep filter/search *(landed)*, virtualize the list + fix live-append past page 0 *(landed
   on `feat/traffic-list-perf`: `@tanstack/react-virtual` in TrafficTable, inspector cap 500→5000,
-  jump-to-live banner)*, host/path tree view, unify the five nav surfaces into one workspace.
+  jump-to-live banner)*, host/path tree view *(landed on `feat/traffic-host-tree`: TrafficTree panel
+  + `GET /v1/traffic/tree`)*, unify the five nav surfaces into one workspace *(design pending)*.
 - **P2** — raw wire view, in-body search + JSON tree + hex, auto-load-full-body, HTML render.
 - **P3** *(landed on `feat/traffic-p3-polish`)* — honest "Clear view", visible blocklist w/ unblock, UI
   "Save request" (+ `POST /v1/traffic/saved`), per-device TLS-pill copy, show/hide column customization.
