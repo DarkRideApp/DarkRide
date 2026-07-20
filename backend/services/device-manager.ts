@@ -1532,7 +1532,7 @@ export class DeviceManager {
 
     const commands = [
       // Teardown any existing tunnel and restore IPv6 (may have been disabled by earlier run)
-      `killall wireguard-go 2>/dev/null; ip link del wg0 2>/dev/null; ip rule del table ${WG_TABLE} 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null; true`,
+      `killall wireguard-go 2>/dev/null; ip link del wg0 2>/dev/null; ip rule del table ${WG_TABLE} 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip -6 rule del not fwmark ${WG_FWMARK} table ${WG_TABLE} priority 100 2>/dev/null; ip -6 route flush table ${WG_TABLE} 2>/dev/null; sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null; true`,
       // Create interface (kernel module or wireguard-go userspace)
       createInterfaceCmd,
       setconfCmd,
@@ -1549,6 +1549,15 @@ export class DeviceManager {
       // High-priority rule (priority 100, checked before wlan0 at ~22000):
       // all traffic EXCEPT WG's own packets uses our table
       `ip rule add not fwmark ${WG_FWMARK} table ${WG_TABLE} priority 100`,
+      // The tunnel is IPv4-only. Without an explicit IPv6 entry in our table,
+      // device-originated IPv6 traffic falls through to the normal wlan0
+      // IPv6 route and bypasses capture entirely. Null-route IPv6 inside our
+      // table instead so IPv6 attempts fail fast (ENETUNREACH); Happy-Eyeballs
+      // clients then fall back to IPv4, which IS captured. (Disabling IPv6 via
+      // sysctl is deliberately avoided — it has broken Android networking
+      // after repeated capture cycles.)
+      `ip -6 route add unreachable default table ${WG_TABLE}`,
+      `ip -6 rule add not fwmark ${WG_FWMARK} table ${WG_TABLE} priority 100`,
       'rm -f /data/local/tmp/wg_peer.conf',
     ];
 
@@ -1609,7 +1618,7 @@ export class DeviceManager {
     try {
       await suShell(
         deviceId,
-        'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true',
+        'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; ip -6 rule del not fwmark 51820 table 51820 priority 100 2>/dev/null; ip -6 route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true',
       );
     } catch {
       // Interface may not exist — that's fine
