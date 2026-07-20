@@ -488,22 +488,35 @@ class DarkRideAddon:
         phases = cfg.get("phases") or ["request", "response"]
         if phase not in phases:
             return False
-        # Hostname glob — check host (may be IP in WireGuard mode) then pretty_host.
-        match_hostname = cfg.get("matchHostname")
+        # Rules take precedence: hold when the flow matches ANY rule. An empty
+        # rule list means match-all. Fall back to the legacy single-match fields
+        # only when no `rules` key is present.
+        rules = cfg.get("rules")
+        if rules is not None:
+            if len(rules) == 0:
+                return True
+            return any(self._rule_matches(flow, r) for r in rules)
+        return self._rule_matches(flow, {
+            "hostname": cfg.get("matchHostname"),
+            "path": cfg.get("matchPath"),
+            "method": cfg.get("matchMethod"),
+        })
+
+    def _rule_matches(self, flow, rule: dict) -> bool:
+        """Does a flow satisfy one rule? All set fields must match (AND)."""
+        match_hostname = rule.get("hostname")
         if match_hostname:
             host = getattr(flow.request, "host", "") or ""
             pretty = getattr(flow.request, "pretty_host", "") or ""
             if not (fnmatch.fnmatch(host, match_hostname) or fnmatch.fnmatch(pretty, match_hostname)):
                 return False
-        # Path glob (strip query string).
-        match_path = cfg.get("matchPath")
+        match_path = rule.get("path")
         if match_path:
             raw_path = getattr(flow.request, "path", "") or ""
             path_no_qs = raw_path.split("?")[0]
             if not fnmatch.fnmatch(path_no_qs, match_path):
                 return False
-        # Method (case-insensitive).
-        match_method = cfg.get("matchMethod")
+        match_method = rule.get("method")
         if match_method:
             req_method = getattr(flow.request, "method", "") or ""
             if req_method.upper() != str(match_method).upper():

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
+import { interceptHost } from '../intercept/interceptArm';
 import { TrafficTable } from './TrafficTable';
 import { ReplayDrawer } from './ReplayDrawer';
 import type { TrafficEntry } from './TrafficEntryRow';
@@ -149,6 +150,10 @@ export function TrafficInspector({ deviceId, sessionId, mode = 'live' }: Traffic
     ws.sendRestApi('POST', '/v1/blocklist/add', { domain: hostname }).catch(() => {});
   }, [ws]);
 
+  const handleInterceptHost = useCallback((hostname: string) => {
+    interceptHost(ws, hostname).catch(() => {});
+  }, [ws]);
+
   const handleSave = useCallback((entry: TrafficEntry) => {
     ws.sendRestApi('POST', '/v1/traffic/saved', { id: entry.id }).catch(() => {});
   }, [ws]);
@@ -174,6 +179,7 @@ export function TrafficInspector({ deviceId, sessionId, mode = 'live' }: Traffic
       onLoadWsFrames={handleLoadWsFrames}
       onLoadFullBody={handleLoadFullBody}
       onBlockHostname={mode === 'live' ? handleBlockHostname : undefined}
+      onInterceptHost={handleInterceptHost}
       liveMode={mode === 'live'}
       onClear={mode === 'live' ? handleClear : undefined}
       footer={

@@ -193,13 +193,23 @@ export interface HeldFlow {
   createdAt: number;
 }
 
+/** A single match rule. All set fields must match (AND); host/path are globs. */
+export interface InterceptMatchRule {
+  hostname?: string | null;
+  path?: string | null;
+  method?: string | null;
+}
+
 /** Armed configuration for interactive interception. */
 export interface InterceptArmedConfig {
   enabled: boolean;
+  /** Match rules — a flow is held when it matches ANY rule. Empty/absent = match all. */
+  rules?: InterceptMatchRule[];
+  phases: ('request' | 'response')[];
+  /** Legacy single-match fields — honored only when `rules` is absent. */
   matchHostname?: string | null;
   matchPath?: string | null;
   matchMethod?: string | null;
-  phases: ('request' | 'response')[];
 }
 
 /** Broadcast when a flow is paused in-flight and needs a manual verdict. */

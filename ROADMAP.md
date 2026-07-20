@@ -167,6 +167,10 @@ Headline items:
 - **P0 — Interactive interception ("breakpoints")** *(landed on `feat/traffic-capture-ux`)* — pause a
   matching request/response in-flight, edit, forward or drop. Closes the biggest gap vs Burp/Charles;
   the old intercept was rule-based auto-modify only.
+  - **Scoped intercept** *(landed on `feat/scoped-intercept`)* — arm intercept for a **list of match
+    rules** (host glob / path glob / method, matched with OR) instead of every flow, via a scope-editor
+    popover on the arm button + a plain-English summary + a scope chip, plus "Intercept this host"
+    from the request detail panel. Backend/proxy honor `rules[]` (mitmproxy `_hold_matches` + JS mirror).
 - **P0 — Real per-request timing** *(landed on `feat/traffic-capture-ux`)* — forwarded mitmproxy
   timestamps, Duration column + timing waterfall, real HAR timings (were zeroed).
 - **P0 — In-place, tunnel-routed replay** *(landed on `feat/traffic-capture-ux`)* — in-context

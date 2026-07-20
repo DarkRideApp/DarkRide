@@ -115,8 +115,8 @@ export function registerInterceptLiveEndpoints(
 
   // POST /v1/intercept/armed — set the armed config.
   registerEndpoint('POST', '/v1/intercept/armed', (req, res) => {
-    const { enabled, matchHostname, matchPath, matchMethod, phases } = req.body || {};
-    const config = setArmed({ enabled, matchHostname, matchPath, matchMethod, phases });
+    const { enabled, rules, matchHostname, matchPath, matchMethod, phases } = req.body || {};
+    const config = setArmed({ enabled, rules, matchHostname, matchPath, matchMethod, phases });
 
     // Persist to the addon-visible file so the mitmproxy bridge picks it up.
     try {
