@@ -29,6 +29,12 @@ function wireRegistry(
     getActiveDockerClient: () => null,
     lookupRuntimeId: () => undefined,
     waitForTunnelReady: (serial: string) => manager.waitForTunnelReady(serial),
+    ensureConfigs: () => ({
+      clientPrivateKey: 'test-client-priv',
+      serverPublicKey: 'test-server-pub',
+      clientAddress: '10.0.0.2/32',
+      serverEndpoint: '203.0.113.1:51820',
+    }),
   });
   registry.register('wireguard', handlers.wireguard);
   registry.register('emu-http-proxy', handlers['emu-http-proxy']);

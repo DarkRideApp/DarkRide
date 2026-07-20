@@ -35,6 +35,13 @@ export interface CaptureHandlerDeps {
   lookupRuntimeId: (deviceId: string) => string | undefined;
   /** Probe tunnel connectivity; resolves true once reachable. */
   waitForTunnelReady: (deviceId: string) => Promise<boolean>;
+  /**
+   * Deterministically (re)derive a device's WireGuard tunnel info without
+   * touching mitmproxy. Used to recover tunnel keys/addresses when the
+   * on-device tunnel needs to be re-activated but mitmproxy is already
+   * running (so it won't hand back fresh `tunnelInfo` itself).
+   */
+  ensureConfigs: (deviceId: string, wgPort?: number) => WireGuardTunnelInfo;
 }
 
 export type CaptureMode = 'wireguard' | 'emu-http-proxy' | 'ios-bridge';
@@ -61,6 +68,7 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
     getActiveDockerClient,
     lookupRuntimeId,
     waitForTunnelReady,
+    ensureConfigs,
   } = deps;
 
   const wireguard: CaptureHandler = async (ctx: CaptureModeContext): Promise<CaptureModeResult> => {
@@ -72,13 +80,39 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
     ctx.setSubsystem('mitmproxy', 'ok');
 
     if (!tunnelInfo) {
-      // mitmproxy reports it was already running for this device; we
-      // can't set up the tunnel without fresh keys. Mark the rest of
-      // the subsystems as skipped so the UI shows the right state.
-      ctx.setSubsystem('certInjection', 'skipped');
-      ctx.setSubsystem('wireguard', 'skipped');
-      ctx.setSubsystem('connectivity', 'skipped');
-      return { tunnelActivated: false };
+      // mitmproxy reports it was already running for this device. That
+      // normally means the device's tunnel is already up too, but host
+      // and device state can drift apart — e.g. the device reboots and
+      // loses its tunnel interface/routes while the host-side mitmproxy
+      // process keeps running untouched. Probe actual device
+      // connectivity before assuming the capture is fully active; if
+      // the tunnel is confirmed down, re-derive its config deterministically
+      // and re-activate it on the device.
+      const tunnelReady = await waitForTunnelReady(ctx.deviceId);
+      if (tunnelReady) {
+        ctx.setSubsystem('certInjection', 'skipped');
+        ctx.setSubsystem('wireguard', 'skipped');
+        ctx.setSubsystem('connectivity', 'skipped');
+        return { tunnelActivated: false };
+      }
+
+      log(`Device tunnel for ${ctx.deviceId} is down but mitmproxy is already running; re-activating`);
+      const wgPort = (ctx.mitmOptions as MitmproxyOptions)?.wgPort ?? 51820;
+      const recoveredTunnelInfo = ensureConfigs(ctx.deviceId, wgPort);
+
+      await deviceManager.injectMitmproxyCaCert(ctx.deviceId);
+      ctx.setSubsystem('certInjection', 'ok');
+
+      await deviceManager.activateWireGuardTunnel(ctx.deviceId, recoveredTunnelInfo);
+      ctx.setSubsystem('wireguard', 'ok');
+
+      const readyAfterReactivation = await waitForTunnelReady(ctx.deviceId);
+      ctx.setSubsystem('connectivity', readyAfterReactivation ? 'ok' : 'warning');
+      if (!readyAfterReactivation) {
+        log(`Tunnel connectivity not confirmed after re-activation for device ${ctx.deviceId}, proceeding anyway`);
+      }
+
+      return { tunnelActivated: true };
     }
 
     // Inject CA cert
