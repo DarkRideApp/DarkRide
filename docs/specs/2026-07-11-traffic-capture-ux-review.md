@@ -75,9 +75,14 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
   narrow only the fetched 50-row page — push those predicates server-side.)*
 - `[x]` **E2E infra fix (found en route).** WS origin allowlist only accepted Vite 5173 but E2E runs
   on 5199, so every WS-dependent Playwright spec hung and timed out. Fixed in `playwright.config.ts`.
-- `[ ]` **Host/path tree view.** Charles's tree (endpoints grouped by domain) is a top RE feature
+- `[x]` **Host/path tree view.** Charles's tree (endpoints grouped by domain) is a top RE feature
   and DarkRide is flat-table-only. Add a collapsible host → path tree alongside the table.
   (Partially served by the separate API Catalogue page — consider unifying.)
+  *(Landed on `feat/traffic-host-tree`: `TrafficTree` panel on the global Traffic page, backed by a
+  new `GET /v1/traffic/tree` (whole-DB hostname GROUP BY; per-host path breakdown, capped at 2000
+  rows w/ a `truncated` flag). Clicking a host/path narrows the table server-side via the existing
+  /list hostname+path params across all pages; paths load lazily; toggle persisted to localStorage.
+  Design: `docs/specs/2026-07-19-traffic-host-tree-design.md`.)*
 - `[ ]` **Unify the surface.** Fold the per-device Capture live view, the global Traffic page, and
   Intercept into one workspace with a device/scope selector, so replay and interception happen
   without page hops. Five nav entries for one workflow is the root of most friction.

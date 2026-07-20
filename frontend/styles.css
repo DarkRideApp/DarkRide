@@ -8115,3 +8115,207 @@ body.live-log-open .ai-chat-fab {
 .traffic-columns-item input:disabled {
   cursor: not-allowed;
 }
+
+/* Host/path tree navigator beside the Traffic table. */
+.traffic-workspace {
+  display: flex;
+  align-items: stretch;
+  min-height: 0;
+  flex: 1;
+}
+.traffic-tree-panel {
+  width: 260px;
+  flex: 0 0 260px;
+  overflow-y: auto;
+  border-right: 1px solid var(--border-color, #333);
+  background: var(--bg-secondary, #1e1e2e);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+}
+.traffic-tree-panel::-webkit-scrollbar { width: 6px; }
+.traffic-tree-panel::-webkit-scrollbar-track { background: transparent; }
+.traffic-tree-panel::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.08); border-radius: 3px; }
+.traffic-tree-panel::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.15); }
+.traffic-workspace > .traffic-table-container {
+  flex: 1;
+  min-width: 0;
+}
+.traffic-tree {
+  font-size: 12px;
+}
+/* Sticky section header so it stays put while the host list scrolls. */
+.traffic-tree-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 12px;
+  background: color-mix(in srgb, var(--bg-secondary, #1e1e2e) 92%, transparent);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--border-color, #333);
+}
+.traffic-tree-header-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* Quick host filter. */
+.traffic-tree-filter-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.traffic-tree-filter-icon {
+  position: absolute;
+  left: 8px;
+  color: var(--text-muted, #888);
+  pointer-events: none;
+}
+.traffic-tree-filter {
+  width: 100%;
+  padding: 5px 24px 5px 26px;
+  font-size: 12px;
+  color: var(--text-primary, #eee);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-color, #333);
+  border-radius: 6px;
+  outline: none;
+}
+.traffic-tree-filter:focus {
+  border-color: color-mix(in srgb, var(--accent, #4a9eff) 55%, transparent);
+  background: rgba(255, 255, 255, 0.06);
+}
+.traffic-tree-filter::placeholder { color: var(--text-muted, #888); }
+.traffic-tree-filter-clear {
+  position: absolute;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--text-muted, #888);
+  border-radius: 4px;
+}
+.traffic-tree-filter-clear:hover { color: var(--text-primary, #eee); background: rgba(255, 255, 255, 0.08); }
+.traffic-tree-header-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted, #888);
+}
+.traffic-tree-header-count {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-secondary, #aaa);
+  font-variant-numeric: tabular-nums;
+}
+.traffic-tree-list { padding: 4px; }
+.traffic-tree-empty {
+  padding: 16px 12px;
+  color: var(--text-muted, #888);
+}
+.traffic-tree-host {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  position: relative;
+  transition: background 0.12s ease;
+}
+.traffic-tree-host:hover { background: rgba(255, 255, 255, 0.05); }
+.traffic-tree-host.active {
+  background: color-mix(in srgb, var(--accent, #4a9eff) 14%, transparent);
+}
+/* Accent bar on the active host, matching selected rows elsewhere. */
+.traffic-tree-host.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 3px;
+  bottom: 3px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent, #4a9eff);
+}
+.traffic-tree-caret {
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-muted, #888);
+  transition: transform 0.15s ease, color 0.12s ease;
+}
+.traffic-tree-caret.open { transform: rotate(90deg); }
+.traffic-tree-host:hover .traffic-tree-caret { color: var(--text-secondary, #aaa); }
+.traffic-tree-hostname {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary, #eee);
+  font-weight: 500;
+}
+.traffic-tree-host.active .traffic-tree-hostname { color: var(--accent, #4a9eff); }
+.traffic-tree-count {
+  flex: 0 0 auto;
+  min-width: 18px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-muted, #888);
+  font-variant-numeric: tabular-nums;
+}
+.traffic-tree-host.active .traffic-tree-count {
+  background: color-mix(in srgb, var(--accent, #4a9eff) 22%, transparent);
+  color: var(--accent, #4a9eff);
+}
+/* Indent guide line down the left of a host's paths. */
+.traffic-tree-paths {
+  margin: 1px 0 3px 15px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border-color, #333);
+}
+.traffic-tree-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.traffic-tree-path:hover { background: rgba(255, 255, 255, 0.05); }
+.traffic-tree-path-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-secondary, #ccc);
+}
+.traffic-tree-path:hover .traffic-tree-path-label { color: var(--text-primary, #eee); }
+.traffic-tree-path-loading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--text-muted, #888);
+}
+.traffic-tree-path-loading .spin { animation: spin 1s linear infinite; }

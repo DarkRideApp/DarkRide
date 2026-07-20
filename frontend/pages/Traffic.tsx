@@ -5,8 +5,9 @@ import { SkeletonTable } from '@darkrideapp/plugin-sdk/react';
 import { TrafficTable } from '../components/traffic/TrafficTable';
 import { ReplayDrawer } from '../components/traffic/ReplayDrawer';
 import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
-import { Trash2, Repeat, ShieldBan } from 'lucide-react';
+import { Trash2, Repeat, ShieldBan, ListTree } from 'lucide-react';
 import { BlocklistPanel } from '../components/traffic/BlocklistPanel';
+import { TrafficTree } from '../components/traffic/TrafficTree';
 import { ConfirmDialog } from '@darkrideapp/plugin-sdk/react';
 import type { CapturedTrafficEntry, WebSocketMessageEntry } from '../../shared/types/api';
 import type { TrafficEntry } from '../components/traffic/TrafficEntryRow';
@@ -197,6 +198,20 @@ export function Traffic() {
   const [serverStatusCentury, setServerStatusCentury] = useState('');
   const [serverMethod, setServerMethod] = useState('');
   const [serverSearch, setServerSearch] = useState('');
+  // Host/path narrowing driven by the tree navigator (precise, server-side,
+  // across all pages via the /list hostname + path params).
+  const [serverHostname, setServerHostname] = useState('');
+  const [serverPath, setServerPath] = useState('');
+  const [treeOpen, setTreeOpen] = useState(() => {
+    try { return localStorage.getItem('darkride:traffic-tree-open') === '1'; } catch { return false; }
+  });
+  const toggleTree = useCallback(() => {
+    setTreeOpen(prev => {
+      const next = !prev;
+      try { localStorage.setItem('darkride:traffic-tree-open', next ? '1' : '0'); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
 
   // Server-side sort state
   const [sortBy, setSortBy] = useState('capturedAt');
@@ -214,6 +229,8 @@ export function Traffic() {
       if (serverMethod) params.set('method', serverMethod);
       if (serverStatusCentury) params.set('status', serverStatusCentury);
       if (serverSearch) params.set('search', serverSearch);
+      if (serverHostname) params.set('hostname', serverHostname);
+      if (serverPath) params.set('path', serverPath);
       params.set('sortBy', sortBy);
       params.set('sortDir', sortDir);
 
@@ -233,7 +250,7 @@ export function Traffic() {
     } finally {
       setLoading(false);
     }
-  }, [ws, page, serverType, serverMethod, serverStatusCentury, serverSearch, sortBy, sortDir]);
+  }, [ws, page, serverType, serverMethod, serverStatusCentury, serverSearch, serverHostname, serverPath, sortBy, sortDir]);
 
   useEffect(() => {
     if (ws.connected && activeTab === 'live') fetchTraffic();
@@ -269,7 +286,7 @@ export function Traffic() {
       // default newest-first order with no active search. In any other view
       // (paged away, custom sort, or searching) the entry doesn't belong at the
       // top, so buffer it and let the banner offer a one-click jump back.
-      const defaultLiveOrder = sortBy === 'capturedAt' && sortDir === 'desc' && !serverSearch;
+      const defaultLiveOrder = sortBy === 'capturedAt' && sortDir === 'desc' && !serverSearch && !serverHostname && !serverPath;
       if (page === 0 && defaultLiveOrder) {
         setEntries(prev => {
           if (prev.some(p => p.id === entry.id)) return prev;
@@ -303,7 +320,7 @@ export function Traffic() {
     });
 
     return () => { unsubEntry(); unsubFrame(); unsubClosed(); };
-  }, [ws, page, activeTab, sortBy, sortDir, serverSearch]);
+  }, [ws, page, activeTab, sortBy, sortDir, serverSearch, serverHostname, serverPath]);
 
   const handleFilterChange = useCallback((filters: TrafficFilters) => {
     // Derive server-side filters from the tri-state method picks. When exactly
@@ -375,6 +392,19 @@ export function Traffic() {
   const handleSave = useCallback((entry: TrafficEntry) => {
     ws.sendRestApi('POST', '/v1/traffic/saved', { id: entry.id }).catch(() => {});
   }, [ws]);
+
+  const handleSelectHost = useCallback((hostname: string) => {
+    setServerHostname(hostname === '(unknown)' ? '' : hostname);
+    setServerPath('');
+    setPage(0);
+  }, []);
+
+  const handleSelectPath = useCallback((hostname: string, path: string, latestId: number) => {
+    setServerHostname(hostname === '(unknown)' ? '' : hostname);
+    setServerPath(path);
+    setPage(0);
+    setSelectedId(latestId);
+  }, []);
 
   const handleClear = useCallback(() => {
     setEntries([]);
@@ -467,6 +497,15 @@ export function Traffic() {
         </div>
         <div className="traffic-subheader-actions">
           <InterceptArmControl />
+          <button
+            className={`traffic-action-btn${treeOpen ? ' traffic-action-primary' : ''}`}
+            data-testid="traffic-tree-toggle"
+            onClick={toggleTree}
+            title="Toggle the host / path tree navigator"
+          >
+            <ListTree size={14} />
+            Tree
+          </button>
           <div style={{ position: 'relative' }}>
             <button
               className="traffic-action-btn"
@@ -520,6 +559,17 @@ export function Traffic() {
             </button>
           </div>
         )}
+        <div className="traffic-workspace">
+        {treeOpen && (
+          <div className="traffic-tree-panel" data-testid="traffic-tree-panel">
+            <TrafficTree
+              ws={ws}
+              activeHost={serverHostname || null}
+              onSelectHost={handleSelectHost}
+              onSelectPath={handleSelectPath}
+            />
+          </div>
+        )}
         <TrafficTable
           entries={entries as TrafficEntry[]}
           loading={loading}
@@ -549,6 +599,7 @@ export function Traffic() {
           sortBy={sortBy}
           sortDir={sortDir}
         />
+        </div>
         </>
       )}
     </div>
