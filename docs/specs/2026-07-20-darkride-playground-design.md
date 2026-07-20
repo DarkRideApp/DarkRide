@@ -1,7 +1,10 @@
 # DarkRide Playground — deliberately-vulnerable demo target — Design
 
 Date: 2026-07-20
-Status: **Scoping/design for review.** No code. Decisions 1-4 below were made autonomously (Cube away) and are flagged.
+Status: **Approved; build started.** Repo: **[DarkRideApp/playground](https://github.com/DarkRideApp/playground)**
+(the authoritative, maintained design lives there). Decision #2 changed on approval: the demo API is a
+**Cloudflare Worker** at `play-api.darkride.app` (not a bundled-local server). The Worker API is built +
+tested; the Android app is next.
 
 ## Why
 
@@ -18,9 +21,10 @@ each DarkRide hero beat has a target and a visible payoff. It triples as:
 ## Decisions (autonomous, pending Cube review)
 
 1. **Home:** new repo **`DarkRideApp/playground`** (self-contained, independently published APK + API).
-2. **Demo API:** **bundled local server** (Node/TS) with a **self-signed cert the app pins** — makes
-   capture + cert-pinning demos fully offline, deterministic, CI-friendly. Designed to be trivially
-   hostable later (single container) if a public `play-api.darkride.app` is ever wanted.
+2. **Demo API:** ~~bundled local server~~ → **Cloudflare Worker** at `play-api.darkride.app` (Cube's
+   call on approval). Real managed TLS, no servers to run; the app pins the endpoint's **intermediate
+   CA SPKI** (leaf rotates ~90 days) and the Frida bypass defeats it. `wrangler dev` gives a local
+   instance for offline/CI.
 3. **App stack:** **native Kotlin** (most common RE target, cleanest jadx/Frida story). Flutter/RN
    variant deferred.
 4. **Scope:** **curated to the hero beats** — ~7 features, each a CTF-style flag — not broad MASVS.
