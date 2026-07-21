@@ -31,18 +31,22 @@ vi.mock('fs', async (importOriginal) => {
     default: {
       ...original,
       mkdirSync: vi.fn(),
-      statSync: vi.fn(() => ({ size: 54321 })),
+      statSync: vi.fn(() => ({ size: 54321, isDirectory: () => false })),
       existsSync: vi.fn(() => true),
       writeFileSync: vi.fn(),
       renameSync: vi.fn(),
       unlinkSync: vi.fn(),
+      rmSync: vi.fn(),
+      readdirSync: vi.fn(() => []),
     },
     mkdirSync: vi.fn(),
-    statSync: vi.fn(() => ({ size: 54321 })),
+    statSync: vi.fn(() => ({ size: 54321, isDirectory: () => false })),
     existsSync: vi.fn(() => true),
     writeFileSync: vi.fn(),
     renameSync: vi.fn(),
     unlinkSync: vi.fn(),
+    rmSync: vi.fn(),
+    readdirSync: vi.fn(() => []),
   };
 });
 
@@ -470,6 +474,72 @@ describe('ApkTracker', () => {
       await trackerWith(ps).checkForUpdates();
 
       expect(vi.mocked(fs.unlinkSync)).toHaveBeenCalledWith('/tmp/test.apk');
+      expect(vi.mocked(fs.renameSync)).not.toHaveBeenCalled();
+    });
+
+    // A source that served an XAPK: downloadApk returns a staged split DIR.
+    function fakeSplitSource(overrides: Record<string, any> = {}) {
+      return fakeSource({
+        downloadApk: vi.fn(async () => ({
+          success: true,
+          versionCode: 300,
+          versionName: '3.0.0',
+          splitDir: '/tmp/split',
+          fileSize: 22222,
+        })),
+        ...overrides,
+      });
+    }
+
+    it('finalizes a staged split dir via directory rename and tracks each child APK', async () => {
+      const appId = addApp();
+      seedSource(appId, { lastVersion: '2.0.0' });
+
+      // statSync: the staged path is a directory; its children are files.
+      vi.mocked(fs.statSync).mockImplementation((p: any) => {
+        const s = String(p);
+        const isDir = s === '/tmp/split' || s.endsWith('300_3.0.0');
+        return { size: 4444, isDirectory: () => isDir } as any;
+      });
+      // After rename, the final dir enumerates to base.apk + a config split.
+      vi.mocked(fs.readdirSync).mockReturnValue(['base.apk', 'config.arm64_v8a.apk'] as any);
+
+      const trackFile = vi.fn();
+      const ps = fakeSplitSource();
+      const tracker = trackerWith(ps);
+      tracker.setFileSync({ trackFile } as any);
+      await tracker.checkForUpdates();
+
+      // Directory rename into a filename WITHOUT the .apk suffix.
+      const renameCall = vi.mocked(fs.renameSync).mock.calls.find(c => c[0] === '/tmp/split');
+      expect(renameCall).toBeTruthy();
+      expect(String(renameCall![1])).toMatch(/300_3\.0\.0$/);
+      expect(String(renameCall![1])).not.toMatch(/\.apk$/);
+
+      // Each split child is tracked with a per-child cloudKey under the dir key.
+      expect(trackFile).toHaveBeenCalledTimes(2);
+      const cloudKeys = trackFile.mock.calls.map(c => c[1]);
+      expect(cloudKeys).toContain('apks/com.example.app/300_3.0.0/base.apk');
+      expect(cloudKeys).toContain('apks/com.example.app/300_3.0.0/config.arm64_v8a.apk');
+    });
+
+    it('discards a staged split dir recursively on dedup, never renaming it', async () => {
+      const appId = addApp();
+      seedSource(appId, { lastVersion: '2.0.0' });
+      db.insert(apkVersions).values({
+        trackedAppId: appId, versionCode: 400, versionName: '4.0.0',
+        filename: '400_4.0.0.apk', source: 'device', downloadedAt: new Date(),
+      }).run();
+      vi.mocked(fs.renameSync).mockClear();
+      vi.mocked(fs.rmSync).mockClear();
+      vi.mocked(fs.statSync).mockImplementation((p: any) => (
+        { size: 4444, isDirectory: () => String(p) === '/tmp/split' } as any
+      ));
+
+      const ps = fakeSplitSource(); // versionCode 300 < stored 400 → dedup
+      await trackerWith(ps).checkForUpdates();
+
+      expect(vi.mocked(fs.rmSync)).toHaveBeenCalledWith('/tmp/split', { recursive: true, force: true });
       expect(vi.mocked(fs.renameSync)).not.toHaveBeenCalled();
     });
   });

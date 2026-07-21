@@ -23,7 +23,16 @@ export interface VersionCheckResult {
 
 export interface DownloadResult {
   success: boolean;
+  /** Absolute path to a single staged `.apk` file (the non-bundle case). */
   filePath?: string;
+  /**
+   * Absolute path to a staged DIRECTORY holding `base.apk` + its config/density/
+   * ABI splits, produced when the source served an XAPK/APKS bundle. Mutually
+   * exclusive with `filePath`. The ingest path renames this directory into the
+   * package store and tracks each child APK individually (native libs ship in
+   * the splits, so the whole set must survive — not just `base.apk`).
+   */
+  splitDir?: string;
   versionCode?: number;
   versionName?: string;
   fileSize?: number;

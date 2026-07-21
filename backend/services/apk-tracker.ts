@@ -426,20 +426,27 @@ export class ApkTracker {
         return { newVersionId: null, error: msg };
       }
 
-      // Build a path-safe filename from the (untrusted) versionName; the
-      // display versionName stored on the row keeps its original value.
-      const filename = `${result.versionCode}_${sanitizeVersionName(result.versionName)}.apk`;
+      // Build a path-safe on-disk name from the (untrusted) versionName; the
+      // display versionName stored on the row keeps its original value. A split
+      // bundle (XAPK) is a DIRECTORY, so its name carries no `.apk` suffix —
+      // mirroring the device split path (checkAppOnDevice).
+      const safeName = `${result.versionCode}_${sanitizeVersionName(result.versionName)}`;
+      const isSplit = !!result.splitDir;
+      const filename = isSplit ? safeName : `${safeName}.apk`;
 
+      // Remote sources return a STAGED temp path (a single .apk file, or a
+      // directory of splits); ingestVersion moves it to `filename` only if the
+      // version is kept, and discards it on dedup. The split case lets
+      // ingestVersion build per-child cloudFiles — we don't build them here.
+      const stagedPath = result.splitDir ?? result.filePath;
       const versionId = this.ingestVersion(app, source.id, {
         versionCode: result.versionCode,
         versionName: result.versionName || 'unknown',
         filename,
         fileSize: result.fileSize || 0,
         displayName: appName,
-        // Remote sources return a STAGED temp file; ingestVersion moves it to
-        // `filename` only if the version is kept, discards it on dedup.
-        staged: result.filePath
-          ? { path: result.filePath, cloudKey: `apks/${app.packageName}/${filename}` }
+        staged: stagedPath
+          ? { path: stagedPath, cloudKey: `apks/${app.packageName}/${filename}` }
           : undefined,
       });
 
@@ -491,9 +498,16 @@ export class ApkTracker {
     const latestCode = versions.length > 0 ? Math.max(...versions.map(v => v.versionCode)) : 0;
 
     if (hasExact || data.versionCode <= latestCode) {
-      // Discard the staged download — never touch the stored final file.
+      // Discard the staged download — never touch the stored final file. A
+      // staged split bundle is a directory, so remove it recursively.
       if (data.staged) {
-        try { fs.unlinkSync(data.staged.path); } catch { /* best-effort */ }
+        try {
+          if (fs.statSync(data.staged.path).isDirectory()) {
+            fs.rmSync(data.staged.path, { recursive: true, force: true });
+          } else {
+            fs.unlinkSync(data.staged.path);
+          }
+        } catch { /* best-effort */ }
       }
       if (!hasExact && data.versionCode < latestCode) {
         log(`${sourceLabel(sourceId)} version skipped for ${app.packageName}: v${data.versionName} (${data.versionCode}) is older than stored (${latestCode})`);
@@ -509,8 +523,26 @@ export class ApkTracker {
       const pkgDir = packageDir(app.packageName);
       fs.mkdirSync(pkgDir, { recursive: true });
       const finalPath = safeJoinInside(pkgDir, data.filename);
-      fs.renameSync(data.staged.path, finalPath);
-      cloudFiles = [{ localPath: finalPath, cloudKey: data.staged.cloudKey, size: data.fileSize }];
+      if (fs.statSync(data.staged.path).isDirectory()) {
+        // A staged split bundle: rename the whole directory into place, then
+        // track each child APK under a per-child cloudKey (native libs live in
+        // the config/ABI splits, so every part must sync — mirrors the device
+        // split path in checkAppOnDevice).
+        fs.renameSync(data.staged.path, finalPath);
+        cloudFiles = fs.readdirSync(finalPath)
+          .filter(name => name.toLowerCase().endsWith('.apk'))
+          .map(name => {
+            const localPath = path.join(finalPath, name);
+            return {
+              localPath,
+              cloudKey: `${data.staged!.cloudKey}/${name}`,
+              size: fs.statSync(localPath).size,
+            };
+          });
+      } else {
+        fs.renameSync(data.staged.path, finalPath);
+        cloudFiles = [{ localPath: finalPath, cloudKey: data.staged.cloudKey, size: data.fileSize }];
+      }
     }
 
     const insertResult = this.db.insert(apkVersions)

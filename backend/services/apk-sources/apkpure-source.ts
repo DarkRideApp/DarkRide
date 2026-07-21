@@ -4,8 +4,8 @@ import os from 'os';
 import crypto from 'crypto';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
-import AdmZip from 'adm-zip';
 import { readApkVersion } from '../../utils/apk-version-reader';
+import { unpackApkBundle } from '../apk-bundle';
 import { createLoggers } from '../../logs';
 import type { AppDatabase } from '../../db/index';
 import { packageDir } from '../../utils/apk-paths';
@@ -199,38 +199,6 @@ export function parseApkPureBlob(buf: Buffer): ApkPureParsed | null {
   return { versionName, versionCode, fileSize, downloadUrl, isXapk, sha256: undefined };
 }
 
-/**
- * Extract the base APK from an XAPK bundle (a ZIP of split APKs + manifest.json).
- * Returns the path to the written base.apk, or null on failure. Mirrors
- * PlayStoreSource.extractBaseApkFromXapk.
- *
- * Limitation: split-APK XAPKs cannot be merged here; we keep the base APK only,
- * so config/density/abi splits are dropped. Good enough for version tracking +
- * static analysis; a split-aware install path would need all the splits.
- */
-function extractBaseApkFromXapk(xapkPath: string, tmpDir: string): string | null {
-  try {
-    const zip = new AdmZip(xapkPath);
-    const apkEntries = zip.getEntries().filter(e => e.entryName.endsWith('.apk'));
-    if (apkEntries.length === 0) return null;
-
-    const base = apkEntries.find(e => e.entryName === 'base.apk' || !e.entryName.includes('split'))
-      || apkEntries.reduce((a, b) => (a.header.size > b.header.size ? a : b));
-
-    const outPath = path.join(tmpDir, 'base.apk');
-    zip.extractEntryTo(base, tmpDir, false, true);
-    const extractedName = path.join(tmpDir, path.basename(base.entryName));
-    if (extractedName !== outPath && fs.existsSync(extractedName)) {
-      fs.renameSync(extractedName, outPath);
-    }
-    if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1000) return outPath;
-    return null;
-  } catch (err: any) {
-    error(`Failed to extract base APK from XAPK: ${err.message}`);
-    return null;
-  }
-}
-
 export class ApkPureSource implements RemoteApkSource {
   readonly id = 'apkpure';
   readonly label = 'APKPure';
@@ -322,8 +290,11 @@ export class ApkPureSource implements RemoteApkSource {
     const pkgDir = packageDir(packageName);
     fs.mkdirSync(pkgDir, { recursive: true });
     const stagedPath = path.join(pkgDir, `.dl-${crypto.randomUUID()}.apk`);
-    // XAPK extraction needs a scratch dir for the raw download + the split apks.
+    // XAPK download needs a scratch dir for the raw zip. The exploded split set
+    // is staged inside pkgDir (same filesystem) so the tracker's finalize is a
+    // rename, not a cross-device copy.
     let tmpDir: string | null = null;
+    let splitDir: string | null = null;
 
     try {
       const res = await fetchApkPure(parsed.downloadUrl, {
@@ -333,8 +304,8 @@ export class ApkPureSource implements RemoteApkSource {
       if (!res.ok || !res.body) throw new Error(`Download failed: HTTP ${res.status}`);
 
       // Download the raw bytes. For an XAPK we must land the whole zip first,
-      // then crack out base.apk; for a plain APK the raw bytes ARE the staged
-      // file, so we stream straight to stagedPath.
+      // then explode it into its split set; for a plain APK the raw bytes ARE
+      // the staged file, so we stream straight to stagedPath.
       let rawPath = stagedPath;
       if (parsed.isXapk) {
         tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apkpure-xapk-'));
@@ -351,26 +322,37 @@ export class ApkPureSource implements RemoteApkSource {
         throw new Error(`Size mismatch: got ${rawSize} bytes, expected ${parsed.fileSize}`);
       }
 
+      // The APK we read version metadata from + the total on-disk size.
+      let versionApk: string;
+      let finalSize: number;
       if (parsed.isXapk) {
-        const base = extractBaseApkFromXapk(rawPath, tmpDir!);
-        if (!base) throw new Error('Could not extract base APK from XAPK bundle');
-        fs.copyFileSync(base, stagedPath);
+        // Explode the whole split set (base.apk + config/density/ABI splits, which
+        // hold native libraries) into a staged dir on pkgDir's filesystem.
+        splitDir = path.join(pkgDir, `.dl-${crypto.randomUUID()}`);
+        const unpacked = await unpackApkBundle(rawPath, splitDir);
+        versionApk = unpacked.baseApk;
+        finalSize = unpacked.apkFiles.reduce((sum, f) => sum + fs.statSync(f).size, 0);
+      } else {
+        versionApk = stagedPath;
+        finalSize = fs.statSync(stagedPath).size;
       }
-
-      const finalSize = fs.statSync(stagedPath).size;
       if (finalSize < 1000) throw new Error('Extracted APK too small');
 
       // Prefer the APK manifest's own versionCode; fall back to the API value.
-      const manifest = readApkVersion(stagedPath);
+      const manifest = readApkVersion(versionApk);
       const versionCode = manifest.versionCode ?? parsed.versionCode ?? null;
       if (!versionCode) throw new Error('Could not determine versionCode');
       const versionName = manifest.versionName || parsed.versionName || 'unknown';
 
-      log(`APKPure downloaded ${packageName} v${versionName} (${versionCode}) — ${(finalSize / 1024 / 1024).toFixed(1)} MB${parsed.isXapk ? ' (from XAPK)' : ''}`);
-      // filePath is a STAGED file; the tracker finalizes or discards it.
+      log(`APKPure downloaded ${packageName} v${versionName} (${versionCode}) — ${(finalSize / 1024 / 1024).toFixed(1)} MB${parsed.isXapk ? ' (XAPK, splits preserved)' : ''}`);
+      // The staged path (file or split dir) is finalized/discarded by the tracker.
+      if (parsed.isXapk) {
+        return { success: true, splitDir: splitDir!, versionCode, versionName, fileSize: finalSize };
+      }
       return { success: true, filePath: stagedPath, versionCode, versionName, fileSize: finalSize };
     } catch (err: any) {
       try { fs.unlinkSync(stagedPath); } catch { /* ignore */ }
+      if (splitDir) { try { fs.rmSync(splitDir, { recursive: true, force: true }); } catch { /* ignore */ } }
       error(`APKPure download failed for ${packageName}: ${err.message}`);
       return { success: false, error: err.message };
     } finally {

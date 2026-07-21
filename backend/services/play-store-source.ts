@@ -5,8 +5,8 @@ import os from 'os';
 import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { eq } from 'drizzle-orm';
-import AdmZip from 'adm-zip';
 import { readApkVersion } from '../utils/apk-version-reader';
+import { unpackApkBundle } from './apk-bundle';
 import { createLoggers } from '../logs';
 import { settings } from '../db/schema';
 import type { AppDatabase } from '../db/index';
@@ -36,39 +36,6 @@ function runApkeep(args: string[], timeoutMs = 300000): Promise<string> {
       }
     });
   });
-}
-
-/**
- * Extract the base APK from an XAPK bundle.
- * XAPK is a ZIP containing one or more .apk files + a manifest.json.
- */
-function extractBaseApkFromXapk(xapkPath: string, tmpDir: string): string | null {
-  try {
-    const zip = new AdmZip(xapkPath);
-    const entries = zip.getEntries();
-
-    const apkEntries = entries.filter(e => e.entryName.endsWith('.apk'));
-    if (apkEntries.length === 0) return null;
-
-    // Prefer "base.apk" or non-split APK, otherwise take the largest
-    const base = apkEntries.find(e => e.entryName === 'base.apk' || !e.entryName.includes('split'))
-      || apkEntries.reduce((a, b) => a.header.size > b.header.size ? a : b);
-
-    const outPath = path.join(tmpDir, 'base.apk');
-    zip.extractEntryTo(base, tmpDir, false, true);
-    const extractedName = path.join(tmpDir, path.basename(base.entryName));
-    if (extractedName !== outPath && fs.existsSync(extractedName)) {
-      fs.renameSync(extractedName, outPath);
-    }
-
-    if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1000) {
-      return outPath;
-    }
-    return null;
-  } catch (err: any) {
-    error(`Failed to extract base APK from XAPK: ${err.message}`);
-    return null;
-  }
 }
 
 export class PlayStoreSource implements RemoteApkSource {
@@ -222,24 +189,51 @@ export class PlayStoreSource implements RemoteApkSource {
       const apkFiles = allFiles.filter(f => f.endsWith('.apk'));
       const xapkFiles = allFiles.filter(f => f.endsWith('.xapk'));
 
-      let apkPath: string;
+      // Both cases stage into the package dir. The tracker dedups first and
+      // finalizes the move only when the version is kept, so a deduped download
+      // can't overwrite/delete a stored APK.
+      const pkgDir = path.join(APK_DIR, packageName);
+      fs.mkdirSync(pkgDir, { recursive: true });
 
-      if (apkFiles.length > 0) {
-        apkPath = path.join(tmpDir, apkFiles[0]);
-      } else if (xapkFiles.length > 0) {
-        // XAPK is a ZIP containing base.apk + split APKs — extract the base APK
+      if (xapkFiles.length > 0) {
+        // XAPK is a ZIP of base.apk + config/density/ABI splits (the splits hold
+        // native libraries). Explode the whole set into a staged dir on pkgDir's
+        // filesystem so the tracker's finalize is a rename, not a copy.
         const xapkPath = path.join(tmpDir, xapkFiles[0]);
-        log(`Extracting base APK from XAPK bundle: ${xapkFiles[0]} (${(fs.statSync(xapkPath).size / 1024 / 1024).toFixed(1)} MB)`);
-        const extracted = extractBaseApkFromXapk(xapkPath, tmpDir);
-        if (!extracted) {
-          return { success: false, error: 'Failed to extract base APK from XAPK bundle' };
+        log(`Exploding XAPK bundle: ${xapkFiles[0]} (${(fs.statSync(xapkPath).size / 1024 / 1024).toFixed(1)} MB)`);
+        const splitDir = path.join(pkgDir, `.dl-${crypto.randomUUID()}`);
+        const unpacked = await unpackApkBundle(xapkPath, splitDir);
+
+        const versionInfo = readApkVersion(unpacked.baseApk);
+        if (!versionInfo.versionCode) {
+          fs.rmSync(splitDir, { recursive: true, force: true });
+          log(`Could not extract versionCode from base APK for ${packageName}`);
+          return { success: false, error: 'Could not extract versionCode from downloaded APK' };
         }
-        apkPath = extracted;
-      } else {
+        const versionName = versionInfo.versionName || 'unknown';
+        const totalSize = unpacked.apkFiles.reduce((sum, f) => sum + fs.statSync(f).size, 0);
+        if (totalSize < 1000) {
+          fs.rmSync(splitDir, { recursive: true, force: true });
+          return { success: false, error: 'Downloaded APK file too small' };
+        }
+
+        log(`Downloaded ${packageName} v${versionName} (${versionInfo.versionCode}) — ${unpacked.apkFiles.length} split(s), ${totalSize} bytes via ${sourceName}`);
+        // splitDir is a STAGED directory; the tracker finalizes or discards it.
+        return {
+          success: true,
+          splitDir,
+          versionCode: versionInfo.versionCode,
+          versionName,
+          fileSize: totalSize,
+        };
+      }
+
+      if (apkFiles.length === 0) {
         log(`apkeep produced no APK/XAPK files for ${packageName} (${sourceName}), got: ${allFiles.join(', ') || '(empty)'}`);
         return { success: false, error: `apkeep produced no downloadable files (${sourceName})` };
       }
 
+      const apkPath = path.join(tmpDir, apkFiles[0]);
       const apkSize = fs.statSync(apkPath).size;
       if (apkSize < 1000) {
         log(`Downloaded APK too small (${apkSize} bytes) for ${packageName}`);
@@ -256,11 +250,6 @@ export class PlayStoreSource implements RemoteApkSource {
       }
 
       const versionName = versionInfo.versionName || 'unknown';
-      // Copy into a uniquely-named staging file inside the package dir. The
-      // tracker dedups first and finalizes the move only when the version is
-      // kept, so a deduped download can't overwrite/delete a stored APK.
-      const pkgDir = path.join(APK_DIR, packageName);
-      fs.mkdirSync(pkgDir, { recursive: true });
       const stagedPath = path.join(pkgDir, `.dl-${crypto.randomUUID()}.apk`);
 
       fs.copyFileSync(apkPath, stagedPath);

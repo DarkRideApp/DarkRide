@@ -208,7 +208,7 @@ describe('ApkPureSource.downloadApk', () => {
     expect(path.basename(r.filePath!)).toMatch(/^\.dl-.*\.apk$/);
   });
 
-  it('extracts base.apk from an XAPK bundle', async () => {
+  it('explodes an XAPK bundle into a staged split dir preserving every APK', async () => {
     const apk = makeApk(217, '6.0.28');
     const xapk = makeXapk(apk);
     mockDownload(
@@ -217,11 +217,19 @@ describe('ApkPureSource.downloadApk', () => {
     );
     const r = await src.downloadApk(PKG);
     expect(r.success).toBe(true);
-    expect(r.versionCode).toBe(217); // read from the extracted base.apk manifest
-    expect(fs.existsSync(r.filePath!)).toBe(true);
-    expect(path.basename(r.filePath!)).toMatch(/^\.dl-.*\.apk$/);
-    // The staged file is the base APK, not the XAPK zip.
-    expect(new AdmZip(r.filePath!).getEntry('AndroidManifest.xml')).not.toBeNull();
+    expect(r.versionCode).toBe(217); // read from the base.apk manifest inside the bundle
+    expect(r.versionName).toBe('6.0.28');
+    // XAPK yields a split DIRECTORY, never a single staged file.
+    expect(r.filePath).toBeUndefined();
+    expect(r.splitDir).toBeDefined();
+    expect(fs.statSync(r.splitDir!).isDirectory()).toBe(true);
+    expect(path.basename(r.splitDir!)).toMatch(/^\.dl-/);
+    // The split set survives intact: base.apk PLUS the config split.
+    const names = fs.readdirSync(r.splitDir!);
+    expect(names).toContain('base.apk');
+    expect(names).toContain('config.arm64_v8a.apk');
+    // base.apk is the real APK with a manifest (not the XAPK zip).
+    expect(new AdmZip(path.join(r.splitDir!, 'base.apk')).getEntry('AndroidManifest.xml')).not.toBeNull();
   });
 
   it('rejects a download URL on a non-APKPure host (SSRF guard)', async () => {
