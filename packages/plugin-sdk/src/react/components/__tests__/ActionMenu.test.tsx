@@ -96,4 +96,37 @@ describe('ActionMenu', () => {
     render(<ActionMenu items={makeItems()} label="Version actions" />);
     expect(screen.getByRole('button', { name: 'Version actions' })).not.toHaveAttribute('aria-expanded');
   });
+
+  it('renders the open menu in a portal on document.body, not inside the trigger root', () => {
+    render(<ActionMenu items={makeItems()} label="Version actions" data-testid="am-root" />);
+    fireEvent.click(screen.getByRole('button', { name: 'Version actions' }));
+    const menu = screen.getByRole('menu');
+    const root = screen.getByTestId('am-root');
+    // The list must escape the .action-menu root so ancestor overflow:hidden
+    // (tables, cards) cannot clip it.
+    expect(root.contains(menu)).toBe(false);
+    expect(document.body.contains(menu)).toBe(true);
+    expect(menu.style.position).toBe('fixed');
+  });
+
+  it('click outside still closes; clicking a menu item selects and closes', () => {
+    const onDelete = vi.fn();
+    render(<ActionMenu items={makeItems(onDelete)} label="Version actions" />);
+    const trigger = screen.getByRole('button', { name: 'Version actions' });
+
+    // Clicking a portalled menu item must count as "inside": it selects and closes.
+    fireEvent.click(trigger);
+    const item = screen.getByTestId('menu-item-delete');
+    fireEvent.mouseDown(item);
+    expect(screen.getByRole('menu')).toBeInTheDocument(); // mousedown on the list must not close it
+    fireEvent.click(item);
+    expect(onDelete).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+
+    // Clicking genuinely outside still closes.
+    fireEvent.click(trigger);
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+  });
 });
