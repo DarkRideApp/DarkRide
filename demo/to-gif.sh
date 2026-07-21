@@ -3,13 +3,14 @@
 # Usage: demo/to-gif.sh demo/out/hero.webm [fps] [width]
 set -euo pipefail
 
-IN="${1:?usage: to-gif.sh <input.webm> [fps=15] [width=960]}"
+IN="${1:?usage: to-gif.sh <input.webm> [fps=15] [width=960] [trim-start-secs=0]}"
 FPS="${2:-15}"
 WIDTH="${3:-960}"
+TRIM="${4:-0}"   # drop this many seconds off the start (e.g. the login intro)
 BASE="${IN%.*}"
 
 # 1) MP4 (H.264) — the primary hero asset: small, crisp, loops in a <video>.
-ffmpeg -y -i "$IN" \
+ffmpeg -y -ss "$TRIM" -i "$IN" \
   -movflags +faststart -pix_fmt yuv420p \
   -vf "scale=${WIDTH}:-2:flags=lanczos" \
   -c:v libx264 -crf 23 -preset veryslow -an \
@@ -17,8 +18,8 @@ ffmpeg -y -i "$IN" \
 
 # 2) Optimized GIF — two-pass palettegen/paletteuse for clean colors + small size.
 PALETTE="$(mktemp --suffix=.png)"
-ffmpeg -y -i "$IN" -vf "fps=${FPS},scale=${WIDTH}:-1:flags=lanczos,palettegen=stats_mode=diff" "$PALETTE"
-ffmpeg -y -i "$IN" -i "$PALETTE" \
+ffmpeg -y -ss "$TRIM" -i "$IN" -vf "fps=${FPS},scale=${WIDTH}:-1:flags=lanczos,palettegen=stats_mode=diff" "$PALETTE"
+ffmpeg -y -ss "$TRIM" -i "$IN" -i "$PALETTE" \
   -lavfi "fps=${FPS},scale=${WIDTH}:-1:flags=lanczos [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle" \
   "${BASE}.gif"
 rm -f "$PALETTE"

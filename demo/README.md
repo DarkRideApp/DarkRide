@@ -29,16 +29,22 @@ Not runnable in a disk-constrained CI sandbox — an Android emulator needs KVM 
 a system image (multi-GB). Run on a machine/CI with the room:
 
 ```bash
-# 1. Boot an emulator and connect it to DarkRide (docker-android or a local AVD).
+# 1. Connect a device (physical or emulator) to DarkRide.
 # 2. Install the Playground target (published from DarkRideApp/playground CI):
 demo/fetch-playground.sh
 adb install demo/assets/playground.apk
-# 3. Start DarkRide (backend + frontend), then record + convert:
+# 3. Start DarkRide, then record + convert. The recorder logs into DarkRide
+#    first (else you just film the login screen) — creds via env vars:
+export DARKRIDE_USER=you DARKRIDE_PASS=yourpassword
 node demo/record.mjs \
   --scenario demo/scenarios/hero-playground.mjs \
   --base-url http://localhost:5173 --name hero
-demo/to-gif.sh demo/out/hero.webm 15 960
+# trim the ~3s login intro off the front (4th arg = start seconds):
+demo/to-gif.sh demo/out/hero.webm 15 960 3
 ```
+
+`DARKRIDE_USER`/`DARKRIDE_PASS` (or `--user`/`--pass`) auth the recorder's browser.
+Without them you record the login screen. Login mirrors `tests/e2e/helpers/auth.ts`.
 
 Use the resulting `hero.mp4` in a looping muted `<video>` on the site hero, with
 `hero.gif` as the fallback / social-embed asset.

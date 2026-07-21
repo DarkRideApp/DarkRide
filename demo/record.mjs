@@ -19,6 +19,7 @@ import { chromium } from 'playwright';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { loginToDarkride } from './lib/darkride-login.mjs';
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);
@@ -52,8 +53,19 @@ const context = await browser.newContext({
 const page = await context.newPage();
 const video = page.video();
 
+// Log into DarkRide first if creds are supplied (env vars preferred so they
+// stay out of shell history): DARKRIDE_USER / DARKRIDE_PASS, or --user/--pass.
+const user = arg('user', process.env.DARKRIDE_USER);
+const pass = arg('pass', process.env.DARKRIDE_PASS);
+
 let failed = false;
 try {
+  if (user && pass) {
+    console.log('  • logging in to DarkRide…');
+    await loginToDarkride(page, baseURL, user, pass);
+  } else if (baseURL !== 'about:blank') {
+    console.warn('  ! no DARKRIDE_USER/DARKRIDE_PASS set — the recorder is not logged in, so you\'ll get the login screen. Set them and rerun.');
+  }
   await scenario(page, { baseURL, width, height });
 } catch (err) {
   failed = true;
