@@ -1430,7 +1430,26 @@ def handle_frida_run(params):
         raise BridgeError(ErrorCode.INVALID_PARAMS, "bundle_id is required for spawn mode")
     app_name = params.get('app_name')
     if mode == 'attach' and pid is None and not app_name:
-        raise BridgeError(ErrorCode.INVALID_PARAMS, "pid or app_name is required for attach mode")
+        if bundle_id:
+            # Callers (run_frida_script) know only the package id. Resolve the
+            # running process's PID from it so attach-by-package works.
+            out = ''
+            try:
+                out = _adb_run(['pidof', bundle_id]).strip()
+            except Exception:
+                out = ''
+            if out:
+                pid = int(out.split()[0])
+            else:
+                raise BridgeError(
+                    ErrorCode.INVALID_PARAMS,
+                    f"No running process found for '{bundle_id}' — start the app on the device before attaching",
+                )
+        else:
+            raise BridgeError(
+                ErrorCode.INVALID_PARAMS,
+                "pid, app_name, or bundle_id (of a running app) is required for attach mode",
+            )
 
     # Kill previous frida process if still running
     if _frida_process and _frida_process.poll() is None:

@@ -68,11 +68,80 @@ class TestFridaRunParamValidation:
             handle_frida_run({})
         assert exc.value.code == ErrorCode.INVALID_PARAMS
 
-    def test_attach_mode_requires_pid_or_app_name(self):
+    def test_attach_mode_requires_identifier(self):
+        """With no pid, app_name, or bundle_id, attach mode must reject the call."""
         from bridge import handle_frida_run, BridgeError, ErrorCode
         with pytest.raises(BridgeError) as exc:
             handle_frida_run({'mode': 'attach'})
         assert exc.value.code == ErrorCode.INVALID_PARAMS
+
+
+class TestFridaRunAttachByBundle:
+    """Attach mode should resolve a running process's PID from bundle_id when
+    no explicit pid/app_name is supplied — callers only know the package id."""
+
+    def setup_method(self):
+        import bridge
+        bridge._frida_message_lock = threading.Lock()
+        bridge._frida_messages.clear()
+        bridge._frida_process = None
+
+    def _patch_common(self, bridge, monkeypatch, popen_mock):
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(bridge, 'handle_frida_start_server', lambda *a, **kw: {'status': 'running'})
+        fake_dev = MagicMock()
+        fake_dev.id = 'device-id-abc'
+        monkeypatch.setattr(bridge, '_get_frida_device', lambda: fake_dev)
+        monkeypatch.setattr(bridge, '_frida_cli_path', lambda: '/fake/frida')
+        # Threads would read from the MagicMock proc forever — no-op them.
+        monkeypatch.setattr(bridge, '_frida_output_reader', lambda proc: None)
+        monkeypatch.setattr(bridge, '_frida_stderr_reader', lambda proc: None)
+        monkeypatch.setattr(bridge.subprocess, 'Popen', popen_mock)
+
+    def test_attach_with_bundle_id_resolves_pid(self, monkeypatch):
+        import bridge
+        from bridge import handle_frida_run
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(bridge, '_adb_run', lambda *a, **kw: '12345\n')
+        popen_mock = MagicMock()
+        self._patch_common(bridge, monkeypatch, popen_mock)
+
+        handle_frida_run({'mode': 'attach', 'bundle_id': 'com.example.app', 'code': ''})
+
+        cmd = popen_mock.call_args[0][0]
+        assert '-p' in cmd, f"expected -p in command; got {cmd}"
+        assert cmd[cmd.index('-p') + 1] == '12345', f"pid not passed after -p; got {cmd}"
+        assert '-f' not in cmd, f"attach mode must not spawn (-f); got {cmd}"
+
+    def test_attach_with_bundle_id_picks_first_pid(self, monkeypatch):
+        import bridge
+        from bridge import handle_frida_run
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(bridge, '_adb_run', lambda *a, **kw: '12345 67890\n')
+        popen_mock = MagicMock()
+        self._patch_common(bridge, monkeypatch, popen_mock)
+
+        handle_frida_run({'mode': 'attach', 'bundle_id': 'com.example.app', 'code': ''})
+
+        cmd = popen_mock.call_args[0][0]
+        assert cmd[cmd.index('-p') + 1] == '12345', f"should pick first pid; got {cmd}"
+
+    def test_attach_with_bundle_id_not_running_raises(self, monkeypatch):
+        import bridge
+        from bridge import handle_frida_run, BridgeError, ErrorCode
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(bridge, '_adb_run', lambda *a, **kw: '')
+        popen_mock = MagicMock()
+        self._patch_common(bridge, monkeypatch, popen_mock)
+
+        with pytest.raises(BridgeError) as exc:
+            handle_frida_run({'mode': 'attach', 'bundle_id': 'com.example.app', 'code': ''})
+        assert exc.value.code == ErrorCode.INVALID_PARAMS
+        assert 'No running process found' in str(exc.value)
+        popen_mock.assert_not_called()
 
 
 class TestFridaSpawnControlledParamValidation:
