@@ -15,11 +15,26 @@ function pickFile(name: string) {
 describe('UploadApkModal', () => {
   beforeEach(() => vi.mocked(uploadApk).mockReset());
 
-  it('rejects non-.apk files client-side', () => {
+  it('rejects unsupported files client-side', () => {
     render(<UploadApkModal onClose={() => {}} onUploaded={() => {}} />);
     pickFile('archive.zip');
     expect(screen.getByText(/must be an \.apk/i)).toBeInTheDocument();
     expect(uploadApk).not.toHaveBeenCalled();
+  });
+
+  it('accepts .xapk and .apks split-APK bundles client-side', () => {
+    const { unmount } = render(<UploadApkModal onClose={() => {}} onUploaded={() => {}} />);
+    pickFile('bundle.xapk');
+    expect(screen.queryByText(/must be an/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/bundle\.xapk/)).toBeInTheDocument();
+    expect(screen.getByTestId('upload-submit-btn')).not.toBeDisabled();
+    unmount();
+
+    render(<UploadApkModal onClose={() => {}} onUploaded={() => {}} />);
+    pickFile('bundle.apks');
+    expect(screen.queryByText(/must be an/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/bundle\.apks/)).toBeInTheDocument();
+    expect(screen.getByTestId('upload-submit-btn')).not.toBeDisabled();
   });
 
   it('uploads and reports success', async () => {
