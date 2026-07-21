@@ -245,6 +245,32 @@ export function parseInstallerPackageName(dumpsysOutput: string): string | null 
   return null;
 }
 
+/** Signals in shell output/errors that root is genuinely unavailable. */
+const ROOT_UNAVAILABLE_RE = /su: (inaccessible|not found)|permission denied|operation not permitted/i;
+
+/** User-facing message when a privileged command can't run for lack of root. */
+const ROOT_REQUIRED_MESSAGE =
+  "Setting the install source requires root, which isn't available on this device (no root adb shell and no accessible su).";
+
+/**
+ * Run a root-requiring command on a device, choosing the right privileged-exec
+ * path:
+ *   - adbd already root (emulator / userdebug / `adb root` builds, `id -u`==0):
+ *     run the command directly via `adbShell` — there is no `su` and none is
+ *     needed.
+ *   - otherwise (`id -u`!=0): go through `suShell` (Magisk-style `su -c`).
+ *
+ * `pm set-installer` inherently needs root; this helper does NOT grant root, it
+ * just picks the exec path that works on the device. When neither path has
+ * root, the underlying shell surfaces a "su: not found" / permission error that
+ * the caller maps to a clear, actionable message. Exported for unit testing.
+ */
+export async function runPrivileged(deviceId: string, cmd: string): Promise<string> {
+  const uid = (await adbShell(deviceId, 'id -u')).trim();
+  if (uid === '0') return adbShell(deviceId, cmd);
+  return suShell(deviceId, cmd);
+}
+
 /**
  * Get the app label via aapt on the device (more reliable for app names).
  */
@@ -756,9 +782,12 @@ export function registerAppEndpoints(
 
   // PUT /v1/device/apps/:deviceId/install-source/:packageName — set the
   // OS-recorded installer package via `pm set-installer` (persistent).
-  // NOTE: `pm set-installer` requires root and may reject an installer package
-  // that isn't recognized on some Android versions; that rejection is surfaced
-  // as the device error below.
+  // NOTE: `pm set-installer` inherently requires root. runPrivileged picks the
+  // right privileged-exec path — direct exec when adbd is already root, else
+  // `su -c` — and when neither has root we return a clear 403 instead of a raw
+  // "su: not found" dump. It may also reject an installer package that isn't
+  // recognized on some Android versions; that rejection is surfaced as the
+  // device error below.
   registerEndpoint('PUT', '/v1/device/apps/:deviceId/install-source/:packageName', async (req, res) => {
     const deviceId = req.params.deviceId as string;
     const packageName = req.params.packageName as string;
@@ -780,7 +809,14 @@ export function registerAppEndpoints(
 
     try {
       // pm set-installer prints nothing on success, an error marker on failure.
-      const output = await suShell(deviceId, `pm set-installer ${packageName} ${installer}`, 10000);
+      // runPrivileged picks direct-exec (root adbd) vs `su -c` (Magisk root).
+      const output = await runPrivileged(deviceId, `pm set-installer ${packageName} ${installer}`);
+      // No root anywhere → the shell reports su missing / permission denied.
+      // Surface a clear, actionable message rather than the raw device dump.
+      if (ROOT_UNAVAILABLE_RE.test(output)) {
+        res.status(403).json({ success: false, error: ROOT_REQUIRED_MESSAGE });
+        return;
+      }
       if (/error|failure|exception/i.test(output)) {
         res.status(500).json({ success: false, error: output.trim() });
         return;
@@ -791,6 +827,11 @@ export function registerAppEndpoints(
       log(`Set installer for ${packageName} to ${installer} on ${deviceId}`);
       res.json({ success: true, data: { packageName, installerPackageName } });
     } catch (err: any) {
+      // A thrown "su: not found" / permission error means root isn't available.
+      if (ROOT_UNAVAILABLE_RE.test(err?.message ?? '')) {
+        res.status(403).json({ success: false, error: ROOT_REQUIRED_MESSAGE });
+        return;
+      }
       error(`Failed to set install source for ${packageName} on ${deviceId}: ${err.message}`);
       res.status(500).json({ success: false, error: err.message });
     }
