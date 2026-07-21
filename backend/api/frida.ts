@@ -13,6 +13,7 @@ import type { GadgetInjector } from '../services/gadget-injector';
 import { createLoggers } from '../logs';
 import { CATEGORY_LABELS, seedFridaScriptLibrary } from '../services/frida-script-library';
 import { callFridaBridge as callFridaBridgeShared } from '../services/frida-bridge';
+import { fridaServerNeedsRepush } from './frida-version';
 
 const execFileAsync = promisify(execFile);
 const { log, error: logError } = createLoggers('frida');
@@ -169,20 +170,49 @@ export function registerFridaEndpoints(db: AppDatabase, releaseManager: FridaRel
       // Wake & unlock the device if needed
       try { await callFridaBridge(deviceId, 'wakeAndUnlock', {}); } catch {}
 
-      // Skip binary push + restart if frida-server is already running and responsive
+      // Resolve version — 'auto' matches the Python frida package version
+      const resolved = releaseManager.resolveVersion(version);
+
+      // Skip binary push + restart only when the on-device server is BOTH
+      // responsive AND version-matched to the resolved target. A stale,
+      // mismatched binary can still answer probes, so responsiveness alone is
+      // not sufficient — force a re-push on any version drift.
+      let responsive = false;
+      let apps: unknown[] = [];
       try {
         const testResult = await callFridaBridge(deviceId, 'frida_list_apps', {});
         if (testResult && Array.isArray(testResult)) {
-          log(`frida-server already running on ${deviceId} — skipping restart`);
-          res.json({ success: true, data: { status: 'already-running', apps: testResult.length } });
-          return;
+          responsive = true;
+          apps = testResult;
         }
       } catch {
-        // Server not running — proceed with start
+        // Server not running or unresponsive — proceed with start
       }
 
-      // Resolve version — 'auto' matches the Python frida package version
-      const resolved = releaseManager.resolveVersion(version);
+      // Query the on-device server version. Any failure (binary missing,
+      // timeout, non-zero exit) is treated as unknown → forces a re-push.
+      let deviceVersion: string | null = null;
+      try {
+        const { stdout } = await execFileAsync(
+          'adb',
+          ['-s', deviceId, 'shell', "su -c '/data/local/tmp/frida-server --version'"],
+          { timeout: 5000 },
+        );
+        deviceVersion = stdout.trim() || null;
+      } catch {
+        deviceVersion = null;
+      }
+
+      if (!fridaServerNeedsRepush({ responsive, deviceVersion, targetVersion: resolved })) {
+        log(`frida-server already running and version-matched on ${deviceId} — skipping restart`);
+        res.json({ success: true, data: { status: 'already-running', apps: apps.length } });
+        return;
+      }
+
+      if (responsive && deviceVersion !== resolved) {
+        log(`frida-server version mismatch on ${deviceId} (device=${deviceVersion ?? 'unknown'} target=${resolved ?? 'unknown'}) — re-pushing`);
+      }
+
       if (!resolved) {
         res.status(400).json({ success: false, error: `No Frida version available (requested: ${version}). Sync releases first.` });
         return;
