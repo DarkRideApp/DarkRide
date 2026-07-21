@@ -713,7 +713,7 @@ class TestFridaInjectApk:
         """Verify frida_run raises when neither pid nor app_name given in attach mode."""
         from bridge import HANDLERS
         handler = HANDLERS['frida_run']
-        with pytest.raises(Exception, match='pid or app_name'):
+        with pytest.raises(Exception, match=r'pid.*app_name.*bundle_id'):
             handler({'mode': 'attach', 'code': ''})
 
 
