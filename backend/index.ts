@@ -147,6 +147,7 @@ import { createDockerClient, setActiveDockerClient, getActiveDockerClient, spawn
 import { createAvdProvider } from './services/providers/avd';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { makeCaptureHandlers } from './services/capture-handlers';
+import { ensureConfigs } from './services/wireguard-config';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
 import { stopSpawnedInstances } from './services/stop-spawned-instances';
@@ -321,6 +322,7 @@ const captureHandlers = makeCaptureHandlers({
   // serial can't shadow the live emulator (mirrors resolveCaptureMode's H3 fix).
   lookupRuntimeId: (serial) => deviceInstancesRepo?.findRuntimeIdBySerial(serial),
   waitForTunnelReady: (serial) => captureManager.waitForTunnelReady(serial),
+  ensureConfigs,
 });
 captureModeRegistry.register('wireguard', captureHandlers.wireguard);
 captureModeRegistry.register('emu-http-proxy', captureHandlers['emu-http-proxy']);

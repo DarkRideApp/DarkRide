@@ -17,6 +17,13 @@ function deps() {
     getActiveDockerClient: vi.fn().mockReturnValue({}),
     lookupRuntimeId: vi.fn().mockReturnValue('container123'),
     waitForTunnelReady: vi.fn().mockResolvedValue(true),
+    ensureConfigs: vi.fn().mockReturnValue({
+      clientPrivateKey: 'client-priv',
+      serverPublicKey: 'server-pub',
+      clientAddress: '10.0.0.2/32',
+      serverEndpoint: '203.0.113.1:51820',
+      serverConfigPath: '/tmp/wg-config.json',
+    }),
   };
 }
 const ctx = (over = {}) => ({
@@ -37,6 +44,31 @@ describe('capture handlers', () => {
   it('wireguard: already-running (no tunnelInfo) skips on-device setup, tunnelActivated false', async () => {
     const d = deps();
     d.mitmproxyManager.startCapture = vi.fn().mockResolvedValue(undefined);
+    const h = makeCaptureHandlers(d as any);
+    const r = await h.wireguard(ctx());
+    expect(d.mitmproxyManager.startCapture).toHaveBeenCalled();
+    expect(d.deviceManager.injectMitmproxyCaCert).not.toHaveBeenCalled();
+    expect(d.deviceManager.activateWireGuardTunnel).not.toHaveBeenCalled();
+    expect(r.tunnelActivated).toBe(false);
+  });
+
+  it('wireguard: re-activates the device tunnel when mitmproxy is already running but the tunnel is down', async () => {
+    const d = deps();
+    d.mitmproxyManager.startCapture = vi.fn().mockResolvedValue(undefined);
+    d.waitForTunnelReady = vi.fn().mockResolvedValue(false);
+    const h = makeCaptureHandlers(d as any);
+    const r = await h.wireguard(ctx());
+    expect(d.mitmproxyManager.startCapture).toHaveBeenCalled();
+    expect(d.ensureConfigs).toHaveBeenCalledWith('localhost:32770', expect.anything());
+    expect(d.deviceManager.injectMitmproxyCaCert).toHaveBeenCalledWith('localhost:32770');
+    expect(d.deviceManager.activateWireGuardTunnel).toHaveBeenCalled();
+    expect(r.tunnelActivated).toBe(true);
+  });
+
+  it('wireguard: does NOT re-activate when mitmproxy is already running and the tunnel is up', async () => {
+    const d = deps();
+    d.mitmproxyManager.startCapture = vi.fn().mockResolvedValue(undefined);
+    d.waitForTunnelReady = vi.fn().mockResolvedValue(true);
     const h = makeCaptureHandlers(d as any);
     const r = await h.wireguard(ctx());
     expect(d.mitmproxyManager.startCapture).toHaveBeenCalled();
