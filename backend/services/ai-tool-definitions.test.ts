@@ -34,6 +34,7 @@ vi.mock('./intercept-config-writer', () => ({
 describe('registerAllTools', () => {
   let db: BetterSQLite3Database<typeof schema>;
   let registry: AiToolRegistry;
+  let fakeDeviceManagerRef: any;
 
   beforeEach(() => {
     db = createTestDb();
@@ -44,9 +45,11 @@ describe('registerAllTools', () => {
     const fakeDeviceManager = {
       markBusy: vi.fn(),
       markIdle: vi.fn(),
-      getDeviceStatus: vi.fn().mockResolvedValue({ isOnline: true }),
+      getDeviceStatus: vi.fn().mockResolvedValue({ isOnline: true, platform: 'android' }),
       executeShellCommand: vi.fn().mockResolvedValue(''),
+      takeScreenshot: vi.fn(),
     } as any;
+    fakeDeviceManagerRef = fakeDeviceManager;
     registerAllTools(registry, db as any, { bridgeManager: fakeBridge, deviceManager: fakeDeviceManager });
     mockCallFridaBridge.mockReset();
   });
@@ -3377,6 +3380,37 @@ class AuthManager {
       expect(names).toContain('list_tracked_apps');
       expect(names).toContain('get_app_versions');
       expect(names).toContain('trigger_apk_analysis');
+    });
+  });
+
+  describe('capture_screenshot', () => {
+    it('is registered on the devices context', () => {
+      const tools = registry.getToolsForContext('devices');
+      const names = tools.map(t => t.name);
+      expect(names).toContain('capture_screenshot');
+    });
+
+    it('returns an _mcpImage result with base64 PNG data for an Android device', async () => {
+      fakeDeviceManagerRef.getDeviceStatus.mockResolvedValue({ isOnline: true, platform: 'android' });
+      fakeDeviceManagerRef.takeScreenshot.mockResolvedValue(Buffer.from('PNGDATA'));
+
+      const result = await registry.executeTool('capture_screenshot', { deviceId: 'dev1' });
+
+      expect(fakeDeviceManagerRef.takeScreenshot).toHaveBeenCalledWith('dev1');
+      expect(result).toEqual({
+        _mcpImage: true,
+        data: Buffer.from('PNGDATA').toString('base64'),
+        mimeType: 'image/png',
+      });
+    });
+
+    it('returns a plain error (no screenshot) for an iOS device', async () => {
+      fakeDeviceManagerRef.getDeviceStatus.mockResolvedValue({ isOnline: true, platform: 'ios' });
+
+      const result: any = await registry.executeTool('capture_screenshot', { deviceId: 'dev1' });
+
+      expect(fakeDeviceManagerRef.takeScreenshot).not.toHaveBeenCalled();
+      expect(result.error).toMatch(/ios/i);
     });
   });
 });

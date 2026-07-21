@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { describeMcpRequest } from './mcp-server';
+import { describeMcpRequest, toMcpToolContent, isImageToolResult } from './mcp-server';
 
 describe('describeMcpRequest', () => {
   it('describes a tools/list request', () => {
@@ -46,5 +46,49 @@ describe('describeMcpRequest', () => {
     expect(describeMcpRequest(undefined)).toBe('method=<missing>');
     expect(describeMcpRequest({})).toBe('method=<no-method>');
     expect(describeMcpRequest('not an object')).toBe('method=<malformed>');
+  });
+});
+
+describe('isImageToolResult', () => {
+  it('returns true for a well-formed image result', () => {
+    expect(isImageToolResult({ _mcpImage: true, data: 'AAAA', mimeType: 'image/png' })).toBe(true);
+  });
+
+  it('returns false for null/undefined', () => {
+    expect(isImageToolResult(null)).toBe(false);
+    expect(isImageToolResult(undefined)).toBe(false);
+  });
+
+  it('returns false for strings and numbers', () => {
+    expect(isImageToolResult('AAAA')).toBe(false);
+    expect(isImageToolResult(42)).toBe(false);
+  });
+
+  it('returns false for partial/mistyped objects', () => {
+    expect(isImageToolResult({ _mcpImage: true })).toBe(false);
+    expect(isImageToolResult({ _mcpImage: true, data: 'AAAA' })).toBe(false);
+    expect(isImageToolResult({ _mcpImage: false, data: 'AAAA', mimeType: 'image/png' })).toBe(false);
+    expect(isImageToolResult({ data: 'AAAA', mimeType: 'image/png' })).toBe(false);
+    expect(isImageToolResult({ _mcpImage: true, data: 123, mimeType: 'image/png' })).toBe(false);
+  });
+});
+
+describe('toMcpToolContent', () => {
+  it('wraps a string result in a single text block', () => {
+    expect(toMcpToolContent('hello world')).toEqual([{ type: 'text', text: 'hello world' }]);
+  });
+
+  it('serialises an object result to JSON in a single text block', () => {
+    const result = { a: 1, b: 'two' };
+    expect(toMcpToolContent(result)).toEqual([
+      { type: 'text', text: JSON.stringify(result, null, 2) },
+    ]);
+  });
+
+  it('emits a single image block for an image result', () => {
+    const result = { _mcpImage: true as const, data: 'AAAA', mimeType: 'image/png' };
+    expect(toMcpToolContent(result)).toEqual([
+      { type: 'image', data: 'AAAA', mimeType: 'image/png' },
+    ]);
   });
 });

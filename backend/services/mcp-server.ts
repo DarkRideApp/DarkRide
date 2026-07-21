@@ -51,6 +51,46 @@ function truncate(s: string, max: number): string {
 }
 
 /**
+ * Marker shape a tool returns when its result is an image rather than text.
+ * The MCP result layer detects this and emits an `image` content block so the
+ * client renders it as a picture instead of a giant base64 JSON string.
+ */
+export interface ImageToolResult {
+  _mcpImage: true;
+  /** Base64-encoded image bytes (no data: URI prefix). */
+  data: string;
+  /** MIME type of the image, e.g. `image/png`. */
+  mimeType: string;
+}
+
+/** Narrow an arbitrary tool result to an ImageToolResult. */
+export function isImageToolResult(x: unknown): x is ImageToolResult {
+  return (
+    !!x &&
+    typeof x === 'object' &&
+    (x as any)._mcpImage === true &&
+    typeof (x as any).data === 'string' &&
+    typeof (x as any).mimeType === 'string'
+  );
+}
+
+/**
+ * Convert a tool's raw return value into MCP `content` blocks.
+ *
+ * Image results (see ImageToolResult) become a single `image` block; every
+ * other value is serialised to text — strings verbatim, objects as pretty JSON.
+ */
+export function toMcpToolContent(
+  result: unknown,
+): Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> {
+  if (isImageToolResult(result)) {
+    return [{ type: 'image', data: result.data, mimeType: result.mimeType }];
+  }
+  const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  return [{ type: 'text', text }];
+}
+
+/**
  * Mount an MCP HTTP Streamable server on the given Express app at `/mcp`.
  *
  * Uses stateless mode — each POST request gets its own transport + Server instance.
@@ -86,8 +126,7 @@ export function mountMcpSseServer(app: Express, registry: AiToolRegistry, db: Ap
       const { name, arguments: args } = request.params;
       try {
         const result = await registry.executeTool(name, args ?? {}, userScopes);
-        const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-        return { content: [{ type: 'text' as const, text }] };
+        return { content: toMcpToolContent(result) };
       } catch (err: any) {
         return {
           content: [{ type: 'text' as const, text: `Error: ${err.message}` }],
