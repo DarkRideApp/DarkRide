@@ -499,6 +499,15 @@ describe('DeviceManager', () => {
       // Android's `32000: unreachable` rule requires explicit routing for fwmark packets
       expect(allCmds).toContain('ip rule add fwmark 51820 lookup main priority 90');
       expect(allCmds).toContain('ip rule add not fwmark 51820 table 51820 priority 100');
+      // IPv6 must be null-routed inside the custom table so IPv6 attempts fail
+      // fast (ENETUNREACH) and Happy-Eyeballs-capable clients fall back to the
+      // captured IPv4 path, instead of silently bypassing the tunnel.
+      expect(allCmds).toContain('ip -6 route add unreachable default table 51820');
+      expect(allCmds).toContain('ip -6 rule add not fwmark 51820 table 51820 priority 100');
+      // The inline teardown at the start of the command chain must also
+      // reverse the v6 null-route/rule from any prior run.
+      expect(allCmds).toContain('ip -6 rule del not fwmark 51820 table 51820 priority 100');
+      expect(allCmds).toContain('ip -6 route flush table 51820');
     });
 
     it('uses wireguard-go and wg-uapi when kernel WireGuard not available', async () => {
@@ -566,6 +575,9 @@ describe('DeviceManager', () => {
       expect(allCmds).toContain('killall wireguard-go');
       expect(allCmds).toContain('ip rule del table 51820');
       expect(allCmds).toContain('ip route flush table 51820');
+      // Reverse the IPv6 null-route/rule installed during activation.
+      expect(allCmds).toContain('ip -6 rule del not fwmark 51820 table 51820 priority 100');
+      expect(allCmds).toContain('ip -6 route flush table 51820');
     });
   });
 
