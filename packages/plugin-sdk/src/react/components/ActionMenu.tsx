@@ -1,4 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { MoreVertical } from 'lucide-react';
 
 export interface ActionMenuItem {
@@ -28,11 +29,17 @@ export interface ActionMenuProps {
  * keyboard pattern: opening focuses the first enabled item, Arrow keys
  * cycle between enabled items, and Escape/selection return focus to the
  * trigger.
+ *
+ * The open list renders through a portal on `document.body` with `fixed`
+ * positioning derived from the trigger's bounding rect, so ancestor
+ * `overflow: hidden` containers (tables, cards) cannot clip it.
  */
 export function ActionMenu({ items, label, 'data-testid': testId }: ActionMenuProps) {
   const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   // Indices (into `items`) of enabled, selectable menu items — the focus ring.
@@ -43,10 +50,34 @@ export function ActionMenu({ items, label, 'data-testid': testId }: ActionMenuPr
   useEffect(() => {
     if (!open) return;
     const onDocClick = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+      const target = e.target as Node;
+      // The list lives in a portal, so it is NOT inside rootRef — treat a
+      // click inside either the trigger root or the list as "inside".
+      const inside =
+        (rootRef.current?.contains(target) ?? false) ||
+        (listRef.current?.contains(target) ?? false);
+      if (!inside) setOpen(false);
     };
     document.addEventListener('mousedown', onDocClick);
     return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  // Position the portalled list under the trigger, right-aligned (matches the
+  // old `right: 0` absolute layout). Track scrolling ancestors and resizes.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const update = () => {
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      setPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+    };
+    update();
+    window.addEventListener('scroll', update, { capture: true });
+    window.addEventListener('resize', update);
+    return () => {
+      window.removeEventListener('scroll', update, { capture: true });
+      window.removeEventListener('resize', update);
+    };
   }, [open]);
 
   // Focus the first enabled item when the menu opens.
@@ -91,10 +122,12 @@ export function ActionMenu({ items, label, 'data-testid': testId }: ActionMenuPr
       >
         <MoreVertical size={15} />
       </button>
-      {open && (
+      {open && createPortal(
         <div
           className="action-menu-list"
+          ref={listRef}
           role="menu"
+          style={{ position: 'fixed', top: pos?.top ?? 0, right: pos?.right ?? 0, left: 'auto' }}
           onKeyDown={onMenuKeyDown}
           onClick={e => e.stopPropagation()}
         >
@@ -118,7 +151,8 @@ export function ActionMenu({ items, label, 'data-testid': testId }: ActionMenuPr
               </button>
             ),
           )}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
