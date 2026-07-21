@@ -247,24 +247,35 @@ export function AppDetailModal({ deviceId, app, onClose, onAppUpdated }: AppDeta
             </span>
           </div>
 
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-            <select
-              className="input"
-              data-testid="app-detail-install-source-select"
-              value={selected}
-              onChange={(e) => { setSelected(e.target.value); setSourceError(null); }}
-              disabled={applying || loadingSource}
-              style={{ maxWidth: 200 }}
-            >
-              {KNOWN_INSTALLERS.map(i => (
-                <option key={i.value} value={i.value}>{i.label}</option>
-              ))}
-              <option value={CUSTOM_OPTION}>Custom…</option>
-            </select>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <select
+                className="field-select"
+                data-testid="app-detail-install-source-select"
+                value={selected}
+                onChange={(e) => { setSelected(e.target.value); setSourceError(null); }}
+                disabled={applying || loadingSource}
+                style={{ maxWidth: 200 }}
+              >
+                {KNOWN_INSTALLERS.map(i => (
+                  <option key={i.value} value={i.value}>{i.label}</option>
+                ))}
+                <option value={CUSTOM_OPTION}>Custom…</option>
+              </select>
+
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={handleApplyInstallSource}
+                disabled={applying || loadingSource}
+                data-testid="app-detail-install-source-apply"
+              >
+                {applying ? 'Applying…' : 'Apply'}
+              </button>
+            </div>
 
             {selected === CUSTOM_OPTION && (
               <input
-                className="input"
+                className="field-input"
                 type="text"
                 data-testid="app-detail-install-source-custom-input"
                 placeholder="com.example.installer"
@@ -274,15 +285,6 @@ export function AppDetailModal({ deviceId, app, onClose, onAppUpdated }: AppDeta
                 style={{ maxWidth: 220 }}
               />
             )}
-
-            <button
-              className="btn btn-secondary"
-              onClick={handleApplyInstallSource}
-              disabled={applying || loadingSource}
-              data-testid="app-detail-install-source-apply"
-            >
-              {applying ? 'Applying…' : 'Apply'}
-            </button>
           </div>
 
           {sourceError && (

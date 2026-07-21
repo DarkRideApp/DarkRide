@@ -53,7 +53,7 @@ vi.mock('fs', async (importOriginal) => {
 
 import { adbShell, adbCommand, adbPull, suShell } from '../services/device-manager';
 import { createTestDb } from '../test-utils/create-test-db';
-import { parseInstallerPackageName } from './apps';
+import { parseInstallerPackageName, runPrivileged } from './apps';
 
 const mockedAdbShell = vi.mocked(adbShell);
 const mockedAdbCommand = vi.mocked(adbCommand);
@@ -758,11 +758,15 @@ describe('Apps API', () => {
     });
 
     describe('PUT /v1/device/apps/:deviceId/install-source/:packageName', () => {
-      it('sets the installer and returns the re-read value', async () => {
+      it('sets the installer via su when the shell is not root, and returns the re-read value', async () => {
+        // Non-root adb shell → route through su.
+        mockedAdbShell.mockImplementation(async (_dev: string, cmd: string) => {
+          if (cmd === 'id -u') return '2000';
+          if (cmd.startsWith('dumpsys package')) return dumpsysWith('com.amazon.venezia');
+          return '';
+        });
         // pm set-installer prints nothing on success.
         mockedSuShell.mockResolvedValueOnce('');
-        // Re-read reflects the new installer.
-        mockedAdbShell.mockResolvedValueOnce(dumpsysWith('com.amazon.venezia'));
 
         const res = await request(app)
           .put('/v1/device/apps/DEV001/install-source/com.example.app')
@@ -777,7 +781,29 @@ describe('Apps API', () => {
         expect(mockedSuShell).toHaveBeenCalledWith(
           'DEV001',
           'pm set-installer com.example.app com.amazon.venezia',
-          expect.any(Number),
+        );
+      });
+
+      it('sets the installer via direct exec (no su) when adbd is already root (id -u=0)', async () => {
+        mockedAdbShell.mockImplementation(async (_dev: string, cmd: string) => {
+          if (cmd === 'id -u') return '0';
+          if (cmd.startsWith('pm set-installer')) return '';
+          if (cmd.startsWith('dumpsys package')) return dumpsysWith('com.android.vending');
+          return '';
+        });
+
+        const res = await request(app)
+          .put('/v1/device/apps/DEV001/install-source/com.example.app')
+          .send({ installer: 'com.android.vending' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.data.installerPackageName).toBe('com.android.vending');
+        // Root adbd must NOT invoke su, and the set must run via the plain shell.
+        expect(mockedSuShell).not.toHaveBeenCalled();
+        expect(mockedAdbShell).toHaveBeenCalledWith(
+          'DEV001',
+          'pm set-installer com.example.app com.android.vending',
         );
       });
 
@@ -805,6 +831,10 @@ describe('Apps API', () => {
       });
 
       it('returns 500 with the device output when set fails', async () => {
+        mockedAdbShell.mockImplementation(async (_dev: string, cmd: string) => {
+          if (cmd === 'id -u') return '2000';
+          return '';
+        });
         mockedSuShell.mockResolvedValueOnce('Failure [INSTALL_FAILED]');
         const res = await request(app)
           .put('/v1/device/apps/DEV001/install-source/com.example.app')
@@ -813,17 +843,82 @@ describe('Apps API', () => {
         expect(res.body.error).toContain('Failure');
       });
 
-      it('returns 500 when the root shell throws', async () => {
-        mockedSuShell.mockRejectedValueOnce(new Error('Root access unavailable'));
+      it('returns a clear root-required error (403) when su is missing and adbd is not root', async () => {
+        // Non-root shell, and the su attempt throws the classic "not found".
+        mockedAdbShell.mockImplementation(async (_dev: string, cmd: string) => {
+          if (cmd === 'id -u') return '2000';
+          return '';
+        });
+        mockedSuShell.mockRejectedValueOnce(
+          new Error('Command failed: adb -s DEV001 shell su -c \'pm set-installer ...\'\nsu: inaccessible or not found'),
+        );
+        const res = await request(app)
+          .put('/v1/device/apps/DEV001/install-source/com.example.app')
+          .send({ installer: 'com.android.vending' });
+        expect(res.status).toBe(403);
+        expect(res.body.success).toBe(false);
+        // Actionable message, NOT a raw device dump.
+        expect(res.body.error).toMatch(/requires root/i);
+        expect(res.body.error).not.toMatch(/inaccessible or not found/i);
+      });
+
+      it('returns the root-required error (403) when su output reports it is missing', async () => {
+        mockedAdbShell.mockImplementation(async (_dev: string, cmd: string) => {
+          if (cmd === 'id -u') return '2000';
+          return '';
+        });
+        // Some shells print the failure to stdout rather than throwing.
+        mockedSuShell.mockResolvedValueOnce('/system/bin/sh: su: not found');
+        const res = await request(app)
+          .put('/v1/device/apps/DEV001/install-source/com.example.app')
+          .send({ installer: 'com.android.vending' });
+        expect(res.status).toBe(403);
+        expect(res.body.error).toMatch(/requires root/i);
+      });
+
+      it('returns 500 (not the root-required message) for an unrelated shell error', async () => {
+        mockedAdbShell.mockImplementation(async (_dev: string, cmd: string) => {
+          if (cmd === 'id -u') return '2000';
+          return '';
+        });
+        mockedSuShell.mockRejectedValueOnce(new Error('adb: device offline'));
         const res = await request(app)
           .put('/v1/device/apps/DEV001/install-source/com.example.app')
           .send({ installer: 'com.android.vending' });
         expect(res.status).toBe(500);
-        expect(res.body.error).toContain('Root access unavailable');
+        expect(res.body.error).toContain('device offline');
       });
     });
   });
 
+});
+
+describe('runPrivileged', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('runs the command directly via the plain shell when adbd is root (id -u=0)', async () => {
+    mockedAdbShell.mockImplementation(async (_dev: string, cmd: string) => {
+      if (cmd === 'id -u') return '0';
+      return 'DIRECT_OK';
+    });
+    const out = await runPrivileged('DEV001', 'pm set-installer a.b c.d');
+    expect(out).toBe('DIRECT_OK');
+    expect(mockedAdbShell).toHaveBeenCalledWith('DEV001', 'pm set-installer a.b c.d');
+    expect(mockedSuShell).not.toHaveBeenCalled();
+  });
+
+  it('routes through suShell (su -c) when the shell uid is non-zero', async () => {
+    mockedAdbShell.mockImplementation(async (_dev: string, cmd: string) => {
+      if (cmd === 'id -u') return '2000';
+      return '';
+    });
+    mockedSuShell.mockResolvedValueOnce('SU_OK');
+    const out = await runPrivileged('DEV001', 'pm set-installer a.b c.d');
+    expect(out).toBe('SU_OK');
+    expect(mockedSuShell).toHaveBeenCalledWith('DEV001', 'pm set-installer a.b c.d');
+  });
 });
 
 describe('parseInstallerPackageName', () => {
