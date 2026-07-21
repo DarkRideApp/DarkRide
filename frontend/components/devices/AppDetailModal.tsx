@@ -1,6 +1,22 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
+import { useWebSocket, useToast } from '@darkrideapp/plugin-sdk/react';
 import { Modal } from '@darkrideapp/plugin-sdk/react';
+
+/** Known installer packages → friendly labels for the install-source UI. */
+const KNOWN_INSTALLERS: Array<{ value: string; label: string }> = [
+  { value: 'com.android.vending', label: 'Play Store' },
+  { value: 'com.amazon.venezia', label: 'Amazon Appstore' },
+  { value: 'com.sec.android.app.samsungapps', label: 'Galaxy Store' },
+  { value: 'org.fdroid.fdroid', label: 'F-Droid' },
+];
+
+const CUSTOM_OPTION = '__custom__';
+
+/** Map an installer package to a friendly label, falling back to the raw value. */
+function installerLabel(pkg: string | null): string {
+  if (!pkg) return 'None / sideloaded';
+  return KNOWN_INSTALLERS.find(i => i.value === pkg)?.label ?? pkg;
+}
 
 export interface InstalledApp {
   packageName: string;
@@ -20,11 +36,82 @@ interface AppDetailModalProps {
 
 export function AppDetailModal({ deviceId, app, onClose, onAppUpdated }: AppDetailModalProps) {
   const ws = useWebSocket();
+  const toast = useToast();
   const [current, setCurrent] = useState<InstalledApp>(app);
   const [pullingApk, setPullingApk] = useState(false);
   const [togglingTrack, setTogglingTrack] = useState(false);
   const [copied, setCopied] = useState(false);
   const [iconFailed, setIconFailed] = useState(false);
+
+  // Install source (OS-recorded installer package).
+  const [installSource, setInstallSource] = useState<string | null>(null);
+  const [loadingSource, setLoadingSource] = useState(true);
+  const [selected, setSelected] = useState<string>(KNOWN_INSTALLERS[0].value);
+  const [customValue, setCustomValue] = useState('');
+  const [applying, setApplying] = useState(false);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+
+  // Load the current install source on mount (and when the target app changes).
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingSource(true);
+    (async () => {
+      try {
+        const res = await ws.sendRestApi(
+          'GET',
+          `/v1/device/apps/${encodeURIComponent(deviceId)}/install-source/${encodeURIComponent(app.packageName)}`,
+        );
+        if (cancelled) return;
+        if (res.body?.success) {
+          const value: string | null = res.body.data?.installerPackageName ?? null;
+          setInstallSource(value);
+          // Preselect the matching preset when the current installer is known.
+          if (value && KNOWN_INSTALLERS.some(i => i.value === value)) {
+            setSelected(value);
+          }
+        }
+      } catch {
+        // Leave installSource null; the row still renders "None / sideloaded".
+      } finally {
+        if (!cancelled) setLoadingSource(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [ws, deviceId, app.packageName]);
+
+  const handleApplyInstallSource = useCallback(async () => {
+    if (applying) return;
+    const installer = (selected === CUSTOM_OPTION ? customValue : selected).trim();
+    // Require a non-empty value that looks like a package name (must contain a dot).
+    if (!installer || !installer.includes('.')) {
+      setSourceError('Enter a valid installer package name');
+      return;
+    }
+    setSourceError(null);
+    setApplying(true);
+    try {
+      const res = await ws.sendRestApi(
+        'PUT',
+        `/v1/device/apps/${encodeURIComponent(deviceId)}/install-source/${encodeURIComponent(current.packageName)}`,
+        { installer },
+      );
+      if (res.body?.success) {
+        const value: string | null = res.body.data?.installerPackageName ?? installer;
+        setInstallSource(value);
+        toast.success(`Install source set to ${installerLabel(value)}`);
+      } else {
+        const msg = res.body?.error || 'Failed to set install source';
+        setSourceError(msg);
+        toast.error(msg);
+      }
+    } catch (err: any) {
+      const msg = err?.message || 'Failed to set install source';
+      setSourceError(msg);
+      toast.error(msg);
+    } finally {
+      setApplying(false);
+    }
+  }, [ws, deviceId, current.packageName, selected, customValue, applying, toast]);
 
   // Keep parent in sync whenever current changes
   useEffect(() => {
@@ -145,6 +232,67 @@ export function AppDetailModal({ deviceId, app, onClose, onAppUpdated }: AppDeta
               )}
             </span>
           </div>
+        </div>
+
+        {/* Install source (OS-recorded installer package) */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, fontSize: 13 }}>
+            <span style={{ color: 'var(--text-muted, #888)', minWidth: 100 }}>Install source</span>
+            <span data-testid="app-detail-install-source-current">
+              {loadingSource ? (
+                <span style={{ color: 'var(--text-muted, #888)' }}>Loading…</span>
+              ) : (
+                installerLabel(installSource)
+              )}
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <select
+              className="input"
+              data-testid="app-detail-install-source-select"
+              value={selected}
+              onChange={(e) => { setSelected(e.target.value); setSourceError(null); }}
+              disabled={applying || loadingSource}
+              style={{ maxWidth: 200 }}
+            >
+              {KNOWN_INSTALLERS.map(i => (
+                <option key={i.value} value={i.value}>{i.label}</option>
+              ))}
+              <option value={CUSTOM_OPTION}>Custom…</option>
+            </select>
+
+            {selected === CUSTOM_OPTION && (
+              <input
+                className="input"
+                type="text"
+                data-testid="app-detail-install-source-custom-input"
+                placeholder="com.example.installer"
+                value={customValue}
+                onChange={(e) => { setCustomValue(e.target.value); setSourceError(null); }}
+                disabled={applying}
+                style={{ maxWidth: 220 }}
+              />
+            )}
+
+            <button
+              className="btn btn-secondary"
+              onClick={handleApplyInstallSource}
+              disabled={applying || loadingSource}
+              data-testid="app-detail-install-source-apply"
+            >
+              {applying ? 'Applying…' : 'Apply'}
+            </button>
+          </div>
+
+          {sourceError && (
+            <div
+              data-testid="app-detail-install-source-error"
+              style={{ fontSize: 12, color: 'var(--color-error, #ef4444)', wordBreak: 'break-word' }}
+            >
+              {sourceError}
+            </div>
+          )}
         </div>
 
         {/* Action buttons */}

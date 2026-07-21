@@ -16,6 +16,7 @@ vi.mock('../services/device-manager', async (importOriginal) => {
     adbShell: vi.fn(),
     adbCommand: vi.fn(),
     adbPull: vi.fn(),
+    suShell: vi.fn(),
   };
 });
 
@@ -50,12 +51,14 @@ vi.mock('fs', async (importOriginal) => {
   };
 });
 
-import { adbShell, adbCommand, adbPull } from '../services/device-manager';
+import { adbShell, adbCommand, adbPull, suShell } from '../services/device-manager';
 import { createTestDb } from '../test-utils/create-test-db';
+import { parseInstallerPackageName } from './apps';
 
 const mockedAdbShell = vi.mocked(adbShell);
 const mockedAdbCommand = vi.mocked(adbCommand);
 const mockedAdbPull = vi.mocked(adbPull);
+const mockedSuShell = vi.mocked(suShell);
 
 function createApp(db: BetterSQLite3Database<typeof schema>) {
   clearEndpoints();
@@ -708,6 +711,142 @@ describe('Apps API', () => {
     });
   });
 
+  describe('install-source endpoints', () => {
+    // A trimmed-down dumpsys blob carrying the installerPackageName line.
+    const dumpsysWith = (installer: string) =>
+      `Packages:\n  Package [com.example.app] (abc):\n    versionCode=100\n    installerPackageName=${installer}\n    dataDir=/data/user/0/com.example.app`;
+
+    describe('GET /v1/device/apps/:deviceId/install-source/:packageName', () => {
+      it('returns the parsed installer package', async () => {
+        mockedAdbShell.mockResolvedValueOnce(dumpsysWith('com.android.vending'));
+        const res = await request(app).get(
+          '/v1/device/apps/DEV001/install-source/com.example.app',
+        );
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.data).toEqual({
+          packageName: 'com.example.app',
+          installerPackageName: 'com.android.vending',
+        });
+        // dumpsys read must NOT use root.
+        expect(mockedSuShell).not.toHaveBeenCalled();
+      });
+
+      it('returns null installer when unset', async () => {
+        mockedAdbShell.mockResolvedValueOnce(dumpsysWith('null'));
+        const res = await request(app).get(
+          '/v1/device/apps/DEV001/install-source/com.example.app',
+        );
+        expect(res.status).toBe(200);
+        expect(res.body.data.installerPackageName).toBeNull();
+      });
+
+      it('rejects an invalid package name with 400', async () => {
+        const res = await request(app).get(
+          '/v1/device/apps/DEV001/install-source/123bad',
+        );
+        expect(res.status).toBe(400);
+      });
+
+      it('returns 400 when device offline', async () => {
+        mockDeviceManager.isOnline.mockReturnValue(false);
+        const res = await request(app).get(
+          '/v1/device/apps/DEV001/install-source/com.example.app',
+        );
+        expect(res.status).toBe(400);
+      });
+    });
+
+    describe('PUT /v1/device/apps/:deviceId/install-source/:packageName', () => {
+      it('sets the installer and returns the re-read value', async () => {
+        // pm set-installer prints nothing on success.
+        mockedSuShell.mockResolvedValueOnce('');
+        // Re-read reflects the new installer.
+        mockedAdbShell.mockResolvedValueOnce(dumpsysWith('com.amazon.venezia'));
+
+        const res = await request(app)
+          .put('/v1/device/apps/DEV001/install-source/com.example.app')
+          .send({ installer: 'com.amazon.venezia' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.data).toEqual({
+          packageName: 'com.example.app',
+          installerPackageName: 'com.amazon.venezia',
+        });
+        expect(mockedSuShell).toHaveBeenCalledWith(
+          'DEV001',
+          'pm set-installer com.example.app com.amazon.venezia',
+          expect.any(Number),
+        );
+      });
+
+      it('rejects an invalid installer with 400', async () => {
+        const res = await request(app)
+          .put('/v1/device/apps/DEV001/install-source/com.example.app')
+          .send({ installer: 'not a package' });
+        expect(res.status).toBe(400);
+        expect(mockedSuShell).not.toHaveBeenCalled();
+      });
+
+      it('rejects a blank/omitted installer with 400', async () => {
+        const res = await request(app)
+          .put('/v1/device/apps/DEV001/install-source/com.example.app')
+          .send({});
+        expect(res.status).toBe(400);
+        expect(mockedSuShell).not.toHaveBeenCalled();
+      });
+
+      it('rejects an invalid package name with 400', async () => {
+        const res = await request(app)
+          .put('/v1/device/apps/DEV001/install-source/123bad')
+          .send({ installer: 'com.android.vending' });
+        expect(res.status).toBe(400);
+      });
+
+      it('returns 500 with the device output when set fails', async () => {
+        mockedSuShell.mockResolvedValueOnce('Failure [INSTALL_FAILED]');
+        const res = await request(app)
+          .put('/v1/device/apps/DEV001/install-source/com.example.app')
+          .send({ installer: 'com.android.vending' });
+        expect(res.status).toBe(500);
+        expect(res.body.error).toContain('Failure');
+      });
+
+      it('returns 500 when the root shell throws', async () => {
+        mockedSuShell.mockRejectedValueOnce(new Error('Root access unavailable'));
+        const res = await request(app)
+          .put('/v1/device/apps/DEV001/install-source/com.example.app')
+          .send({ installer: 'com.android.vending' });
+        expect(res.status).toBe(500);
+        expect(res.body.error).toContain('Root access unavailable');
+      });
+    });
+  });
+
+});
+
+describe('parseInstallerPackageName', () => {
+  it('parses a normal installer value', () => {
+    expect(parseInstallerPackageName('installerPackageName=com.android.vending')).toBe('com.android.vending');
+  });
+
+  it('tolerates surrounding dumpsys text and whitespace', () => {
+    const blob = 'Packages:\n  Package [x]:\n    installerPackageName=org.fdroid.fdroid  \n    other=1';
+    expect(parseInstallerPackageName(blob)).toBe('org.fdroid.fdroid');
+  });
+
+  it('returns null for installerPackageName=null', () => {
+    expect(parseInstallerPackageName('    installerPackageName=null')).toBeNull();
+  });
+
+  it('returns null when the line is absent', () => {
+    expect(parseInstallerPackageName('Packages:\n  versionCode=1\n  versionName=1.0')).toBeNull();
+  });
+
+  it('returns null for an empty value', () => {
+    expect(parseInstallerPackageName('installerPackageName=')).toBeNull();
+  });
 });
 
 describe('GET /v1/apps/tracked latestAnalysis enrichment', () => {

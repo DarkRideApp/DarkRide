@@ -11,7 +11,7 @@ import { and } from 'drizzle-orm';
 import { ensureAppSources } from '../services/apk-sources';
 import { sourceLabel, type RemoteApkSource } from '../services/apk-sources/types';
 import type { SourceRegistry } from '../services/apk-sources/registry';
-import { adbShell, adbCommand, adbPull } from '../services/device-manager';
+import { adbShell, adbCommand, adbPull, suShell } from '../services/device-manager';
 import type { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
 import type { ApkTracker } from '../services/apk-tracker';
@@ -224,6 +224,25 @@ function parseDumpsysPackage(output: string): {
   }
 
   return { appName, versionCode, versionName };
+}
+
+/**
+ * Parse the recorded installer package from `dumpsys package <pkg>` output.
+ *
+ * The line looks like `    installerPackageName=com.android.vending`. Returns
+ * null when the installer is unset (`installerPackageName=null`), blank, or the
+ * line is absent entirely (some Android builds omit it for sideloaded apps).
+ */
+export function parseInstallerPackageName(dumpsysOutput: string): string | null {
+  for (const rawLine of dumpsysOutput.split('\n')) {
+    const match = rawLine.trim().match(/^installerPackageName=(.*)$/);
+    if (match) {
+      const value = match[1].trim();
+      if (!value || value === 'null') return null;
+      return value;
+    }
+  }
+  return null;
 }
 
 /**
@@ -705,6 +724,74 @@ export function registerAppEndpoints(
       res.json({ success: true, data: inserted });
     } catch (err: any) {
       error(`Failed to pull APK ${packageName} from ${deviceId}: ${err.message}`);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  }, { requires: ['core.apk:manage'] });
+
+  // GET /v1/device/apps/:deviceId/install-source/:packageName — read the
+  // OS-recorded installer package for an installed app. dumpsys is a read-only
+  // query and does NOT need root.
+  registerEndpoint('GET', '/v1/device/apps/:deviceId/install-source/:packageName', async (req, res) => {
+    const deviceId = req.params.deviceId as string;
+    const packageName = req.params.packageName as string;
+
+    if (!isValidPackageName(packageName)) {
+      res.status(400).json({ success: false, error: 'Invalid package name' });
+      return;
+    }
+    if (!deviceManager.isOnline(deviceId)) {
+      res.status(400).json({ success: false, error: 'Device is not online' });
+      return;
+    }
+
+    try {
+      const dumpsys = await adbShell(deviceId, `dumpsys package ${packageName}`, 10000);
+      const installerPackageName = parseInstallerPackageName(dumpsys);
+      res.json({ success: true, data: { packageName, installerPackageName } });
+    } catch (err: any) {
+      error(`Failed to read install source for ${packageName} on ${deviceId}: ${err.message}`);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  }, { requires: ['core.apk:read'] });
+
+  // PUT /v1/device/apps/:deviceId/install-source/:packageName — set the
+  // OS-recorded installer package via `pm set-installer` (persistent).
+  // NOTE: `pm set-installer` requires root and may reject an installer package
+  // that isn't recognized on some Android versions; that rejection is surfaced
+  // as the device error below.
+  registerEndpoint('PUT', '/v1/device/apps/:deviceId/install-source/:packageName', async (req, res) => {
+    const deviceId = req.params.deviceId as string;
+    const packageName = req.params.packageName as string;
+    const { installer } = req.body as { installer?: unknown };
+
+    if (!isValidPackageName(packageName)) {
+      res.status(400).json({ success: false, error: 'Invalid package name' });
+      return;
+    }
+    // A blank/omitted installer is a client error — we never attempt to "clear".
+    if (!installer || typeof installer !== 'string' || !isValidPackageName(installer)) {
+      res.status(400).json({ success: false, error: 'installer must be a valid package name' });
+      return;
+    }
+    if (!deviceManager.isOnline(deviceId)) {
+      res.status(400).json({ success: false, error: 'Device is not online' });
+      return;
+    }
+
+    try {
+      // pm set-installer prints nothing on success, an error marker on failure.
+      const output = await suShell(deviceId, `pm set-installer ${packageName} ${installer}`, 10000);
+      if (/error|failure|exception/i.test(output)) {
+        res.status(500).json({ success: false, error: output.trim() });
+        return;
+      }
+      // Re-read so the response reflects what the device actually recorded.
+      const dumpsys = await adbShell(deviceId, `dumpsys package ${packageName}`, 10000);
+      const installerPackageName = parseInstallerPackageName(dumpsys);
+      log(`Set installer for ${packageName} to ${installer} on ${deviceId}`);
+      res.json({ success: true, data: { packageName, installerPackageName } });
+    } catch (err: any) {
+      error(`Failed to set install source for ${packageName} on ${deviceId}: ${err.message}`);
       res.status(500).json({ success: false, error: err.message });
     }
   }, { requires: ['core.apk:manage'] });
