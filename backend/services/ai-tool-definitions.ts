@@ -8,6 +8,7 @@ import AdmZip from 'adm-zip';
 import type { AppDatabase } from '../db/index';
 import * as schema from '../db/schema';
 import type { AiToolRegistry } from './ai-tools';
+import type { ImageToolResult } from './mcp-server';
 import type { PythonBridgeManager } from './python-bridge';
 import type { DeviceManager } from './device-manager';
 import type { AutomationRunner } from './automation-runner';
@@ -3156,6 +3157,39 @@ export function registerAllTools(
         // surface them as {error} so the AI can report the problem clearly.
         return { error: err.message ?? String(err) };
       }
+    },
+  });
+
+  registry.register({
+    name: 'capture_screenshot',
+    description: 'Capture a screenshot of the device\'s current screen and return it as a viewable PNG image. Useful for inspecting single-canvas UIs (games, maps, custom-rendered views) where the on-screen state can\'t be read from the view hierarchy or logs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deviceId: { type: 'string', description: 'The device ID' },
+      },
+      required: ['deviceId'],
+    },
+    context: ['devices'],
+    requiredScope: 'core.devices:shell',
+    async execute(params: { deviceId: string }) {
+      if (!deviceManager) throw new Error('DeviceManager not wired into AI tools');
+      const status = await deviceManager.getDeviceStatus(params.deviceId);
+      if (!status) throw new Error('Device not found');
+      if (!status.isOnline) throw new Error('Device is offline');
+      // Android-only for now: takeScreenshot shells out to `adb screencap`.
+      // iOS screenshots aren't cleanly reachable from this scope yet — return a
+      // plain error so the model reports it rather than crashing a turn.
+      if (status.platform === 'ios') {
+        return { error: 'iOS screenshots not yet supported by capture_screenshot' };
+      }
+      const buf = await deviceManager.takeScreenshot(params.deviceId);
+      const image: ImageToolResult = {
+        _mcpImage: true,
+        data: buf.toString('base64'),
+        mimeType: 'image/png',
+      };
+      return image;
     },
   });
 
