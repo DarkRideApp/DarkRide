@@ -4,6 +4,7 @@ import express from 'express';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import AdmZip from 'adm-zip';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
 import { trackedApps, apkVersions } from '../db/schema';
@@ -43,6 +44,15 @@ function makeApp(db: BetterSQLite3Database<typeof schema>, opts: {
 }
 
 const APK_BYTES = Buffer.from('PK\x03\x04fakeapk');
+
+/** Build a real XAPK/APKS zip buffer with base.apk + one split. */
+function makeBundle(): Buffer {
+  const zip = new AdmZip();
+  zip.addFile('base.apk', Buffer.from('PK\x03\x04basedummy'));
+  zip.addFile('split_config.arm64_v8a.apk', Buffer.from('PK\x03\x04splitdummy'));
+  zip.addFile('manifest.json', Buffer.from('{}'));
+  return zip.toBuffer();
+}
 
 describe('POST /v1/apps/upload', () => {
   let db: BetterSQLite3Database<typeof schema>;
@@ -100,10 +110,46 @@ describe('POST /v1/apps/upload', () => {
     expect(res.body.error).toMatch(/file/i);
   });
 
-  it('400s on non-.apk filename', async () => {
+  it('400s on an unsupported extension', async () => {
     const { app } = makeApp(db);
-    const res = await request(app).post('/v1/apps/upload').attach('apk', APK_BYTES, 'archive.zip');
+    const res = await request(app).post('/v1/apps/upload').attach('apk', APK_BYTES, 'notes.txt');
     expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/\.apk, \.xapk, or \.apks/);
+  });
+
+  it('uploads an XAPK, stores a split directory, enqueues analysis', async () => {
+    const { app, analyzer, apkDir } = makeApp(db);
+    const res = await request(app).post('/v1/apps/upload').attach('apk', makeBundle(), 'my-app.xapk');
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    const versions = db.select().from(apkVersions).all();
+    expect(versions).toHaveLength(1);
+    expect(versions[0].source).toBe('upload');
+    expect(versions[0].versionCode).toBe(7);
+    expect(versions[0].filename).toBe('7_7.0.apk');
+
+    const dir = path.join(apkDir, 'com.up.app', '7_7.0.apk');
+    expect(fs.statSync(dir).isDirectory()).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'base.apk'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'split_config.arm64_v8a.apk'))).toBe(true);
+    // fileSize is the sum of child files, not statSync of the directory.
+    const expected = fs.statSync(path.join(dir, 'base.apk')).size
+      + fs.statSync(path.join(dir, 'split_config.arm64_v8a.apk')).size;
+    expect(versions[0].fileSize).toBe(expected);
+
+    expect(analyzer.enqueue).toHaveBeenCalledWith(versions[0].id);
+    expect(vi.mocked(broadcastToAll)).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'apk:version-pulled', packageName: 'com.up.app', versionCode: 7, source: 'upload',
+    }));
+  });
+
+  it('accepts an .apks bundle and stores a split directory', async () => {
+    const { app, apkDir } = makeApp(db);
+    const res = await request(app).post('/v1/apps/upload').attach('apk', makeBundle(), 'my-app.apks');
+    expect(res.status).toBe(200);
+    const dir = path.join(apkDir, 'com.up.app', '7_7.0.apk');
+    expect(fs.statSync(dir).isDirectory()).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'base.apk'))).toBe(true);
   });
 
   it('allows an authenticated user with core.apk:manage', async () => {

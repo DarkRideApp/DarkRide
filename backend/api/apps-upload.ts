@@ -9,6 +9,7 @@ import { trackedApps, apkVersions } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { broadcastToAll } from '../websocket/index';
 import { extractApkQuickMeta, type ApkMetaExtractor } from '../services/apk-meta';
+import { unpackApkBundle } from '../services/apk-bundle';
 import { getApkDir } from '../utils/apk-paths';
 import { safeJoinInside } from '../utils/safe-path';
 import { isValidPackageName } from '../utils/validators';
@@ -63,8 +64,13 @@ export function registerAppsUploadEndpoint(db: AppDatabase, analyzer: AnalyzerLi
 
   getApiRouter().post('/v1/apps/upload', requireApkManage, handleMulter, async (req: Request, res: Response) => {
     const file = req.file;
-    // Always remove multer's temp file, whatever path we exit by.
-    const cleanup = () => file ? fs.promises.unlink(file.path).catch(() => {}) : Promise.resolve();
+    // Temp dir used to unpack XAPK/APKS bundles; removed in finally.
+    let unpackDir: string | null = null;
+    // Always remove multer's temp file (and any unpack dir), whatever path we exit by.
+    const cleanup = async () => {
+      if (file) await fs.promises.unlink(file.path).catch(() => {});
+      if (unpackDir) await fs.promises.rm(unpackDir, { recursive: true, force: true }).catch(() => {});
+    };
 
 
     if (!file) {
@@ -73,12 +79,24 @@ export function registerAppsUploadEndpoint(db: AppDatabase, analyzer: AnalyzerLi
     }
 
     try {
-      if (!file.originalname.toLowerCase().endsWith('.apk')) {
-        res.status(400).json({ success: false, error: 'File must be an .apk' });
+      const lower = file.originalname.toLowerCase();
+      const isBundle = lower.endsWith('.xapk') || lower.endsWith('.apks');
+      if (!lower.endsWith('.apk') && !isBundle) {
+        res.status(400).json({ success: false, error: 'File must be an .apk, .xapk, or .apks' });
         return;
       }
 
-      const meta = await extractor(file.path).catch((e: any) => {
+      // For a bundle, unpack to a temp dir and read identity from the base APK;
+      // for a single .apk, read the file directly.
+      if (isBundle) {
+        unpackDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkride-xapk-'));
+        await unpackApkBundle(file.path, unpackDir).catch((e: any) => {
+          throw Object.assign(new Error(e?.message || 'Could not unpack bundle'), { statusCode: 400 });
+        });
+      }
+      const identityApk = isBundle ? path.join(unpackDir!, 'base.apk') : file.path;
+
+      const meta = await extractor(identityApk).catch((e: any) => {
         throw Object.assign(new Error(e?.message || 'Could not read APK'), { statusCode: 400 });
       });
       if (!isValidPackageName(meta.packageName)) {
@@ -107,10 +125,24 @@ export function registerAppsUploadEndpoint(db: AppDatabase, analyzer: AnalyzerLi
       // safeJoinInside throws if packageName/filename would escape apkRoot — a
       // belt-and-suspenders guard on top of the isValidPackageName check above.
       const dest = safeJoinInside(apkRoot, meta.packageName, filename);
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      await fs.promises.copyFile(file.path, dest); // copy+unlink: rename() fails across devices
+      let storedSize: number;
+      if (isBundle) {
+        // Store a DIRECTORY of split APKs; downstream keys off isDirectory().
+        fs.mkdirSync(dest, { recursive: true });
+        storedSize = 0;
+        for (const name of fs.readdirSync(unpackDir!)) {
+          if (!name.toLowerCase().endsWith('.apk')) continue;
+          const from = path.join(unpackDir!, name);
+          const to = path.join(dest, name);
+          await fs.promises.copyFile(from, to);
+          storedSize += fs.statSync(to).size;
+        }
+      } else {
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        await fs.promises.copyFile(file.path, dest); // copy+unlink: rename() fails across devices
+        storedSize = fs.statSync(dest).size;
+      }
 
-      const stat = fs.statSync(dest);
       let inserted;
       try {
         db.insert(apkVersions).values({
@@ -118,7 +150,7 @@ export function registerAppsUploadEndpoint(db: AppDatabase, analyzer: AnalyzerLi
           versionCode: meta.versionCode,
           versionName: meta.versionName,
           filename,
-          fileSize: stat.size,
+          fileSize: storedSize,
           deviceId: null,
           source: 'upload',
           downloadedAt: new Date(),
@@ -128,8 +160,8 @@ export function registerAppsUploadEndpoint(db: AppDatabase, analyzer: AnalyzerLi
           eq(apkVersions.versionCode, meta.versionCode),
         )).get()!;
       } catch (insertErr) {
-        // Don't leave an orphaned APK on disk if the row couldn't be written.
-        await fs.promises.unlink(dest).catch(() => {});
+        // Don't leave an orphaned APK/dir on disk if the row couldn't be written.
+        await fs.promises.rm(dest, { recursive: true, force: true }).catch(() => {});
         throw insertErr;
       }
 
@@ -146,7 +178,7 @@ export function registerAppsUploadEndpoint(db: AppDatabase, analyzer: AnalyzerLi
         analyzer.enqueue(inserted.id).catch(() => {});
       }
 
-      log(`Uploaded ${meta.packageName} v${meta.versionCode} (${stat.size} bytes)`);
+      log(`Uploaded ${meta.packageName} v${meta.versionCode} (${storedSize} bytes)`);
       res.json({ success: true, data: { id: inserted.id, trackedAppId: tracked.id, packageName: meta.packageName, versionCode: meta.versionCode, versionName: meta.versionName } });
     } catch (err: any) {
       error(`Upload failed: ${err?.message}`);
