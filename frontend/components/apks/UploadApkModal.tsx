@@ -14,7 +14,8 @@ interface UploadApkModalProps {
 }
 
 export function UploadApkModal({ onClose, onUploaded, expectedPackage, initialFile }: UploadApkModalProps) {
-  const isApk = (f: File) => f.name.toLowerCase().endsWith('.apk');
+  // Accept a single .apk or a split-APK bundle (.xapk / .apks); the backend unpacks bundles.
+  const isApk = (f: File) => /\.(apk|xapk|apks)$/i.test(f.name);
   const auth = useAuthOptional();
   // A drag-dropped initialFile must pass the same .apk gate as a picked one.
   const [file, setFile] = useState<File | null>(initialFile && isApk(initialFile) ? initialFile : null);
@@ -26,7 +27,7 @@ export function UploadApkModal({ onClose, onUploaded, expectedPackage, initialFi
     setError(null); setWarning(null);
     if (f && !isApk(f)) {
       setFile(null);
-      setError('File must be an .apk');
+      setError('File must be an .apk, .xapk, or .apks');
       return;
     }
     setFile(f);
@@ -64,10 +65,10 @@ export function UploadApkModal({ onClose, onUploaded, expectedPackage, initialFi
         }}
       >
         <Upload size={22} strokeWidth={1.5} />
-        {file ? <span style={{ color: 'var(--text-primary)' }}>{file.name} · {formatBytes(file.size)}</span> : 'Choose an .apk file'}
+        {file ? <span style={{ color: 'var(--text-primary)' }}>{file.name} · {formatBytes(file.size)}</span> : 'Choose an .apk, .xapk, or .apks file'}
         <input
           type="file"
-          accept=".apk"
+          accept=".apk,.xapk,.apks"
           style={{ display: 'none' }}
           data-testid="upload-file-input"
           onChange={e => pick(e.target.files?.[0] ?? null)}
