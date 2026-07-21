@@ -17,6 +17,12 @@ vi.mock('adm-zip', () => ({
   default: vi.fn(),
 }));
 
+// Mock the bundle exploder — the split-preservation logic is unit-tested in
+// apk-bundle.test.ts; here we assert play-store routes an XAPK through it.
+vi.mock('./apk-bundle', () => ({
+  unpackApkBundle: vi.fn(),
+}));
+
 // Mock child_process
 vi.mock('child_process', () => ({
   execFile: vi.fn(),
@@ -55,6 +61,7 @@ import gplay from 'google-play-scraper';
 import { execFile } from 'child_process';
 import fs from 'fs';
 import { readApkVersion } from '../utils/apk-version-reader';
+import { unpackApkBundle } from './apk-bundle';
 import { PlayStoreSource } from './play-store-source';
 
 describe('PlayStoreSource', () => {
@@ -233,6 +240,39 @@ describe('PlayStoreSource', () => {
 
       const result = await source.downloadApk('com.example.app', 'Example App');
       expect(result.success).toBe(false);
+    });
+
+    it('explodes an XAPK download into a staged split dir (not a single base.apk)', async () => {
+      vi.mocked(execFile).mockImplementation((_cmd, _args, _opts, cb: any) => {
+        cb(null, 'Downloaded', '');
+        return {} as any;
+      });
+      // apkeep produced an .xapk bundle, not a plain .apk.
+      vi.mocked(fs.readdirSync).mockReturnValue(['bundle.xapk'] as any);
+      vi.mocked(unpackApkBundle).mockResolvedValue({
+        dir: '/tmp/darkride-apkeep-test/.dl-split',
+        baseApk: '/tmp/darkride-apkeep-test/.dl-split/base.apk',
+        apkFiles: [
+          '/tmp/darkride-apkeep-test/.dl-split/base.apk',
+          '/tmp/darkride-apkeep-test/.dl-split/config.arm64_v8a.apk',
+        ],
+      });
+      vi.mocked(readApkVersion).mockReturnValue({
+        versionCode: 321,
+        versionName: '3.2.1',
+        packageName: 'com.example.app',
+      });
+
+      const result = await source.downloadApk('com.example.app', 'Example App');
+      expect(result.success).toBe(true);
+      expect(result.versionCode).toBe(321);
+      expect(result.versionName).toBe('3.2.1');
+      // Split bundle → splitDir, never a single staged file.
+      expect(result.filePath).toBeUndefined();
+      expect(result.splitDir).toBeDefined();
+      // Version metadata is read from the exploded base.apk.
+      expect(unpackApkBundle).toHaveBeenCalled();
+      expect(readApkVersion).toHaveBeenCalledWith('/tmp/darkride-apkeep-test/.dl-split/base.apk');
     });
 
     it('returns failure when no APK files produced', async () => {
