@@ -299,6 +299,28 @@ describe('Auth API endpoints', () => {
       expect(res.body.authenticated).toBe(false);
       expect(res.body.setupRequired).toBe(false);
     });
+
+    it('returns setupRequired: true when only service accounts exist', async () => {
+      // Service accounts (__system__, service:*:ai) are seeded at startup on
+      // every real deployment. They must NOT satisfy the setup gate, or the
+      // first-admin wizard never renders in the browser. Regression for the
+      // unfiltered users count that reported setupRequired: false here.
+      const { app: svcApp, db: svcDb } = createApp();
+      const now = new Date();
+      (svcDb as any).insert(schema.users).values({
+        username: '__system__',
+        providerId: 'core.local',
+        kind: 'core-service',
+        scopes: JSON.stringify(['core.admin:*']) as any,
+        createdAt: now,
+        updatedAt: now,
+      }).run();
+
+      const res = await request(svcApp).get('/v1/auth/me');
+      expect(res.status).toBe(200);
+      expect(res.body.authenticated).toBe(false);
+      expect(res.body.setupRequired).toBe(true);
+    });
   });
 
   describe('POST /v1/auth/claim', () => {

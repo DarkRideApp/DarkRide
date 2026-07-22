@@ -55,7 +55,11 @@ export function registerAuthEndpoints(
   // This is on the auth allowlist and works both authenticated and unauthenticated
   registerEndpoint('GET', '/v1/auth/me', (req, res) => {
     if (!req.authUser) {
-      const hasUsers = db.select({ id: users.id }).from(users).limit(1).get();
+      // Only human users gate setup — service accounts (__system__, service:*:ai)
+      // are seeded at startup and must not make setupRequired read false, or the
+      // first-admin wizard never renders. Mirrors the bootstrap check in bootstrap.ts.
+      const hasUsers = db.select({ id: users.id }).from(users)
+        .where(eq(users.kind, 'human')).limit(1).get();
       res.json({ authenticated: false, setupRequired: !hasUsers });
       return;
     }
