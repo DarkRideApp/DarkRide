@@ -51,20 +51,26 @@ const context = await browser.newContext({
   recordVideo: { dir: outDir, size: { width, height } },
 });
 const page = await context.newPage();
+// Force dark theme before any page script runs (a light-theme flash is a common
+// source of white frames/chunks in the capture).
+await page.addInitScript(() => { try { localStorage.setItem('theme', 'dark'); } catch { /* ignore */ } });
 const video = page.video();
 
-// Log into DarkRide first if creds are supplied (env vars preferred so they
-// stay out of shell history): DARKRIDE_USER / DARKRIDE_PASS, or --user/--pass.
-const user = arg('user', process.env.DARKRIDE_USER);
-const pass = arg('pass', process.env.DARKRIDE_PASS);
+// Log into DarkRide first (else you just film the login screen). Creds default
+// to the seeded `hero` admin from demo/hero-env.sh; override with env vars
+// (preferred — stays out of shell history) or --user/--pass.
+const user = arg('user', process.env.DARKRIDE_USER || 'hero');
+const pass = arg('pass', process.env.DARKRIDE_PASS || 'hero-demo-pass');
 
 let failed = false;
 try {
-  if (user && pass) {
-    console.log('  • logging in to DarkRide…');
-    await loginToDarkride(page, baseURL, user, pass);
-  } else if (baseURL !== 'about:blank') {
-    console.warn('  ! no DARKRIDE_USER/DARKRIDE_PASS set — the recorder is not logged in, so you\'ll get the login screen. Set them and rerun.');
+  if (baseURL !== 'about:blank') {
+    console.log(`  • logging in to DarkRide as ${user}…`);
+    try {
+      await loginToDarkride(page, baseURL, user, pass);
+    } catch {
+      throw new Error(`DarkRide login failed for "${user}". Set DARKRIDE_USER/DARKRIDE_PASS, or run demo/hero-env.sh (fresh instance seeded with a "hero" admin + clean data).`);
+    }
   }
   await scenario(page, { baseURL, width, height });
 } catch (err) {
