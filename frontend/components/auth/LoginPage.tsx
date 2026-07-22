@@ -48,6 +48,16 @@ export function LoginPage() {
       // Success — refresh auth state to flip the guard
       await refreshAuth();
 
+      // If the session cookie didn't stick (e.g. a Secure cookie served over
+      // plain HTTP is silently dropped by the browser), the guard never flips
+      // and we'd sit on the spinner forever. Detect it and surface an error.
+      const me = await fetch('/v1/auth/me').then(r => r.json()).catch(() => null);
+      if (!me?.authenticated) {
+        setError('Signed in, but the browser did not store the session cookie — check the server\'s cookie/TLS configuration.');
+        setLoading(false);
+        return;
+      }
+
       // Redirect to ?next= if it's a safe relative URL, otherwise go to root.
       // Uses window.location because LoginPage renders outside the BrowserRouter context.
       const urlParams = new URLSearchParams(window.location.search);
