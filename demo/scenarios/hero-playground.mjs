@@ -1,56 +1,105 @@
 /**
- * HERO scenario — DarkRide vs the DarkRide Playground target.
+ * HERO scenario — DarkRide vs the DarkRide Playground (rooted/Frida-able device).
  *
- * The Playground (DarkRideApp/playground) is purpose-built so every beat has a
- * clean, branded, repeatable payoff — unlike Allsafe, which has no real traffic.
- * This is the intended hero once the Playground APK is published.
+ * A narrated, choreographed sequence with on-screen captions. The reliable
+ * backbone — captions, launching the Playground over adb (it auto-logs-in), and
+ * navigating the right panes — always runs. The app-specific UI clicks (Frida,
+ * APK findings, WS row) are best-effort: tune the SELECTORS below on your first
+ * run; a miss logs and the recording continues (the seeded data + the caption
+ * still carry the beat).
  *
- * REQUIRES a full live stack (not runnable in a disk-constrained sandbox):
- *   - DarkRide backend + frontend running (pass its URL via --base-url)
- *   - An emulator connected to DarkRide with the Playground installed:
- *       demo/fetch-playground.sh && adb install demo/assets/playground.apk
- *   - The Playground API deployed (play-api.darkride.app) or `wrangler dev`.
- *
- * Beats (each exposes a DR{...} flag from the app/API):
- *   1. Login demo/demo -> token appears in Traffic                (capture)
- *   2. /profile is cert-pinned -> Frida pin-bypass -> it appears  (Frida)
- *   3. APK analysis: hardcoded API key + AI summary               (APK analysis)
- *   4. Root/emulator gate -> Frida detection-bypass               (Frida)
- *   5. Insecure token in SharedPrefs -> data-extraction           (data extraction)
- *   6. WebSocket /telemetry frames decode in the frames panel     (decoders)
- *
- * Selectors are best-effort from data-testids; verify on the first real run.
+ * Prereqs (on the recording machine):
+ *   - Playground v1.1+ installed on a connected, Frida-able device:
+ *       demo/fetch-playground.sh && adb install -r demo/assets/playground.apk
+ *   - `adb` on PATH, a device authorised, `--headed` (WebCodecs device stream).
+ *   - Ideally the hero DarkRide from demo/hero-env.sh (clean seeded data).
  */
+import { caption, clearCaption } from '../lib/captions.mjs';
+import { hasDevice, launchPlayground, relaunchPlayground, stopPlayground } from '../lib/device.mjs';
+
+// ── Tune these against your live UI on the first run ───────────────────────
+const SELECTORS = {
+  fridaPinScript: 'text=/cert.?pinning/i',   // the cert-pinning-bypass script entry
+  fridaRootScript: 'text=/root.?detection/i',
+  fridaRun: 'button:has-text("Run"), [data-testid="frida-run"]',
+  apkPlayground: 'text=/playground/i',       // the Playground APK row on /ui/apks
+  apkFindings: 'text=/finding/i',
+  aiOpen: '[data-testid="ai-chat-toggle"], button[aria-label*="AI"]',
+};
+// ───────────────────────────────────────────────────────────────────────────
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
 export default async function heroPlayground(page, { baseURL }) {
-  const step = async (label, fn) => { console.log(`  • ${label}`); await fn(); await page.waitForTimeout(1200); };
+  if (!hasDevice()) console.warn('  ! no adb device detected — live beats will be empty; seeded data still shows.');
 
-  await page.goto(baseURL, { waitUntil: 'networkidle' });
+  // Beat helper: set the caption, run the (guarded) actions, hold for readability.
+  const beat = async (n, title, subtitle, fn) => {
+    console.log(`  ▸ beat ${n}: ${title}`);
+    await caption(page, `${n}. ${title}`, subtitle);
+    try { await fn(); } catch (e) { console.warn(`    (beat ${n} interaction skipped: ${e.message.split('\n')[0]})`); }
+    await wait(2600);
+  };
 
-  await step('open the Network workspace — capture armed', async () => {
-    await page.goto(`${baseURL}/ui/network`, { waitUntil: 'networkidle' });
+  const goPane = async (path) => {
+    await page.goto(`${baseURL}${path}`, { waitUntil: 'networkidle' }).catch(() => {});
+    await wait(700);
+  };
+  const clickSoft = async (sel, timeout = 3500) => {
+    const loc = page.locator(sel).first();
+    await loc.waitFor({ state: 'visible', timeout });
+    await loc.click();
+  };
+  const trafficRow = (pathText) => page.locator('.traffic-path', { hasText: pathText }).first();
+
+  await goPane('/ui/network');
+
+  // ── Act 1: capture the (unpinned) login ────────────────────────────────
+  await beat(1, 'Capturing live traffic', 'The Playground logs in — the token hits DarkRide instantly', async () => {
+    stopPlayground(); await wait(600);
+    launchPlayground({ autologin: true });            // fires POST /login (unpinned)
+    await trafficRow('/login').waitFor({ state: 'visible', timeout: 12_000 });
+    await trafficRow('/login').click();               // open its detail
   });
 
-  await step('capture the demo/demo login token', async () => {
-    // TODO(verify): drive the Playground login on the device; the POST /login
-    // row + its bearer-token response appear in the Traffic pane.
+  // ── Act 2: the pinned call is invisible ─────────────────────────────────
+  await beat(2, 'But /profile is certificate-pinned', 'The app pins its authed calls — they never reach the proxy', async () => {
+    await goPane('/ui/network?pane=traffic');
+    // (nothing to click — the point is the absence; the caption carries it)
   });
 
-  await step('bypass the cert pin on /profile with Frida', async () => {
-    await page.goto(`${baseURL}/ui/frida`, { waitUntil: 'networkidle' });
-    // TODO(verify): run the cert-pinning-bypass script against the Playground;
-    // the previously-hidden /profile call now shows in Traffic.
+  // ── Act 3: one Frida script defeats the pin + root check ─────────────────
+  await beat(3, 'Frida defeats the pin and the root check', 'Arm the bypass, respawn the app with it attached', async () => {
+    await goPane('/ui/frida');
+    await clickSoft(SELECTORS.fridaPinScript).catch(() => {});
+    await clickSoft(SELECTORS.fridaRootScript).catch(() => {});
+    await clickSoft(SELECTORS.fridaRun).catch(() => {});
+    await wait(1500);
+    relaunchPlayground({ autologin: true });          // respawns; authed calls now flow
+    await wait(2000);
   });
 
-  await step('APK analysis: the hardcoded API key + AI summary', async () => {
-    await page.goto(`${baseURL}/ui/apks`, { waitUntil: 'networkidle' });
-    // TODO(verify): open the Playground APK -> findings -> HARDCODED_API_KEY;
-    // ask the AI agent to summarise.
+  // ── Act 4: now the pinned calls flow ────────────────────────────────────
+  await beat(4, 'Now everything flows', 'profile, feed, telemetry — captured in the clear', async () => {
+    await goPane('/ui/network?pane=traffic');
+    await trafficRow('/profile').first().click().catch(() => {});
   });
 
-  await step('decode the telemetry WebSocket', async () => {
-    await page.goto(`${baseURL}/ui/network?pane=traffic`, { waitUntil: 'networkidle' });
-    // TODO(verify): select the /telemetry WS row; frames render in the panel.
+  // ── Act 5: the APK gives up its secrets ─────────────────────────────────
+  await beat(5, 'The APK gives up its secrets', 'A hardcoded API key, surfaced and summarised by the agent', async () => {
+    await goPane('/ui/apks');
+    await clickSoft(SELECTORS.apkPlayground).catch(() => {});
+    await wait(1200);
+    await clickSoft(SELECTORS.apkFindings).catch(() => {});
+    await clickSoft(SELECTORS.aiOpen).catch(() => {});
   });
 
-  await page.waitForTimeout(1500);
+  // ── Act 6: decode the live WebSocket ────────────────────────────────────
+  await beat(6, 'Decoding the live WebSocket', 'Telemetry frames, structured in the panel', async () => {
+    await goPane('/ui/network?pane=traffic');
+    await trafficRow('/telemetry').first().click().catch(() => {});
+  });
+
+  await clearCaption(page);
+  await wait(1500);
 }

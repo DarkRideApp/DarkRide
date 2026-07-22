@@ -68,6 +68,26 @@ demo/to-gif.sh demo/out/hero.webm 15 960 3
 
 `hero-seed.mjs` (curated rows) and the ports/DB are overridable via env — see the scripts.
 
+## The hero scenario (`scenarios/hero-playground.mjs`)
+
+A narrated, choreographed six-beat sequence with on-screen captions (injected via
+`lib/captions.mjs` — no post-production), driving a **rooted/Frida-able device**:
+
+1. **Capture** — launches the Playground over adb (`lib/device.mjs`, auto-login); the *unpinned* login token appears in Traffic live.
+2. **Pinned** — the authed `/profile` call is cert-pinned, so it's invisible.
+3. **Frida** — arm the cert-pinning + root-detection bypass, respawn the app with it attached.
+4. **Flow** — profile / feed / telemetry now stream in the clear.
+5. **APK** — the hardcoded API key, surfaced + summarised by the agent.
+6. **Decode** — the telemetry WebSocket frames, structured.
+
+**Backbone vs. best-effort.** Captions, the adb app-driving, and pane navigation are
+reliable. The app-specific clicks (Frida controls, APK findings, WS row) are
+best-effort — **tune the `SELECTORS` object at the top of the scenario on your first
+run**; a miss logs and continues (the seeded data + caption still carry the beat).
+
+Prereqs: Playground **v1.1+** on a connected Frida-able device
+(`adb install -r demo/assets/playground.apk`), `adb` on PATH, and `--headed`.
+
 ## White chunks / blank areas in the capture
 
 - The recorder now forces **dark theme** (a light-theme flash is a common cause).
