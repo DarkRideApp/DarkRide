@@ -43,8 +43,37 @@ node demo/record.mjs \
 demo/to-gif.sh demo/out/hero.webm 15 960 3
 ```
 
-`DARKRIDE_USER`/`DARKRIDE_PASS` (or `--user`/`--pass`) auth the recorder's browser.
-Without them you record the login screen. Login mirrors `tests/e2e/helpers/auth.ts`.
+`DARKRIDE_USER`/`DARKRIDE_PASS` (or `--user`/`--pass`) auth the recorder's browser
+(default: the seeded `hero` admin — see Hero mode). Login mirrors `tests/e2e/helpers/auth.ts`.
+
+## Hero mode — clean data + a known login
+
+Recording against your real DarkRide films your local test captures. `hero-env.sh` boots a **fresh,
+throwaway DarkRide** (separate DB + a `hero` admin), seeds it with curated on-brand Playground
+traffic, and leaves your real instance/DB untouched:
+
+```bash
+demo/hero-env.sh
+# → fresh DarkRide on http://localhost:5399, login hero / hero-demo-pass,
+#   pre-seeded with clean Playground traffic. Connect your device to it.
+```
+
+In another terminal, record against it — creds default to `hero`, so nothing to pass:
+
+```bash
+node demo/record.mjs --scenario demo/scenarios/hero-playground.mjs \
+  --base-url http://localhost:5399 --name hero
+demo/to-gif.sh demo/out/hero.webm 15 960 3
+```
+
+`hero-seed.mjs` (curated rows) and the ports/DB are overridable via env — see the scripts.
+
+## White chunks / blank areas in the capture
+
+- The recorder now forces **dark theme** (a light-theme flash is a common cause).
+- The **live device screen** is decoded with WebCodecs, which often renders **blank in headless**
+  Chromium. Record **`--headed`** on a machine with a display so that region captures:
+  `node demo/record.mjs … --headed`.
 
 Use the resulting `hero.mp4` in a looping muted `<video>` on the site hero, with
 `hero.gif` as the fallback / social-embed asset.
