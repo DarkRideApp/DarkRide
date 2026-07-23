@@ -17,12 +17,14 @@ export function registerAuthEndpoints(
   claimManager: ClaimManager,
 ) {
   // Helper to set the session cookie
-  function setSessionCookie(res: Response, sessionId: string, hostname: string): void {
-    const isProduction = process.env.NODE_ENV === 'production';
-    const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1';
+  function setSessionCookie(res: Response, sessionId: string, secure: boolean): void {
+    // `secure` should be req.secure: whether the request actually arrived over
+    // HTTPS (honors X-Forwarded-Proto when TRUST_PROXY is set). The previous
+    // NODE_ENV heuristic marked cookies Secure on plain-HTTP LAN deployments,
+    // where browsers silently drop them — login returned 200 but never stuck.
     res.cookie('darkride_sid', sessionId, {
       httpOnly: true,
-      secure: isProduction && !isLocalhost,
+      secure,
       sameSite: 'lax',
       path: '/',
       maxAge: 30 * 24 * 60 * 60 * 1000,
@@ -118,7 +120,7 @@ export function registerAuthEndpoints(
         req.ip ?? null,
       );
 
-      setSessionCookie(res, session.id, req.hostname);
+      setSessionCookie(res, session.id, req.secure);
 
       const user = db.select().from(users).where(eq(users.id, result.userId)).get();
       res.json({
@@ -158,7 +160,7 @@ export function registerAuthEndpoints(
         req.headers['user-agent'] ?? null,
         req.ip ?? null,
       );
-      setSessionCookie(res, session.id, req.hostname);
+      setSessionCookie(res, session.id, req.secure);
 
       res.json({ success: true, csrfToken: session.csrfToken });
     } catch (err: any) {
@@ -185,7 +187,7 @@ export function registerAuthEndpoints(
     try {
       const { userId } = await claimManager.consumeClaim(token, password);
       const session = sessionManager.create(userId, 'core.local', req.headers['user-agent'] ?? null, req.ip ?? null);
-      setSessionCookie(res, session.id, req.hostname);
+      setSessionCookie(res, session.id, req.secure);
       res.json({ success: true, csrfToken: session.csrfToken });
     } catch (err: any) {
       res.status(400).json({ success: false, error: err.message });
