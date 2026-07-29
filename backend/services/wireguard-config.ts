@@ -2,8 +2,12 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { createLoggers } from '../logs';
 import { safeJoinInside } from '../utils/safe-path';
+
+const execFileAsync = promisify(execFile);
 
 const { log } = createLoggers('wireguard-config');
 
@@ -101,56 +105,168 @@ export function generateClientWgConfig(
   ].join('\n');
 }
 
-/**
- * Check if an IPv4 address belongs to a VPN/overlay network range
- * that Android devices on a LAN typically can't reach directly.
- */
-function isVpnAddress(address: string): boolean {
-  // Tailscale/CGNAT: 100.64.0.0/10
-  if (address.startsWith('100.')) {
-    const second = parseInt(address.split('.')[1], 10);
-    if (second >= 64 && second <= 127) return true;
+/** Parse an IPv4 dotted-quad to a 32-bit unsigned int, or null if malformed. */
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const part of parts) {
+    // Require plain decimal digits. `Number()` alone would accept '', '0x10',
+    // '4e0', ' 4' and '+4' — so a truncated address like '1.2.3.' would parse
+    // as 1.2.3.0 and silently compare against the wrong subnet.
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    n = (n * 256) + octet;
   }
-  // Docker: 172.17.x.x - 172.31.x.x (common Docker bridge ranges)
-  if (address.startsWith('172.')) {
-    const second = parseInt(address.split('.')[1], 10);
-    if (second >= 17 && second <= 31) return true;
-  }
-  // WireGuard/VPN common ranges: 10.0.0.x, 10.x.x.x (only skip narrow VPN ranges)
-  // Don't skip all of 10.x.x.x since it's also used for real LANs
-  return false;
+  return n >>> 0;
+}
+
+/** True if `a` and `b` fall in the same IPv4 subnet under `netmask`. */
+function sameSubnet(a: string, b: string, netmask: string): boolean {
+  const ai = ipv4ToInt(a);
+  const bi = ipv4ToInt(b);
+  const mi = ipv4ToInt(netmask);
+  if (ai === null || bi === null || mi === null) return false;
+  return ((ai & mi) >>> 0) === ((bi & mi) >>> 0);
 }
 
 /**
- * Get the server IP address for the WireGuard endpoint.
- * Uses WG_SERVER_IP env var or falls back to best non-internal IPv4 address.
- * Prefers LAN addresses over VPN/overlay addresses.
+ * Interface-name substrings that mark a virtual / VPN / overlay adapter which
+ * is never the LAN path to a USB- or WiFi-attached phone. Matched
+ * case-insensitively. Name-based detection is far more reliable than IP-range
+ * guessing: a real home/office LAN legitimately uses 10.x and 172.x, so those
+ * ranges can't be blanket-excluded — but a `NordLynx` / `tailscale` / `docker`
+ * / WSL `vEthernet` adapter can be, by name, regardless of its address.
  */
-export function getServerIp(): string {
+const VIRTUAL_IFACE_HINTS = [
+  // VPN / overlay. Short forms subsume longer ones under substring matching:
+  // 'nord' covers 'nordlynx', 'wg' covers 'wireguard', 'tun' covers 'utun',
+  // 'veth' covers 'vEthernet'.
+  'nord', 'tailscale', 'zerotier', 'hamachi', 'wg', 'tun', 'tap', 'ppp',
+  // Hypervisor / container host bridges.
+  'veth', 'wsl', 'docker', 'hyper-v', 'hyperv', 'vmware', 'virtualbox', 'vbox', 'virbr',
+  // Npcap / MS KM-TEST loopback adapters report internal:false, so the
+  // os.networkInterfaces() `internal` filter alone doesn't catch them.
+  'loopback',
+];
+/**
+ * Prefix-matched (not substring) because these are short enough to appear
+ * inside legitimate adapter names. `br-<hex>` is a Docker user-defined /
+ * Compose network bridge; `zt<hex>` is ZeroTier on Linux.
+ */
+const VIRTUAL_IFACE_PATTERNS = [/^br-[0-9a-f]+$/i, /^zt[0-9a-z]{6,}$/i];
+
+function isVirtualIface(name: string): boolean {
+  const n = name.toLowerCase();
+  if (VIRTUAL_IFACE_HINTS.some((hint) => n.includes(hint))) return true;
+  return VIRTUAL_IFACE_PATTERNS.some((re) => re.test(n));
+}
+
+interface HostIface { name: string; address: string; netmask: string; }
+
+function hostIpv4Ifaces(): HostIface[] {
+  const interfaces = os.networkInterfaces();
+  const out: HostIface[] = [];
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name] ?? []) {
+      if (iface.family !== 'IPv4' || iface.internal) continue;
+      // 169.254.0.0/16 is APIPA/link-local — assigned when DHCP fails and never
+      // routable off-link, so it can never be a WireGuard endpoint.
+      if (iface.address.startsWith('169.254.')) continue;
+      out.push({ name, address: iface.address, netmask: iface.netmask });
+    }
+  }
+  return out;
+}
+
+/**
+ * Get the host IP a device should dial for the WireGuard endpoint.
+ *
+ * When `deviceLanIp` is known, we pick the host interface on the SAME subnet as
+ * the device — that address is reachable by construction, which is the only
+ * thing that actually matters for the handshake. This is what makes capture
+ * work when the host is also on a VPN (NordVPN/Tailscale): those adapters are a
+ * different subnet, so they're never chosen.
+ *
+ * Without `deviceLanIp` (or if nothing matched), fall back to a heuristic:
+ * drop virtual/VPN adapters by name, then prefer a private LAN address. The old
+ * heuristic returned the first non-192.168 address in enumeration order, which
+ * on a VPN-connected host with no 192.168 LAN was often a NordVPN 10.x or a
+ * link-local 169.254 address the phone could never reach.
+ *
+ * `WG_SERVER_IP` overrides everything.
+ */
+export function getServerIp(deviceLanIp?: string): string {
   if (process.env.WG_SERVER_IP) {
     return process.env.WG_SERVER_IP;
   }
 
-  const interfaces = os.networkInterfaces();
-  let preferred: string | null = null;  // 192.168.x.x — almost always real LAN
-  let secondary: string | null = null;  // other non-VPN IPv4
-  let fallback: string | null = null;   // VPN addresses (last resort)
+  const candidates = hostIpv4Ifaces();
 
-  for (const name of Object.keys(interfaces)) {
-    for (const iface of interfaces[name]!) {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        if (isVpnAddress(iface.address)) {
-          if (!fallback) fallback = iface.address;
-        } else if (iface.address.startsWith('192.168.')) {
-          if (!preferred) preferred = iface.address;
-        } else {
-          if (!secondary) secondary = iface.address;
-        }
-      }
-    }
+  // Best: a host interface on the device's own subnet — reachable by
+  // construction. Prefer a non-virtual adapter if more than one matches.
+  if (deviceLanIp) {
+    const sameNet = candidates.filter((c) => sameSubnet(c.address, deviceLanIp, c.netmask));
+    const chosen = sameNet.find((c) => !isVirtualIface(c.name)) ?? sameNet[0];
+    if (chosen) return chosen.address;
   }
 
-  return preferred || secondary || fallback || '127.0.0.1';
+  // Fallback heuristic: prefer real (non-virtual) adapters, then a LAN address.
+  const physical = candidates.filter((c) => !isVirtualIface(c.name));
+  const pool = physical.length ? physical : candidates;
+  const is192 = (a: string) => a.startsWith('192.168.');
+  const isPrivate = (a: string) => a.startsWith('10.') || /^172\.(1[6-9]|2\d|3[01])\./.test(a);
+  return (
+    pool.find((c) => is192(c.address))?.address ??
+    pool.find((c) => isPrivate(c.address))?.address ??
+    pool[0]?.address ??
+    '127.0.0.1'
+  );
+}
+
+/**
+ * Resolve the device's own LAN IPv4 — the address the WireGuard endpoint should
+ * live on the same subnet as. Reads the device's interface list over ADB and
+ * prefers WiFi (`wlan*`), then cellular (`rmnet*`). Deliberately ignores the
+ * capture tunnel (`wg*`) and loopback, and any 169.254 link-local, so a stale
+ * tunnel from a previous attempt can't shadow the real LAN address.
+ *
+ * Returns undefined if ADB is unavailable or the device has no usable LAN
+ * address; callers then fall back to {@link getServerIp}'s heuristic.
+ */
+export async function getDeviceLanIp(deviceId: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      'adb', ['-s', deviceId, 'shell', 'ip -o -4 addr show'], { timeout: 5000 },
+    );
+    const rows = stdout.split('\n')
+      .map((line) => {
+        // e.g. "23: wlan0    inet 10.180.85.74/24 brd 10.180.85.255 scope global wlan0"
+        const m = line.match(/^\s*\d+:\s+(\S+)\s+inet\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
+        return m ? { iface: m[1], ip: m[2] } : null;
+      })
+      .filter((r): r is { iface: string; ip: string } => r !== null)
+      // Skip loopback, our own capture tunnel, link-local, and the device's own
+      // VPN interfaces. The last matters for the same reason we skip VPN
+      // adapters host-side: this product's users often run a VPN app on the
+      // phone, and returning its tun0 address makes every host interface look
+      // "different subnet", silently reverting to the heuristic we're trying to
+      // improve on.
+      .filter((r) => r.iface !== 'lo'
+        && !r.iface.startsWith('wg')
+        && !r.iface.startsWith('tun')
+        && !r.iface.startsWith('ppp')
+        && !r.iface.startsWith('dummy')
+        && !r.ip.startsWith('169.254.'));
+
+    const wifi = rows.find((r) => r.iface.startsWith('wlan'));
+    // rmnet* = Qualcomm, ccmni* = MediaTek. (There is no `radio*` convention.)
+    const cellular = rows.find((r) => r.iface.startsWith('rmnet') || r.iface.startsWith('ccmni'));
+    return (wifi ?? cellular ?? rows[0])?.ip;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -160,13 +276,16 @@ export function getServerIp(): string {
 export function ensureConfigs(
   deviceId: string,
   serverPort: number = 51820,
+  deviceLanIp?: string,
 ): EnsureConfigsResult {
   const configDir = path.resolve('./data/wireguard');
   const configPath = safeJoinInside(configDir, `${deviceId}.json`);
 
   // Client address: deterministic based on device position but simple default
   const clientAddress = '10.0.0.2/32';
-  const serverIp = getServerIp();
+  // Pick the endpoint on the device's own subnet when we know it, so the
+  // handshake target is actually reachable from the phone (see getServerIp).
+  const serverIp = getServerIp(deviceLanIp);
   const serverEndpoint = `${serverIp}:${serverPort}`;
 
   // Check if config already exists

@@ -14,6 +14,7 @@ import {
   adbShell,
   adbCommand,
   suShell,
+  ensureRootAccess,
 } from './device-manager';
 
 const { devices } = schema;
@@ -543,6 +544,75 @@ describe('DeviceManager', () => {
       expect(allCmds).toContain('/data/local/tmp/wg-uapi setconf wg0');
       expect(allCmds).toContain('/data/local/tmp/wg-uapi set wg0 fwmark 51820');
     });
+
+    it('routes the device DNS resolvers around the tunnel (priority 50)', async () => {
+      // Regression for "tunnel up but zero app traffic": mitmproxy's WireGuard
+      // DNS replies don't reach some resolvers (Android 16 + kernel WG), so DNS
+      // must resolve on the device's real network. Bypass rules for each DNS
+      // server must be emitted at priority 50 (before the catch-all at 100).
+      const commands: string[] = [];
+      execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+        commands.push(cmd);
+        if (cmd.includes('dumpsys connectivity')) {
+          cb(null, 'lp{{InterfaceName: wlan1 DnsAddresses: [ /192.168.1.1,/8.8.8.8 ] Domains: home}}', '');
+        } else if (cmd.includes('which wg')) {
+          cb(null, '/usr/bin/wg', '');
+        } else {
+          cb(null, '', '');
+        }
+      });
+
+      await manager.activateWireGuardTunnel('DEV001', {
+        clientPrivateKey: 'k', serverPublicKey: 'k', clientAddress: '10.0.0.2/32', serverEndpoint: '192.168.1.100:51820',
+      });
+
+      const allCmds = commands.join(' ');
+      expect(allCmds).toContain('ip rule add to 192.168.1.1 lookup main priority 50');
+      expect(allCmds).toContain('ip rule add to 8.8.8.8 lookup main priority 50');
+      // Stale bypass rules from a prior run are cleared first.
+      expect(allCmds).toContain('ip rule del priority 50');
+    });
+
+    it('emits no DNS-bypass rule when resolvers cannot be determined', async () => {
+      const commands: string[] = [];
+      execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+        commands.push(cmd);
+        // `dumpsys connectivity` fails outright — the resolver list is genuinely
+        // unavailable, not merely empty.
+        if (cmd.includes('dumpsys connectivity')) {
+          cb(new Error('dumpsys: command not found'), '', '');
+          return;
+        }
+        cb(null, cmd.includes('which wg') ? '/usr/bin/wg' : '', '');
+      });
+
+      await manager.activateWireGuardTunnel('DEV001', {
+        clientPrivateKey: 'k', serverPublicKey: 'k', clientAddress: '10.0.0.2/32', serverEndpoint: '192.168.1.100:51820',
+      });
+
+      expect(commands.join(' ')).not.toContain('lookup main priority 50');
+    });
+  });
+
+  describe('getDeviceDnsServers', () => {
+    let execMock: ReturnType<typeof vi.fn>;
+    beforeEach(async () => {
+      const cp = await import('child_process');
+      execMock = cp.exec as unknown as ReturnType<typeof vi.fn>;
+    });
+
+    it('parses IPv4 DnsAddresses from dumpsys connectivity, de-duplicated', async () => {
+      execMock.mockImplementation((_cmd: string, _opts: any, cb: any) => {
+        cb(null, 'DnsAddresses: [ /192.168.1.1 ] ... DnsAddresses: [ /192.168.1.1,/1.1.1.1 ]', '');
+      });
+      const dns = await manager.getDeviceDnsServers('DEV001');
+      expect(dns).toEqual(['192.168.1.1', '1.1.1.1']);
+    });
+
+    it('returns [] when dumpsys fails', async () => {
+      execMock.mockImplementation((_cmd: string, _opts: any, cb: any) => cb(new Error('boom'), '', ''));
+      expect(await manager.getDeviceDnsServers('DEV001')).toEqual([]);
+    });
   });
 
   describe('deactivateWireGuardTunnel', () => {
@@ -579,6 +649,122 @@ describe('DeviceManager', () => {
       // Reverse the IPv6 null-route/rule installed during activation.
       expect(allCmds).toContain('ip -6 rule del not fwmark 51820 table 51820 priority 100');
       expect(allCmds).toContain('ip -6 route flush table 51820');
+    });
+
+    it('loop-deletes the priority 50/90/100 rules so duplicates cannot survive', async () => {
+      const commands: string[] = [];
+      execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+        commands.push(cmd);
+        cb(null, '', '');
+      });
+
+      await manager.deactivateWireGuardTunnel('DEV001');
+
+      const allCmds = commands.join(' ');
+      // A bare `ip rule del` removes only the first match; a leftover
+      // priority-100 rule points the default route at a dead wg0 and
+      // black-holes every packet the device sends. Bounded `for` rather than
+      // `while` so a non-iproute2 `ip` that exits 0 on a no-op can't spin.
+      for (const sel of ['priority 100', 'priority 90', 'priority 50', 'table 51820']) {
+        expect(allCmds).toContain(`for i in 1 2 3 4 5 6 7 8; do ip rule del ${sel} 2>/dev/null || break; done`);
+      }
+      // The IPv6 catch-all accumulates duplicates the same way.
+      expect(allCmds).toContain('do ip -6 rule del not fwmark 51820 table 51820 priority 100 2>/dev/null || break; done');
+    });
+  });
+
+  describe('reconcileOrphanTunnel', () => {
+    let execMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(async () => {
+      const cp = await import('child_process');
+      execMock = cp.exec as unknown as ReturnType<typeof vi.fn>;
+    });
+
+    it('tears down a wg0 left behind by a previous process', async () => {
+      const commands: string[] = [];
+      let tornDown = false;
+      execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+        commands.push(cmd);
+        if (cmd.includes('ip link del wg0')) tornDown = true;
+        if (cmd.includes('ip link show wg0')) {
+          // Gone once the teardown has run — the method re-probes to confirm.
+          cb(null, tornDown ? '' : '52: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 state UNKNOWN', '');
+          return;
+        }
+        cb(null, '', '');
+      });
+
+      const cleaned = await manager.reconcileOrphanTunnel('DEV001');
+
+      expect(cleaned).toBe(true);
+      expect(commands.join(' ')).toContain('ip link del wg0');
+    });
+
+    it('reports failure when the tunnel survives teardown (unrooted device)', async () => {
+      // deactivateWireGuardTunnel swallows its own errors, so "we ran teardown"
+      // must not be reported as "the tunnel is gone".
+      execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+        if (cmd.includes('ip link show wg0')) {
+          cb(null, '52: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 state UNKNOWN', '');
+          return;
+        }
+        cb(new Error('su: permission denied'), '', '');
+      });
+
+      await expect(manager.reconcileOrphanTunnel('DEV001')).resolves.toBe(false);
+    });
+
+    it('ignores an `ip` build that prints its error to stdout', async () => {
+      // Some builds print `Device "wg0" does not exist.` on STDOUT. A loose
+      // match would "clean up" a tunnel that isn't there — popping an
+      // unsolicited Magisk prompt on every device connect.
+      const commands: string[] = [];
+      execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+        commands.push(cmd);
+        cb(null, 'Device "wg0" does not exist.', '');
+      });
+
+      const cleaned = await manager.reconcileOrphanTunnel('DEV001');
+
+      expect(cleaned).toBe(false);
+      expect(commands.join(' ')).not.toContain('ip link del wg0');
+    });
+
+    it('does nothing when the device has no wg0', async () => {
+      const commands: string[] = [];
+      execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+        commands.push(cmd);
+        cb(null, '', '');
+      });
+
+      const cleaned = await manager.reconcileOrphanTunnel('DEV001');
+
+      expect(cleaned).toBe(false);
+      expect(commands.join(' ')).not.toContain('ip link del wg0');
+    });
+
+    it('leaves the tunnel alone when a capture owns the device', async () => {
+      const commands: string[] = [];
+      execMock.mockImplementation((cmd: string, _opts: any, cb: any) => {
+        commands.push(cmd);
+        cb(null, '52: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP>', '');
+      });
+      manager.setCaptureActiveCheck((id) => id === 'DEV001');
+
+      const cleaned = await manager.reconcileOrphanTunnel('DEV001');
+
+      expect(cleaned).toBe(false);
+      // Must not even probe — a live capture is authoritative.
+      expect(commands).toHaveLength(0);
+    });
+
+    it('stays quiet when the device is unreachable', async () => {
+      execMock.mockImplementation((_cmd: string, _opts: any, cb: any) => {
+        cb(new Error('device offline'), '', '');
+      });
+
+      await expect(manager.reconcileOrphanTunnel('DEV001')).resolves.toBe(false);
     });
   });
 
@@ -1003,5 +1189,56 @@ describe('adb helpers — command-injection prevention', () => {
     expect(sent).toBe(chain);                 // exact bare form
     expect(sent).not.toMatch(/^"/);           // never wrapped in literal quotes
     expect(sent).not.toMatch(/"$/);
+  });
+});
+
+describe('ensureRootAccess — interactive Magisk grant', () => {
+  let execMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    const cp = await import('child_process');
+    execMock = cp.exec as unknown as ReturnType<typeof vi.fn>;
+  });
+
+  it('waits out the on-phone grant instead of failing fast (>= 30s, not the old 3s)', async () => {
+    // Regression guard for "rooted device won't capture, it just times out":
+    // the root check is the first su -c of the capture, so it triggers the
+    // Magisk superuser prompt the user has to physically tap. A 3s timeout
+    // killed adb before they could respond and reported a false "no root".
+    let seenTimeout = 0;
+    execMock.mockImplementation((cmd: string, opts: any, cb: any) => {
+      const sent = cmd.replace(/^adb -s \S+ shell /, '');
+      if (/^su -c /.test(sent)) {
+        seenTimeout = opts?.timeout ?? 0;
+        cb(null, 'uid=0(root) gid=0(root)', '');
+      } else {
+        cb(new Error('unexpected'), '', sent);
+      }
+    });
+
+    await expect(ensureRootAccess('DEV001')).resolves.toBeUndefined();
+    // Must give a human time to tap Grant; anything back near the old 3s
+    // reintroduces the false-negative on a genuinely rooted device.
+    expect(seenTimeout).toBeGreaterThanOrEqual(30_000);
+  });
+
+  it('when the grant prompt is never answered (adb killed on timeout), says so', async () => {
+    // execFile kills the child with SIGTERM when the timeout elapses.
+    execMock.mockImplementation((_cmd: string, _opts: any, cb: any) => {
+      const err: any = new Error('Command failed: adb ... shell su -c id');
+      err.killed = true;
+      err.signal = 'SIGTERM';
+      cb(err, '', '');
+    });
+
+    await expect(ensureRootAccess('DEV001', 50)).rejects.toThrow(/not granted in time/i);
+  });
+
+  it('when there is no usable root (su denied/absent, fast error), says not rooted', async () => {
+    execMock.mockImplementation((_cmd: string, _opts: any, cb: any) => {
+      cb(new Error('Command failed'), '', '/system/bin/sh: su: inaccessible or not found');
+    });
+
+    await expect(ensureRootAccess('DEV001')).rejects.toThrow(/not rooted, or su access was denied/i);
   });
 });

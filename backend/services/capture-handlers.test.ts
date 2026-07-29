@@ -17,6 +17,7 @@ function deps() {
     getActiveDockerClient: vi.fn().mockReturnValue({}),
     lookupRuntimeId: vi.fn().mockReturnValue('container123'),
     waitForTunnelReady: vi.fn().mockResolvedValue(true),
+    getActiveSessionId: vi.fn().mockReturnValue(1),
     ensureConfigs: vi.fn().mockReturnValue({
       clientPrivateKey: 'client-priv',
       serverPublicKey: 'server-pub',
@@ -39,6 +40,90 @@ describe('capture handlers', () => {
     expect(d.deviceManager.injectMitmproxyCaCert).toHaveBeenCalledWith('localhost:32770');
     expect(d.deviceManager.activateWireGuardTunnel).toHaveBeenCalled();
     expect(r.tunnelActivated).toBe(true);
+  });
+
+  it('wireguard: returns without awaiting the connectivity probe (so a slow probe cannot time out the capture-start response)', async () => {
+    // Regression for "gets to 3/4 and times out": the connectivity probe is a
+    // slow best-effort confirmation, and awaiting it kept the HTTP response
+    // pending past the frontend's 30s cutoff. The handler must resolve as soon
+    // as the tunnel is active, even if the probe never resolves.
+    const d = deps();
+    d.waitForTunnelReady = vi.fn().mockReturnValue(new Promise<boolean>(() => {})); // never resolves
+    const h = makeCaptureHandlers(d as any);
+
+    const r = await h.wireguard(ctx()); // must not hang on the probe
+
+    expect(r.tunnelActivated).toBe(true);
+    expect(d.deviceManager.activateWireGuardTunnel).toHaveBeenCalled();
+  });
+
+  it('wireguard: reports connectivity over the subsystem channel after the detached probe finishes', async () => {
+    const d = deps();
+    let resolveProbe!: (v: boolean) => void;
+    d.waitForTunnelReady = vi.fn().mockReturnValue(new Promise<boolean>((res) => { resolveProbe = res; }));
+    const h = makeCaptureHandlers(d as any);
+    const setSubsystem = vi.fn();
+
+    await h.wireguard(ctx({ setSubsystem }));
+    // Not reported yet — probe is still in flight, capture already "started".
+    expect(setSubsystem).not.toHaveBeenCalledWith('connectivity', expect.anything());
+
+    resolveProbe(true);
+    await vi.waitFor(() => expect(setSubsystem).toHaveBeenCalledWith('connectivity', 'ok'));
+  });
+
+  it('wireguard: a detached probe that finishes after capture stopped does not re-broadcast connectivity', async () => {
+    const d = deps();
+    let resolveProbe!: (v: boolean) => void;
+    d.waitForTunnelReady = vi.fn().mockReturnValue(new Promise<boolean>((res) => { resolveProbe = res; }));
+    // Read through a variable: makeCaptureHandlers destructures the dep, so
+    // reassigning d.getActiveSessionId afterwards would not reach the closure.
+    let activeSession: number | undefined = 1;
+    d.getActiveSessionId = vi.fn(() => activeSession);
+    const h = makeCaptureHandlers(d as any);
+    const setSubsystem = vi.fn();
+
+    await h.wireguard(ctx({ sessionId: 1, setSubsystem }));
+    // Simulate the user stopping capture before the probe resolves: no session
+    // is active on the device any more.
+    d.mitmproxyManager.isCapturing = vi.fn().mockReturnValue(false);
+    activeSession = undefined;
+
+    resolveProbe(true);
+    // Give the detached task a chance to run, then assert it stayed quiet.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(setSubsystem).not.toHaveBeenCalledWith('connectivity', expect.anything());
+  });
+
+  it('wireguard: a probe from a stopped session never reports into the session that replaced it', async () => {
+    // stop + start inside the probe window. `isCapturing(deviceId)` is true
+    // again by then (a NEW capture owns the device), so a device-scoped guard
+    // would publish session 1's stale subsystem snapshot over session 2's.
+    const d = deps();
+    let release: (v: boolean) => void = () => {};
+    d.waitForTunnelReady = vi.fn().mockReturnValue(new Promise<boolean>((r) => { release = r; }));
+    d.getActiveSessionId = vi.fn().mockReturnValue(2); // session 2 is live now
+    const setSubsystem = vi.fn();
+    const h = makeCaptureHandlers(d as any);
+
+    await h.wireguard(ctx({ sessionId: 1, setSubsystem }));
+    setSubsystem.mockClear();
+    release(true);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(setSubsystem).not.toHaveBeenCalled();
+  });
+
+  it('wireguard: the detached probe still reports into its own session', async () => {
+    const d = deps();
+    d.getActiveSessionId = vi.fn().mockReturnValue(7);
+    const setSubsystem = vi.fn();
+    const h = makeCaptureHandlers(d as any);
+
+    await h.wireguard(ctx({ sessionId: 7, setSubsystem }));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(setSubsystem).toHaveBeenCalledWith('connectivity', 'ok');
   });
 
   it('wireguard: already-running (no tunnelInfo) skips on-device setup, tunnelActivated false', async () => {

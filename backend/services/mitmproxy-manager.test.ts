@@ -41,8 +41,11 @@ vi.mock('../logs', () => ({
 
 const mockEnsureConfigs = vi.fn();
 
+const mockGetDeviceLanIp = vi.fn().mockResolvedValue(undefined);
+
 vi.mock('./wireguard-config', () => ({
   ensureConfigs: (...args: any[]) => mockEnsureConfigs(...args),
+  getDeviceLanIp: (...args: any[]) => mockGetDeviceLanIp(...args),
 }));
 
 const mockSocksInstances: Array<{ start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>; getPort: ReturnType<typeof vi.fn> }> = [];
@@ -97,10 +100,30 @@ describe('MitmproxyManager', () => {
   });
 
   describe('startCapture', () => {
+    it("threads the device's resolved LAN IP into ensureConfigs", async () => {
+      // The whole point of resolving it: ensureConfigs uses it to pick a
+      // WireGuard endpoint on the phone's own subnet. Passing it through is the
+      // difference between a reachable endpoint and the VPN address that made
+      // the tunnel come up and move zero bytes.
+      mockGetDeviceLanIp.mockResolvedValueOnce('192.168.1.196');
+
+      await manager.startCapture('device-lan');
+
+      expect(mockGetDeviceLanIp).toHaveBeenCalledWith('device-lan');
+      expect(mockEnsureConfigs).toHaveBeenCalledWith('device-lan', 51820, '192.168.1.196');
+    });
+
+    it('still starts capture when the device LAN IP cannot be resolved', async () => {
+      mockGetDeviceLanIp.mockRejectedValueOnce(new Error('device offline'));
+
+      await expect(manager.startCapture('device-nolan')).resolves.toBeDefined();
+      expect(mockEnsureConfigs).toHaveBeenCalledWith('device-nolan', 51820, undefined);
+    });
+
     it('calls ensureConfigs and spawns mitmdump with @port suffix', async () => {
       await manager.startCapture('device-1');
 
-      expect(mockEnsureConfigs).toHaveBeenCalledWith('device-1', 51820);
+      expect(mockEnsureConfigs).toHaveBeenCalledWith('device-1', 51820, undefined);
       // The branch resolves mitmdump through resolveVenvBin() (so the venv
       // copy wins over any host install), so the command is an absolute
       // path ending in mitmdump rather than the bare 'mitmdump' name.
@@ -137,7 +160,7 @@ describe('MitmproxyManager', () => {
     it('uses custom wgPort when provided', async () => {
       await manager.startCapture('device-1', { wgPort: 9999 });
 
-      expect(mockEnsureConfigs).toHaveBeenCalledWith('device-1', 9999);
+      expect(mockEnsureConfigs).toHaveBeenCalledWith('device-1', 9999, undefined);
       const args = spawnMock.mock.calls[0][1] as string[];
       const modeIdx = args.indexOf('--mode');
       expect(args[modeIdx + 1]).toBe('wireguard:./data/wireguard/device-1.json@9999');

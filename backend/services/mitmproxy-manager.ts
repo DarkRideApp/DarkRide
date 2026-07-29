@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import { createLoggers } from '../logs';
 import { ProxyRotator } from './proxy-rotator';
-import { ensureConfigs, type WireGuardTunnelInfo } from './wireguard-config';
+import { ensureConfigs, getDeviceLanIp, type WireGuardTunnelInfo } from './wireguard-config';
 import { getBlocklistPath } from './blocklist-writer';
 import { getHiddenlistPath } from './hiddenlist-writer';
 import { SocksProxyServer } from './socks-proxy-server';
@@ -109,7 +109,23 @@ export class MitmproxyManager {
     }
 
     const wgPort = options?.wgPort ?? 51820;
-    const configs = ensureConfigs(deviceId, wgPort);
+    // Resolve the device's LAN IP first (before any tunnel exists) so the
+    // WireGuard endpoint is chosen on the device's own subnet — otherwise, on a
+    // host that's also on a VPN (NordVPN/Tailscale), the endpoint defaults to a
+    // host-only VPN address the phone can't reach and the handshake never
+    // happens (tunnel comes up, 0 bytes, capture is silent).
+    // Never fatal: this is an optimisation over the heuristic, so a device that
+    // can't answer must degrade to the old behaviour rather than block capture.
+    const deviceLanIp = await getDeviceLanIp(deviceId).catch((err: any) => {
+      log(`Could not resolve LAN IP for ${deviceId} (${err?.message ?? err}); falling back to heuristic endpoint`);
+      return undefined;
+    });
+    const configs = ensureConfigs(deviceId, wgPort, deviceLanIp);
+    if (deviceLanIp) {
+      log(`Device ${deviceId} LAN IP ${deviceLanIp} -> WireGuard endpoint ${configs.serverEndpoint}`);
+    } else {
+      log(`Device ${deviceId} LAN IP unknown; using heuristic WireGuard endpoint ${configs.serverEndpoint}`);
+    }
     const webhookUrl = options?.webhookUrl || this.defaultWebhookUrl;
     const wgConfigPath = configs.serverConfigPath;
 
