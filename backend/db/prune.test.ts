@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import path from 'path';
 import * as schema from './schema';
 import { pruneOldData, cleanStaleSessions } from './prune';
 
@@ -150,8 +151,8 @@ describe('pruneOldData', () => {
     await pruneOldData(db as any, 7, '/data/screenshots');
 
     expect(unlink).toHaveBeenCalledTimes(2);
-    expect(unlink).toHaveBeenCalledWith('/data/screenshots/delete-me.png');
-    expect(unlink).toHaveBeenCalledWith('/data/screenshots/delete-me-too.png');
+    expect(unlink).toHaveBeenCalledWith(path.join('/data/screenshots', 'delete-me.png'));
+    expect(unlink).toHaveBeenCalledWith(path.join('/data/screenshots', 'delete-me-too.png'));
   });
 
   it('should handle missing screenshot files gracefully', async () => {
@@ -304,7 +305,7 @@ describe('pruneOldData', () => {
 
     // Only the unpinned screenshot file should have been deleted
     expect(unlink).toHaveBeenCalledTimes(1);
-    expect(unlink).toHaveBeenCalledWith('/tmp/screenshots/unpinned-screenshot.png');
+    expect(unlink).toHaveBeenCalledWith(path.join('/tmp/screenshots', 'unpinned-screenshot.png'));
   });
 
   it('should prune old websocket messages', async () => {

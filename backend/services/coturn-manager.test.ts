@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync
 import { Readable } from 'stream';
 import { tmpdir } from 'os';
 import path from 'path';
+import { findPosixShell, toShellPath } from '../test-utils/posix-shell';
 import {
   buildTurncfgScript,
   buildCoturnContainerSpec,
@@ -14,7 +15,7 @@ import {
 const CREDS = { username: 'darkride', password: 'deadbeefcafef00d0123456789abcdef' };
 
 /**
- * Run the turncfg script through /bin/sh exactly as the emulator does and
+ * Run the turncfg script through a POSIX shell exactly as the emulator does and
  * return the parsed JSON it prints. Executing the real script (rather than
  * string-matching the printf body) is the only way to verify the contract:
  * the emitted stdout must be valid iceServers JSON with the values
@@ -26,7 +27,9 @@ function runTurncfg(lanIp: string, creds = CREDS): any {
     const file = path.join(dir, 'turncfg.sh');
     writeFileSync(file, buildTurncfgScript(lanIp, creds));
     chmodSync(file, 0o755);
-    const stdout = execFileSync('/bin/sh', [file], { encoding: 'utf-8' });
+    const sh = findPosixShell();
+    if (!sh) throw new Error('no POSIX shell available to run the script');
+    const stdout = execFileSync(sh, [toShellPath(file)], { encoding: 'utf-8' });
     return JSON.parse(stdout);
   } finally {
     rmSync(dir, { recursive: true, force: true });

@@ -105,7 +105,8 @@ describe('MitmproxyManager', () => {
       // copy wins over any host install), so the command is an absolute
       // path ending in mitmdump rather than the bare 'mitmdump' name.
       expect(spawnMock).toHaveBeenCalledWith(
-        expect.stringMatching(/mitmdump$/),
+        // .exe on Windows venvs, extensionless on POSIX.
+        expect.stringMatching(/mitmdump(\.exe)?$/),
         expect.arrayContaining([
           '--mode', 'wireguard:./data/wireguard/device-1.json@51820',
           '-s', expect.stringContaining('mitmproxy_bridge.py'),

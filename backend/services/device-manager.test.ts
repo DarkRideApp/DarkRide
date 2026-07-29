@@ -3,6 +3,7 @@ import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { createTestDb } from '../test-utils/create-test-db';
+import { findPosixShell } from '../test-utils/posix-shell';
 import {
   DeviceManager,
   parseAdbDevices,
@@ -979,7 +980,10 @@ describe('adb helpers — command-injection prevention', () => {
     // Verify with a REAL shell (the suite mocks child_process) so the assertion
     // checks POSIX correctness rather than re-implementing the escape algorithm.
     const realCp = await vi.importActual<typeof import('child_process')>('child_process');
-    const reconstructed = realCp.execFileSync('/bin/sh', ['-c', `printf %s ${payload}`]).toString();
+    // This suite mocks child_process, so hand the probe the real execFileSync.
+    const sh = findPosixShell(realCp.execFileSync);
+    expect(sh, 'no POSIX shell available to verify the quoting').not.toBeNull();
+    const reconstructed = realCp.execFileSync(sh!, ['-c', `printf %s ${payload}`]).toString();
     expect(reconstructed).toBe(tricky);
   });
 

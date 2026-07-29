@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import path from 'path';
 import { createTestDb } from '../test-utils/create-test-db';
 import { interceptRules, clientCerts } from '../db/schema';
 import { syncInterceptConfig, getInterceptConfigPath } from './intercept-config-writer';
@@ -67,7 +68,8 @@ describe('syncInterceptConfig', () => {
   it('returns the correct file path', () => {
     const filePath = syncInterceptConfig(db as any);
     expect(filePath).toBe(getInterceptConfigPath());
-    expect(filePath).toContain('data/intercept-config.json');
+    // An absolute filesystem path, so the separator is the platform's.
+    expect(filePath).toContain(path.join('data', 'intercept-config.json'));
   });
 
   it('creates the data directory', () => {

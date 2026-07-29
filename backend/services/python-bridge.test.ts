@@ -115,7 +115,9 @@ describe('PythonBridgeManager', () => {
       expect(bridge.port).toBe(9100);
       expect(bridge.isRunning()).toBe(true);
       expect(spawnCalls).toHaveLength(1);
-      expect(spawnCalls[0][0]).toMatch(/python3?$/);
+      // Windows venvs expose python.exe, POSIX ones python/python3 — match the
+      // interpreter name with an optional extension rather than assuming POSIX.
+      expect(spawnCalls[0][0]).toMatch(/python3?(\.exe)?$/);
       expect(spawnCalls[0][1]).toContain('--device');
     });
 

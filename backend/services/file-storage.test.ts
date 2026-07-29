@@ -920,14 +920,14 @@ describe('FileStorageService', () => {
       // mkdirSync should have been called for ./data/plugins/maps/
       expect(mkdirSyncSpy).toHaveBeenCalled();
       const calledPath = mkdirSyncSpy.mock.calls[0][0] as string;
-      expect(calledPath).toContain('data/plugins/maps');
+      expect(calledPath).toContain(path.join('data', 'plugins', 'maps'));
     });
 
     it('creates directory if it does not exist', () => {
       existsSyncSpy.mockReturnValue(false);
       fileSync.forPlugin('new-plugin');
       expect(mkdirSyncSpy).toHaveBeenCalledWith(
-        expect.stringContaining('data/plugins/new-plugin'),
+        expect.stringContaining(path.join('data', 'plugins', 'new-plugin')),
         { recursive: true },
       );
     });
@@ -945,14 +945,14 @@ describe('FileStorageService', () => {
       expect(ns.url('com.test/1.apk')).toBe('/v1/files/apks/com.test/1.apk');
       expect(mkdirSyncSpy).toHaveBeenCalled();
       const calledPath = mkdirSyncSpy.mock.calls[0][0] as string;
-      expect(calledPath).toContain('data/apks');
+      expect(calledPath).toContain(path.join('data', 'apks'));
     });
 
     it('creates directory if it does not exist', () => {
       existsSyncSpy.mockReturnValue(false);
       fileSync.forNamespace('screenshots');
       expect(mkdirSyncSpy).toHaveBeenCalledWith(
-        expect.stringContaining('data/screenshots'),
+        expect.stringContaining(path.join('data', 'screenshots')),
         { recursive: true },
       );
     });

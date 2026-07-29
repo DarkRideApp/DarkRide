@@ -29,7 +29,26 @@ describe('backend/config/paths', () => {
 
   it('toRelativeLocalPath strips DATA_ROOT from absolute paths under it', () => {
     const abs = path.join(getDataRoot(), 'apks', 'pkg', 'v1.apk');
-    expect(toRelativeLocalPath(abs)).toBe(path.join('apks', 'pkg', 'v1.apk'));
+    expect(toRelativeLocalPath(abs)).toBe('apks/pkg/v1.apk');
+  });
+
+  it('toRelativeLocalPath always emits forward slashes', () => {
+    // The stored cloud_files.local_path is compared against, and derived
+    // alongside, POSIX cloud keys — NamespacedStorage.list() builds its prefix
+    // with '/' and matches it against this column. A native-separator value
+    // silently never matched on Windows, so cloud-only files disappeared from
+    // listings. One canonical form also keeps a data dir + DB portable.
+    const abs = path.join(getDataRoot(), 'plugins', 'maps', 'tiles', '0.png');
+    const rel = toRelativeLocalPath(abs);
+
+    expect(rel).toBe('plugins/maps/tiles/0.png');
+    expect(rel).not.toContain('\\');
+    // Round-trips back to a usable absolute path on every platform.
+    expect(absoluteLocalPath(rel)).toBe(abs);
+  });
+
+  it('toRelativeLocalPath normalises separators in relative input too', () => {
+    expect(toRelativeLocalPath(path.join('apks', 'pkg', 'v1.apk'))).toBe('apks/pkg/v1.apk');
   });
 
   it('toRelativeLocalPath rejects absolute paths outside DATA_ROOT', () => {

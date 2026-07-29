@@ -34,12 +34,26 @@ export function absoluteLocalPath(stored: string): string {
  * Absolute paths under DATA_ROOT are stripped to their DATA_ROOT-relative form.
  * Absolute paths outside DATA_ROOT throw — we refuse to track files that
  * live outside our managed data directory.
+ *
+ * Separators are always forward slashes, on every platform. `path.relative`
+ * emits `\` on Windows, and this value is the stored `cloud_files.local_path`,
+ * which is compared against — and derived alongside — POSIX cloud keys:
+ * `NamespacedStorage.list()` builds its prefix with `/` and matches it against
+ * this column, so a backslash-separated row silently never matched and
+ * cloud-only files vanished from listings. Keeping one canonical form also
+ * means a `data/` directory plus its DB stays portable between OSes.
+ * `absoluteLocalPath` re-resolves either separator correctly on Windows.
  */
 export function toRelativeLocalPath(input: string): string {
-  if (!path.isAbsolute(input)) return input;
+  if (!path.isAbsolute(input)) return toPosixSeparators(input);
   const rel = path.relative(getDataRoot(), input);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     throw new Error(`Path outside DATA_ROOT cannot be tracked: ${input}`);
   }
-  return rel;
+  return toPosixSeparators(rel);
+}
+
+/** Canonicalise separators to `/` so stored paths are platform-independent. */
+function toPosixSeparators(p: string): string {
+  return p.split(path.sep).join('/');
 }
