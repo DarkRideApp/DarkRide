@@ -185,6 +185,16 @@ function setupInstalledPlugin(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+/**
+ * Normalise a path to forward slashes before matching. These assertions look
+ * for scoped package segments like `@darkride/plugin-a`, but the path is joined
+ * natively, so on Windows the scope separator is a backslash and the match
+ * silently failed.
+ */
+function posixPath(p: unknown): string {
+  return String(p).split('\\').join('/');
+}
+
 describe('Plugin API Endpoints', () => {
   let pluginManager: PluginManager;
   let stateManager: PluginStateManager;
@@ -462,7 +472,7 @@ describe('Plugin API Endpoints', () => {
       expect(pluginInstallsRepo.record).not.toHaveBeenCalled();
       expect(stateManager.upsertManagedPending).not.toHaveBeenCalled();
       // Rollback removed the tarball.
-      const rolledBack = rmSyncSpy.mock.calls.find(c => String(c[0]).endsWith('@darkride/plugin-demo-b'));
+      const rolledBack = rmSyncSpy.mock.calls.find(c => posixPath(c[0]).endsWith('@darkride/plugin-demo-b'));
       expect(rolledBack).toBeDefined();
     });
 
@@ -818,7 +828,7 @@ describe('Plugin API Endpoints', () => {
       expect(stateManager.remove).toHaveBeenCalledWith('@x/p');
       expect(mockDropPluginTables).not.toHaveBeenCalled();
       // rmSync should run once on the npm pkgDir but NOT on data/plugins/<name>/
-      const dataPluginsCalls = rmSyncSpy.mock.calls.filter((c: any[]) => String(c[0]).includes('/plugins/@x/p'));
+      const dataPluginsCalls = rmSyncSpy.mock.calls.filter((c: any[]) => posixPath(c[0]).includes('/plugins/@x/p'));
       expect(dataPluginsCalls).toHaveLength(0);
     });
 
@@ -1158,7 +1168,7 @@ describe('Plugin API Endpoints', () => {
       // Rollback called rmSync on the post-update tarball dir (fs.rmSync is
       // a spy in this suite; this confirms the rollback path was reached
       // with the expected target).
-      const rollbackCall = rmSyncSpy.mock.calls.find(c => String(c[0]).endsWith('@darkride/plugin-a'));
+      const rollbackCall = rmSyncSpy.mock.calls.find(c => posixPath(c[0]).endsWith('@darkride/plugin-a'));
       expect(rollbackCall).toBeDefined();
       expect((rollbackCall as any)[1]).toEqual(expect.objectContaining({ recursive: true, force: true }));
     });

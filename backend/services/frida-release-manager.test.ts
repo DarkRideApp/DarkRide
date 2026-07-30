@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import fs from 'fs';
+import path from 'path';
 import * as schema from '../db/schema';
 import { FridaReleaseManager } from './frida-release-manager';
 import { createTestDb } from '../test-utils/create-test-db';
@@ -387,7 +388,7 @@ describe('FridaReleaseManager', () => {
   describe('getBinaryPath', () => {
     it('should return the correct path for a version', () => {
       const binPath = manager.getBinaryPath('16.7.19');
-      expect(binPath).toBe('/tmp/test-frida/16.7.19/frida-server-arm64');
+      expect(binPath).toBe(path.resolve('/tmp/test-frida', '16.7.19', 'frida-server-arm64'));
     });
   });
 
@@ -420,7 +421,7 @@ describe('FridaReleaseManager', () => {
 
       manager.deleteVersion('16.7.19');
 
-      expect(fsMock.rmSync).toHaveBeenCalledWith('/tmp/test-frida/16.7.19', { recursive: true });
+      expect(fsMock.rmSync).toHaveBeenCalledWith(path.resolve('/tmp/test-frida', '16.7.19'), { recursive: true });
     });
 
     it('should handle non-existent directory gracefully', async () => {
@@ -453,7 +454,7 @@ describe('FridaReleaseManager', () => {
       }).run();
 
       const result = await manager.downloadVersion('16.7.19');
-      expect(result).toBe('/tmp/test-frida/16.7.19/frida-server-arm64');
+      expect(result).toBe(path.resolve('/tmp/test-frida', '16.7.19', 'frida-server-arm64'));
     });
   });
 
@@ -505,7 +506,7 @@ describe('FridaReleaseManager', () => {
 
   describe('gadget binary management', () => {
     it('getGadgetPath returns correct path', () => {
-      expect(manager.getGadgetPath('16.0.0')).toContain('16.0.0/frida-gadget-arm64.so');
+      expect(manager.getGadgetPath('16.0.0')).toContain(path.join('16.0.0', 'frida-gadget-arm64.so'));
     });
 
     it('isGadgetDownloaded returns false when file missing', () => {
