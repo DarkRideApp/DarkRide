@@ -903,7 +903,8 @@ export function registerAppEndpoints(
     res.json({ success: true, data });
   }, { requires: ['core.apk:read'] });
 
-  // PATCH /v1/apps/track/:id — Update per-app settings (e.g. autoFetchPlayStore)
+  // PATCH /v1/apps/track/:id — Update per-app settings (autoAnalyse, appName,
+  // and the legacy autoFetchPlayStore alias)
   registerEndpoint('PATCH', '/v1/apps/track/:id', (req, res) => {
     const id = parseInt(req.params.id as string, 10);
     if (isNaN(id)) {
@@ -923,6 +924,18 @@ export function registerAppEndpoints(
     // Back-compat: `autoFetchPlayStore` now lives in app_sources('playstore').
     if (typeof req.body.autoFetchPlayStore === 'boolean') {
       setSourceEnabled(db, id, 'playstore', req.body.autoFetchPlayStore);
+    }
+    // Download + analyse on a new version. Separate from the source `enabled`
+    // flag: a source can be watched for versions without its APK being fetched.
+    if (req.body.autoAnalyse !== undefined) {
+      // Reject a malformed value rather than ignoring it, as appName does. A
+      // 200 that silently changed nothing is the worst answer here: the caller
+      // believes analysis is off when it is still on.
+      if (typeof req.body.autoAnalyse !== 'boolean') {
+        res.status(400).json({ success: false, error: 'autoAnalyse must be a boolean' });
+        return;
+      }
+      db.update(trackedApps).set({ autoAnalyse: req.body.autoAnalyse }).where(eq(trackedApps.id, id)).run();
     }
     if (typeof req.body.appName === 'string') {
       const appName = req.body.appName.trim();

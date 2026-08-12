@@ -41,6 +41,8 @@ interface ApkVersionRow {
 interface TrackedApp {
   id: number; packageName: string; appName: string | null;
   createdAt: string | number; versionCount: number; latestVersion: ApkVersionRow | null;
+  /** Download + analyse the APK when a new version is detected. */
+  autoAnalyse?: boolean;
 }
 interface AppSourceRow {
   source: string; label: string; enabled: boolean;
@@ -248,6 +250,17 @@ export function AppDetail() {
     } catch { toast.error(`Failed to update ${label} setting`); }
   }, [ws, appId, toast]);
 
+  const toggleAutoAnalyse = useCallback(async (next: boolean) => {
+    try {
+      const res = await ws.sendRestApi('PATCH', `/v1/apps/track/${appId}`, { autoAnalyse: next });
+      if (!res.body?.success) return;
+      setApp(prev => (prev ? { ...prev, autoAnalyse: next } : prev));
+      toast.success(next
+        ? 'Auto-analysis enabled — new versions will be downloaded and analysed'
+        : 'Auto-analysis disabled — versions will be tracked without downloading');
+    } catch { toast.error('Failed to update auto-analysis'); }
+  }, [ws, appId, toast]);
+
   const fetchNow = useCallback(async (source: string, label: string) => {
     setSourceBusy(source);
     try {
@@ -393,6 +406,31 @@ export function AppDetail() {
             </button>
           )}
           <ActionMenu label="App settings" items={[{ key: 'untrack', label: 'Untrack app…', danger: true, onSelect: () => setUntrackOpen(true) }]} />
+        </div>
+      </div>
+
+      <div className="card" style={{ padding: '12px 20px', marginBottom: 16 }} data-testid="analysis-panel">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <button
+            role="switch"
+            aria-checked={!!app.autoAnalyse}
+            aria-label="Auto-analyse new versions"
+            data-testid="auto-analyse-toggle"
+            disabled={!canManage}
+            onClick={() => toggleAutoAnalyse(!app.autoAnalyse)}
+            className={`btn btn-sm${app.autoAnalyse ? ' btn-primary' : ''}`}
+            style={{ minWidth: 44 }}
+          >
+            {app.autoAnalyse ? 'On' : 'Off'}
+          </button>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>Auto-analyse new versions</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              Download and analyse the APK whenever a new version is found. Off means versions are still
+              tracked and reported, but nothing is downloaded — cheap for apps you only want to watch.
+              <strong> Fetch now</strong> always downloads, whatever this is set to.
+            </div>
+          </div>
         </div>
       </div>
 

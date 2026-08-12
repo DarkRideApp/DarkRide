@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { WebSocketContext, ToastProvider, pluginRegistry } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
@@ -46,6 +46,51 @@ function renderDetail() {
     </WebSocketContext.Provider>,
   );
 }
+
+describe('AppDetail — auto-analyse toggle', () => {
+  it('reflects the app state and flips it through the API', async () => {
+    const calls: Array<[string, string, any]> = [];
+    const ws = {
+      connected: true, serverReady: true, startupMessage: '',
+      sendMessage: vi.fn(),
+      sendRestApi: vi.fn().mockImplementation((method: string, path: string, body?: any) => {
+        calls.push([method, path, body]);
+        if (path === '/v1/apps/tracked') {
+          return Promise.resolve({ type: 'restapi', id: '1', status: 200, body: { success: true, data: [{ ...app, autoAnalyse: false }] } });
+        }
+        // Everything else returns [] — a bare object here makes the versions
+        // list blow up before the page renders, and the toggle never mounts.
+        if (method === 'PATCH') return Promise.resolve({ type: 'restapi', id: '2', status: 200, body: { success: true, data: {} } });
+        return Promise.resolve({ type: 'restapi', id: '9', status: 200, body: { success: true, data: [] } });
+      }),
+      subscribe: vi.fn().mockReturnValue(() => {}),
+    } as any;
+
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <ToastProvider>
+          <MemoryRouter initialEntries={['/ui/apps/1']}>
+            <Routes><Route path="/ui/apps/:trackedAppId" element={<AppDetail />} /></Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </WebSocketContext.Provider>,
+    );
+
+    const toggle = await screen.findByTestId('auto-analyse-toggle');
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
+    expect(toggle.textContent).toBe('Off');
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      const patch = calls.find(c => c[0] === 'PATCH' && c[1] === '/v1/apps/track/1');
+      expect(patch, 'no PATCH to the tracked app').toBeTruthy();
+      expect(patch![2]).toEqual({ autoAnalyse: true });
+    });
+    // Optimistic-but-confirmed: the button only flips after a success body.
+    await waitFor(() => expect(screen.getByTestId('auto-analyse-toggle').getAttribute('aria-checked')).toBe('true'));
+  });
+});
 
 describe('AppDetail — app-detail:panels slot', () => {
   let warn: ReturnType<typeof vi.spyOn>;

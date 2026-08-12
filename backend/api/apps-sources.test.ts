@@ -3,6 +3,7 @@ import request from 'supertest';
 import express from 'express';
 import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
+const { trackedApps } = schema;
 import { clearEndpoints, getApiRouter } from './api-service';
 import { registerAppEndpoints } from './apps';
 import { SourceRegistry } from '../services/apk-sources/registry';
@@ -111,6 +112,38 @@ describe('Apps source-config API', () => {
     const patch = await request(h.app).patch('/v1/apps/track/9999/sources/qq').send({ enabled: true });
     expect(patch.status).toBe(404);
     expect(h.db.select().from(appSources).all().filter(r => r.trackedAppId === 9999)).toHaveLength(0);
+  });
+
+  // ── PATCH /v1/apps/track/:id — auto-analyse ─────────────────────────────
+  // The switch that decides whether a detected version is downloaded at all.
+  // Until this endpoint existed it could only be changed in the database.
+  it('a newly tracked app does NOT auto-analyse', async () => {
+    const id = await trackApp();
+    const row = h.db.select().from(trackedApps).all().find(a => a.id === id)!;
+    expect(row.autoAnalyse, 'tracking a new app should be cheap by default').toBe(false);
+  });
+
+  it('PATCH toggles auto-analyse and returns the updated app', async () => {
+    const id = await trackApp();
+    const on = await request(h.app).patch(`/v1/apps/track/${id}`).send({ autoAnalyse: true });
+    expect(on.status).toBe(200);
+    expect(on.body.data.autoAnalyse).toBe(true);
+    expect(h.db.select().from(trackedApps).all().find(a => a.id === id)!.autoAnalyse).toBe(true);
+
+    const off = await request(h.app).patch(`/v1/apps/track/${id}`).send({ autoAnalyse: false });
+    expect(off.status).toBe(200);
+    expect(h.db.select().from(trackedApps).all().find(a => a.id === id)!.autoAnalyse).toBe(false);
+  });
+
+  it('PATCH rejects a non-boolean and 404s an unknown app', async () => {
+    const id = await trackApp();
+    const bad = await request(h.app).patch(`/v1/apps/track/${id}`).send({ autoAnalyse: 'yes' });
+    expect(bad.status).toBe(400);
+    // Unchanged — a rejected request must not half-apply.
+    expect(h.db.select().from(trackedApps).all().find(a => a.id === id)!.autoAnalyse).toBe(false);
+
+    const missing = await request(h.app).patch('/v1/apps/track/9999').send({ autoAnalyse: true });
+    expect(missing.status).toBe(404);
   });
 
   it('rejects an invalid packageName on track', async () => {
