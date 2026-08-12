@@ -335,8 +335,11 @@ describe('ApkTracker', () => {
       return tracker;
     }
 
-    function addApp(): number {
-      db.insert(trackedApps).values({ packageName: 'com.example.app', createdAt: new Date() }).run();
+    // autoAnalyse: true because these tests are about the DOWNLOAD path, and it
+    // mirrors migration 0098, which backfills every pre-existing tracked app to
+    // true. New apps default to false — covered in the block at the end.
+    function addApp(autoAnalyse = true): number {
+      db.insert(trackedApps).values({ packageName: 'com.example.app', autoAnalyse, createdAt: new Date() }).run();
       return db.select().from(trackedApps).all()[0].id;
     }
 
@@ -353,6 +356,170 @@ describe('ApkTracker', () => {
     function sourceRow(appId: number) {
       return db.select().from(appSources).all().find(r => r.trackedAppId === appId && r.source === 'playstore');
     }
+
+    // ── track without analysing ──────────────────────────────────────────
+    // The whole point of the tracking/analysis split: an app can be watched for
+    // versions without its APK ever being fetched. If these pass only with
+    // auto-analyse enabled, the separation is cosmetic.
+    describe('auto-analyse off', () => {
+      function hookBus() {
+        const emit = vi.fn();
+        return { emit, bus: { define: vi.fn(), on: vi.fn(), off: vi.fn(), emit } as any };
+      }
+
+      it('records the new version WITHOUT downloading', async () => {
+        const appId = addApp(false);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = fakeSource();
+        const tracker = trackerWith(ps);
+
+        const result = await tracker.checkRemoteSource(
+          { id: appId, packageName: 'com.example.app', appName: null }, ps,
+        );
+
+        expect(ps.checkVersion).toHaveBeenCalled();
+        expect(ps.downloadApk, 'downloaded the APK despite auto-analyse being off').not.toHaveBeenCalled();
+        expect(result.newVersionId).toBeNull();
+        // The version is still recorded — otherwise every cycle would re-detect
+        // it as new and re-announce it forever.
+        expect(sourceRow(appId)!.lastVersion).toBe('3.0.0');
+        expect(db.select().from(apkVersions).all()).toHaveLength(0);
+      });
+
+      it('emits apk:version-detected with analysed:false', async () => {
+        const appId = addApp(false);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = fakeSource();
+        const tracker = trackerWith(ps);
+        const { emit, bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        await tracker.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, ps);
+
+        expect(emit).toHaveBeenCalledWith('apk:version-detected', expect.objectContaining({
+          trackedAppId: appId,
+          packageName: 'com.example.app',
+          source: 'playstore',
+          versionName: '3.0.0',
+          previousVersion: '2.0.0',
+          analysed: false,
+        }));
+      });
+
+      it('emits apk:version-detected with analysed:true when it did download', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = fakeSource();
+        const tracker = trackerWith(ps);
+        const { emit, bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        await tracker.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, ps);
+
+        expect(ps.downloadApk).toHaveBeenCalled();
+        expect(emit).toHaveBeenCalledWith('apk:version-detected', expect.objectContaining({ analysed: true }));
+      });
+
+      it('does not re-announce an unchanged version', async () => {
+        const appId = addApp(false);
+        seedSource(appId, { lastVersion: '3.0.0' });   // already at the reported version
+        const ps = fakeSource();
+        const tracker = trackerWith(ps);
+        const { emit, bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        await tracker.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, ps);
+
+        expect(emit).not.toHaveBeenCalled();
+        expect(ps.downloadApk).not.toHaveBeenCalled();
+      });
+
+      it('a forced fetch still downloads — the button must not silently no-op', async () => {
+        const appId = addApp(false);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = fakeSource();
+        const tracker = trackerWith(ps);
+
+        await tracker.checkRemoteSource(
+          { id: appId, packageName: 'com.example.app', appName: null }, ps, { force: true },
+        );
+
+        expect(ps.downloadApk, 'explicit fetch-now was ignored').toHaveBeenCalled();
+      });
+
+      it('a throwing subscriber does not break the check', async () => {
+        const appId = addApp(false);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = fakeSource();
+        const tracker = trackerWith(ps);
+        tracker.setHookBus({
+          define: vi.fn(), on: vi.fn(), off: vi.fn(),
+          emit: vi.fn(() => { throw new Error('subscriber exploded'); }),
+        } as any);
+
+        await expect(
+          tracker.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, ps),
+        ).resolves.toBeTruthy();
+        // The version still got recorded despite the subscriber throwing.
+        expect(sourceRow(appId)!.lastVersion).toBe('3.0.0');
+      });
+    });
+
+    // ── store metadata captured alongside the version ────────────────────
+    describe('store metadata', () => {
+      const meta = {
+        versionName: '3.0.0', appName: 'Test App',
+        iconUrl: 'https://example.test/icon.png',
+        releaseNotes: 'Fixed the thing',
+        sizeLabel: '24M',
+        storeUpdatedAt: new Date('2026-08-01T00:00:00Z'),
+      };
+
+      it('persists icon, release notes, size and store-updated alongside lastVersion', async () => {
+        const appId = addApp(false);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = fakeSource({ checkVersion: vi.fn(async () => meta) });
+        const tracker = trackerWith(ps);
+
+        await tracker.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, ps);
+
+        const row = sourceRow(appId)!;
+        expect(row.lastIconUrl).toBe('https://example.test/icon.png');
+        expect(row.lastReleaseNotes).toBe('Fixed the thing');
+        expect(row.lastSizeLabel).toBe('24M');
+        expect(row.lastStoreUpdatedAt).toEqual(meta.storeUpdatedAt);
+      });
+
+      it('refreshes metadata even when the version is unchanged', async () => {
+        // A store can edit an icon or release notes without shipping a build,
+        // so the unchanged-version path must not skip the metadata update.
+        const appId = addApp(false);
+        seedSource(appId, { lastVersion: '3.0.0' });
+        const ps = fakeSource({ checkVersion: vi.fn(async () => meta) });
+        const tracker = trackerWith(ps);
+
+        await tracker.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, ps);
+
+        expect(sourceRow(appId)!.lastReleaseNotes).toBe('Fixed the thing');
+      });
+
+      it('keeps the previous metadata when a source reports none', async () => {
+        const appId = addApp(false);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const withMeta = fakeSource({ checkVersion: vi.fn(async () => meta) });
+        const tracker = trackerWith(withMeta);
+        await tracker.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, withMeta);
+
+        // A later check from a source that publishes no icon must not blank it.
+        const bare = fakeSource({ checkVersion: vi.fn(async () => ({ versionName: '4.0.0' })) });
+        const tracker2 = trackerWith(bare);
+        await tracker2.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, bare);
+
+        const row = sourceRow(appId)!;
+        expect(row.lastVersion).toBe('4.0.0');
+        expect(row.lastIconUrl, 'metadata was blanked by a source that had none').toBe('https://example.test/icon.png');
+      });
+    });
 
     it('skips download when the source reports the last-seen version', async () => {
       const appId = addApp();

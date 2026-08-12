@@ -1205,6 +1205,7 @@ httpServer.listen(PORT, HOST, () => {
   // Give the apk analyzer access to the plugin hook bus so it can emit
   // `apk:analyzed` events that plugins (e.g. maps) subscribe to.
   apkAnalyzer.setHookBus(pluginManager.getHookBus());
+  apkTracker.setHookBus(pluginManager.getHookBus());
   deviceManager.setHookBus(pluginManager.getHookBus());
   captureManager.setHookBus(pluginManager.getHookBus());
   runner.setHookBus(pluginManager.getHookBus());

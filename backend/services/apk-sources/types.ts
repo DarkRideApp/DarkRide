@@ -19,6 +19,23 @@ export interface VersionCheckResult {
   fileSize?: number;
   /** Expected sha256 (hex), when the source publishes one (QQ does). */
   sha256?: string;
+  /**
+   * Store-listing metadata, when the source's version check happens to carry it.
+   *
+   * These exist so a consumer can describe a release without a second request:
+   * the Play check already receives icon, release notes, size and an updated
+   * timestamp in the same response it reads the version from, and used to throw
+   * them away. All optional — a source that does not publish release notes just
+   * leaves them undefined, and nothing downstream should require them.
+   */
+  /** Store listing icon URL. */
+  iconUrl?: string;
+  /** "What's new" text for this version. */
+  releaseNotes?: string;
+  /** Download size as the store DISPLAYS it (e.g. "24M"), not bytes. */
+  sizeLabel?: string;
+  /** When the STORE says the listing was last updated. */
+  storeUpdatedAt?: Date;
 }
 
 export interface DownloadResult {

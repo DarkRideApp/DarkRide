@@ -235,11 +235,38 @@ export class ApkTracker {
   private sourceRegistry: SourceRegistry | null = null;
   private notificationService: NotificationService | null = null;
 
+  private hookBus: import('@darkrideapp/plugin-sdk').HookBus | null = null;
+
   constructor(
     private db: AppDatabase,
     private deviceManager: DeviceManager,
     private checkIntervalMs: number = DEFAULT_CHECK_INTERVAL,
   ) {}
+
+  setHookBus(bus: import('@darkrideapp/plugin-sdk').HookBus): void {
+    this.hookBus = bus;
+  }
+
+  /**
+   * Announce a new version. Fires whether or not the APK is downloaded, which
+   * is the point: with auto-analyse off nothing else in the pipeline runs, so
+   * `apk:analyzed` never fires and a subscriber would hear nothing at all.
+   *
+   * Never allowed to break a check cycle — a throwing subscriber must not stop
+   * us recording the version we just found.
+   */
+  private emitVersionDetected(payload: {
+    trackedAppId: number; packageName: string; appName: string | null;
+    source: string; versionName: string; previousVersion: string | null;
+    analysed: boolean;
+  }): void {
+    if (!this.hookBus) return;
+    try {
+      this.hookBus.emit('apk:version-detected', payload);
+    } catch (err: any) {
+      error(`apk:version-detected hook failed for ${payload.packageName}: ${err.message}`);
+    }
+  }
 
   setApkAnalyzer(analyzer: ApkAnalyzerService): void {
     this.apkAnalyzer = analyzer;
@@ -410,10 +437,51 @@ export class ApkTracker {
         return { newVersionId: null, notFound: true };
       }
 
+      // Store-listing metadata rides along with the version: the source already
+      // fetched it in the same response, so persisting it costs nothing and
+      // saves consumers a second identical request.
+      const storeMeta = {
+        lastIconUrl: versionInfo.iconUrl ?? row?.lastIconUrl ?? null,
+        lastReleaseNotes: versionInfo.releaseNotes ?? row?.lastReleaseNotes ?? null,
+        lastSizeLabel: versionInfo.sizeLabel ?? row?.lastSizeLabel ?? null,
+        lastStoreUpdatedAt: versionInfo.storeUpdatedAt ?? row?.lastStoreUpdatedAt ?? null,
+      };
+
       // Skip the download if the source reports the same version we last saw,
-      // unless the caller forced a refresh.
+      // unless the caller forced a refresh. Metadata is still refreshed — a
+      // store can edit an icon or release notes without shipping a new build.
       if (!opts.force && versionInfo.versionName && versionInfo.versionName === row?.lastVersion) {
-        markState({ lastCheckedAt: new Date(), lastError: null });
+        markState({ ...storeMeta, lastCheckedAt: new Date(), lastError: null });
+        return { newVersionId: null };
+      }
+
+      const previousVersion = row?.lastVersion ?? null;
+      const autoAnalyse = this.db.select({ autoAnalyse: trackedApps.autoAnalyse })
+        .from(trackedApps).where(eq(trackedApps.id, app.id)).all()[0]?.autoAnalyse ?? false;
+
+      // TRACK WITHOUT ANALYSING. A new version is recorded and announced, but
+      // the APK is not fetched unless the app opted in. `force` is an explicit
+      // human "fetch now", so it overrides — otherwise the button would appear
+      // to do nothing.
+      if (!autoAnalyse && !opts.force) {
+        markState({
+          ...storeMeta,
+          lastVersion: versionInfo.versionName ?? row?.lastVersion ?? null,
+          lastCheckedAt: new Date(),
+          lastError: null,
+        });
+        if (!app.appName && versionInfo.appName) {
+          this.db.update(trackedApps).set({ appName: versionInfo.appName }).where(eq(trackedApps.id, app.id)).run();
+          app.appName = versionInfo.appName;
+        }
+        if (versionInfo.versionName) {
+          this.emitVersionDetected({
+            trackedAppId: app.id, packageName: app.packageName, appName: app.appName,
+            source: source.id, versionName: versionInfo.versionName,
+            previousVersion, analysed: false,
+          });
+        }
+        log(`${source.label}: ${app.packageName} ${versionInfo.versionName} detected (auto-analyse off, not downloading)`);
         return { newVersionId: null };
       }
 
@@ -452,10 +520,18 @@ export class ApkTracker {
 
       // Record the version string + clear errors regardless of dedup outcome so
       // we don't re-download an already-stored version next cycle.
-      markState({ lastVersion: versionInfo.versionName ?? row?.lastVersion ?? null, lastCheckedAt: new Date(), lastError: null });
+      markState({ ...storeMeta, lastVersion: versionInfo.versionName ?? row?.lastVersion ?? null, lastCheckedAt: new Date(), lastError: null });
       if (!app.appName && versionInfo.appName) {
         this.db.update(trackedApps).set({ appName: versionInfo.appName }).where(eq(trackedApps.id, app.id)).run();
         app.appName = versionInfo.appName;
+      }
+
+      if (versionInfo.versionName) {
+        this.emitVersionDetected({
+          trackedAppId: app.id, packageName: app.packageName, appName: app.appName,
+          source: source.id, versionName: versionInfo.versionName,
+          previousVersion, analysed: true,
+        });
       }
 
       return { newVersionId: versionId };
