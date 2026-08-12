@@ -2,14 +2,31 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Copy, Check, Upload, Syringe, ExternalLink } from 'lucide-react';
 import {
-  Breadcrumbs, ConfirmDialog, SkeletonCard, SortableHeader, ActionMenu,
+  Breadcrumbs, ConfirmDialog, SkeletonCard, SortableHeader, ActionMenu, ExtensionSlot,
   useSortableTable, useWebSocket, useToast, useDocumentTitle, useAuthOptional,
+  pluginRegistry,
 } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
 import { AppIcon } from '../components/apks/AppIcon';
 import { ActivityChip } from '../components/apks/ActivityChip';
 import { ActivityPanel } from '../components/apks/ActivityPanel';
 import { UploadApkModal } from '../components/apks/UploadApkModal';
+
+// Declared here, mounted below the Fetch-sources card. Registering at module
+// scope mirrors DeviceViewer's `device-viewer:overflow-actions` — the slot must
+// exist in the registry before ExtensionSlot renders, or it warns about an
+// undeclared id.
+//
+// `props` carry the app, so a contribution knows which app it is rendering for
+// without refetching. Anything added here becomes API surface for plugins: the
+// id and the prop names cannot change without breaking them.
+pluginRegistry.registerUiSlots('core', [
+  {
+    id: 'app-detail:panels',
+    kind: 'container',
+    description: 'Cards below the Fetch-sources panel on an app\'s detail page. Receives { trackedAppId, packageName, appName }. Plugins add per-app panels here, e.g. publish-to-an-external-service toggles.',
+  },
+]);
 import { InstallDeviceModal, type OnlineDevice } from '../components/apks/InstallDeviceModal';
 import { InjectGadgetConfirm } from '../components/apks/InjectGadgetConfirm';
 import { AvailabilityBadge, type AvailabilityState } from '../components/apks/AvailabilityBadge';
@@ -450,6 +467,11 @@ export function AppDetail() {
           </div>
         </div>
       )}
+
+      <ExtensionSlot
+        id="app-detail:panels"
+        props={{ trackedAppId: app.id, packageName: app.packageName, appName: app.appName }}
+      />
 
       <div className="table-card">
         <table className="data-table">
