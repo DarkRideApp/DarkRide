@@ -126,6 +126,36 @@ describe('FileStorageService', () => {
       expect(result.path).toBe('/data/test/file.bin');
     });
 
+    // Regression: a cloud_only row whose local file reappeared (restored by a
+    // path other than acquireLocal) kept syncState=cloud_only forever. The
+    // evictor only ever selects syncState='synced', so those files became
+    // invisible to both the budget accounting and eviction — 4.2 GB of them
+    // were stranded on production.
+    it('returns a reappeared cloud_only file to synced so it stays evictable', async () => {
+      const now = new Date();
+      db.insert(cloudFiles).values({
+        cloudKey: 'test/reappeared.bin',
+        relativePath: '/data/test/reappeared.bin',
+        fileType: 'binary',
+        fileSize: 5000,
+        syncState: 'cloud_only',
+        lastAccessed: now,
+        createdAt: now,
+      }).run();
+
+      // File is present locally at the expected size — no download needed.
+      existsSyncSpy.mockReturnValue(true);
+      statSyncSpy.mockReturnValue({ size: 5000 } as any);
+
+      const result = await fileSync.acquireLocal('test/reappeared.bin', 'apk-analyzer');
+      expect(result.error).toBeUndefined();
+      expect(mockCloud.download).not.toHaveBeenCalled();
+
+      const row = db.select().from(cloudFiles)
+        .where(eq(cloudFiles.cloudKey, 'test/reappeared.bin')).get();
+      expect(row!.syncState).toBe('synced');
+    });
+
     it('downloads from cloud when file is cloud_only', async () => {
       const now = new Date();
       db.insert(cloudFiles).values({
@@ -590,6 +620,149 @@ describe('FileStorageService', () => {
       const newFile = files.find(f => f.cloudKey === 'evict/new.bin');
       expect(oldFile!.syncState).toBe('cloud_only');
       expect(newFile!.syncState).toBe('synced');
+    });
+
+    // Regression: on production every APK was permanently un-evictable because
+    // nothing ever registers analysis/<vc>/source.db or metadata.json in
+    // cloud_files. isVersionSafeToEvict treated "artifact untracked" the same
+    // as "artifact mid-upload" and returned false forever, so the evictor
+    // logged 107k skips over 48h and freed nothing while the disk hit 96%.
+    it('evicts a synced APK whose analysis artifacts were never tracked', async () => {
+      const trackedAppResult = db.insert(schema.trackedApps).values({
+        packageName: 'com.untracked.analysis',
+        appName: 'Untracked Analysis',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }).run();
+      db.insert(schema.apkVersions).values({
+        trackedAppId: Number(trackedAppResult.lastInsertRowid),
+        versionCode: 7,
+        versionName: '0.7',
+        filename: '7_0.7.apk',
+        downloadedAt: new Date(),
+      }).run();
+
+      db.insert(settings).values({ key: 'cloud_local_cache_mb', value: '1' }).run();
+      const olderDate = new Date(Date.now() - 86400000);
+      db.insert(cloudFiles).values({
+        cloudKey: 'apks/com.untracked.analysis/7_0.7.apk',
+        relativePath: 'apks/com.untracked.analysis/7_0.7.apk',
+        fileType: 'apk',
+        fileSize: 10 * 1024 * 1024,
+        syncState: 'synced',
+        lastAccessed: olderDate,
+        createdAt: olderDate,
+      }).run();
+      // Deliberately NO analysis rows — this is the production state.
+
+      existsSyncSpy.mockReturnValue(true);
+
+      await (fileSync as any).runEviction();
+
+      const row = db.select().from(cloudFiles)
+        .where(eq(cloudFiles.cloudKey, 'apks/com.untracked.analysis/7_0.7.apk')).get();
+      expect(row!.syncState).toBe('cloud_only');
+    });
+
+    // The original race this gate was built for must still hold: a genuinely
+    // tracked-but-unuploaded source.db still blocks eviction of its APK.
+    it('does not evict an APK whose tracked analysis artifact is still uploading', async () => {
+      const trackedAppResult = db.insert(schema.trackedApps).values({
+        packageName: 'com.pending.analysis',
+        appName: 'Pending Analysis',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }).run();
+      db.insert(schema.apkVersions).values({
+        trackedAppId: Number(trackedAppResult.lastInsertRowid),
+        versionCode: 9,
+        versionName: '0.9',
+        filename: '9_0.9.apk',
+        downloadedAt: new Date(),
+      }).run();
+
+      db.insert(settings).values({ key: 'cloud_local_cache_mb', value: '1' }).run();
+      const olderDate = new Date(Date.now() - 86400000);
+      db.insert(cloudFiles).values({
+        cloudKey: 'apks/com.pending.analysis/9_0.9.apk',
+        relativePath: 'apks/com.pending.analysis/9_0.9.apk',
+        fileType: 'apk',
+        fileSize: 10 * 1024 * 1024,
+        syncState: 'synced',
+        lastAccessed: olderDate,
+        createdAt: olderDate,
+      }).run();
+      db.insert(cloudFiles).values({
+        cloudKey: 'apks/com.pending.analysis/analysis/9/source.db',
+        relativePath: 'apks/com.pending.analysis/analysis/9/source.db',
+        fileType: 'analysis',
+        fileSize: 1000,
+        syncState: 'pending_upload',
+        lastAccessed: olderDate,
+        createdAt: olderDate,
+      }).run();
+
+      existsSyncSpy.mockReturnValue(true);
+
+      await (fileSync as any).runEviction();
+
+      const row = db.select().from(cloudFiles)
+        .where(eq(cloudFiles.cloudKey, 'apks/com.pending.analysis/9_0.9.apk')).get();
+      expect(row!.syncState).toBe('synced');
+    });
+
+    // A cloud_only row whose local file is still on disk is invisible to both
+    // the budget total and the eviction loop. Production had 101 such rows
+    // holding 4.2 GB. Eviction reconciles them back to 'synced' first so the
+    // cache heals itself instead of needing a manual sweep.
+    it('reclaims cloud_only rows whose local file is still on disk', async () => {
+      db.insert(settings).values({ key: 'cloud_local_cache_mb', value: '1' }).run();
+
+      const olderDate = new Date(Date.now() - 86400000);
+      db.insert(cloudFiles).values({
+        cloudKey: 'evict/stranded.bin',
+        relativePath: 'evict/stranded.bin',
+        fileType: 'binary',
+        fileSize: 4 * 1024 * 1024,
+        syncState: 'cloud_only',
+        lastAccessed: olderDate,
+        createdAt: olderDate,
+      }).run();
+
+      existsSyncSpy.mockReturnValue(true);
+      statSyncSpy.mockReturnValue({ size: 4 * 1024 * 1024 } as any);
+
+      await (fileSync as any).runEviction();
+
+      // Reclaimed into the evictable pool, then evicted (over the 1MB budget),
+      // which is what actually frees the disk space.
+      const row = db.select().from(cloudFiles)
+        .where(eq(cloudFiles.cloudKey, 'evict/stranded.bin')).get();
+      expect(row!.syncState).toBe('cloud_only');
+      expect(unlinkSyncSpy).toHaveBeenCalled();
+    });
+
+    it('leaves cloud_only rows alone when the local file is genuinely gone', async () => {
+      db.insert(settings).values({ key: 'cloud_local_cache_mb', value: '1' }).run();
+
+      db.insert(cloudFiles).values({
+        cloudKey: 'evict/really-gone.bin',
+        relativePath: 'evict/really-gone.bin',
+        fileType: 'binary',
+        fileSize: 4 * 1024 * 1024,
+        syncState: 'cloud_only',
+        lastAccessed: new Date(),
+        createdAt: new Date(),
+      }).run();
+
+      existsSyncSpy.mockReturnValue(false);
+
+      await (fileSync as any).runEviction();
+
+      const row = db.select().from(cloudFiles)
+        .where(eq(cloudFiles.cloudKey, 'evict/really-gone.bin')).get();
+      expect(row!.syncState).toBe('cloud_only');
+      expect(unlinkSyncSpy).not.toHaveBeenCalled();
     });
 
     it('does not evict retained files', async () => {
