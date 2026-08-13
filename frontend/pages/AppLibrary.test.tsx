@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { useEffect } from 'react';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { WebSocketContext, ToastProvider } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
+import { pluginRegistry } from '@darkrideapp/plugin-sdk/react';
 import { AppLibrary } from './AppLibrary';
 
 const apps = [
@@ -136,6 +138,7 @@ describe('AppLibrary', () => {
 
     await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/apps/track', {
       packageName: 'com.hytch.ftthemepark', appName: null, sources: { playstore: true, qq: true }, fetch: true,
+      autoAnalyse: false,
     }));
   });
 
@@ -164,5 +167,207 @@ describe('AppLibrary', () => {
     expect(screen.getByTestId('activity-chip')).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('activity-chip'));
     await waitFor(() => expect(screen.getByTestId('activity-panel')).toBeInTheDocument());
+  });
+});
+
+/**
+ * `add-app:options` is the first slot whose contributions can ACT rather than
+ * only render: they register a callback that core runs once the app exists.
+ * The id, the prop names and that lifecycle are API surface — a plugin breaks
+ * if any of them change — so they are asserted here rather than left to a
+ * plugin's own tests, which cannot fail this repo.
+ */
+describe('AppLibrary — add-app:options slot', () => {
+  function wsForAdd(created: any = { id: 5, packageName: 'com.new.app', appName: null }, ok = true) {
+    const ws = mockWs([]);
+    (ws.sendRestApi as any).mockImplementation((method: string, path: string) => {
+      if (path === '/v1/apps/sources') return Promise.resolve({ type: 'restapi', id: 's', status: 200, body: { success: true, data: [] } });
+      if (method === 'POST' && path === '/v1/apps/track') {
+        return ok
+          ? Promise.resolve({ type: 'restapi', id: 't', status: 201, body: { success: true, data: created } })
+          : Promise.resolve({ type: 'restapi', id: 't', status: 400, body: { success: false, error: 'nope' } });
+      }
+      return Promise.resolve({ type: 'restapi', id: '9', status: 200, body: { success: true, data: [] } });
+    });
+    return ws;
+  }
+
+  async function openAndSubmit(pkg = 'com.new.app') {
+    await waitFor(() => screen.getByTestId('add-app-empty-btn'));
+    fireEvent.click(screen.getByTestId('add-app-empty-btn'));
+    await waitFor(() => screen.getByTestId('add-app-package-input'));
+    fireEvent.change(screen.getByTestId('add-app-package-input'), { target: { value: pkg } });
+    fireEvent.click(screen.getByTestId('add-app-submit-btn'));
+  }
+
+  /** Registers a contribution that captures its props and records callbacks. */
+  function contribute(name: string, onCreated?: (app: any) => void | Promise<void>) {
+    const seen: Record<string, unknown>[] = [];
+    pluginRegistry.registerContributionComponents('test-plugin', {
+      [name]: (props: any) => {
+        seen.push(props);
+        // Real contributions register from an effect, not during render.
+        useEffect(() => {
+          if (onCreated) props.registerOnCreated(onCreated);
+        }, [props.registerOnCreated]);
+        return <div data-testid="contributed-option">option for {String(props.packageName)}</div>;
+      },
+    } as any);
+    pluginRegistry.registerUiContributions('test-plugin', [
+      { slot: 'add-app:options', id: 'test:option', component: name } as any,
+    ]);
+    return seen;
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    pluginRegistry.setDisabledPlugins([]);
+  });
+
+  it('declares the slot with a usable description', () => {
+    const slot = pluginRegistry.getAllSlots().find(s => s.id === 'add-app:options');
+    expect(slot, 'add-app:options is not declared').toBeDefined();
+    expect(slot!.plugin).toBe('core');
+    // A plugin author reads this to know the callback exists at all.
+    expect(slot!.description).toMatch(/registerOnCreated/);
+  });
+
+  it('renders a contribution and passes the package name as it is typed', async () => {
+    const seen = contribute('OptA');
+    renderLibrary(wsForAdd());
+    await waitFor(() => screen.getByTestId('add-app-empty-btn'));
+    fireEvent.click(screen.getByTestId('add-app-empty-btn'));
+    await waitFor(() => screen.getByTestId('contributed-option'));
+
+    fireEvent.change(screen.getByTestId('add-app-package-input'), { target: { value: 'com.typed.app' } });
+    await waitFor(() => expect(screen.getByTestId('contributed-option').textContent).toContain('com.typed.app'));
+    expect(seen[0]).toHaveProperty('registerOnCreated');
+    expect(typeof (seen[0] as any).registerOnCreated).toBe('function');
+  });
+
+  it('invokes a registered callback with the created app, and awaits it', async () => {
+    const order: string[] = [];
+    const cb = vi.fn(async (app: any) => {
+      await Promise.resolve();
+      order.push(`cb:${app.packageName}`);
+    });
+    contribute('OptB', cb);
+    renderLibrary(wsForAdd({ id: 7, packageName: 'com.new.app', appName: null }));
+    await openAndSubmit();
+
+    await waitFor(() => expect(cb).toHaveBeenCalledTimes(1));
+    expect(cb.mock.calls[0][0]).toMatchObject({ id: 7, packageName: 'com.new.app' });
+    expect(order).toEqual(['cb:com.new.app']);
+  });
+
+  it('does NOT invoke callbacks when the add fails', async () => {
+    // Enabling a plugin setting for an app that was never created would leave
+    // the plugin holding state for something that does not exist.
+    const cb = vi.fn();
+    contribute('OptC', cb);
+    renderLibrary(wsForAdd(undefined, false));
+    await openAndSubmit();
+
+    await waitFor(() => screen.getByTestId('add-app-error'));
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('a throwing callback does not cost the operator the app', async () => {
+    const boom = vi.fn(() => { throw new Error('plugin exploded'); });
+    const after = vi.fn();
+    contribute('OptD', boom as any);
+    // A second contribution proves one failure does not skip the rest.
+    pluginRegistry.registerContributionComponents('other-plugin', {
+      OptE: (props: any) => {
+        useEffect(() => { props.registerOnCreated(after); }, [props.registerOnCreated]);
+        return null;
+      },
+    } as any);
+    pluginRegistry.registerUiContributions('other-plugin', [
+      { slot: 'add-app:options', id: 'other:option', component: 'OptE' } as any,
+    ]);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    renderLibrary(wsForAdd());
+    await openAndSubmit();
+
+    await waitFor(() => expect(boom).toHaveBeenCalled());
+    expect(after, 'a failing plugin blocked the next one').toHaveBeenCalled();
+    // The add still succeeded: the modal closed.
+    await waitFor(() => expect(screen.queryByTestId('add-app-package-input')).toBeNull());
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+    pluginRegistry.setDisabledPlugins(['other-plugin']);
+  });
+
+  it('forgets callbacks between opens', async () => {
+    // Otherwise the second app added in a session gets the first app's
+    // callbacks, applied to the wrong app.
+    const cb = vi.fn();
+    contribute('OptF', cb);
+    renderLibrary(wsForAdd());
+    await openAndSubmit('com.first.app');
+    await waitFor(() => expect(cb).toHaveBeenCalledTimes(1));
+
+    pluginRegistry.setDisabledPlugins(['test-plugin']);   // contribution goes away
+    fireEvent.click(screen.getByTestId('add-app-empty-btn'));
+    await waitFor(() => screen.getByTestId('add-app-package-input'));
+    fireEvent.change(screen.getByTestId('add-app-package-input'), { target: { value: 'com.second.app' } });
+    fireEvent.click(screen.getByTestId('add-app-submit-btn'));
+
+    await waitFor(() => expect(screen.queryByTestId('add-app-package-input')).toBeNull());
+    expect(cb, 'a stale callback fired for a later app').toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AppLibrary — auto-analyse', () => {
+  beforeEach(() => { localStorage.clear(); pluginRegistry.setDisabledPlugins(['test-plugin', 'other-plugin']); });
+
+  it('defaults to off and sends the operator choice', async () => {
+    const ws = mockWs([]);
+    (ws.sendRestApi as any).mockImplementation((method: string, path: string) => {
+      if (path === '/v1/apps/sources') return Promise.resolve({ type: 'restapi', id: 's', status: 200, body: { success: true, data: [] } });
+      if (method === 'POST' && path === '/v1/apps/track') return Promise.resolve({ type: 'restapi', id: 't', status: 201, body: { success: true, data: { id: 9 } } });
+      return Promise.resolve({ type: 'restapi', id: '9', status: 200, body: { success: true, data: [] } });
+    });
+    renderLibrary(ws);
+
+    await waitFor(() => screen.getByTestId('add-app-empty-btn'));
+    fireEvent.click(screen.getByTestId('add-app-empty-btn'));
+    await waitFor(() => screen.getByTestId('add-app-auto-analyse'));
+
+    // Off by default: tracking a version must stay cheap, per migration 0098.
+    const cb = screen.getByTestId('add-app-auto-analyse') as HTMLInputElement;
+    expect(cb.checked).toBe(false);
+
+    fireEvent.click(cb);
+    fireEvent.change(screen.getByTestId('add-app-package-input'), { target: { value: 'com.analyse.me' } });
+    fireEvent.click(screen.getByTestId('add-app-submit-btn'));
+
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('POST', '/v1/apps/track',
+      expect.objectContaining({ packageName: 'com.analyse.me', autoAnalyse: true })));
+  });
+
+  it('resets to off when the modal is reopened', async () => {
+    const ws = mockWs([]);
+    (ws.sendRestApi as any).mockImplementation((method: string, path: string) => {
+      if (path === '/v1/apps/sources') return Promise.resolve({ type: 'restapi', id: 's', status: 200, body: { success: true, data: [] } });
+      if (method === 'POST' && path === '/v1/apps/track') return Promise.resolve({ type: 'restapi', id: 't', status: 201, body: { success: true, data: { id: 9 } } });
+      return Promise.resolve({ type: 'restapi', id: '9', status: 200, body: { success: true, data: [] } });
+    });
+    renderLibrary(ws);
+    await waitFor(() => screen.getByTestId('add-app-empty-btn'));
+
+    fireEvent.click(screen.getByTestId('add-app-empty-btn'));
+    await waitFor(() => screen.getByTestId('add-app-auto-analyse'));
+    fireEvent.click(screen.getByTestId('add-app-auto-analyse'));
+    fireEvent.change(screen.getByTestId('add-app-package-input'), { target: { value: 'com.one.app' } });
+    fireEvent.click(screen.getByTestId('add-app-submit-btn'));
+    await waitFor(() => expect(screen.queryByTestId('add-app-package-input')).toBeNull());
+
+    fireEvent.click(screen.getByTestId('add-app-empty-btn'));
+    await waitFor(() => screen.getByTestId('add-app-auto-analyse'));
+    expect((screen.getByTestId('add-app-auto-analyse') as HTMLInputElement).checked,
+      'the previous add\'s choice leaked into the next one').toBe(false);
   });
 });

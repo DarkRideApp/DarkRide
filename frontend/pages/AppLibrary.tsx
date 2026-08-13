@@ -4,6 +4,7 @@ import { Package, Upload } from 'lucide-react';
 import {
   PageHeader, Modal, ConfirmDialog, SkeletonCard, SearchInput, ActionMenu,
   useWebSocket, useToast, useDocumentTitle, useAuthOptional,
+  ExtensionSlot, pluginRegistry,
 } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
 import { AppIcon } from '../components/apks/AppIcon';
@@ -11,6 +12,29 @@ import { ActivityChip } from '../components/apks/ActivityChip';
 import { ActivityPanel } from '../components/apks/ActivityPanel';
 import { UploadApkModal } from '../components/apks/UploadApkModal';
 import { formatBytes, formatDateRelative, toMs } from '../utils/format';
+
+/**
+ * Options plugins can add to the Add App modal.
+ *
+ * Unlike every other slot, a contribution here can ACT when the app is created,
+ * not just render: it calls `registerOnCreated(fn)` and core invokes each fn
+ * with the created app after the POST succeeds. That is what lets a plugin
+ * apply a per-app setting of its own at add time instead of making the operator
+ * add the app, find it, and toggle something else.
+ *
+ * The id and prop names are API surface — a plugin breaks if either changes.
+ */
+pluginRegistry.registerUiSlots('core', [
+  {
+    id: 'add-app:options',
+    kind: 'container',
+    description: 'Extra options in the Add App modal. Receives { packageName, registerOnCreated }. '
+      + 'packageName is the live value of the input, so it updates as it is typed. '
+      + 'registerOnCreated(fn) registers a callback invoked as fn({ id, packageName, appName }) '
+      + 'after the app is successfully tracked; it may be async. A callback that throws is logged '
+      + 'and skipped — it never fails the add or blocks the other callbacks.',
+  },
+]);
 
 interface LatestVersion {
   id: number; trackedAppId: number; versionCode: number; versionName: string | null;
@@ -68,6 +92,11 @@ export function AppLibrary() {
   const [addAppError, setAddAppError] = useState<string | null>(null);
   const [storeSources, setStoreSources] = useState<{ source: string; label: string; defaultEnabled: boolean }[]>([]);
   const [selectedSources, setSelectedSources] = useState<Record<string, boolean>>({});
+  const [autoAnalyse, setAutoAnalyse] = useState(false);
+  // Callbacks registered by slot contributions, kept in a ref so registering
+  // one does not re-render the modal (a contribution that registers during
+  // render would otherwise loop).
+  const onCreatedRef = useRef<Array<(app: TrackedAppRow) => void | Promise<void>>>([]);
 
   const [untrackConfirm, setUntrackConfirm] = useState<TrackedAppRow | null>(null);
 
@@ -112,6 +141,15 @@ export function AppLibrary() {
 
   // Load the available remote stores when the Add App modal opens, defaulting
   // each checkbox to the source's defaultEnabled (Play Store on, QQ opt-in off).
+  // Reset per-open state. Without this, callbacks registered by a contribution
+  // during a previous add would fire again on the next one, against a different
+  // app, and the auto-analyse choice would silently persist.
+  useEffect(() => {
+    if (!addAppOpen) return;
+    onCreatedRef.current = [];
+    setAutoAnalyse(false);
+  }, [addAppOpen]);
+
   useEffect(() => {
     if (!addAppOpen || !ws.connected) return;
     ws.sendRestApi('GET', '/v1/apps/sources').then(res => {
@@ -135,9 +173,19 @@ export function AppLibrary() {
     const anySelected = Object.values(selectedSources).some(Boolean);
     try {
       const res = await ws.sendRestApi('POST', '/v1/apps/track', {
-        packageName: pkg, appName: null, sources: selectedSources, fetch: true,
+        packageName: pkg, appName: null, sources: selectedSources, fetch: true, autoAnalyse,
       });
       if (res.body?.success) {
+        // Plugin contributions act here, with the created app. Each is isolated:
+        // a plugin that throws must not cost the operator the app they just
+        // added, so failures are logged and the rest still run.
+        for (const fn of onCreatedRef.current) {
+          try {
+            await fn(res.body.data);
+          } catch (err) {
+            console.warn('[add-app:options] a plugin callback failed', err);
+          }
+        }
         setAddAppOpen(false);
         setAddAppPackage('');
         fetchApps();
@@ -150,7 +198,7 @@ export function AppLibrary() {
     } finally {
       setAddAppSaving(false);
     }
-  }, [ws, addAppPackage, selectedSources, fetchApps, toast]);
+  }, [ws, addAppPackage, selectedSources, autoAnalyse, fetchApps, toast]);
 
   const untrack = useCallback(async (appId: number) => {
     try {
@@ -341,6 +389,35 @@ export function AppLibrary() {
                 </div>
               </div>
             )}
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={autoAnalyse}
+                  onChange={e => setAutoAnalyse(e.target.checked)}
+                  data-testid="add-app-auto-analyse"
+                />
+                Download and analyse each new version
+              </label>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                Off means versions are still tracked — the APK just is not pulled or decompiled.
+                Can be changed later from the app&apos;s page.
+              </div>
+            </div>
+
+            {/* Plugin options. Contributions may also register a callback that
+                runs once the app exists — see the slot declaration at the top
+                of this file. */}
+            <ExtensionSlot
+              id="add-app:options"
+              props={{
+                packageName: addAppPackage.trim(),
+                registerOnCreated: (fn: (app: TrackedAppRow) => void | Promise<void>) => {
+                  if (!onCreatedRef.current.includes(fn)) onCreatedRef.current.push(fn);
+                },
+              }}
+            />
+
             {addAppError && (
               <div className="status-strip status-strip-error" data-testid="add-app-error">
                 <span className="status-strip-label">{addAppError}</span>

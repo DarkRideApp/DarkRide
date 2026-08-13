@@ -862,7 +862,21 @@ export function registerAppEndpoints(
     const { sources, fetch } = req.body as { sources?: unknown; fetch?: unknown };
     const fetchNow = fetch === true;
 
+    // Whether to download and decompile each new version, or only record that
+    // the version changed. Off unless asked for: migration 0098 split tracking
+    // from analysis precisely so watching a version costs nothing, and a modal
+    // that silently opted every new app into full APK pulls would put that
+    // back. Only an explicit `true` turns it on.
+    const autoAnalyse = (req.body as { autoAnalyse?: unknown }).autoAnalyse === true;
+
     if (existing) {
+      // Re-adding a tracked app is how the modal is used to change its stores,
+      // so an explicit autoAnalyse in the body applies to it too. Absent means
+      // "leave it alone" rather than "turn it off".
+      if ((req.body as { autoAnalyse?: unknown }).autoAnalyse !== undefined) {
+        db.update(trackedApps).set({ autoAnalyse })
+          .where(eq(trackedApps.id, existing.id)).run();
+      }
       if (sourceRegistry) ensureAppSources(db, existing.id, sourceRegistry);
       applyTrackSources(db, sourceRegistry, apkTracker,
         { id: existing.id, packageName: existing.packageName, appName: existing.appName }, sources, fetchNow);
@@ -874,6 +888,7 @@ export function registerAppEndpoints(
       .values({
         packageName,
         appName: appName || null,
+        autoAnalyse,
         createdAt: new Date(),
       })
       .run();
