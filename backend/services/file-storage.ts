@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { and, eq, like, or, sql } from 'drizzle-orm';
+import { and, eq, inArray, like, or, sql } from 'drizzle-orm';
 import type { AppDatabase } from '../db/index';
 import * as schema from '../db/schema';
 import { createLoggers } from '../logs';
@@ -29,6 +29,35 @@ export function isVersionSafeToEvict(
   versionCode: number,
   filename: string,
 ): boolean {
+  return apkVersionEvictability(db, packageName, versionCode, filename) === 'safe';
+}
+
+/**
+ * Eviction verdict for one APK version.
+ *
+ *  - `blocked`            the APK itself is not fully synced, or one of its
+ *                         analysis artifacts IS tracked but has not finished
+ *                         uploading. Evicting now would lose data.
+ *  - `safe`               APK and both analysis artifacts are synced to cloud.
+ *  - `safe-no-analysis`   APK is synced, but the analysis artifacts were never
+ *                         tracked in cloud_files at all. The APK is safe to
+ *                         evict (it exists in the cloud), but the local
+ *                         analysis dir must be left alone — it has no cloud
+ *                         copy to restore from.
+ *
+ * The untracked case is not hypothetical: nothing in the analyzer registers
+ * source.db or metadata.json with the file-sync service, so on a real install
+ * every version lands here. Treating that as `blocked` (the original
+ * behaviour) made the APK cache un-evictable forever.
+ */
+export type ApkEvictability = 'blocked' | 'safe' | 'safe-no-analysis';
+
+export function apkVersionEvictability(
+  db: AppDatabase,
+  packageName: string,
+  versionCode: number,
+  filename: string,
+): ApkEvictability {
   const apkKeyPrefix = `apks/${packageName}/${filename}`;
 
   // Get APK rows: exact match (single APK) OR children under the prefix (split APK)
@@ -38,21 +67,24 @@ export function isVersionSafeToEvict(
       like(cloudFiles.cloudKey, `${apkKeyPrefix}/%`),
     )).all();
 
-  if (apkRows.length === 0) return false; // APK never tracked
-  if (apkRows.some(r => r.syncState !== 'synced')) return false;
+  if (apkRows.length === 0) return 'blocked'; // APK never tracked
+  if (apkRows.some(r => r.syncState !== 'synced')) return 'blocked';
 
   const requiredAnalysisKeys = [
     `apks/${packageName}/analysis/${versionCode}/source.db`,
     `apks/${packageName}/analysis/${versionCode}/metadata.json`,
   ];
 
+  let tracked = 0;
   for (const key of requiredAnalysisKeys) {
     const row = db.select().from(cloudFiles).where(eq(cloudFiles.cloudKey, key)).get();
-    if (!row) return false;
-    if (row.syncState !== 'synced') return false;
+    if (!row) continue;
+    // Tracked but mid-flight — this is the race the gate exists to prevent.
+    if (row.syncState !== 'synced') return 'blocked';
+    tracked++;
   }
 
-  return true;
+  return tracked === requiredAnalysisKeys.length ? 'safe' : 'safe-no-analysis';
 }
 
 /**
@@ -307,9 +339,14 @@ export class FileStorageService implements IFileStorageService {
       // then fail further down the stack with misleading errors.
       return { error: `File ${cloudKey} is ${file.syncState} and not present locally` };
     } else {
-      // Update lastAccessed
+      // Update lastAccessed. If the row still says cloud_only but the file is
+      // present at the right size, the local copy was restored by some path
+      // other than this method — return the row to 'synced' so the evictor can
+      // see it again. runEviction only ever selects syncState='synced', so
+      // leaving it as cloud_only strands the file on disk permanently and hides
+      // it from the cache-budget accounting.
       this.db.update(cloudFiles)
-        .set({ lastAccessed: now })
+        .set({ lastAccessed: now, ...(file.syncState === 'cloud_only' ? { syncState: 'synced' as const } : {}) })
         .where(eq(cloudFiles.id, file.id))
         .run();
     }
@@ -444,9 +481,51 @@ export class FileStorageService implements IFileStorageService {
     }
   }
 
+  /**
+   * Return cloud_only rows whose local file is actually still present to
+   * 'synced'. A cloud_only row is assumed to have no local copy, so it is
+   * counted as zero against the cache budget and never considered for
+   * eviction. When a local copy reappears — restored by a code path that did
+   * not go through acquireLocal, or an unlink that silently failed — the file
+   * occupies disk that nothing will ever reclaim.
+   */
+  private reconcileStrandedLocals(): number {
+    const strandedRows = this.db.select()
+      .from(cloudFiles)
+      .where(eq(cloudFiles.syncState, 'cloud_only'))
+      .all();
+
+    const reclaimed: number[] = [];
+    for (const row of strandedRows) {
+      try {
+        const local = absoluteLocalPath(row.relativePath);
+        if (!fs.existsSync(local)) continue;
+        // Only trust a full-size local copy; a truncated leftover is not a
+        // usable cache entry and is handled by the normal download path.
+        if (fs.statSync(local).size !== row.fileSize) continue;
+        reclaimed.push(row.id);
+      } catch {
+        // Unreadable / path outside DATA_ROOT — leave the row untouched.
+      }
+    }
+
+    if (reclaimed.length > 0) {
+      this.db.update(cloudFiles)
+        .set({ syncState: 'synced' })
+        .where(inArray(cloudFiles.id, reclaimed))
+        .run();
+      logger.log(`Reclaimed ${reclaimed.length} cloud_only file(s) still present on disk into the evictable cache`);
+    }
+    return reclaimed.length;
+  }
+
   private async runEviction(): Promise<void> {
     const budgetMb = this.getCacheBudgetMb();
     const budgetBytes = budgetMb * 1024 * 1024;
+
+    // Fold any stranded local copies back in before measuring the cache, so
+    // the budget reflects real disk usage rather than what the DB assumes.
+    this.reconcileStrandedLocals();
 
     // Get all synced files (have both local + cloud copies)
     const syncedFiles = this.db.select()
@@ -465,21 +544,30 @@ export class FileStorageService implements IFileStorageService {
     });
 
     let currentSize = totalSize;
+    let skippedNotSynced = 0;
+    let skippedRetained = 0;
 
     for (const file of syncedFiles) {
       if (currentSize <= budgetBytes) break;
 
       // Skip retained files — they should never be evicted
-      if (file.retain) continue;
+      if (file.retain) { skippedRetained++; continue; }
 
       // Safety check: if this file belongs to an APK version, ensure all
       // artifacts of that version (APK + source.db + metadata.json) are fully
       // synced before evicting any of them. This prevents the race where we
       // evict an APK file while source.db is still pending_upload.
       const meta = extractApkVersionMetaFromCloudKey(this.db, file.cloudKey);
-      if (meta && !isVersionSafeToEvict(this.db, meta.packageName, meta.versionCode, meta.filename)) {
-        logger.log(`Eviction skipping ${file.cloudKey} — version ${meta.packageName}@${meta.versionCode} not fully synced yet`);
-        continue;
+      let verdict: ApkEvictability = 'safe';
+      if (meta) {
+        verdict = apkVersionEvictability(this.db, meta.packageName, meta.versionCode, meta.filename);
+        if (verdict === 'blocked') {
+          // Counted and summarised after the loop. Logging per-file here ran
+          // every 5 minutes against every APK and produced ~108k journal lines
+          // in 48 hours on production.
+          skippedNotSynced++;
+          continue;
+        }
       }
 
       // Evict: delete local file, set state to cloud_only
@@ -499,7 +587,12 @@ export class FileStorageService implements IFileStorageService {
       // APKs own an analysis dir that becomes stale once the APK is gone
       // locally; regenerable from source.db rebuild. Notes are preserved in
       // the apk_notes table and are NOT touched by this cleanup.
-      if (file.cloudKey.startsWith('apks/')) {
+      //
+      // Only safe when the analysis artifacts actually reached the cloud. Under
+      // 'safe-no-analysis' there is no cloud copy, so deleting the dir would
+      // destroy the only copy of the analysis — leave it for the APK-level
+      // analysis retention job instead.
+      if (file.cloudKey.startsWith('apks/') && verdict === 'safe') {
         try {
           cleanupEvictedApkAnalysisDir(this.db, file.cloudKey);
         } catch (err: any) {
@@ -509,6 +602,14 @@ export class FileStorageService implements IFileStorageService {
 
       currentSize -= file.fileSize;
       logger.log(`Evicted ${file.cloudKey} (${file.fileSize} bytes)`);
+    }
+
+    if (currentSize > budgetBytes) {
+      logger.log(
+        `Eviction finished over budget: ${(currentSize / 1048576).toFixed(0)}MB local vs ${budgetMb}MB budget ` +
+        `(${skippedRetained} files pinned by retention, ${skippedNotSynced} not fully synced). ` +
+        `Lower the APK retention count or raise the cache budget to close the gap.`,
+      );
     }
   }
 
