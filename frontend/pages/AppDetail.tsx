@@ -2,14 +2,31 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Copy, Check, Upload, Syringe, ExternalLink } from 'lucide-react';
 import {
-  Breadcrumbs, ConfirmDialog, SkeletonCard, SortableHeader, ActionMenu,
+  Breadcrumbs, ConfirmDialog, SkeletonCard, SortableHeader, ActionMenu, ExtensionSlot,
   useSortableTable, useWebSocket, useToast, useDocumentTitle, useAuthOptional,
+  pluginRegistry,
 } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
 import { AppIcon } from '../components/apks/AppIcon';
 import { ActivityChip } from '../components/apks/ActivityChip';
 import { ActivityPanel } from '../components/apks/ActivityPanel';
 import { UploadApkModal } from '../components/apks/UploadApkModal';
+
+// Declared here, mounted below the Fetch-sources card. Registering at module
+// scope mirrors DeviceViewer's `device-viewer:overflow-actions` — the slot must
+// exist in the registry before ExtensionSlot renders, or it warns about an
+// undeclared id.
+//
+// `props` carry the app, so a contribution knows which app it is rendering for
+// without refetching. Anything added here becomes API surface for plugins: the
+// id and the prop names cannot change without breaking them.
+pluginRegistry.registerUiSlots('core', [
+  {
+    id: 'app-detail:panels',
+    kind: 'container',
+    description: 'Cards below the Fetch-sources panel on an app\'s detail page. Receives { trackedAppId, packageName, appName }. Plugins add per-app panels here, e.g. publish-to-an-external-service toggles.',
+  },
+]);
 import { InstallDeviceModal, type OnlineDevice } from '../components/apks/InstallDeviceModal';
 import { InjectGadgetConfirm } from '../components/apks/InjectGadgetConfirm';
 import { AvailabilityBadge, type AvailabilityState } from '../components/apks/AvailabilityBadge';
@@ -24,6 +41,8 @@ interface ApkVersionRow {
 interface TrackedApp {
   id: number; packageName: string; appName: string | null;
   createdAt: string | number; versionCount: number; latestVersion: ApkVersionRow | null;
+  /** Download + analyse the APK when a new version is detected. */
+  autoAnalyse?: boolean;
 }
 interface AppSourceRow {
   source: string; label: string; enabled: boolean;
@@ -231,6 +250,17 @@ export function AppDetail() {
     } catch { toast.error(`Failed to update ${label} setting`); }
   }, [ws, appId, toast]);
 
+  const toggleAutoAnalyse = useCallback(async (next: boolean) => {
+    try {
+      const res = await ws.sendRestApi('PATCH', `/v1/apps/track/${appId}`, { autoAnalyse: next });
+      if (!res.body?.success) return;
+      setApp(prev => (prev ? { ...prev, autoAnalyse: next } : prev));
+      toast.success(next
+        ? 'Auto-analysis enabled — new versions will be downloaded and analysed'
+        : 'Auto-analysis disabled — versions will be tracked without downloading');
+    } catch { toast.error('Failed to update auto-analysis'); }
+  }, [ws, appId, toast]);
+
   const fetchNow = useCallback(async (source: string, label: string) => {
     setSourceBusy(source);
     try {
@@ -379,6 +409,31 @@ export function AppDetail() {
         </div>
       </div>
 
+      <div className="card" style={{ padding: '12px 20px', marginBottom: 16 }} data-testid="analysis-panel">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <button
+            role="switch"
+            aria-checked={!!app.autoAnalyse}
+            aria-label="Auto-analyse new versions"
+            data-testid="auto-analyse-toggle"
+            disabled={!canManage}
+            onClick={() => toggleAutoAnalyse(!app.autoAnalyse)}
+            className={`btn btn-sm${app.autoAnalyse ? ' btn-primary' : ''}`}
+            style={{ minWidth: 44 }}
+          >
+            {app.autoAnalyse ? 'On' : 'Off'}
+          </button>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>Auto-analyse new versions</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              Download and analyse the APK whenever a new version is found. Off means versions are still
+              tracked and reported, but nothing is downloaded — cheap for apps you only want to watch.
+              <strong> Fetch now</strong> always downloads, whatever this is set to.
+            </div>
+          </div>
+        </div>
+      </div>
+
       {sources.length > 0 && (
         <div className="card" style={{ padding: '12px 20px', marginBottom: 16 }} data-testid="sources-panel">
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -450,6 +505,11 @@ export function AppDetail() {
           </div>
         </div>
       )}
+
+      <ExtensionSlot
+        id="app-detail:panels"
+        props={{ trackedAppId: app.id, packageName: app.packageName, appName: app.appName }}
+      />
 
       <div className="table-card">
         <table className="data-table">

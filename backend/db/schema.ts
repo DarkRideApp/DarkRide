@@ -258,6 +258,20 @@ export const trackedApps = sqliteTable('tracked_apps', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   packageName: text('package_name').notNull().unique(),
   appName: text('app_name'),
+  /**
+   * Download + analyse the APK when a new version is detected.
+   *
+   * Tracking and analysis used to be the same thing: any enabled source that
+   * saw a new version immediately downloaded and decompiled it. That makes
+   * "watch this app's version" cost a full APK pull, which is wrong for anyone
+   * who only wants to know that a release happened.
+   *
+   * OFF by default, so tracking a new app is cheap and analysis is a deliberate
+   * opt-in. Migration 0098 backfills every EXISTING row to true, because those
+   * apps are being analysed today and silently stopping that would be a
+   * regression rather than a new default.
+   */
+  autoAnalyse: integer('auto_analyse', { mode: 'boolean' }).notNull().default(false),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
@@ -280,6 +294,22 @@ export const appSources = sqliteTable('app_sources', {
   lastCheckedAt: integer('last_checked_at', { mode: 'timestamp' }),
   /** Last per-source failure message, surfaced in the UI (null = healthy). */
   lastError: text('last_error'),
+  /**
+   * Store-listing metadata captured alongside `lastVersion`, so a consumer can
+   * describe a release without re-fetching it. The source already has all of
+   * this in the response it makes to read the version — it used to be thrown
+   * away because `VersionCheckResult` modelled only the version string.
+   *
+   * Per-source rather than per-app: two stores list the same app with different
+   * icons, names and release notes. All nullable — a source that does not
+   * publish release notes simply leaves them null.
+   */
+  lastIconUrl: text('last_icon_url'),
+  lastReleaseNotes: text('last_release_notes'),
+  /** Store's own "download size" label, as displayed (e.g. "24M"). */
+  lastSizeLabel: text('last_size_label'),
+  /** When the STORE says the listing was last updated (not when we checked). */
+  lastStoreUpdatedAt: integer('last_store_updated_at', { mode: 'timestamp' }),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 }, (table) => ({
   appSource: unique('app_sources_app_source').on(table.trackedAppId, table.source),

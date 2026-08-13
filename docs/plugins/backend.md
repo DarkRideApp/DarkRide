@@ -295,7 +295,9 @@ ctx.hooks.on('automation:completed', ({ sessionId, success, error }) => {
 ctx.hooks.define('my-plugin:item-created', { id: 'number', title: 'string' });
 ```
 
-**Available core hooks:** `app:startup`, `app:shutdown`, `device:connected`, `device:disconnected`, `session:created`, `automation:started`, `automation:completed`, `apk:detected-app`, `apk:analyzed`
+**Available core hooks:** `app:startup`, `app:shutdown`, `device:connected`, `device:disconnected`, `session:created`, `automation:started`, `automation:completed`, `apk:detected-app`, `apk:version-detected`, `apk:analyzed`
+
+`apk:version-detected` fires when a tracked app's source reports a version it has not seen before, **whether or not the APK is downloaded**. If you want to react to a release, subscribe to this one — `apk:analyzed` only fires for apps with auto-analyse enabled, so on a version-watch-only app it never fires at all. Payload: `{ trackedAppId, packageName, appName, source, versionName, previousVersion, analysed }`, where `analysed` tells you whether an analysis pipeline followed.
 
 Low-level network traffic events (per-packet, per-request) are not on the lifecycle hook bus — they're routed through a separate, host-internal `TrafficHookRegistry` that today is only reachable from plugins that ship in-tree with the host repo. If your standalone plugin needs to inspect captured traffic, [open an issue](https://github.com/DarkRideApp/DarkRide/issues) describing the use case so the right surface can be added to `ctx`.
 

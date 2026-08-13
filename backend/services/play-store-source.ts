@@ -125,9 +125,16 @@ export class PlayStoreSource implements RemoteApkSource {
     try {
       await this.rateLimit();
       const result = await gplay.app({ appId: packageName, lang: 'en', country: 'us' });
+      // Everything below already arrived in this one response; returning only
+      // the version meant a consumer wanting an icon or release notes had to
+      // make a second identical request.
       return {
         versionName: result.version,
         appName: result.title,
+        iconUrl: result.icon,
+        releaseNotes: result.recentChanges,
+        sizeLabel: typeof result.size === 'string' ? result.size : undefined,
+        storeUpdatedAt: typeof result.updated === 'number' ? new Date(result.updated) : undefined,
       };
     } catch (err: any) {
       log(`Play Store check failed for ${packageName}: ${err.message}`);

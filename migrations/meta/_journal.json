@@ -1,573 +1,580 @@
 {
-	"version": "7",
-	"dialect": "sqlite",
-	"entries": [
-		{
-			"idx": 0,
-			"version": "0000",
-			"when": 1738900000000,
-			"tag": "0000_initial_schema",
-			"breakpoints": true
-		},
-		{
-			"idx": 1,
-			"version": "0001",
-			"when": 1739059200000,
-			"tag": "0001_add_wg_port",
-			"breakpoints": true
-		},
-		{
-			"idx": 2,
-			"version": "0002",
-			"when": 1739145600000,
-			"tag": "0002_add_blocked_domains",
-			"breakpoints": true
-		},
-		{
-			"idx": 3,
-			"version": "0003",
-			"when": 1739232000000,
-			"tag": "0003_add_credentials",
-			"breakpoints": true
-		},
-		{
-			"idx": 4,
-			"version": "0004",
-			"when": 1739318400000,
-			"tag": "0004_add_settings",
-			"breakpoints": true
-		},
-		{
-			"idx": 5,
-			"version": "0005",
-			"when": 1739404800000,
-			"tag": "0005_add_session_name",
-			"breakpoints": true
-		},
-		{
-			"idx": 6,
-			"version": "0006",
-			"when": 1739491200000,
-			"tag": "0006_add_websocket_messages",
-			"breakpoints": true
-		},
-		{
-			"idx": 7,
-			"version": "0007",
-			"when": 1739577600000,
-			"tag": "0007_add_hidden_domains",
-			"breakpoints": true
-		},
-		{
-			"idx": 8,
-			"version": "0008",
-			"when": 1739664000000,
-			"tag": "0008_add_session_pinned",
-			"breakpoints": true
-		},
-		{
-			"idx": 9,
-			"version": "0009",
-			"when": 1739750400000,
-			"tag": "0009_add_capture_rules",
-			"breakpoints": true
-		},
-		{
-			"idx": 10,
-			"version": "0010",
-			"when": 1739836800000,
-			"tag": "0010_add_automation_schedule",
-			"breakpoints": true
-		},
-		{
-			"idx": 11,
-			"version": "0011",
-			"when": 1739923200000,
-			"tag": "0011_add_apk_tracking",
-			"breakpoints": true
-		},
-		{
-			"idx": 12,
-			"version": "0012",
-			"when": 1740009600000,
-			"tag": "0012_add_device_filter",
-			"breakpoints": true
-		},
-		{
-			"idx": 13,
-			"version": "0013",
-			"when": 1740096000000,
-			"tag": "0013_add_saved_traffic",
-			"breakpoints": true
-		},
-		{
-			"idx": 14,
-			"version": "0014",
-			"when": 1740182400000,
-			"tag": "0014_add_frida_tables",
-			"breakpoints": true
-		},
-		{
-			"idx": 15,
-			"version": "0015",
-			"when": 1740268800000,
-			"tag": "0015_add_gadget_support",
-			"breakpoints": true
-		},
-		{
-			"idx": 16,
-			"version": "0016",
-			"when": 1740355200000,
-			"tag": "0016_add_analysis_jobs",
-			"breakpoints": true
-		},
-		{
-			"idx": 17,
-			"version": "0017",
-			"when": 1740441600000,
-			"tag": "0017_add_analysis_stage",
-			"breakpoints": true
-		},
-		{
-			"idx": 18,
-			"version": "0018",
-			"when": 1740528000000,
-			"tag": "0018_add_db_size_snapshots",
-			"breakpoints": true
-		},
-		{
-			"idx": 19,
-			"version": "0019",
-			"when": 1740614400000,
-			"tag": "0019_add_cloud_storage",
-			"breakpoints": true
-		},
-		{
-			"idx": 20,
-			"version": "0020",
-			"when": 1740700800000,
-			"tag": "0020_add_response_headers",
-			"breakpoints": true
-		},
-		{
-			"idx": 21,
-			"version": "0021",
-			"when": 1740787200000,
-			"tag": "0021_add_ai_conversations",
-			"breakpoints": true
-		},
-		{
-			"idx": 22,
-			"version": "0022",
-			"when": 1740873600000,
-			"tag": "0022_add_ai_models",
-			"breakpoints": true
-		},
-		{
-			"idx": 24,
-			"version": "0024",
-			"when": 1740960100000,
-			"tag": "0024_add_ai_providers",
-			"breakpoints": true
-		},
-		{
-			"idx": 25,
-			"version": "0025",
-			"when": 1740960200000,
-			"tag": "0025_add_indexes",
-			"breakpoints": true
-		},
-		{
-			"idx": 29,
-			"version": "0029",
-			"when": 1740960600000,
-			"tag": "0029_add_apk_contents",
-			"breakpoints": true
-		},
-		{
-			"idx": 30,
-			"version": "0030",
-			"when": 1740960700000,
-			"tag": "0030_add_apk_diff_reports",
-			"breakpoints": true
-		},
-		{
-			"idx": 31,
-			"version": "0031",
-			"when": 1740960800000,
-			"tag": "0031_add_ai_conversation_usage",
-			"breakpoints": true
-		},
-		{
-			"idx": 32,
-			"version": "0032",
-			"when": 1740960900000,
-			"tag": "0032_add_apk_fetch_source",
-			"breakpoints": true
-		},
-		{
-			"idx": 35,
-			"version": "0035",
-			"when": 1740961200000,
-			"tag": "0035_add_api_catalogue",
-			"breakpoints": true
-		},
-		{
-			"idx": 36,
-			"version": "0036",
-			"when": 1740961300000,
-			"tag": "0036_add_group_patterns",
-			"breakpoints": true
-		},
-		{
-			"idx": 38,
-			"version": "0038",
-			"when": 1740961500000,
-			"tag": "0038_add_frida_script_library",
-			"breakpoints": true
-		},
-		{
-			"idx": 39,
-			"version": "0039",
-			"when": 1740961600000,
-			"tag": "0039_add_device_properties",
-			"breakpoints": true
-		},
-		{
-			"idx": 40,
-			"version": "0040",
-			"when": 1741475200000,
-			"tag": "0040_add_last_play_store_version",
-			"breakpoints": true
-		},
-		{
-			"idx": 43,
-			"version": "0043",
-			"when": 1741820800000,
-			"tag": "0043_ios_support",
-			"breakpoints": true
-		},
-		{
-			"idx": 45,
-			"version": "0045",
-			"when": 1742083200000,
-			"tag": "0045_add_notification_channels",
-			"breakpoints": true
-		},
-		{
-			"idx": 46,
-			"version": "0046",
-			"when": 1742169600000,
-			"tag": "0046_add_job_config",
-			"breakpoints": true
-		},
-		{
-			"idx": 47,
-			"version": "7",
-			"when": 1742428800000,
-			"tag": "0047_add_intercept_rules_and_client_certs",
-			"breakpoints": true
-		},
-		{
-			"idx": 48,
-			"version": "7",
-			"when": 1742515200000,
-			"tag": "0048_add_api_endpoint_query_params",
-			"breakpoints": true
-		},
-		{
-			"idx": 49,
-			"version": "7",
-			"when": 1742601600000,
-			"tag": "0049_add_api_group_notes",
-			"breakpoints": true
-		},
-		{
-			"idx": 50,
-			"version": "7",
-			"when": 1742688000000,
-			"tag": "0050_add_endpoint_response_spec",
-			"breakpoints": true
-		},
-		{
-			"idx": 54,
-			"version": "6",
-			"when": 1774289571669,
-			"tag": "0054_lonely_ultimatum",
-			"breakpoints": true
-		},
-		{
-			"idx": 56,
-			"version": "6",
-			"when": 1774994400000,
-			"tag": "0056_add_intercept_rule_match_fields",
-			"breakpoints": true
-		},
-		{
-			"idx": 57,
-			"version": "6",
-			"when": 1775080800000,
-			"tag": "0057_add_claude_session_id",
-			"breakpoints": true
-		},
-		{
-			"idx": 58,
-			"version": "6",
-			"when": 1775167200000,
-			"tag": "0058_add_model_task_type",
-			"breakpoints": true
-		},
-		{
-			"idx": 59,
-			"version": "6",
-			"when": 1775253600000,
-			"tag": "0059_add_binary_response_body",
-			"breakpoints": true
-		},
-		{
-			"idx": 60,
-			"version": "6",
-			"when": 1775426400000,
-			"tag": "0060_add_notification_queue",
-			"breakpoints": true
-		},
-		{
-			"idx": 61,
-			"version": "7",
-			"when": 1775512800000,
-			"tag": "0061_plugin_migrations",
-			"breakpoints": true
-		},
-		{
-			"idx": 62,
-			"version": "7",
-			"when": 1775599200000,
-			"tag": "0062_file_storage_upgrade",
-			"breakpoints": true
-		},
-		{
-			"idx": 63,
-			"version": "7",
-			"when": 1775685600000,
-			"tag": "0063_add_auth_tables",
-			"breakpoints": true
-		},
-		{
-			"idx": 64,
-			"version": "7",
-			"when": 1776033313576,
-			"tag": "0064_add_session_notes",
-			"breakpoints": true
-		},
-		{
-			"idx": 65,
-			"version": "7",
-			"when": 1776119713576,
-			"tag": "0065_add_traffic_hostname",
-			"breakpoints": true
-		},
-		{
-			"idx": 66,
-			"version": "7",
-			"when": 1776206113576,
-			"tag": "0066_add_plugin_state",
-			"breakpoints": true
-		},
-		{
-			"idx": 67,
-			"version": "7",
-			"when": 1776292513576,
-			"tag": "0067_add_plugin_sources",
-			"breakpoints": true
-		},
-		{
-			"idx": 68,
-			"version": "7",
-			"when": 1775952000000,
-			"tag": "0068_add_trusted_signing_keys",
-			"breakpoints": true
-		},
-		{
-			"idx": 70,
-			"version": "7",
-			"when": 1776465313576,
-			"tag": "0070_apk_retention_and_notes",
-			"breakpoints": true
-		},
-		{
-			"idx": 73,
-			"version": "7",
-			"when": 1776606480000,
-			"tag": "0073_add_oauth_tables",
-			"breakpoints": true
-		},
-		{
-			"idx": 74,
-			"version": "7",
-			"when": 1744839780000,
-			"tag": "0074_add_api_keys_internal",
-			"breakpoints": true
-		},
-		{
-			"idx": 75,
-			"version": "7",
-			"when": 1776671533288,
-			"tag": "0075_add_users_kind",
-			"breakpoints": true
-		},
-		{
-			"idx": 76,
-			"version": "7",
-			"when": 1776674735000,
-			"tag": "0076_add_ai_call_log",
-			"breakpoints": true
-		},
-		{
-			"idx": 77,
-			"version": "7",
-			"when": 1776761135000,
-			"tag": "0077_add_plugin_state_approved_scopes",
-			"breakpoints": true
-		},
-		{
-			"idx": 78,
-			"version": "7",
-			"when": 1745400000000,
-			"tag": "0078_cloud_files_relative_paths",
-			"breakpoints": true
-		},
-		{
-			"idx": 79,
-			"version": "7",
-			"when": 1745410000000,
-			"tag": "0079_scopes_unwrap_double_encoded",
-			"breakpoints": true
-		},
-		{
-			"idx": 80,
-			"version": "7",
-			"when": 1745420000000,
-			"tag": "0080_drop_local_path_column",
-			"breakpoints": true
-		},
-		{
-			"idx": 81,
-			"version": "7",
-			"when": 1776850000000,
-			"tag": "0081_add_github_monitor",
-			"breakpoints": true
-		},
-		{
-			"idx": 82,
-			"version": "7",
-			"when": 1776900000000,
-			"tag": "0082_ai_tiers",
-			"breakpoints": true
-		},
-		{
-			"idx": 83,
-			"version": "6",
-			"when": 1777099883831,
-			"tag": "0083_baseline",
-			"breakpoints": true
-		},
-		{
-			"idx": 84,
-			"version": "7",
-			"when": 1777105478455,
-			"tag": "0084_job_config_run_history",
-			"breakpoints": true
-		},
-		{
-			"idx": 85,
-			"version": "7",
-			"when": 1777105478456,
-			"tag": "0085_repair_orphan_ai_models",
-			"breakpoints": true
-		},
-		{
-			"idx": 86,
-			"version": "7",
-			"when": 1777105478457,
-			"tag": "0086_drop_plugin_migrations",
-			"breakpoints": true
-		},
-		{
-			"idx": 87,
-			"version": "7",
-			"when": 1777105478458,
-			"tag": "0087_plugin_migrations_table",
-			"breakpoints": true
-		},
-		{
-			"idx": 88,
-			"version": "7",
-			"when": 1777105478459,
-			"tag": "0088_plugin_installs",
-			"breakpoints": true
-		},
-		{
-			"idx": 89,
-			"version": "7",
-			"when": 1777105478460,
-			"tag": "0089_system_state",
-			"breakpoints": true
-		},
-		{
-			"idx": 90,
-			"version": "7",
-			"when": 1777105478461,
-			"tag": "0090_plugin_installs_auth_token",
-			"breakpoints": true
-		},
-		{
-			"idx": 91,
-			"version": "7",
-			"when": 1777105478462,
-			"tag": "0091_plugin_state_last_error",
-			"breakpoints": true
-		},
-		{
-			"idx": 92,
-			"version": "7",
-			"when": 1779785033963,
-			"tag": "0092_disk_usage_snapshots",
-			"breakpoints": true
-		},
-		{
-			"idx": 93,
-			"version": "7",
-			"when": 1779785033964,
-			"tag": "0093_managed_automations",
-			"breakpoints": true
-		},
-		{
-			"idx": 94,
-			"version": "7",
-			"when": 1779785033965,
-			"tag": "0094_managed_automation_default_schedule",
-			"breakpoints": true
-		},
-		{
-			"idx": 95,
-			"version": "7",
-			"when": 1779785033966,
-			"tag": "0095_device_instances",
-			"breakpoints": true
-		},
-		{
-			"idx": 96,
-			"version": "7",
-			"when": 1779785033967,
-			"tag": "0096_app_sources",
-			"breakpoints": true
-		},
-		{
-			"idx": 97,
-			"version": "7",
-			"when": 1779785033968,
-			"tag": "0097_add_traffic_timing",
-			"breakpoints": true
-		}
-	]
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "0000",
+      "when": 1738900000000,
+      "tag": "0000_initial_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "0001",
+      "when": 1739059200000,
+      "tag": "0001_add_wg_port",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "0002",
+      "when": 1739145600000,
+      "tag": "0002_add_blocked_domains",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "0003",
+      "when": 1739232000000,
+      "tag": "0003_add_credentials",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "0004",
+      "when": 1739318400000,
+      "tag": "0004_add_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "0005",
+      "when": 1739404800000,
+      "tag": "0005_add_session_name",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "0006",
+      "when": 1739491200000,
+      "tag": "0006_add_websocket_messages",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "0007",
+      "when": 1739577600000,
+      "tag": "0007_add_hidden_domains",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "0008",
+      "when": 1739664000000,
+      "tag": "0008_add_session_pinned",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "0009",
+      "when": 1739750400000,
+      "tag": "0009_add_capture_rules",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "0010",
+      "when": 1739836800000,
+      "tag": "0010_add_automation_schedule",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "0011",
+      "when": 1739923200000,
+      "tag": "0011_add_apk_tracking",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "0012",
+      "when": 1740009600000,
+      "tag": "0012_add_device_filter",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "0013",
+      "when": 1740096000000,
+      "tag": "0013_add_saved_traffic",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "0014",
+      "when": 1740182400000,
+      "tag": "0014_add_frida_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "0015",
+      "when": 1740268800000,
+      "tag": "0015_add_gadget_support",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "0016",
+      "when": 1740355200000,
+      "tag": "0016_add_analysis_jobs",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "0017",
+      "when": 1740441600000,
+      "tag": "0017_add_analysis_stage",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "0018",
+      "when": 1740528000000,
+      "tag": "0018_add_db_size_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "0019",
+      "when": 1740614400000,
+      "tag": "0019_add_cloud_storage",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "0020",
+      "when": 1740700800000,
+      "tag": "0020_add_response_headers",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "0021",
+      "when": 1740787200000,
+      "tag": "0021_add_ai_conversations",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "0022",
+      "when": 1740873600000,
+      "tag": "0022_add_ai_models",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "0024",
+      "when": 1740960100000,
+      "tag": "0024_add_ai_providers",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "0025",
+      "when": 1740960200000,
+      "tag": "0025_add_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "0029",
+      "when": 1740960600000,
+      "tag": "0029_add_apk_contents",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "0030",
+      "when": 1740960700000,
+      "tag": "0030_add_apk_diff_reports",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "0031",
+      "when": 1740960800000,
+      "tag": "0031_add_ai_conversation_usage",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "0032",
+      "when": 1740960900000,
+      "tag": "0032_add_apk_fetch_source",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "0035",
+      "when": 1740961200000,
+      "tag": "0035_add_api_catalogue",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "0036",
+      "when": 1740961300000,
+      "tag": "0036_add_group_patterns",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "0038",
+      "when": 1740961500000,
+      "tag": "0038_add_frida_script_library",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "0039",
+      "when": 1740961600000,
+      "tag": "0039_add_device_properties",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "0040",
+      "when": 1741475200000,
+      "tag": "0040_add_last_play_store_version",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "0043",
+      "when": 1741820800000,
+      "tag": "0043_ios_support",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "0045",
+      "when": 1742083200000,
+      "tag": "0045_add_notification_channels",
+      "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "0046",
+      "when": 1742169600000,
+      "tag": "0046_add_job_config",
+      "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1742428800000,
+      "tag": "0047_add_intercept_rules_and_client_certs",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1742515200000,
+      "tag": "0048_add_api_endpoint_query_params",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1742601600000,
+      "tag": "0049_add_api_group_notes",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1742688000000,
+      "tag": "0050_add_endpoint_response_spec",
+      "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "6",
+      "when": 1774289571669,
+      "tag": "0054_lonely_ultimatum",
+      "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "6",
+      "when": 1774994400000,
+      "tag": "0056_add_intercept_rule_match_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "6",
+      "when": 1775080800000,
+      "tag": "0057_add_claude_session_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "6",
+      "when": 1775167200000,
+      "tag": "0058_add_model_task_type",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "6",
+      "when": 1775253600000,
+      "tag": "0059_add_binary_response_body",
+      "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "6",
+      "when": 1775426400000,
+      "tag": "0060_add_notification_queue",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1775512800000,
+      "tag": "0061_plugin_migrations",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1775599200000,
+      "tag": "0062_file_storage_upgrade",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1775685600000,
+      "tag": "0063_add_auth_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1776033313576,
+      "tag": "0064_add_session_notes",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1776119713576,
+      "tag": "0065_add_traffic_hostname",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "7",
+      "when": 1776206113576,
+      "tag": "0066_add_plugin_state",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1776292513576,
+      "tag": "0067_add_plugin_sources",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1775952000000,
+      "tag": "0068_add_trusted_signing_keys",
+      "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "7",
+      "when": 1776465313576,
+      "tag": "0070_apk_retention_and_notes",
+      "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1776606480000,
+      "tag": "0073_add_oauth_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1744839780000,
+      "tag": "0074_add_api_keys_internal",
+      "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1776671533288,
+      "tag": "0075_add_users_kind",
+      "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "7",
+      "when": 1776674735000,
+      "tag": "0076_add_ai_call_log",
+      "breakpoints": true
+    },
+    {
+      "idx": 77,
+      "version": "7",
+      "when": 1776761135000,
+      "tag": "0077_add_plugin_state_approved_scopes",
+      "breakpoints": true
+    },
+    {
+      "idx": 78,
+      "version": "7",
+      "when": 1745400000000,
+      "tag": "0078_cloud_files_relative_paths",
+      "breakpoints": true
+    },
+    {
+      "idx": 79,
+      "version": "7",
+      "when": 1745410000000,
+      "tag": "0079_scopes_unwrap_double_encoded",
+      "breakpoints": true
+    },
+    {
+      "idx": 80,
+      "version": "7",
+      "when": 1745420000000,
+      "tag": "0080_drop_local_path_column",
+      "breakpoints": true
+    },
+    {
+      "idx": 81,
+      "version": "7",
+      "when": 1776850000000,
+      "tag": "0081_add_github_monitor",
+      "breakpoints": true
+    },
+    {
+      "idx": 82,
+      "version": "7",
+      "when": 1776900000000,
+      "tag": "0082_ai_tiers",
+      "breakpoints": true
+    },
+    {
+      "idx": 83,
+      "version": "6",
+      "when": 1777099883831,
+      "tag": "0083_baseline",
+      "breakpoints": true
+    },
+    {
+      "idx": 84,
+      "version": "7",
+      "when": 1777105478455,
+      "tag": "0084_job_config_run_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 85,
+      "version": "7",
+      "when": 1777105478456,
+      "tag": "0085_repair_orphan_ai_models",
+      "breakpoints": true
+    },
+    {
+      "idx": 86,
+      "version": "7",
+      "when": 1777105478457,
+      "tag": "0086_drop_plugin_migrations",
+      "breakpoints": true
+    },
+    {
+      "idx": 87,
+      "version": "7",
+      "when": 1777105478458,
+      "tag": "0087_plugin_migrations_table",
+      "breakpoints": true
+    },
+    {
+      "idx": 88,
+      "version": "7",
+      "when": 1777105478459,
+      "tag": "0088_plugin_installs",
+      "breakpoints": true
+    },
+    {
+      "idx": 89,
+      "version": "7",
+      "when": 1777105478460,
+      "tag": "0089_system_state",
+      "breakpoints": true
+    },
+    {
+      "idx": 90,
+      "version": "7",
+      "when": 1777105478461,
+      "tag": "0090_plugin_installs_auth_token",
+      "breakpoints": true
+    },
+    {
+      "idx": 91,
+      "version": "7",
+      "when": 1777105478462,
+      "tag": "0091_plugin_state_last_error",
+      "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1779785033963,
+      "tag": "0092_disk_usage_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1779785033964,
+      "tag": "0093_managed_automations",
+      "breakpoints": true
+    },
+    {
+      "idx": 94,
+      "version": "7",
+      "when": 1779785033965,
+      "tag": "0094_managed_automation_default_schedule",
+      "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "7",
+      "when": 1779785033966,
+      "tag": "0095_device_instances",
+      "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "7",
+      "when": 1779785033967,
+      "tag": "0096_app_sources",
+      "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "7",
+      "when": 1779785033968,
+      "tag": "0097_add_traffic_timing",
+      "breakpoints": true
+    },
+    {
+      "idx": 98,
+      "version": "7",
+      "when": 1779785033969,
+      "tag": "0098_track_without_analyse",
+      "breakpoints": true
+    }
+  ]
 }
