@@ -285,6 +285,10 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const streamingSegmentsRef = useRef<MessageSegment[]>([]);
   const staleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeRequestIdRef = useRef<string | null>(null);
+  const requestSequenceRef = useRef(0);
+  const hasLocalMutationRef = useRef(false);
+  const wasConnectedRef = useRef(ws.connected);
 
   // Auto-scroll to bottom when messages change or streaming updates
   useEffect(() => {
@@ -300,8 +304,12 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   useEffect(() => {
     return () => {
       if (staleTimerRef.current) clearTimeout(staleTimerRef.current);
+      if (activeRequestIdRef.current) {
+        ws.sendMessage('ai:cancel', { conversationId, requestId: activeRequestIdRef.current });
+      }
+      onStreamingChange?.(false);
     };
-  }, []);
+  }, [ws, conversationId, onStreamingChange]);
 
   // Load latest conversation for this context on mount
   useEffect(() => {
@@ -309,7 +317,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     const params = new URLSearchParams({ pageContext, contextId });
     ws.sendRestApi('GET', `/v1/ai/conversations/latest?${params}`)
       .then(res => {
-        if (cancelled) return;
+        if (cancelled || hasLocalMutationRef.current) return;
         if (res.status === 200 && res.body?.data) {
           const conv = res.body.data;
           const restored = convertDbMessages(conv.messages);
@@ -354,11 +362,26 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     }
   }, []);
 
+  useEffect(() => {
+    const wasConnected = wasConnectedRef.current;
+    wasConnectedRef.current = ws.connected;
+    if (wasConnected && !ws.connected && activeRequestIdRef.current) {
+      clearStaleTimer();
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Error: Connection lost while the response was streaming.' }]);
+      activeRequestIdRef.current = null;
+      setPendingConfirm(null);
+      setStreamingSegments([]);
+      streamingSegmentsRef.current = [];
+      setIsStreaming(false);
+    }
+  }, [ws.connected, clearStaleTimer]);
+
   // WebSocket subscriptions
   useEffect(() => {
     const unsubs: (() => void)[] = [];
 
     unsubs.push(ws.subscribe('ai:token', (msg: AiTokenEvent) => {
+      if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
       setStreamingSegments(prev => {
         const next = [...prev];
@@ -374,6 +397,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     }));
 
     unsubs.push(ws.subscribe('ai:tool-start', (msg: AiToolStartEvent) => {
+      if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
       setStreamingSegments(prev => {
         const next = [...prev];
@@ -395,6 +419,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     }));
 
     unsubs.push(ws.subscribe('ai:tool-result', (msg: AiToolResultEvent) => {
+      if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
       setStreamingSegments(prev => {
         const next = prev.map(seg => {
@@ -412,10 +437,12 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     }));
 
     unsubs.push(ws.subscribe('ai:context-usage', (msg: AiContextUsageEvent) => {
+      if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       setContextPercent(msg.percent);
     }));
 
     unsubs.push(ws.subscribe('ai:done', (msg: AiDoneEvent) => {
+      if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
       const segments = streamingSegmentsRef.current;
       const content = segments
@@ -442,6 +469,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     }));
 
     unsubs.push(ws.subscribe('ai:tool-confirm', (msg: AiToolConfirmEvent) => {
+      if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
       setPendingConfirm({
         toolUseId: msg.toolUseId,
@@ -451,6 +479,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     }));
 
     unsubs.push(ws.subscribe('ai:error', (msg: AiErrorEvent) => {
+      if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
       const segments = streamingSegmentsRef.current;
       const content = segments
@@ -477,6 +506,9 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   const sendMessage = useCallback((text: string) => {
     const trimmed = text.trim();
     if (!trimmed || isStreaming) return;
+    hasLocalMutationRef.current = true;
+    const requestId = 'ai-' + Date.now() + '-' + (++requestSequenceRef.current);
+    activeRequestIdRef.current = requestId;
 
     setMessages(prev => [...prev, { role: 'user', content: trimmed }]);
     setInput('');
@@ -491,6 +523,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
       message: trimmed,
       pageContext,
       contextId,
+      requestId,
     });
   }, [ws, conversationId, pageContext, contextId, isStreaming, resetStaleTimer]);
 
@@ -505,10 +538,14 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   }, [ws, pendingConfirm, resetStaleTimer]);
 
   const cancelRequest = useCallback(() => {
-    ws.sendMessage('ai:cancel', { conversationId });
+    ws.sendMessage('ai:cancel', { conversationId, requestId: activeRequestIdRef.current });
   }, [ws, conversationId]);
 
   const newConversation = useCallback(() => {
+    hasLocalMutationRef.current = true;
+    if (activeRequestIdRef.current) ws.sendMessage('ai:cancel', { conversationId, requestId: activeRequestIdRef.current });
+    activeRequestIdRef.current = null;
+    setPendingConfirm(null);
     clearStaleTimer();
     setMessages([]);
     setInput('');
@@ -518,7 +555,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     setTurnLimitReached(false);
     setContextPercent(null);
     streamingSegmentsRef.current = [];
-  }, [clearStaleTimer]);
+  }, [ws, conversationId, clearStaleTimer]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {

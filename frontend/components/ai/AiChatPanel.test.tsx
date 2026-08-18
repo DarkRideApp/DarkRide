@@ -657,7 +657,7 @@ describe('AiChatPanel', () => {
     fireEvent.click(screen.getByTestId('ai-chat-send-btn'));
     fireEvent.click(screen.getByTestId('ai-chat-cancel-btn'));
 
-    expect(sendMessageMock).toHaveBeenCalledWith('ai:cancel', { conversationId: null });
+    expect(sendMessageMock).toHaveBeenCalledWith('ai:cancel', expect.objectContaining({ conversationId: null }));
   });
 
   it('sends cancel message when Cancel button is clicked', () => {
@@ -689,7 +689,7 @@ describe('AiChatPanel', () => {
 
     // Now click cancel
     fireEvent.click(screen.getByTestId('ai-chat-cancel-btn'));
-    expect(sendMessageMock).toHaveBeenCalledWith('ai:cancel', { conversationId: 42 });
+    expect(sendMessageMock).toHaveBeenCalledWith('ai:cancel', expect.objectContaining({ conversationId: 42 }));
   });
 
   it('accumulates streamed text tokens into the streaming area', () => {

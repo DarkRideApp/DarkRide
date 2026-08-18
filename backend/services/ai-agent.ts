@@ -741,9 +741,9 @@ export class AiAgent implements AiAgentInterface {
         writeBuffered.push(event);
       }
     } catch (writeErr: any) {
-      // Write provider failed — fall back to the research model's response
+      // Do not mask a write-provider stream failure with an earlier response.
       logError(`Write provider escalation failed: ${writeErr.message} — falling back to research model`);
-      writeBuffered = [];
+      throw writeErr;
     }
 
     // If write model didn't actually use a write tool, fall back to cheap model's response

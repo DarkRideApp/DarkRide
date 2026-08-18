@@ -95,6 +95,8 @@ async function* parseSSEStream(
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let currentEvent: string | undefined;
+  let currentData: string[] = [];
 
   try {
     while (true) {
@@ -103,34 +105,36 @@ async function* parseSSEStream(
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
-      const parts = buffer.split('\n');
-      buffer = parts.pop()!;
+      // SSE permits CRLF, LF, or CR endings. Keep a trailing CR buffered so
+      // a CRLF split across network chunks remains one line ending.
+      let lineEnd: number;
+      while ((lineEnd = buffer.search(/\r\n|\r|\n/)) !== -1) {
+        const match = buffer.match(/\r\n|\r|\n/)!;
+        if (match[0] === '\r' && lineEnd === buffer.length - 1) break;
+        const line = buffer.slice(0, lineEnd);
+        buffer = buffer.slice(lineEnd + match[0].length);
 
-      let currentEvent: string | undefined;
-      let currentData = '';
-
-      for (const line of parts) {
-        if (line.startsWith('event: ')) {
-          currentEvent = line.slice(7).trim();
-        } else if (line.startsWith('data: ')) {
-          currentData += (currentData ? '\n' : '') + line.slice(6);
-        } else if (line === '') {
-          if (currentData) {
-            yield { event: currentEvent, data: currentData };
+        if (line === '') {
+          if (currentData.length > 0) {
+            yield { event: currentEvent, data: currentData.join('\n') };
             currentEvent = undefined;
-            currentData = '';
+            currentData = [];
           }
+          continue;
         }
-      }
 
-      // If there's leftover data without trailing blank line, keep it in buffer
-      if (currentData) {
-        // Reconstruct as SSE lines for next iteration
-        const reconstruct: string[] = [];
-        if (currentEvent) reconstruct.push(`event: ${currentEvent}`);
-        reconstruct.push(`data: ${currentData}`);
-        buffer = reconstruct.join('\n') + '\n' + buffer;
+        if (line.startsWith(':')) continue;
+        const colon = line.indexOf(':');
+        const field = colon === -1 ? line : line.slice(0, colon);
+        let fieldValue = colon === -1 ? '' : line.slice(colon + 1);
+        if (fieldValue.startsWith(' ')) fieldValue = fieldValue.slice(1);
+        if (field === 'event') currentEvent = fieldValue;
+        else if (field === 'data') currentData.push(fieldValue);
       }
+    }
+
+    if (currentData.length > 0) {
+      yield { event: currentEvent, data: currentData.join('\n') };
     }
   } finally {
     reader.releaseLock();
@@ -384,6 +388,9 @@ export class AnthropicProvider implements AiProvider {
     }
     if (stopReason === 'max_tokens') {
       throw new Error('Anthropic response reached its output token limit');
+    }
+    if (stopReason === 'model_context_window_exceeded') {
+      throw new Error('Anthropic response reached its context window limit');
     }
     if (stopReason === 'model_context_window_exceeded') {
       throw new Error('Anthropic response reached its context window limit');

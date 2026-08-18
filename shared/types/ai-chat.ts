@@ -86,12 +86,14 @@ export interface AiChatSendMessage {
   pageContext: string;
   contextId?: string;
   message: string;
+  requestId?: string;
 }
 
 /** Cancel an in-progress AI response */
 export interface AiChatCancelMessage {
   action: 'ai:cancel';
   conversationId: number | null;
+  requestId?: string;
 }
 
 /** User responds to a tool confirmation prompt */
@@ -107,6 +109,7 @@ export interface AiToolConfirmResponseMessage {
 export interface AiTokenEvent {
   type: 'ai:token';
   conversationId: number;
+  requestId?: string;
   text: string;
 }
 
@@ -114,6 +117,7 @@ export interface AiTokenEvent {
 export interface AiToolStartEvent {
   type: 'ai:tool-start';
   conversationId: number;
+  requestId?: string;
   toolUseId: string;
   toolName: string;
   input: Record<string, any>;
@@ -125,6 +129,7 @@ export interface AiToolStartEvent {
 export interface AiToolResultEvent {
   type: 'ai:tool-result';
   conversationId: number;
+  requestId?: string;
   toolUseId: string;
   result: string;
   durationMs: number;
@@ -134,6 +139,7 @@ export interface AiToolResultEvent {
 export interface AiDoneEvent {
   type: 'ai:done';
   conversationId: number;
+  requestId?: string;
   usage?: { inputTokens: number; outputTokens: number };
   error?: string;
   /** True when the agent stopped because it ran out of tool-loop turns */
@@ -151,6 +157,7 @@ export interface AiErrorEvent {
 export interface AiContextUsageEvent {
   type: 'ai:context-usage';
   conversationId: number | null;
+  requestId?: string;
   percent: number;
 }
 
@@ -158,6 +165,7 @@ export interface AiContextUsageEvent {
 export interface AiToolConfirmEvent {
   type: 'ai:tool-confirm';
   conversationId: number | null;
+  requestId?: string;
   toolUseId: string;
   toolName: string;
   input: Record<string, any>;
