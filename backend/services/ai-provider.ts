@@ -288,6 +288,8 @@ export class AnthropicProvider implements AiProvider {
     let currentToolId = '';
     let currentToolName = '';
     let currentToolJson = '';
+    let messageStopped = false;
+    let stopReason: string | undefined;
 
     for await (const sse of parseSSEStream(response.body, options?.signal)) {
       if (!sse.data || sse.data === '[DONE]') continue;
@@ -339,6 +341,9 @@ export class AnthropicProvider implements AiProvider {
           break;
         }
         case 'message_delta': {
+          if (typeof parsed.delta?.stop_reason === 'string') {
+            stopReason = parsed.delta.stop_reason;
+          }
           if (parsed.usage) {
             yield {
               type: 'usage',
@@ -358,7 +363,21 @@ export class AnthropicProvider implements AiProvider {
           }
           break;
         }
+        case 'message_stop': {
+          messageStopped = true;
+          break;
+        }
       }
+    }
+
+    // Anthropic sends message_stop only after a complete response. A tunnel or
+    // proxy can close a streaming connection cleanly from fetch's perspective;
+    // without this check that partial response would be presented as complete.
+    if (!messageStopped && !options?.signal?.aborted) {
+      throw new Error('Anthropic stream ended before message_stop');
+    }
+    if (stopReason === 'max_tokens') {
+      throw new Error('Anthropic response reached its output token limit');
     }
   }
 }

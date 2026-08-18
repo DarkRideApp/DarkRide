@@ -391,6 +391,12 @@ export class AiAgent implements AiAgentInterface {
         textChunks = tiered.textChunks;
         toolUses = tiered.toolUses;
         turnInputTokens = tiered.turnInputTokens;
+        if (turnSignal.aborted) {
+          error = signal?.aborted
+            ? 'Request was cancelled'
+            : 'AI response timed out after 2 minutes';
+          break;
+        }
         // Replay text to onToken
         for (const chunk of textChunks) onToken(chunk);
       } else {
@@ -431,6 +437,13 @@ export class AiAgent implements AiAgentInterface {
               totalUsage.outputTokens += event.outputTokens;
               break;
           }
+        }
+
+        if (turnSignal.aborted) {
+          error = signal?.aborted
+            ? 'Request was cancelled'
+            : 'AI response timed out after 2 minutes';
+          break;
         }
 
         // Check if the buffered text is actually a text-based tool call

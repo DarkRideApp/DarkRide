@@ -813,6 +813,38 @@ describe('AiAgent', () => {
     ).rejects.toThrow('stream exploded');
   });
 
+  it('reports cancellation when a provider stops after the request is aborted', async () => {
+    const controller = new AbortController();
+    const provider = makeMockProvider(() => {
+      return (async function* () {
+        yield { type: 'text' as const, text: 'partial' };
+        controller.abort();
+      })();
+    });
+    const agent = new AiAgent(db, makeRegistry(), provider);
+    const onToken = vi.fn();
+
+    const result = await agent.handleMessageWithIdentity({
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: [],
+      onBehalfOfService: 'test',
+    }, {
+      conversationId: null,
+      message: 'Cancel this response',
+      pageContext: 'devices',
+      contextId: '',
+      onToken,
+      onToolStart: vi.fn(),
+      onToolResult: vi.fn(),
+      signal: controller.signal,
+      mode: 'streaming',
+    });
+
+    expect(result.error).toBe('Request was cancelled');
+    expect(onToken).not.toHaveBeenCalled();
+  });
+
   it.skip('should handle tool that returns null', async () => {
     const registry = makeRegistry([
       {

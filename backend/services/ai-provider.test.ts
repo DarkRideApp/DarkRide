@@ -217,6 +217,10 @@ describe('AnthropicProvider', () => {
             usage: { output_tokens: 5 },
           }),
         },
+        {
+          event: 'message_stop',
+          data: JSON.stringify({ type: 'message_stop' }),
+        },
       ]);
 
       fetchSpy.mockResolvedValueOnce(
@@ -237,6 +241,65 @@ describe('AnthropicProvider', () => {
       expect(usageEvents).toHaveLength(2);
       expect(usageEvents[0]).toMatchObject({ inputTokens: 10, outputTokens: 0 });
       expect(usageEvents[1]).toMatchObject({ inputTokens: 0, outputTokens: 5 });
+    });
+
+    it('rejects a destructively truncated Anthropic stream', async () => {
+      // Simulates a VPN or proxy closing the stream before Anthropic's
+      // terminal message_stop event.
+      const sseData = sseBlock([
+        {
+          event: 'message_start',
+          data: JSON.stringify({
+            type: 'message_start',
+            message: { usage: { input_tokens: 10 } },
+          }),
+        },
+        {
+          event: 'content_block_delta',
+          data: JSON.stringify({
+            type: 'content_block_delta',
+            delta: { type: 'text_delta', text: 'Only half an answer' },
+          }),
+        },
+      ]);
+
+      fetchSpy.mockResolvedValueOnce(new Response(streamFromString(sseData), { status: 200 }));
+
+      const provider = new AnthropicProvider({ apiKey: 'test-key' });
+      await expect(
+        collectEvents(provider.createStreamingRequest(minimalMessages, 'system', minimalTools)),
+      ).rejects.toThrow('Anthropic stream ended before message_stop');
+    });
+
+    it('rejects an empty Anthropic stream', async () => {
+      fetchSpy.mockResolvedValueOnce(new Response(streamFromString(''), { status: 200 }));
+
+      const provider = new AnthropicProvider({ apiKey: 'test-key' });
+      await expect(
+        collectEvents(provider.createStreamingRequest(minimalMessages, 'system', minimalTools)),
+      ).rejects.toThrow('Anthropic stream ended before message_stop');
+    });
+
+    it('reports an Anthropic max-token cutoff', async () => {
+      const sseData = sseBlock([
+        {
+          event: 'message_delta',
+          data: JSON.stringify({
+            type: 'message_delta',
+            delta: { stop_reason: 'max_tokens' },
+          }),
+        },
+        {
+          event: 'message_stop',
+          data: JSON.stringify({ type: 'message_stop' }),
+        },
+      ]);
+      fetchSpy.mockResolvedValueOnce(new Response(streamFromString(sseData), { status: 200 }));
+
+      const provider = new AnthropicProvider({ apiKey: 'test-key' });
+      await expect(
+        collectEvents(provider.createStreamingRequest(minimalMessages, 'system', minimalTools)),
+      ).rejects.toThrow('Anthropic response reached its output token limit');
     });
 
     it('should parse tool_use events from Anthropic SSE stream', async () => {
@@ -265,6 +328,10 @@ describe('AnthropicProvider', () => {
         {
           event: 'content_block_stop',
           data: JSON.stringify({ type: 'content_block_stop' }),
+        },
+        {
+          event: 'message_stop',
+          data: JSON.stringify({ type: 'message_stop' }),
         },
       ]);
 
@@ -323,6 +390,10 @@ describe('AnthropicProvider', () => {
             delta: { type: 'text_delta', text: 'ok' },
           }),
         },
+        {
+          event: 'message_stop',
+          data: JSON.stringify({ type: 'message_stop' }),
+        },
       ]);
 
       fetchSpy.mockResolvedValueOnce(
@@ -380,6 +451,10 @@ describe('AnthropicProvider', () => {
             delta: { type: 'text_delta', text: 'done' },
           }),
         },
+        {
+          event: 'message_stop',
+          data: JSON.stringify({ type: 'message_stop' }),
+        },
       ]);
 
       fetchSpy.mockResolvedValueOnce(
@@ -433,6 +508,10 @@ describe('AnthropicProvider', () => {
             type: 'content_block_delta',
             delta: { type: 'text_delta', text: 'ok' },
           }),
+        },
+        {
+          event: 'message_stop',
+          data: JSON.stringify({ type: 'message_stop' }),
         },
       ]);
 
