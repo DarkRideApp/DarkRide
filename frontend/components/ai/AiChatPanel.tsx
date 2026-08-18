@@ -452,9 +452,18 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
 
     unsubs.push(ws.subscribe('ai:error', (msg: AiErrorEvent) => {
       clearStaleTimer();
+      const segments = streamingSegmentsRef.current;
+      const content = segments
+        .filter(s => s.type === 'text')
+        .map(s => s.text || '')
+        .join('');
+      const finalSegments = segments.length > 0
+        ? [...segments, { type: 'text' as const, text: '\n\n*' + msg.error + '*' }]
+        : undefined;
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `Error: ${msg.error}`,
+        content: content || 'Error: ' + msg.error,
+        segments: finalSegments,
       }]);
       setIsStreaming(false);
       setStreamingSegments([]);
@@ -496,9 +505,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   }, [ws, pendingConfirm, resetStaleTimer]);
 
   const cancelRequest = useCallback(() => {
-    if (conversationId !== null) {
-      ws.sendMessage('ai:cancel', { conversationId });
-    }
+    ws.sendMessage('ai:cancel', { conversationId });
   }, [ws, conversationId]);
 
   const newConversation = useCallback(() => {

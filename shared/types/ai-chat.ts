@@ -91,7 +91,7 @@ export interface AiChatSendMessage {
 /** Cancel an in-progress AI response */
 export interface AiChatCancelMessage {
   action: 'ai:cancel';
-  conversationId: number;
+  conversationId: number | null;
 }
 
 /** User responds to a tool confirmation prompt */
@@ -143,7 +143,7 @@ export interface AiDoneEvent {
 /** AI response error */
 export interface AiErrorEvent {
   type: 'ai:error';
-  conversationId: number;
+  conversationId: number | null;
   error: string;
 }
 

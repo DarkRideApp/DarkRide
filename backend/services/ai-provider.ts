@@ -301,6 +301,12 @@ export class AnthropicProvider implements AiProvider {
         continue;
       }
 
+      if (parsed.type === 'error') {
+        const providerError = parsed.error;
+        const detail = providerError?.message || providerError?.type || 'Unknown Anthropic stream error';
+        throw new Error('Anthropic stream error: ' + detail);
+      }
+
       switch (parsed.type) {
         case 'content_block_start': {
           const block = parsed.content_block;
@@ -378,6 +384,9 @@ export class AnthropicProvider implements AiProvider {
     }
     if (stopReason === 'max_tokens') {
       throw new Error('Anthropic response reached its output token limit');
+    }
+    if (stopReason === 'model_context_window_exceeded') {
+      throw new Error('Anthropic response reached its context window limit');
     }
   }
 }

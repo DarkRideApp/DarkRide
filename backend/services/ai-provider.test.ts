@@ -302,6 +302,44 @@ describe('AnthropicProvider', () => {
       ).rejects.toThrow('Anthropic response reached its output token limit');
     });
 
+    it('reports an Anthropic context-window cutoff', async () => {
+      const sseData = sseBlock([
+        {
+          event: 'message_delta',
+          data: JSON.stringify({
+            type: 'message_delta',
+            delta: { stop_reason: 'model_context_window_exceeded' },
+          }),
+        },
+        {
+          event: 'message_stop',
+          data: JSON.stringify({ type: 'message_stop' }),
+        },
+      ]);
+      fetchSpy.mockResolvedValueOnce(new Response(streamFromString(sseData), { status: 200 }));
+
+      const provider = new AnthropicProvider({ apiKey: 'test-key' });
+      await expect(
+        collectEvents(provider.createStreamingRequest(minimalMessages, 'system', minimalTools)),
+      ).rejects.toThrow('Anthropic response reached its context window limit');
+    });
+
+    it('surfaces an Anthropic SSE error event', async () => {
+      const sseData = sseBlock([{
+        event: 'error',
+        data: JSON.stringify({
+          type: 'error',
+          error: { type: 'overloaded_error', message: 'Capacity is temporarily unavailable' },
+        }),
+      }]);
+      fetchSpy.mockResolvedValueOnce(new Response(streamFromString(sseData), { status: 200 }));
+
+      const provider = new AnthropicProvider({ apiKey: 'test-key' });
+      await expect(
+        collectEvents(provider.createStreamingRequest(minimalMessages, 'system', minimalTools)),
+      ).rejects.toThrow('Anthropic stream error: Capacity is temporarily unavailable');
+    });
+
     it('should parse tool_use events from Anthropic SSE stream', async () => {
       const sseData = sseBlock([
         {

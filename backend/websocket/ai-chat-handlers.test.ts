@@ -149,7 +149,7 @@ describe('AI Chat Handlers', () => {
       });
     });
 
-    it('should not send error for AbortError', async () => {
+    it('sends a terminal cancellation error for AbortError', async () => {
       const abortError = new Error('Aborted');
       abortError.name = 'AbortError';
       const mockAgent = {
@@ -162,7 +162,11 @@ describe('AI Chat Handlers', () => {
 
       await handler({ conversationId: 3, message: 'test', pageContext: 'dashboard', contextId: '' }, socket);
 
-      expect(socket.send).not.toHaveBeenCalled();
+      expect(JSON.parse(socket.send.mock.calls[0][0])).toEqual({
+        type: 'ai:error',
+        conversationId: 3,
+        error: 'Request was cancelled',
+      });
     });
 
     it('should not send if socket is not open', async () => {
@@ -456,7 +460,7 @@ describe('AI Chat Handlers', () => {
   });
 
   describe('ai:cancel', () => {
-    it('should abort active request by conversationId', async () => {
+    it('should abort an active new conversation by its temporary tracking key', async () => {
       let capturedSignal: AbortSignal | undefined;
       const mockAgent = {
         handleMessage: vi.fn(async (params: any) => {
@@ -477,13 +481,13 @@ describe('AI Chat Handlers', () => {
       const cancelHandler = getWebsocketHandler('ai:cancel')!.handler;
 
       // Start the message (don't await)
-      const messagePromise = messageHandler({ conversationId: 10, message: 'test', pageContext: 'dashboard', contextId: '' }, socket);
+      const messagePromise = messageHandler({ conversationId: null, message: 'test', pageContext: 'dashboard', contextId: '' }, socket);
 
       // Small delay to let the handler set up
       await new Promise((r) => setTimeout(r, 10));
 
       // Cancel it
-      cancelHandler({ conversationId: 10 }, socket);
+      cancelHandler({ conversationId: null }, socket);
 
       await messagePromise;
 

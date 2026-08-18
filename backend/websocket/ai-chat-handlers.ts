@@ -188,13 +188,13 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
         ...(result.turnLimitReached ? { turnLimitReached: true } : {}),
       });
     } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        sendJson(socket, {
-          type: 'ai:error',
-          conversationId: conversationId ?? null,
-          error: err.message || String(err),
-        });
-      }
+      sendJson(socket, {
+        type: 'ai:error',
+        conversationId: conversationId ?? null,
+        error: err.name === 'AbortError'
+          ? 'Request was cancelled'
+          : err.message || String(err),
+      });
     } finally {
       untrackRequest(socket, trackingId);
     }
