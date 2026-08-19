@@ -9,6 +9,7 @@ import { users } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { isFilteredChannel, getRequiredScopes } from './channel-registry';
 import { verifyOrigin, buildDefaultAllowedOrigins, parseAllowedOriginsEnv } from './origin-check';
+import { cleanupSocket } from './ai-chat-handlers';
 
 const { log, error } = createLoggers('websocket');
 
@@ -215,12 +216,14 @@ export function setupWebSocket(
     });
 
     socket.on('close', () => {
+      cleanupSocket(socket);
       connectedClients.delete(socket);
       log(`Client disconnected (${connectedClients.size} total)`);
     });
 
     socket.on('error', (err) => {
       error(`WebSocket error: ${err.message}`);
+      cleanupSocket(socket);
       connectedClients.delete(socket);
     });
   });

@@ -645,6 +645,21 @@ describe('AiChatPanel', () => {
     expect(screen.getByTestId('ai-chat-input')).toBeDisabled();
   });
 
+  it('sends cancel message for a new conversation', () => {
+    const subscribeMock = vi.fn().mockReturnValue(() => {});
+    const sendMessageMock = vi.fn();
+    renderWithWs(<AiChatPanel pageContext="dashboard" contextId="main" />, {
+      subscribe: subscribeMock,
+      sendMessage: sendMessageMock,
+    });
+
+    fireEvent.change(screen.getByTestId('ai-chat-input'), { target: { value: 'Hello' } });
+    fireEvent.click(screen.getByTestId('ai-chat-send-btn'));
+    fireEvent.click(screen.getByTestId('ai-chat-cancel-btn'));
+
+    expect(sendMessageMock).toHaveBeenCalledWith('ai:cancel', expect.objectContaining({ conversationId: null }));
+  });
+
   it('sends cancel message when Cancel button is clicked', () => {
     const subscribeMock = vi.fn().mockReturnValue(() => {});
     const sendMessageMock = vi.fn();
@@ -674,7 +689,7 @@ describe('AiChatPanel', () => {
 
     // Now click cancel
     fireEvent.click(screen.getByTestId('ai-chat-cancel-btn'));
-    expect(sendMessageMock).toHaveBeenCalledWith('ai:cancel', { conversationId: 42 });
+    expect(sendMessageMock).toHaveBeenCalledWith('ai:cancel', expect.objectContaining({ conversationId: 42 }));
   });
 
   it('accumulates streamed text tokens into the streaming area', () => {
@@ -822,6 +837,11 @@ describe('AiChatPanel', () => {
     fireEvent.click(screen.getByTestId('ai-chat-send-btn'));
 
     const errorHandler = subscribeMock.mock.calls.find((c: any[]) => c[0] === 'ai:error')?.[1];
+    const tokenHandler = subscribeMock.mock.calls.find((c: any[]) => c[0] === 'ai:token')?.[1];
+
+    act(() => {
+      tokenHandler({ type: 'ai:token', conversationId: 1, text: 'Partial answer' });
+    });
 
     act(() => {
       errorHandler({
@@ -835,7 +855,8 @@ describe('AiChatPanel', () => {
     expect(screen.queryByTestId('ai-chat-streaming')).not.toBeInTheDocument();
 
     // Error message should be displayed as an assistant message
-    expect(screen.getByTestId('ai-chat-message-1')).toHaveTextContent('Error: API rate limit exceeded');
+    expect(screen.getByTestId('ai-chat-message-1')).toHaveTextContent('Partial answer');
+    expect(screen.getByTestId('ai-chat-message-1')).toHaveTextContent('API rate limit exceeded');
   });
 
   it('sends a suggested prompt when clicked', () => {

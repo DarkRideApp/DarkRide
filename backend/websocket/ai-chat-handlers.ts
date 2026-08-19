@@ -17,7 +17,7 @@ export interface AiChatDeps {
 // ── Active request tracking ──────────────────────────────────────────
 
 /** Map<socket, Map<conversationId, AbortController>> */
-const activeRequests = new Map<WebSocket, Map<number, AbortController>>();
+const activeRequests = new Map<WebSocket, Map<string, AbortController>>();
 
 // ── Tool confirmation tracking ──────────────────────────────────────
 
@@ -36,19 +36,19 @@ function sendJson(socket: WebSocket, data: Record<string, any>): void {
   }
 }
 
-function trackRequest(socket: WebSocket, conversationId: number, controller: AbortController): void {
+function trackRequest(socket: WebSocket, requestId: string, controller: AbortController): void {
   let socketMap = activeRequests.get(socket);
   if (!socketMap) {
     socketMap = new Map();
     activeRequests.set(socket, socketMap);
   }
-  socketMap.set(conversationId, controller);
+  socketMap.set(requestId, controller);
 }
 
-function untrackRequest(socket: WebSocket, conversationId: number): void {
+function untrackRequest(socket: WebSocket, requestId: string): void {
   const socketMap = activeRequests.get(socket);
   if (socketMap) {
-    socketMap.delete(conversationId);
+    socketMap.delete(requestId);
     if (socketMap.size === 0) {
       activeRequests.delete(socket);
     }
@@ -83,7 +83,10 @@ const VALID_CONTEXT_RE = /^[a-z0-9-]+$/;
 export function registerAiChatEndpoints(deps: AiChatDeps): void {
   // ── ai:message ─────────────────────────────────────────────────
   registerWebsocketEndpoint('ai:message', async (message, socket) => {
-    const { conversationId, message: userMessage, pageContext: rawPageContext, contextId: rawContextId } = message;
+    const { conversationId, message: userMessage, pageContext: rawPageContext, contextId: rawContextId, requestId: rawRequestId } = message;
+    const requestId = typeof rawRequestId === 'string' && rawRequestId.length <= 128
+      ? rawRequestId
+      : undefined;
 
     // Validate pageContext format — reject anything that isn't alphanumeric+hyphens
     const pageContext = (typeof rawPageContext === 'string' && VALID_CONTEXT_RE.test(rawPageContext))
@@ -113,6 +116,7 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
       sendJson(socket, {
         type: 'ai:error',
         conversationId: conversationId ?? null,
+        ...(requestId ? { requestId } : {}),
         error: 'No AI provider configured. Add a provider in Settings > Integrations.',
       });
       return;
@@ -120,7 +124,7 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
 
     const controller = new AbortController();
     // Use a temporary tracking key for new conversations (null -> -1)
-    const trackingId = conversationId ?? -1;
+    const trackingId = requestId ?? String(conversationId ?? -1);
     trackRequest(socket, trackingId, controller);
 
     try {
@@ -136,16 +140,16 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
         mode: 'streaming',
         signal: controller.signal,
         onToken: (text: string) => {
-          sendJson(socket, { type: 'ai:token', conversationId: streamConversationId, text });
+          sendJson(socket, { type: 'ai:token', conversationId: streamConversationId, ...(requestId ? { requestId } : {}), text });
         },
         onToolStart: (toolUseId: string, toolName: string, input: unknown, toolUseCount: number, turnsRemaining: number) => {
-          sendJson(socket, { type: 'ai:tool-start', conversationId: streamConversationId, toolUseId, toolName, input, toolUseCount, turnsRemaining });
+          sendJson(socket, { type: 'ai:tool-start', conversationId: streamConversationId, ...(requestId ? { requestId } : {}), toolUseId, toolName, input, toolUseCount, turnsRemaining });
         },
         onToolResult: (toolUseId: string, toolName: string, output: unknown, durationMs: number) => {
-          sendJson(socket, { type: 'ai:tool-result', conversationId: streamConversationId, toolUseId, result: output, durationMs });
+          sendJson(socket, { type: 'ai:tool-result', conversationId: streamConversationId, ...(requestId ? { requestId } : {}), toolUseId, result: output, durationMs });
         },
         onContextUsage: (percent: number) => {
-          sendJson(socket, { type: 'ai:context-usage', conversationId: streamConversationId, percent });
+          sendJson(socket, { type: 'ai:context-usage', conversationId: streamConversationId, ...(requestId ? { requestId } : {}), percent });
         },
         onToolConfirm: (toolUseId: string, toolName: string, input: unknown) => {
           return new Promise<boolean>((resolve) => {
@@ -161,6 +165,7 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
             sendJson(socket, {
               type: 'ai:tool-confirm',
               conversationId: streamConversationId,
+              ...(requestId ? { requestId } : {}),
               toolUseId,
               toolName,
               input,
@@ -183,18 +188,20 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
       sendJson(socket, {
         type: 'ai:done',
         conversationId: result.conversationId,
+        ...(requestId ? { requestId } : {}),
         usage: result.usage,
         error: result.error,
         ...(result.turnLimitReached ? { turnLimitReached: true } : {}),
       });
     } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        sendJson(socket, {
-          type: 'ai:error',
-          conversationId: conversationId ?? null,
-          error: err.message || String(err),
-        });
-      }
+      sendJson(socket, {
+        type: 'ai:error',
+        conversationId: conversationId ?? null,
+        ...(requestId ? { requestId } : {}),
+        error: err.name === 'AbortError'
+          ? 'Request was cancelled'
+          : err.message || String(err),
+      });
     } finally {
       untrackRequest(socket, trackingId);
     }
@@ -233,14 +240,21 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
 
   // ── ai:cancel ──────────────────────────────────────────────────
   registerWebsocketEndpoint('ai:cancel', (message, socket) => {
-    const { conversationId } = message;
+    const { conversationId, requestId } = message;
     const socketMap = activeRequests.get(socket);
     if (socketMap) {
       // Try the exact conversationId first, then the temp key for new conversations
-      const controller = socketMap.get(conversationId) ?? socketMap.get(-1);
+      const controller = socketMap.get(requestId) ?? socketMap.get(String(conversationId ?? -1));
       if (controller) {
         controller.abort();
       }
+    }
+    // A confirmation blocks the agent outside the provider stream. Deny it
+    // immediately so cancellation does not wait for the confirmation timeout.
+    const confirms = pendingConfirmations.get(socket);
+    if (confirms) {
+      for (const resolve of confirms.values()) resolve(false);
+      pendingConfirmations.delete(socket);
     }
   }, { requires: ['core.ai:chat'] });
 }

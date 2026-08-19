@@ -391,6 +391,12 @@ export class AiAgent implements AiAgentInterface {
         textChunks = tiered.textChunks;
         toolUses = tiered.toolUses;
         turnInputTokens = tiered.turnInputTokens;
+        if (turnSignal.aborted) {
+          error = signal?.aborted
+            ? 'Request was cancelled'
+            : 'AI response timed out after 2 minutes';
+          break;
+        }
         // Replay text to onToken
         for (const chunk of textChunks) onToken(chunk);
       } else {
@@ -431,6 +437,13 @@ export class AiAgent implements AiAgentInterface {
               totalUsage.outputTokens += event.outputTokens;
               break;
           }
+        }
+
+        if (turnSignal.aborted) {
+          error = signal?.aborted
+            ? 'Request was cancelled'
+            : 'AI response timed out after 2 minutes';
+          break;
         }
 
         // Check if the buffered text is actually a text-based tool call
@@ -728,9 +741,9 @@ export class AiAgent implements AiAgentInterface {
         writeBuffered.push(event);
       }
     } catch (writeErr: any) {
-      // Write provider failed — fall back to the research model's response
+      // Do not mask a write-provider stream failure with an earlier response.
       logError(`Write provider escalation failed: ${writeErr.message} — falling back to research model`);
-      writeBuffered = [];
+      throw writeErr;
     }
 
     // If write model didn't actually use a write tool, fall back to cheap model's response
