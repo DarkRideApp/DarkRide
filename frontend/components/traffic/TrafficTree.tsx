@@ -35,7 +35,7 @@ export function TrafficTree({ ws, sessionId, deviceId, activeHost, onSelectHost,
     return q ? hosts.filter(h => h.hostname.toLowerCase().includes(q)) : hosts;
   }, [hosts, filter]);
 
-  const scopeQuery = sessionId != null ? `?sessionId=${sessionId}` : '';
+  const scopeParams = new URLSearchParams();
   if (sessionId != null) scopeParams.set('sessionId', String(sessionId));
   if (deviceId) scopeParams.set('deviceId', deviceId);
   const scopeQuery = scopeParams.size ? '?' + scopeParams.toString() : '';
