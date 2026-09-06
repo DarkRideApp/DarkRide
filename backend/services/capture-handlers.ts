@@ -8,6 +8,13 @@ import type { DockerLike } from './providers/docker-helpers';
 const { log } = createLoggers('capture-handlers');
 
 /**
+ * Cap on the inline "is the existing tunnel still alive?" probe in the
+ * already-running branch. Comfortably under the frontend's 30s abort for the
+ * capture-start call, with room left for the re-activation that may follow.
+ */
+const REACTIVATION_PROBE_TIMEOUT = 12_000;
+
+/**
  * Host-side dependencies a capture-mode handler needs. Every handle here is a
  * pure function or a manager method — no `this`, no DB access. The orchestrator
  * (CaptureSessionManager, Task 6) builds these from its own managers and the
@@ -36,12 +43,19 @@ export interface CaptureHandlerDeps {
   /** Probe tunnel connectivity; resolves true once reachable. */
   waitForTunnelReady: (deviceId: string) => Promise<boolean>;
   /**
+   * Session id of the capture currently active on a device, or undefined if
+   * none. Lets the detached connectivity probe verify it is still reporting on
+   * its OWN session before broadcasting — a stop/start inside the probe window
+   * would otherwise publish the old session's status over the new one's.
+   */
+  getActiveSessionId: (deviceId: string) => number | undefined;
+  /**
    * Deterministically (re)derive a device's WireGuard tunnel info without
    * touching mitmproxy. Used to recover tunnel keys/addresses when the
    * on-device tunnel needs to be re-activated but mitmproxy is already
    * running (so it won't hand back fresh `tunnelInfo` itself).
    */
-  ensureConfigs: (deviceId: string, wgPort?: number) => WireGuardTunnelInfo;
+  ensureConfigs: (deviceId: string, wgPort?: number) => WireGuardTunnelInfo | Promise<WireGuardTunnelInfo>;
 }
 
 export type CaptureMode = 'wireguard' | 'emu-http-proxy' | 'ios-bridge';
@@ -68,8 +82,55 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
     getActiveDockerClient,
     lookupRuntimeId,
     waitForTunnelReady,
+    getActiveSessionId,
     ensureConfigs,
   } = deps;
+
+  /**
+   * Confirm tunnel connectivity WITHOUT blocking the capture-start response.
+   *
+   * Once the WireGuard tunnel is up, capture is already functional — this probe
+   * is a best-effort confirmation. But it is slow: `waitForTunnelReady` runs
+   * several attempts of `curl --max-time 10`, so a device whose connectivity
+   * can't be confirmed keeps the probe busy for tens of seconds. Awaiting it
+   * inside `startCapture` kept the HTTP response pending that whole time, and
+   * the frontend aborts a REST-over-WS call at 30s — so capture reported a
+   * "timeout" stuck at 3/4 (mitmproxy + certInjection + wireguard done,
+   * connectivity never resolving) even though the tunnel was working.
+   *
+   * Instead we detach the probe: return from the handler as soon as the tunnel
+   * is active, and let the probe report `connectivity` over the WS subsystem
+   * channel when it finishes. The subsystem starts 'pending' (its initial
+   * state) and flips to 'ok'/'warning' asynchronously.
+   */
+  const confirmConnectivityDetached = (ctx: CaptureModeContext): void => {
+    void (async () => {
+      let ready = false;
+      try {
+        ready = await waitForTunnelReady(ctx.deviceId);
+      } catch (err: any) {
+        log(`Connectivity probe errored for ${ctx.deviceId}: ${err?.message ?? err}`);
+      }
+      // The user may have stopped — or stopped AND restarted — the capture
+      // while we were probing. `setSubsystem` broadcasts this invocation's
+      // sessionId and subsystem snapshot, so publishing it late would either
+      // resurrect a stopped capture or overwrite a newer session's status with
+      // the previous one's.
+      //
+      // Two checks, because neither alone is sufficient. `isCapturing` answers
+      // "is SOME capture live on this device" — it can't spot a stop+start. And
+      // the session id is not registered until AFTER the handler returns, so a
+      // fast probe legitimately sees `undefined` for its own still-starting
+      // session; treating that as a mismatch would silence the common case.
+      if (!mitmproxyManager.isCapturing(ctx.deviceId)) return;
+      const activeSessionId = getActiveSessionId(ctx.deviceId);
+      if (activeSessionId !== undefined && activeSessionId !== ctx.sessionId) return;
+      ctx.setSubsystem('connectivity', ready ? 'ok' : 'warning');
+      if (!ready) {
+        log(`Tunnel connectivity not confirmed for device ${ctx.deviceId}, capture continues`);
+      }
+    })();
+  };
 
   const wireguard: CaptureHandler = async (ctx: CaptureModeContext): Promise<CaptureModeResult> => {
     // Physical Android device: WireGuard tunnel path.
@@ -88,7 +149,19 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
       // connectivity before assuming the capture is fully active; if
       // the tunnel is confirmed down, re-derive its config deterministically
       // and re-activate it on the device.
-      const tunnelReady = await waitForTunnelReady(ctx.deviceId);
+      //
+      // This probe is load-bearing (it decides whether to re-activate) so it
+      // can't be detached like the one above — but it must still be BOUNDED.
+      // `waitForTunnelReady` is 5 attempts of `curl --max-time 10` plus 1s
+      // sleeps, i.e. up to ~55s, and the frontend aborts the capture-start call
+      // at 30s. Unbounded, this path reproduced the same "capture times out
+      // while actually working" bug the detached probe was introduced to fix.
+      // On timeout we assume the tunnel is down and re-activate: redoing
+      // idempotent setup is cheap, leaving the user with a dead tunnel is not.
+      const tunnelReady = await Promise.race([
+        waitForTunnelReady(ctx.deviceId),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), REACTIVATION_PROBE_TIMEOUT)),
+      ]);
       if (tunnelReady) {
         ctx.setSubsystem('certInjection', 'skipped');
         ctx.setSubsystem('wireguard', 'skipped');
@@ -98,7 +171,7 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
 
       log(`Device tunnel for ${ctx.deviceId} is down but mitmproxy is already running; re-activating`);
       const wgPort = (ctx.mitmOptions as MitmproxyOptions)?.wgPort ?? 51820;
-      const recoveredTunnelInfo = ensureConfigs(ctx.deviceId, wgPort);
+      const recoveredTunnelInfo = await ensureConfigs(ctx.deviceId, wgPort);
 
       await deviceManager.injectMitmproxyCaCert(ctx.deviceId);
       ctx.setSubsystem('certInjection', 'ok');
@@ -106,11 +179,9 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
       await deviceManager.activateWireGuardTunnel(ctx.deviceId, recoveredTunnelInfo);
       ctx.setSubsystem('wireguard', 'ok');
 
-      const readyAfterReactivation = await waitForTunnelReady(ctx.deviceId);
-      ctx.setSubsystem('connectivity', readyAfterReactivation ? 'ok' : 'warning');
-      if (!readyAfterReactivation) {
-        log(`Tunnel connectivity not confirmed after re-activation for device ${ctx.deviceId}, proceeding anyway`);
-      }
+      // Confirm connectivity in the background (see confirmConnectivityDetached)
+      // so re-activation doesn't block the response past the client timeout.
+      confirmConnectivityDetached(ctx);
 
       return { tunnelActivated: true };
     }
@@ -130,12 +201,11 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
       throw new Error('mitmproxy process exited during capture startup');
     }
 
-    // Wait for tunnel connectivity
-    const ready = await waitForTunnelReady(ctx.deviceId);
-    ctx.setSubsystem('connectivity', ready ? 'ok' : 'warning');
-    if (!ready) {
-      log(`Tunnel connectivity not confirmed for device ${ctx.deviceId}, proceeding anyway`);
-    }
+    // Confirm tunnel connectivity in the background so the slow best-effort
+    // probe doesn't block the capture-start response past the client timeout.
+    // `connectivity` stays 'pending' and resolves over WS. See
+    // confirmConnectivityDetached.
+    confirmConnectivityDetached(ctx);
 
     return { tunnelActivated };
   };

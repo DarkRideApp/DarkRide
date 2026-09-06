@@ -84,6 +84,7 @@ import { registerChangelogEndpoints } from './api/changelog';
 import { mountFileServing } from './api/file-serving';
 import { refreshPatternCache } from './services/api-catalogue';
 import { APK_DIR, lookupVersionMeta, ensureApkLocal, analysisDbPath } from './utils/apk-paths';
+import { loopbackUrl } from './utils/loopback-url';
 import { getDataRoot, absoluteLocalPath } from './config/paths';
 import { createSettingsApi } from './services/host-ctx-services/settings-api';
 import { createCloudFilesApi } from './services/host-ctx-services/cloud-files-api';
@@ -147,7 +148,7 @@ import { createDockerClient, setActiveDockerClient, getActiveDockerClient, spawn
 import { createAvdProvider } from './services/providers/avd';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { makeCaptureHandlers } from './services/capture-handlers';
-import { ensureConfigs } from './services/wireguard-config';
+import { ensureConfigs, getDeviceLanIp } from './services/wireguard-config';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
 import { stopSpawnedInstances } from './services/stop-spawned-instances';
@@ -294,8 +295,16 @@ deviceManager.setCaptureModeRegistry(captureModeRegistry);
 const proxyRotator = new ProxyRotator(db);
 const bridgeManager = new PythonBridgeManager(db);
 const compiler = new AutomationCompiler();
-const webhookUrl = `http://localhost:${PORT}/v1/traffic/ingest`;
+// Built from the address the server actually binds, NOT "localhost" — see
+// loopbackUrl. The bridge posts here twice per flow when intercept hooks are
+// active, and an IPv6-first "localhost" lookup against our IPv4-only listener
+// added ~2.1s per POST (~4.3s per proxied request) on Windows.
+const webhookUrl = loopbackUrl(HOST, PORT, '/v1/traffic/ingest');
 const mitmproxyManager = new MitmproxyManager(proxyRotator, webhookUrl, undefined, db);
+
+// Orphan-tunnel reconciliation asks "does a capture own this device's wg0?"
+// before removing it, so a mid-session USB replug can't kill a live capture.
+deviceManager.setCaptureActiveCheck((deviceId) => mitmproxyManager.isCapturing(deviceId));
 
 // Server-side TLS-spoofing proxy pool. Lazy-spawned: no mitmproxy is
 // started until the first automation calls http.setTlsProfile(...).
@@ -322,7 +331,10 @@ const captureHandlers = makeCaptureHandlers({
   // serial can't shadow the live emulator (mirrors resolveCaptureMode's H3 fix).
   lookupRuntimeId: (serial) => deviceInstancesRepo?.findRuntimeIdBySerial(serial),
   waitForTunnelReady: (serial) => captureManager.waitForTunnelReady(serial),
-  ensureConfigs,
+  getActiveSessionId: (serial) => captureManager.getSessionId(serial),
+  // Resolve the device's LAN IP so the recovered endpoint lands on the phone's
+  // subnet (same reason as the fresh-capture path in mitmproxy-manager).
+  ensureConfigs: async (serial, wgPort) => ensureConfigs(serial, wgPort, await getDeviceLanIp(serial)),
 });
 captureModeRegistry.register('wireguard', captureHandlers.wireguard);
 captureModeRegistry.register('emu-http-proxy', captureHandlers['emu-http-proxy']);

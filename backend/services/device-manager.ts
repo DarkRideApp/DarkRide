@@ -27,6 +27,13 @@ const STANDBY_TIMEOUT = 60000;
 const MAX_BUSY_IDLE = 600_000; // 10 minutes without interaction — safety net for stuck-busy devices
 const BUSY_IDLE_WARNING = 120_000; // Warn 2 minutes before forced idle
 const MIN_BATTERY_LEVEL = 50;
+// The first `su -c` of a session pops Magisk's on-device superuser prompt,
+// which the user must physically tap "Grant" on. This is the window we allow
+// for that interaction before treating root as unavailable. It must be long
+// enough for a human to pick up the phone and respond; a genuinely non-rooted
+// device (no su, or su denied) still errors within a second regardless, so a
+// generous value here only costs time on the "waiting for a real grant" path.
+const ROOT_GRANT_TIMEOUT = 30_000;
 
 export interface DeviceStatus {
   id: string;
@@ -72,7 +79,15 @@ export async function adbShell(deviceId: string, command: string, timeout: numbe
     // execFileAsync errors include stdout/stderr — surface them in the error message
     const output = [err.stdout, err.stderr].filter(Boolean).map((s: string) => s.trim()).join('\n').trim();
     if (output) {
-      throw new Error(`${err.message}\n${output}`);
+      // Carry `killed`/`signal`/`code` onto the rewrapped error. Callers
+      // distinguish "timed out" from "failed" by those fields (see
+      // ensureRootAccess), and dropping them turned a Magisk grant timeout into
+      // a false "this device is not rooted".
+      const wrapped = new Error(`${err.message}\n${output}`);
+      Object.assign(wrapped, {
+        killed: err.killed, signal: err.signal, code: err.code, cause: err,
+      });
+      throw wrapped;
     }
     throw err;
   }
@@ -97,6 +112,43 @@ export async function adbShell(deviceId: string, command: string, timeout: numbe
 export async function suShell(deviceId: string, command: string, timeout: number = 10000): Promise<string> {
   const escaped = command.replace(/'/g, `'\\''`);
   return adbShell(deviceId, `su -c '${escaped}'`, timeout);
+}
+
+/**
+ * Verify we can run a command as root on the device, waiting out the
+ * interactive Magisk superuser prompt if one appears.
+ *
+ * This is the first `su -c` in the capture flow, so on a Magisk device it
+ * triggers the on-phone "Grant superuser?" dialog that the user has to
+ * physically tap. The previous 3s timeout killed adb before the user could
+ * respond and reported a false "Root access unavailable" on a device that is
+ * actually rooted — the "rooted device won't capture, it just times out"
+ * failure. We wait {@link ROOT_GRANT_TIMEOUT} instead; a genuinely non-rooted
+ * device (no su binary, or su denies immediately) still errors within a second,
+ * so the generous window only costs time on the "waiting for a real grant" path.
+ *
+ * Throws with a message tailored to which case we hit: a timeout means the
+ * prompt is (probably) still waiting to be tapped; a fast error means there is
+ * no usable root here.
+ */
+export async function ensureRootAccess(deviceId: string, timeout: number = ROOT_GRANT_TIMEOUT): Promise<void> {
+  try {
+    await suShell(deviceId, 'id', timeout);
+  } catch (err: any) {
+    // execFile kills the child with SIGTERM when the timeout elapses; that
+    // surfaces as err.killed / err.signal (and, depending on Node, an
+    // ETIMEDOUT-flavoured message). Treat that as "grant not answered yet"
+    // rather than "no root", so the message points at the right next action.
+    const timedOut =
+      err?.killed === true ||
+      err?.signal === 'SIGTERM' ||
+      /timed out|ETIMEDOUT/i.test(err?.message ?? '');
+    throw new Error(
+      timedOut
+        ? 'Root access not granted in time — check the phone for the Magisk superuser prompt, tap Grant (choose "Remember" to avoid this next time), then start capture again'
+        : 'Root access unavailable — this device is not rooted, or su access was denied. Grant shell/su permission in Magisk and retry',
+    );
+  }
 }
 
 /**
@@ -293,8 +345,24 @@ export class DeviceManager {
   // boot wiring (Task 1.6) can install it now; the read site lands when
   // Phase 2 implements the capture-mode dispatch.
   private captureModeRegistry: CaptureModeRegistry | null = null;
+  /**
+   * Is a capture currently running for this device? Installed by the boot
+   * wiring. Used by {@link reconcileOrphanTunnel} so it never tears down a
+   * tunnel that belongs to a live capture (e.g. a USB replug mid-session).
+   * Defaults to "nothing is capturing" — correct on a cold start, which is
+   * exactly when orphan reconciliation matters.
+   */
+  private isCaptureActive: ((deviceId: string) => boolean) | null = null;
 
   constructor(private db: AppDatabase) {}
+
+  /**
+   * Install the predicate {@link reconcileOrphanTunnel} uses to avoid tearing
+   * down a tunnel that a live capture owns.
+   */
+  setCaptureActiveCheck(fn: (deviceId: string) => boolean): void {
+    this.isCaptureActive = fn;
+  }
 
   setHookBus(bus: HookBus): void {
     this.hookBus = bus;
@@ -445,6 +513,10 @@ export class DeviceManager {
         // so devices don't stay awake indefinitely from a previous session
         if (!wasOnline) {
           this.setStayAwake(id, false).catch(() => {});
+          // Clean up a wg0 stranded by a previous DarkRide process before the
+          // device is handed to anything else. Detached: it costs an ADB
+          // round-trip and must never stall discovery.
+          this.reconcileOrphanTunnel(id).catch(() => {});
           this.hookBus?.emit('device:connected', { id, platform: 'android' });
         }
       } else {
@@ -1451,6 +1523,27 @@ export class DeviceManager {
   }
 
   /**
+   * Read the device's active DNS resolver IPs (IPv4) from `dumpsys connectivity`.
+   * Used to route DNS around the capture tunnel — see activateWireGuardTunnel.
+   * Returns [] if none can be determined (caller then leaves DNS in-tunnel).
+   */
+  async getDeviceDnsServers(deviceId: string): Promise<string[]> {
+    try {
+      const out = await adbShell(deviceId, 'dumpsys connectivity', 8000);
+      const ips = new Set<string>();
+      // LinkProperties render DNS as e.g. "DnsAddresses: [ /192.168.1.1,/8.8.8.8 ]"
+      for (const block of out.matchAll(/DnsAddresses:\s*\[([^\]]*)\]/g)) {
+        for (const ip of block[1].matchAll(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g)) {
+          ips.add(ip[1]);
+        }
+      }
+      return [...ips];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Activate a WireGuard tunnel on the device to route traffic through mitmproxy.
    */
   async activateWireGuardTunnel(
@@ -1530,7 +1623,33 @@ export class DeviceManager {
       ? `${wgPath} set wg0 fwmark ${WG_FWMARK}`
       : `${wgUapiPath} set wg0 fwmark ${WG_FWMARK}`;
 
+    // Route the device's DNS resolver(s) AROUND the tunnel, via the main table
+    // (i.e. its real network). mitmproxy's WireGuard-mode DNS replies don't
+    // reliably reach some devices' resolvers — observed on Android 16 + kernel
+    // WireGuard, where the phone times out resolving while mitmproxy logs
+    // correct answers — which stalls ALL app traffic (apps never get an IP to
+    // connect to). Resolving names natively fixes it; the resulting HTTPS still
+    // egresses through wg0 and is captured. DNS queries themselves are then not
+    // captured — an acceptable trade for capture actually working. The rules
+    // sit at priority 50 (before our catch-all at 100) so DNS packets to these
+    // IPs skip table ${WG_TABLE}.
+    const DNS_BYPASS_PRIO = '50';
+    const dnsServers = await this.getDeviceDnsServers(deviceId);
+    // `|| true`: these are best-effort, but they sit in an `&&` chain whose
+    // LATER links are not optional — the IPv6 null-route (without which
+    // device IPv6 silently escapes capture) and `rm` of the peer config (which
+    // holds the tunnel's private key). A resolver string the kernel refuses, or
+    // a duplicate rule, must not abort the chain and strand those.
+    const dnsBypassCmds = dnsServers.map(
+      (ip) => `{ ip rule add to ${ip} lookup main priority ${DNS_BYPASS_PRIO} || true; }`,
+    );
+    if (dnsServers.length) {
+      log(`Routing DNS around tunnel for ${deviceId} (resolvers: ${dnsServers.join(', ')})`);
+    }
+
     const commands = [
+      // Remove any stale DNS-bypass rules from a previous run (idempotent).
+      `while ip rule del priority ${DNS_BYPASS_PRIO} 2>/dev/null; do :; done; true`,
       // Teardown any existing tunnel and restore IPv6 (may have been disabled by earlier run)
       `killall wireguard-go 2>/dev/null; ip link del wg0 2>/dev/null; ip rule del table ${WG_TABLE} 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip -6 rule del not fwmark ${WG_FWMARK} table ${WG_TABLE} priority 100 2>/dev/null; ip -6 route flush table ${WG_TABLE} 2>/dev/null; sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null; true`,
       // Create interface (kernel module or wireguard-go userspace)
@@ -1549,6 +1668,9 @@ export class DeviceManager {
       // High-priority rule (priority 100, checked before wlan0 at ~22000):
       // all traffic EXCEPT WG's own packets uses our table
       `ip rule add not fwmark ${WG_FWMARK} table ${WG_TABLE} priority 100`,
+      // DNS bypass (priority 50 < 100): resolve names on the device's real
+      // network instead of through the tunnel. See dnsBypassCmds above.
+      ...dnsBypassCmds,
       // The tunnel is IPv4-only. Without an explicit IPv6 entry in our table,
       // device-originated IPv6 traffic falls through to the normal wlan0
       // IPv6 route and bypasses capture entirely. Null-route IPv6 inside our
@@ -1618,12 +1740,86 @@ export class DeviceManager {
     try {
       await suShell(
         deviceId,
-        'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; ip rule del table 51820 2>/dev/null; ip rule del fwmark 0xca6c lookup main 2>/dev/null; ip route flush table 51820 2>/dev/null; ip -6 rule del not fwmark 51820 table 51820 priority 100 2>/dev/null; ip -6 route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true',
+        // Delete the priority 50/90/100 rules REPEATEDLY rather than once each.
+        // A single `ip rule del` removes only the first match, so a session that
+        // re-activated a tunnel without a clean teardown leaves duplicates
+        // behind — and any surviving priority-100 rule points the device's
+        // default route at a wg0 that no longer exists, which black-holes ALL
+        // traffic (the device looks like it has Wi-Fi but nothing resolves).
+        //
+        // Bounded `for` rather than `while`: termination would otherwise depend
+        // on `ip rule del` exiting non-zero when nothing matches. iproute2 does,
+        // but a build that returns 0 on a no-op would spin forever on-device,
+        // capped only by suShell's host-side timeout. 8 covers any realistic
+        // pile-up; `break` exits as soon as there's nothing left to delete.
+        'ip link del wg0 2>/dev/null; killall wireguard-go 2>/dev/null; '
+          + 'for i in 1 2 3 4 5 6 7 8; do ip rule del table 51820 2>/dev/null || break; done; '
+          + 'for i in 1 2 3 4 5 6 7 8; do ip rule del priority 100 2>/dev/null || break; done; '
+          + 'for i in 1 2 3 4 5 6 7 8; do ip rule del fwmark 0xca6c lookup main 2>/dev/null || break; done; '
+          + 'for i in 1 2 3 4 5 6 7 8; do ip rule del priority 90 2>/dev/null || break; done; '
+          + 'for i in 1 2 3 4 5 6 7 8; do ip rule del priority 50 2>/dev/null || break; done; '
+          + 'ip route flush table 51820 2>/dev/null; '
+          // Same duplicate-accumulation problem as the IPv4 rules above.
+          + 'for i in 1 2 3 4 5 6 7 8; do ip -6 rule del not fwmark 51820 table 51820 priority 100 2>/dev/null || break; done; '
+          + 'ip -6 route flush table 51820 2>/dev/null; setenforce 1 2>/dev/null; true',
       );
     } catch {
       // Interface may not exist — that's fine
     }
     log(`WireGuard tunnel deactivated on ${deviceId}`);
+  }
+
+  /**
+   * Tear down a WireGuard tunnel left behind by a previous DarkRide process.
+   *
+   * `deactivateWireGuardTunnel` only runs on the graceful paths (stopCapture,
+   * shutdown). If the server is SIGKILLed, crashes, or the machine reboots,
+   * the device keeps `wg0` plus the priority 50/90/100 `ip rule`s pointing at
+   * a peer that no longer exists. The device then has NO working internet —
+   * Wi-Fi looks connected, but every route goes into a dead tunnel — and it
+   * stays that way until someone cleans it by hand.
+   *
+   * So on first sight of an online device we check for a stray `wg0` and, if
+   * no capture owns it, remove it. Best-effort throughout: a device without
+   * root, without `ip`, or that disconnects mid-check is simply left alone.
+   */
+  async reconcileOrphanTunnel(deviceId: string): Promise<boolean> {
+    // Never touch a tunnel a live capture owns — a mid-session USB replug
+    // re-triggers discovery and would otherwise kill a working capture.
+    if (this.isCaptureActive?.(deviceId)) return false;
+
+    let hasTunnel = false;
+    try {
+      const out = await adbShell(deviceId, 'ip link show wg0 2>/dev/null; true', 5_000);
+      // Match the shape of an `ip link` interface line ("52: wg0: <...>"), not a
+      // bare "wg0" anywhere in the output: some `ip` builds print
+      // `Device "wg0" does not exist.` on STDOUT, and a loose match on that
+      // would make us "clean up" a tunnel that isn't there — popping an
+      // unsolicited Magisk superuser prompt every time a device is plugged in.
+      hasTunnel = /^\s*\d+:\s*wg0[:@]/m.test(out);
+    } catch {
+      // Device went away, no `ip`, or shell denied — nothing safe to do.
+      return false;
+    }
+    if (!hasTunnel) return false;
+
+    log(`Device ${deviceId} has an orphaned wg0 tunnel from a previous session — removing`);
+    await this.deactivateWireGuardTunnel(deviceId);
+
+    // deactivateWireGuardTunnel swallows its own errors (the interface may
+    // legitimately not exist), so re-probe rather than assume success: on an
+    // unrooted device the teardown is denied and wg0 is still there.
+    try {
+      const after = await adbShell(deviceId, 'ip link show wg0 2>/dev/null; true', 5_000);
+      if (/^\s*\d+:\s*wg0[:@]/m.test(after)) {
+        error(`Orphaned wg0 on ${deviceId} could not be removed — device may not be rooted`);
+        return false;
+      }
+    } catch {
+      // Can't confirm either way; don't claim success.
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -1714,14 +1910,8 @@ export class DeviceManager {
 
     log(`Injecting CA cert on ${deviceId}`);
 
-    // Quick root check — fails fast (3s) instead of hanging 30s on Magisk prompt
-    try {
-      await suShell(deviceId, 'id', 3000);
-    } catch {
-      throw new Error(
-        'Root access unavailable — check the phone for a Magisk superuser prompt, or grant shell permanent su access in Magisk settings',
-      );
-    }
+    // Root check — waits out the interactive Magisk grant. See ensureRootAccess.
+    await ensureRootAccess(deviceId);
 
     const certPem = fs.readFileSync(certPath, 'utf-8');
     const certHash = computeSubjectHashOld(certPem);

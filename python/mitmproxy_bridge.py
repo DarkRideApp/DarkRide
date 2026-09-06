@@ -5,15 +5,18 @@ Captures HTTP request/response data and forwards it to the Node.js
 webhook endpoint as fire-and-forget POST requests.
 
 Usage:
-    mitmdump -s mitmproxy_bridge.py --set node_webhook=http://localhost:3000/v1/traffic/ingest
+    mitmdump -s mitmproxy_bridge.py --set node_webhook=http://127.0.0.1:3000/v1/traffic/ingest
 """
 
 import asyncio
 import base64
+import concurrent.futures
 import fnmatch
 import json
 import os
+import queue
 import socket
+import threading
 import urllib.request
 from urllib.parse import urlparse
 from mitmproxy import http, dns, ctx
@@ -332,6 +335,99 @@ class DarkRideAddon:
         self._hold_config: dict = {"enabled": False, "phases": ["request", "response"]}
         self._hold_config_path: str = ""
         self._hold_config_mtime: float = 0.0
+
+        # Fire-and-forget POSTs (ingest, request-started, DNS, TLS-fail, WS) run
+        # on a single background worker thread so they NEVER block mitmproxy's
+        # asyncio event loop. A synchronous urlopen on the loop stalls every
+        # in-flight connection — under a TLS-failure storm from pinned apps this
+        # froze the proxy and made all traffic time out. Bounded queue: if the
+        # backend can't keep up we drop telemetry rather than stall capture.
+        #
+        # EXACTLY ONE worker. These POSTs were strictly ordered when they were
+        # synchronous, and the backend depends on that: /ws-start must be
+        # processed before any /ws-message for the same flow, or the handler
+        # 404s ("Unknown WebSocket flow") and the frame is lost for good.
+        # /request-started likewise has to precede /ingest, or the UI keeps a
+        # ghost "pending" row it can never reconcile. Concurrent workers would
+        # reintroduce exactly those races.
+        self._post_queue: "queue.Queue" = queue.Queue(maxsize=2000)
+        self._post_worker_lock = threading.Lock()
+        self._post_worker: "threading.Thread | None" = None
+        self._dropped_posts = 0
+
+        # Intercept POSTs get their OWN executor rather than asyncio's default.
+        # `_post_to_hold` (interactive intercept) long-polls for up to 300s on
+        # that same default pool, so a few flows paused at a breakpoint would
+        # occupy every worker and queue intercepts behind them — reproducing the
+        # stall this whole change exists to remove.
+        self._intercept_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=16, thread_name_prefix="darkride-intercept",
+        )
+
+    def _ensure_post_worker(self):
+        """Start the drain thread on first use.
+
+        Deliberately lazy rather than started in __init__: addons are
+        constructed at module import, so a mitmproxy hot-reload of this script
+        would otherwise strand the previous thread on an orphaned queue.
+        """
+        if self._post_worker is not None:
+            return
+        with self._post_worker_lock:
+            if self._post_worker is not None:
+                return
+            self._post_worker = threading.Thread(
+                target=self._drain_post_queue, name="darkride-post", daemon=True,
+            )
+            self._post_worker.start()
+
+    def _drain_post_queue(self):
+        """Background worker: drain queued (url, data) POSTs, one at a time."""
+        while True:
+            url, data = self._post_queue.get()
+            try:
+                payload = json.dumps(data).encode("utf-8")
+                req = urllib.request.Request(
+                    url, data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                urllib.request.urlopen(req, timeout=5)
+            except Exception as e:
+                try:
+                    # Include the URL — "a POST failed" is unactionable when six
+                    # different endpoints share this worker.
+                    ctx.log.error(f"[DarkRide] background POST to {url} failed: {e}")
+                except Exception:
+                    pass
+            finally:
+                self._post_queue.task_done()
+
+    def _enqueue_post(self, url: str, data: dict):
+        """Enqueue a fire-and-forget POST.
+
+        Telemetry is dropped when the queue is full — better than stalling
+        capture. WebSocket lifecycle calls are NOT telemetry: dropping /ws-start
+        makes every later frame for that flow 404, and dropping /ws-end leaks the
+        backend's flow entry. Those get a brief blocking wait instead.
+        """
+        self._ensure_post_worker()
+        is_ws_lifecycle = "/ws-start" in url or "/ws-end" in url
+        try:
+            if is_ws_lifecycle:
+                self._post_queue.put((url, data), timeout=2)
+            else:
+                self._post_queue.put_nowait((url, data))
+        except queue.Full:
+            # Rate-limited: the motivating case is a TLS-failure storm, where
+            # logging per drop would itself flood the event-loop thread.
+            self._dropped_posts += 1
+            if self._dropped_posts == 1 or self._dropped_posts % 100 == 0:
+                try:
+                    ctx.log.error(
+                        f"[DarkRide] post queue full — dropped {self._dropped_posts} POST(s)"
+                    )
+                except Exception:
+                    pass
 
     def _reload_blocklist(self):
         """Reload the blocklist JSON file if it has changed on disk."""
@@ -902,7 +998,7 @@ class DarkRideAddon:
                 flow.response = http.Response.make(403, b"Blocked by DarkRide blocklist")
                 return
 
-            # Notify backend that request has started (fire-and-forget)
+            # Notify backend that request has started (non-blocking: enqueued).
             self._notify_request_started(flow)
 
             # Apply intercept rules
@@ -937,7 +1033,13 @@ class DarkRideAddon:
                     "headers": dict(flow.request.headers),
                     "body": request_body,
                 }
-                result = self._post_to_intercept(intercept_data)
+                # Run the blocking HTTP POST in a thread so it never freezes the
+                # asyncio event loop. A synchronous urlopen here stalls EVERY
+                # in-flight flow (upstream connects included) for the round-trip,
+                # which — with hooks matching /.*/ — serialized all traffic and
+                # showed up as multi-second TTFB. Mirrors the hold path (_run_hold).
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(self._intercept_executor, self._post_to_intercept, intercept_data)
                 if self._apply_request_modifications(flow, result):
                     return  # blocked
 
@@ -1048,45 +1150,27 @@ class DarkRideAddon:
         return device_id, parsed_session
 
     def _post_to_webhook(self, data: dict):
-        """Post data to the Node.js webhook endpoint."""
-        webhook_url = ctx.options.node_webhook
-        try:
-            payload = json.dumps(data).encode("utf-8")
-            req = urllib.request.Request(
-                webhook_url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5)
-        except Exception as e:
-            ctx.log.error(f"[DarkRide] Webhook POST failed: {e}")
+        """Queue a fire-and-forget POST to the Node.js webhook endpoint.
+
+        Non-blocking: enqueued to the background worker so it never stalls the
+        event loop (callers include sync mitmproxy hooks — DNS, TLS-fail — that
+        run ON the loop thread).
+        """
+        self._enqueue_post(ctx.options.node_webhook, data)
 
     def _post_to_ws_webhook(self, path: str, data: dict):
-        """Post data to a WebSocket-specific webhook endpoint.
+        """Queue a fire-and-forget POST to a WebSocket-specific webhook endpoint.
 
         Derives the URL from the configured node_webhook by replacing the
-        trailing /ingest segment with the given path.
-        E.g. http://localhost:3000/v1/traffic/ingest + /ws-start
-           → http://localhost:3000/v1/traffic/ws-start
+        trailing /ingest segment with the given path, then enqueues it (see
+        _post_to_webhook). E.g. .../ingest + /ws-start → .../ws-start
         """
         webhook_url = ctx.options.node_webhook
         if webhook_url.endswith("/ingest"):
             base_url = webhook_url[: -len("/ingest")]
         else:
             base_url = webhook_url.rstrip("/")
-        url = base_url + path
-        try:
-            payload = json.dumps(data).encode("utf-8")
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5)
-        except Exception as e:
-            ctx.log.error(f"[DarkRide] WS webhook POST to {path} failed: {e}")
+        self._enqueue_post(base_url + path, data)
 
     def dns_request(self, flow: dns.DNSFlow):
         """Kill DNS queries for blocked domains before they resolve."""
@@ -1304,7 +1388,9 @@ class DarkRideAddon:
                     "responseHeaders": dict(flow.response.headers),
                     "responseBody": resp_body_raw,
                 }
-                result = self._post_to_intercept(intercept_data)
+                # Off the event loop — see the request-phase note above.
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(self._intercept_executor, self._post_to_intercept, intercept_data)
                 if self._apply_response_modifications(flow, result):
                     return  # blocked — skip capture
             except Exception as e:
@@ -1389,6 +1475,8 @@ class DarkRideAddon:
         if matched_rules_final:
             data["matchedRules"] = matched_rules_final
 
+        # Ingest is non-blocking (enqueued) — mitmproxy holds the response from
+        # the client until this handler returns, so the POST must not block.
         self._post_to_webhook(data)
 
     def websocket_message(self, flow: http.HTTPFlow):
@@ -1474,8 +1562,14 @@ def load(loader):
     """Register custom options for mitmproxy."""
     loader.add_option(
         name="node_webhook",
+        # 127.0.0.1, never "localhost": this URL is fetched with urllib for
+        # every flow (twice, when intercept hooks are on). "localhost" resolves
+        # to ::1 first on Windows, and the server binds IPv4-only, so each POST
+        # paid a failed IPv6 connect first — ~2.1s each, ~4.3s per proxied
+        # request. DarkRide always passes --set node_webhook=..., so this is
+        # only the fallback, but the fallback shouldn't re-arm the bug.
         typespec=str,
-        default="http://localhost:3000/v1/traffic/ingest",
+        default="http://127.0.0.1:3000/v1/traffic/ingest",
         help="URL of the Node.js webhook endpoint for traffic capture",
     )
     loader.add_option(

@@ -29,6 +29,7 @@ function wireRegistry(
     getActiveDockerClient: () => null,
     lookupRuntimeId: () => undefined,
     waitForTunnelReady: (serial: string) => manager.waitForTunnelReady(serial),
+    getActiveSessionId: (serial: string) => manager.getSessionId(serial),
     ensureConfigs: () => ({
       clientPrivateKey: 'test-client-priv',
       serverPublicKey: 'test-server-pub',
@@ -342,8 +343,13 @@ describe('CaptureSessionManager', () => {
 
       await manager.startCapture('DEV001');
 
-      expect(mockDm.testTunnelConnectivity).toHaveBeenCalledTimes(3);
+      // Capture is "started" as soon as the tunnel is up — the connectivity
+      // probe now runs detached so it can't block/timeout the start response.
       expect(manager.isCapturing('DEV001')).toBe(true);
+      await vi.waitFor(
+        () => expect(mockDm.testTunnelConnectivity).toHaveBeenCalledTimes(3),
+        { timeout: 10000 },
+      );
     });
 
     it('should proceed even if tunnel connectivity never succeeds', async () => {
@@ -351,9 +357,13 @@ describe('CaptureSessionManager', () => {
 
       await manager.startCapture('DEV001');
 
-      expect(mockDm.testTunnelConnectivity).toHaveBeenCalledTimes(5);
-      // Should still be capturing despite connectivity check failure
+      // Still capturing despite the connectivity check failing — the detached
+      // probe exhausts its retries in the background.
       expect(manager.isCapturing('DEV001')).toBe(true);
+      await vi.waitFor(
+        () => expect(mockDm.testTunnelConnectivity).toHaveBeenCalledTimes(5),
+        { timeout: 10000 },
+      );
     }, 10000);
   });
 
@@ -361,7 +371,12 @@ describe('CaptureSessionManager', () => {
     it('should emit multiple intermediate broadcasts during startup', async () => {
       await manager.startCapture('DEV001');
 
-      // 4 broadcasts: after mitmproxy, after cert, after wg, final
+      // 4 broadcasts: after mitmproxy, after cert, after wg, and the final
+      // connectivity update — which now lands from the detached probe.
+      await vi.waitFor(() => {
+        const n = mockBroadcastToAll.mock.calls.filter((c: any) => c[0].status === 'capturing').length;
+        expect(n).toBe(4);
+      }, { timeout: 10000 });
       const capturingBroadcasts = mockBroadcastToAll.mock.calls.filter(
         (c: any) => c[0].status === 'capturing',
       );
@@ -428,10 +443,13 @@ describe('CaptureSessionManager', () => {
 
       await manager.startCapture('DEV001');
 
-      const finalBroadcast = mockBroadcastToAll.mock.calls
-        .filter((c: any) => c[0].status === 'capturing')
-        .pop();
-      expect(finalBroadcast![0].subsystems.connectivity).toBe('warning');
+      // Connectivity is reported by the detached probe over WS after start.
+      await vi.waitFor(() => {
+        const finalBroadcast = mockBroadcastToAll.mock.calls
+          .filter((c: any) => c[0].status === 'capturing')
+          .pop();
+        expect(finalBroadcast![0].subsystems.connectivity).toBe('warning');
+      }, { timeout: 10000 });
     }, 10000);
 
     it('getSubsystems should return stored state for active capture', async () => {
