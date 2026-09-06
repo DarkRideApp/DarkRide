@@ -4,7 +4,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { ScopeBar } from './ScopeBar';
 import type { NetworkScope } from './NetworkScopeContext';
 
-function mockWs() {
+function mockWs(opts: { capturing?: boolean } = {}) {
   const sendRestApi = vi.fn().mockImplementation((_m: string, path: string) => {
     if (path.startsWith('/v1/device/list')) {
       return Promise.resolve({ body: { data: [{ id: 'dev-1', name: 'Pixel' }] } });
@@ -12,9 +12,12 @@ function mockWs() {
     if (path.startsWith('/v1/automation/sessions')) {
       return Promise.resolve({ body: { data: { sessions: [{ id: 5, name: 'checkout run', deviceId: 'dev-1' }] } } });
     }
+    if (path.startsWith('/v1/capture/status/')) {
+      return Promise.resolve({ body: { data: { capturing: opts.capturing ?? false, sessionId: opts.capturing ? 5 : null } } });
+    }
     return Promise.resolve({ body: {} });
   });
-  return { sendRestApi };
+  return { sendRestApi, subscribe: vi.fn().mockReturnValue(() => {}) };
 }
 
 describe('ScopeBar', () => {
@@ -48,5 +51,21 @@ describe('ScopeBar', () => {
         expect.stringContaining('/ui/network?scope=session:5'),
       ),
     );
+  });
+
+  it('shows active capture status and stops the selected session capture', async () => {
+    const ws = mockWs({ capturing: true });
+    render(<ScopeBar ws={ws as any} scope={{ kind: 'session', sessionId: 5 }} onScopeChange={() => {}} />);
+    expect(await screen.findByTestId('scope-capture-status')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('scope-stop-capture'));
+    await waitFor(() => {
+      expect(ws.sendRestApi).toHaveBeenCalledWith(
+        'POST',
+        '/v1/capture/stop',
+        { deviceId: 'dev-1' },
+      );
+    });
+    await waitFor(() => expect(screen.queryByTestId('scope-capture-status')).not.toBeInTheDocument());
   });
 });
