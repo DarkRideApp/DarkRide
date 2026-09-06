@@ -8390,6 +8390,7 @@ body.live-log-open .ai-chat-fab {
 .scope-kind-btn.active { background: color-mix(in srgb, var(--accent, #4a9eff) 16%, transparent); color: var(--accent, #4a9eff); }
 .scope-select { max-width: 260px; }
 .scope-session-controls { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.scope-capture-status { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--color-success, #22c55e); }
 .network-pane-tabs { display: flex; gap: 2px; }
 .network-pane-tab {
   display: inline-flex; align-items: center; gap: 6px;

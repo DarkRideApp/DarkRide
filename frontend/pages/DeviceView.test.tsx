@@ -80,6 +80,7 @@ function renderAtPath(ws: WebSocketContextValue, path: string) {
           <Routes>
             <Route path="/ui/devices/:id" element={<DeviceView />} />
             <Route path="/ui/devices/:id/:tab" element={<DeviceView />} />
+            <Route path="/ui/network" element={<div data-testid="mock-network-page" />} />
           </Routes>
         </MemoryRouter>
       </ToastProvider>
@@ -258,6 +259,64 @@ describe('DeviceView — Capture tab inline traffic view', () => {
     expect(await findByTestId('capture-live-traffic')).toBeTruthy();
     // MVP external-link button is gone
     expect(queryByTestId('capture-open-traffic-view')).toBeNull();
+  });
+
+  it('keeps active capture running when navigating to Network', async () => {
+    const ws = capturingWs();
+    const { findByTestId } = renderAtPath(ws, '/ui/devices/dev-1/capture');
+    expect(await findByTestId('open-in-network')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('open-in-network'));
+    expect(await findByTestId('mock-network-page')).toBeTruthy();
+
+    const stopCalls = (ws.sendRestApi as any).mock.calls.filter(
+      (c: any[]) => c[0] === 'POST' && c[1] === '/v1/capture/stop',
+    );
+    expect(stopCalls).toHaveLength(0);
+  });
+
+  it('issues only one stop request when Stop Capture is clicked repeatedly', async () => {
+    let resolveStop: () => void = () => {};
+    const stopPromise = new Promise<void>(resolve => { resolveStop = resolve; });
+    const ws = makeWs({
+      sendRestApi: vi.fn().mockImplementation((method: string, path: string) => {
+        if (method === 'GET' && path.startsWith('/v1/device/view/')) {
+          return Promise.resolve({
+            type: 'restapi', id: '1', status: 200,
+            body: { success: true, data: { id: 'dev-1', name: 'Test', platform: 'android', isRooted: true, lastSeen: Date.now() } },
+          });
+        }
+        if (method === 'GET' && path.startsWith('/v1/capture/status/')) {
+          return Promise.resolve({
+            type: 'restapi', id: '2', status: 200,
+            body: { success: true, data: { capturing: true, sessionId: 42 } },
+          });
+        }
+        if (method === 'GET' && path.startsWith('/v1/traffic/list')) {
+          return Promise.resolve({
+            type: 'restapi', id: '3', status: 200,
+            body: { success: true, data: { items: [], total: 0 } },
+          });
+        }
+        if (method === 'POST' && path === '/v1/capture/stop') return stopPromise;
+        return Promise.resolve({ type: 'restapi', id: '4', status: 200, body: { success: true, data: {} } });
+      }),
+    });
+
+    const { findByTestId } = renderAtPath(ws, '/ui/devices/dev-1/capture');
+    const stopButton = await findByTestId('btn-stop-capture');
+    fireEvent.click(stopButton);
+    fireEvent.click(stopButton);
+
+    await waitFor(() => {
+      const stopCalls = (ws.sendRestApi as any).mock.calls.filter(
+        (c: any[]) => c[0] === 'POST' && c[1] === '/v1/capture/stop',
+      );
+      expect(stopCalls).toHaveLength(1);
+    });
+
+    resolveStop();
+    expect(await findByTestId('btn-new-capture')).toBeTruthy();
   });
 
   it('keeps the traffic view visible after capture is stopped (new capture button appears)', async () => {

@@ -39,6 +39,7 @@ export function DeviceView() {
   const [streamError, setStreamError] = useState<string | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [captureSessionId, setCaptureSessionId] = useState<number | null>(null);
+  const stoppingCaptureRef = useRef(false);
   const [streamBackend, setStreamBackend] = useState<string | null>(null);
   const [captureSubsystems, setCaptureSubsystems] = useState<CaptureSubsystemStatus | null>(null);
   const [showSetupModal, setShowSetupModal] = useState(false);
@@ -234,16 +235,6 @@ export function DeviceView() {
     }).catch(() => {});
   }, [ws, deviceId]);
 
-  // Cleanup on unmount — stop capture if actively capturing
-  useEffect(() => {
-    return () => {
-      if (capturing && deviceId) {
-        // Fire-and-forget stop on unmount
-        ws.sendRestApi('POST', '/v1/capture/stop', { deviceId }).catch(() => {});
-      }
-    };
-  }, [capturing, deviceId, ws]);
-
   // Key forwarding — page-level, not canvas-related.
   useEffect(() => {
     if (!deviceId) return;
@@ -315,9 +306,12 @@ export function DeviceView() {
     }
   }, [deviceId, capturing, tlsProfile, proxyMode, proxyCountry, ws, toast]);
 
-  // Stop traffic capture
+  // Stop traffic capture.
+  // Keep the request idempotent while a stop is in flight so a quick double-click
+  // cannot issue duplicate backend stop operations.
   const handleStopCapture = useCallback(async () => {
-    if (!deviceId) return;
+    if (!deviceId || stoppingCaptureRef.current) return;
+    stoppingCaptureRef.current = true;
     try {
       await ws.sendRestApi('POST', '/v1/capture/stop', { deviceId });
       setCapturing(false);
@@ -325,6 +319,8 @@ export function DeviceView() {
       toast.success('Capture stopped');
     } catch (err: any) {
       toast.error(err?.message || 'Failed to stop capture');
+    } finally {
+      stoppingCaptureRef.current = false;
     }
   }, [deviceId, ws, toast]);
 
