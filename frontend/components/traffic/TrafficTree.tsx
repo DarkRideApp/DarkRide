@@ -8,6 +8,8 @@ interface TrafficTreeProps {
   ws: { sendRestApi: (method: string, path: string) => Promise<any> };
   /** Restrict the tree to one capture session (per-device inspector). */
   sessionId?: number | null;
+  /** Restrict the tree to one device. */
+  deviceId?: string | null;
   /** Currently-active host in the table, highlighted in the tree. */
   activeHost?: string | null;
   onSelectHost: (hostname: string) => void;
@@ -20,7 +22,7 @@ interface TrafficTreeProps {
  * aggregate, not just the current 50-row page); a host's paths load lazily on
  * first expand.
  */
-export function TrafficTree({ ws, sessionId, activeHost, onSelectHost, onSelectPath }: TrafficTreeProps) {
+export function TrafficTree({ ws, sessionId, deviceId, activeHost, onSelectHost, onSelectPath }: TrafficTreeProps) {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -33,24 +35,26 @@ export function TrafficTree({ ws, sessionId, activeHost, onSelectHost, onSelectP
     return q ? hosts.filter(h => h.hostname.toLowerCase().includes(q)) : hosts;
   }, [hosts, filter]);
 
-  const sessionQuery = sessionId != null ? `?sessionId=${sessionId}` : '';
-
+  const scopeQuery = sessionId != null ? `?sessionId=${sessionId}` : '';
+  if (sessionId != null) scopeParams.set('sessionId', String(sessionId));
+  if (deviceId) scopeParams.set('deviceId', deviceId);
+  const scopeQuery = scopeParams.size ? '?' + scopeParams.toString() : '';
   useEffect(() => {
     setLoading(true);
-    ws.sendRestApi('GET', `/v1/traffic/tree${sessionQuery}`)
+    ws.sendRestApi('GET', `/v1/traffic/tree${scopeQuery}`)
       .then(res => setHosts(res.body?.data?.hosts ?? []))
       .catch(() => setHosts([]))
       .finally(() => setLoading(false));
-  }, [ws, sessionQuery]);
+  }, [ws, scopeQuery]);
 
   const loadPaths = useCallback((hostname: string) => {
     setLoadingPaths(prev => new Set(prev).add(hostname));
-    const sep = sessionQuery ? '&' : '?';
-    ws.sendRestApi('GET', `/v1/traffic/tree${sessionQuery}${sep}hostname=${encodeURIComponent(hostname)}`)
+    const sep = scopeQuery ? '&' : '?';
+    ws.sendRestApi('GET', `/v1/traffic/tree${scopeQuery}${sep}hostname=${encodeURIComponent(hostname)}`)
       .then(res => setPathsByHost(prev => new Map(prev).set(hostname, res.body?.data?.paths ?? [])))
       .catch(() => setPathsByHost(prev => new Map(prev).set(hostname, [])))
       .finally(() => setLoadingPaths(prev => { const n = new Set(prev); n.delete(hostname); return n; }));
-  }, [ws, sessionQuery]);
+  }, [ws, scopeQuery]);
 
   const toggleExpand = useCallback((hostname: string) => {
     setExpanded(prev => {

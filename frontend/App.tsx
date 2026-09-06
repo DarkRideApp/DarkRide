@@ -32,6 +32,7 @@ import { ChangelogPage } from './pages/settings/ChangelogPage';
 import { LicensePage } from './pages/settings/LicensePage';
 import { Credentials } from './pages/Credentials';
 import { SessionHistory } from './pages/SessionHistory';
+import { ProxiedRequests } from './pages/ProxiedRequests';
 import { AppLibrary } from './pages/AppLibrary';
 import { AppDetail } from './pages/AppDetail';
 import { ApkAnalysis } from './pages/ApkAnalysis';
@@ -269,7 +270,7 @@ function AuthenticatedApp() {
                 Repeater / Catalogue. The old routes redirect into the matching
                 pane so existing links keep working. */}
             <Route path="network" element={<NetworkWorkspace />} />
-            <Route path="proxied-requests" element={<Navigate to="/ui/network?pane=repeater" replace />} />
+            <Route path="proxied-requests" element={<Navigate to="/ui/network?pane=outbound" replace />} />
             <Route path="request-builder" element={<Navigate to="/ui/network?pane=repeater" replace />} />
             <Route path="traffic" element={<Navigate to="/ui/network?pane=traffic" replace />} />
             <Route path="selector-debugger" element={<SelectorDebugger />} />

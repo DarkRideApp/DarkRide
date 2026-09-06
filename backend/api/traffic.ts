@@ -509,9 +509,12 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
     const hostname = req.query.hostname as string | undefined;
     const sessionIdRaw = req.query.sessionId as string | undefined;
     const sessionId = sessionIdRaw !== undefined ? parseInt(sessionIdRaw, 10) : undefined;
+    const deviceIdRaw = req.query.deviceId as string | undefined;
     const sessionCond = sessionId !== undefined && !isNaN(sessionId)
       ? eq(capturedTraffic.sessionId, sessionId)
       : undefined;
+    const deviceCond = deviceIdRaw ? eq(capturedTraffic.deviceId, deviceIdRaw) : undefined;
+    const scopeCond = sessionCond && deviceCond ? and(sessionCond, deviceCond) : sessionCond ?? deviceCond;
 
     if (hostname === undefined) {
       // Hosts mode. COALESCE null/'' hostnames into a single '(unknown)' bucket.
@@ -519,7 +522,7 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
       const rows = db
         .select({ hostname: bucket, count: sql<number>`COUNT(*)` })
         .from(capturedTraffic)
-        .where(sessionCond)
+        .where(scopeCond)
         .groupBy(bucket)
         .orderBy(desc(sql`COUNT(*)`))
         .all();
@@ -535,7 +538,7 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
     const rows = db
       .select({ id: capturedTraffic.id, requestUrl: capturedTraffic.requestUrl })
       .from(capturedTraffic)
-      .where(sessionCond ? and(hostCond, sessionCond) : hostCond)
+      .where(scopeCond ? and(hostCond, scopeCond) : hostCond)
       .orderBy(desc(capturedTraffic.capturedAt))
       .limit(PATH_ROW_CAP + 1)
       .all();

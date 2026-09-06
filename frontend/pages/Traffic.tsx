@@ -271,6 +271,8 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
     const unsubEntry = ws.subscribe('traffic-entry', (msg: any) => {
       const e = msg.entry;
       if (!e) return;
+      if (scopeDeviceId && e.deviceId !== scopeDeviceId) return;
+      if (scopeSessionId != null && e.sessionId !== scopeSessionId) return;
       const entry: CapturedTrafficEntry = {
         id: e.id,
         sessionId: e.sessionId,
@@ -330,7 +332,7 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
     });
 
     return () => { unsubEntry(); unsubFrame(); unsubClosed(); };
-  }, [ws, page, activeTab, sortBy, sortDir, serverSearch, serverHostname, serverPath]);
+  }, [ws, page, activeTab, sortBy, sortDir, serverSearch, serverHostname, serverPath, scopeDeviceId, scopeSessionId]);
 
   const handleFilterChange = useCallback((filters: TrafficFilters) => {
     // Derive server-side filters from the tri-state method picks. When exactly
@@ -579,6 +581,7 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
             <TrafficTree
               ws={ws}
               sessionId={scopeSessionId}
+              deviceId={scopeDeviceId}
               activeHost={serverHostname || null}
               onSelectHost={handleSelectHost}
               onSelectPath={handleSelectPath}
