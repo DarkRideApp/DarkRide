@@ -26,7 +26,7 @@ export function ScopeBar({ ws, scope, onScopeChange }: ScopeBarProps) {
       .then(res => setDevices(res.body?.data?.devices ?? res.body?.data ?? []))
       .catch(() => setDevices([]));
     ws.sendRestApi('GET', '/v1/automation/sessions?triggerType=capture&limit=100')
-      .then(res => setSessions(res.body?.data?.sessions ?? res.body?.data ?? []))
+      .then(res => setSessions(res.body?.data?.items ?? res.body?.data?.sessions ?? res.body?.data ?? []))
       .catch(() => setSessions([]));
   }, [ws]);
 

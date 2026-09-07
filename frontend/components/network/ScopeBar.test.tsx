@@ -10,7 +10,7 @@ function mockWs() {
       return Promise.resolve({ body: { data: [{ id: 'dev-1', name: 'Pixel' }] } });
     }
     if (path.startsWith('/v1/automation/sessions')) {
-      return Promise.resolve({ body: { data: { sessions: [{ id: 5, name: 'checkout run', deviceId: 'dev-1' }] } } });
+      return Promise.resolve({ body: { data: { items: [{ id: 5, name: 'checkout run', deviceId: 'dev-1' }] } } });
     }
     return Promise.resolve({ body: {} });
   });
@@ -48,5 +48,11 @@ describe('ScopeBar', () => {
         expect.stringContaining('/ui/network?scope=session:5'),
       ),
     );
+  });
+  it('selects a session from the production items response shape', async () => {
+    const onScopeChange = vi.fn();
+    render(<ScopeBar ws={mockWs() as any} scope={{ kind: 'all' }} onScopeChange={onScopeChange} />);
+    fireEvent.click(await screen.findByTestId("scope-kind-session'));
+    expect(onScopeChange).toHaveBeenCalledWith({ kind: "session", sessionId: 5 });
   });
 });
