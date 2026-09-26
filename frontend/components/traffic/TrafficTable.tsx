@@ -74,6 +74,7 @@ export interface TrafficTableProps {
    * The component still applies client-side filtering on top of what's passed in.
    */
   onFilterChange?: (filters: TrafficFilters) => void;
+  initialFilters?: TrafficFilters;
 
   /**
    * When provided, the consumer controls whether client-side filtering is applied.
@@ -146,6 +147,7 @@ export function TrafficTable({
   emptyMessage = 'No traffic captured',
   showFilterBar = true,
   onFilterChange,
+  initialFilters,
   clientSideFilter = true,
   onLoadFullBody,
   onReplay: onReplayProp,
@@ -211,7 +213,7 @@ export function TrafficTable({
   }, []);
 
   // Filter state — always owned internally; onFilterChange lets callers react to changes
-  const [filters, setFilters] = useState<TrafficFilters>(createDefaultFilters);
+  const [filters, setFilters] = useState<TrafficFilters>(() => initialFilters ?? createDefaultFilters());
 
   // Collapsible filter panel state
   const [filtersExpanded, setFiltersExpanded] = useState(false);
@@ -323,7 +325,7 @@ export function TrafficTable({
   }, []);
 
   // "Search all" — debounced so we don't push a server refetch on every keystroke
-  const [searchInput, setSearchInput] = useState('');
+  const [searchInput, setSearchInput] = useState(() => initialFilters?.search ?? '');
   const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleSearchInputChange = useCallback((value: string) => {

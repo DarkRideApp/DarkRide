@@ -9,6 +9,14 @@
 import { detectGraphQL } from '../../../shared/lib/graphql-detect';
 import { detectProtobuf } from '../../../shared/lib/protobuf-detect';
 import type { TrafficTimings } from '../../../shared/types/api';
+import {
+  classifyContent,
+  compileUrlFilter,
+  contentFilterMatches,
+  matchesMethodFilter,
+  responseSizeBytes,
+  sizeFilterMatches,
+} from '../../../shared/lib/traffic-classify';
 import type { TrafficEntry } from './TrafficEntryRow';
 
 // ---------------------------------------------------------------------------
@@ -31,17 +39,9 @@ export const METHOD_BADGE_COLORS: Record<string, { bg: string; color: string }> 
   DNS:     { bg: 'rgba(14,165,233,0.15)',  color: '#0ea5e9' },
 };
 
-// ---------------------------------------------------------------------------
-// Helpers for detecting entry types
-// ---------------------------------------------------------------------------
-
-function isGqlEntry(e: TrafficEntry): boolean {
-  return !!detectGraphQL(e.requestMethod, e.requestUrl, e.requestBody);
-}
-
-function isProtoEntry(e: TrafficEntry): boolean {
-  return !!detectProtobuf(e.requestHeaders, e.responseHeaders);
-}
+// Classification rules (method pills, content type, size, URL filter) live in
+// shared/lib/traffic-classify.ts, so the server's stored filter columns and
+// these client checks can't drift.
 
 // ---------------------------------------------------------------------------
 // Tri-state method filter definitions — shared by TrafficTable & TrafficInspector
@@ -55,17 +55,17 @@ export interface MethodFilterDef {
 }
 
 export const METHOD_FILTERS: MethodFilterDef[] = [
-  { key: 'GET',      label: 'GET',      color: '#3b82f6', match: (e) => e.requestMethod === 'GET' && !isGqlEntry(e) && !isProtoEntry(e) },
-  { key: 'POST',     label: 'POST',     color: '#22c55e', match: (e) => e.requestMethod === 'POST' && !isGqlEntry(e) && !isProtoEntry(e) },
-  { key: 'PUT',      label: 'PUT',      color: '#f97316', match: (e) => e.requestMethod === 'PUT' && !isProtoEntry(e) },
-  { key: 'DELETE',   label: 'DELETE',    color: '#ef4444', match: (e) => e.requestMethod === 'DELETE' && !isProtoEntry(e) },
-  { key: 'GQL',      label: 'GQL',      color: '#e535ab', match: isGqlEntry },
-  { key: 'PROTO',    label: 'PROTO',    color: '#06b6d4', match: isProtoEntry },
-  { key: 'CONNECT',  label: 'CONNECT',  color: '#9ca3af', match: (e) => e.requestMethod === 'CONNECT' && (e.responseStatus !== 0 || e.pending === true) },
-  { key: 'OPTIONS',  label: 'OPTIONS',  color: '#6b7280', match: (e) => e.requestMethod === 'OPTIONS' },
-  { key: 'WS',       label: 'WS',       color: '#805ad5', match: (e) => e.type === 'websocket' },
-  { key: 'DNS',      label: 'DNS',      color: '#0ea5e9', match: (e) => e.requestMethod === 'DNS' },
-  { key: 'TLS_FAIL', label: 'TLS Fail', color: '#ef4444', match: (e) => e.requestMethod === 'CONNECT' && e.responseStatus === 0 && e.pending !== true },
+  { key: 'GET',      label: 'GET',      color: '#3b82f6', match: (e) => matchesMethodFilter(e, 'GET') },
+  { key: 'POST',     label: 'POST',     color: '#22c55e', match: (e) => matchesMethodFilter(e, 'POST') },
+  { key: 'PUT',      label: 'PUT',      color: '#f97316', match: (e) => matchesMethodFilter(e, 'PUT') },
+  { key: 'DELETE',   label: 'DELETE',    color: '#ef4444', match: (e) => matchesMethodFilter(e, 'DELETE') },
+  { key: 'GQL',      label: 'GQL',      color: '#e535ab', match: (e) => matchesMethodFilter(e, 'GQL') },
+  { key: 'PROTO',    label: 'PROTO',    color: '#06b6d4', match: (e) => matchesMethodFilter(e, 'PROTO') },
+  { key: 'CONNECT',  label: 'CONNECT',  color: '#9ca3af', match: (e) => matchesMethodFilter(e, 'CONNECT') },
+  { key: 'OPTIONS',  label: 'OPTIONS',  color: '#6b7280', match: (e) => matchesMethodFilter(e, 'OPTIONS') },
+  { key: 'WS',       label: 'WS',       color: '#805ad5', match: (e) => matchesMethodFilter(e, 'WS') },
+  { key: 'DNS',      label: 'DNS',      color: '#0ea5e9', match: (e) => matchesMethodFilter(e, 'DNS') },
+  { key: 'TLS_FAIL', label: 'TLS Fail', color: '#ef4444', match: (e) => matchesMethodFilter(e, 'TLS_FAIL') },
 ];
 
 /** Method filter keys that default to excluded (hidden from ALL view) */
@@ -89,22 +89,7 @@ export function getMethodLabel(entry: Pick<TrafficEntry, 'requestMethod' | 'requ
 // ---------------------------------------------------------------------------
 
 export function getContentType(entry: Pick<TrafficEntry, 'type' | 'requestMethod' | 'requestUrl' | 'requestBody' | 'responseHeaders'>): string {
-  if (entry.type === 'websocket') return 'websocket';
-  const gql = detectGraphQL(entry.requestMethod, entry.requestUrl, entry.requestBody);
-  if (gql) return 'graphql';
-  if (!entry.responseHeaders) return 'fetch/xhr';
-  try {
-    const headers = JSON.parse(entry.responseHeaders);
-    const ct: string = headers['content-type'] || headers['Content-Type'] || '';
-    if (ct.includes('javascript')) return 'script';
-    if (ct.includes('css')) return 'stylesheet';
-    if (ct.includes('html')) return 'document';
-    if (ct.includes('image/')) return 'image';
-    if (ct.includes('font')) return 'font';
-    if (ct.includes('json')) return 'json';
-    if (ct.includes('xml')) return 'xml';
-  } catch {}
-  return 'fetch/xhr';
+  return classifyContent(entry);
 }
 
 // ---------------------------------------------------------------------------
@@ -122,21 +107,7 @@ export function getResponseSize(responseBody: string | null | undefined): string
  * in getResponseSize but returns a number instead of a formatted string.
  */
 export function getResponseSizeBytes(responseBody: string | null | undefined): number {
-  if (!responseBody) return 0;
-
-  // Binary content is replaced by mitmproxy with "[binary image/jpeg, 12345 chars]"
-  const binaryMatch = responseBody.match(/^\[binary .+?, (\d+) chars\]$/);
-  if (binaryMatch) {
-    return parseInt(binaryMatch[1], 10);
-  }
-
-  // Truncated text ends with "…[truncated, 12345 total]"
-  const truncMatch = responseBody.match(/\[truncated, (\d+) total\]$/);
-  if (truncMatch) {
-    return parseInt(truncMatch[1], 10);
-  }
-
-  return new Blob([responseBody]).size;
+  return responseSizeBytes(responseBody);
 }
 
 function formatBytes(bytes: number): string {
@@ -251,17 +222,15 @@ export interface ContentTypeFilterDef {
   match: (contentType: string) => boolean;
 }
 
-const CATEGORISED_CONTENT_TYPES = new Set(['json', 'document', 'script', 'stylesheet', 'image', 'font', 'xml']);
-
 export const CONTENT_TYPE_FILTERS: ContentTypeFilterDef[] = [
-  { key: 'json',  label: 'JSON', match: ct => ct === 'json' },
-  { key: 'html',  label: 'HTML', match: ct => ct === 'document' },
-  { key: 'js',    label: 'JS',   match: ct => ct === 'script' },
-  { key: 'css',   label: 'CSS',  match: ct => ct === 'stylesheet' },
-  { key: 'image', label: 'Image', match: ct => ct === 'image' },
-  { key: 'font',  label: 'Font', match: ct => ct === 'font' },
-  { key: 'xml',   label: 'XML',  match: ct => ct === 'xml' },
-  { key: 'other', label: 'Other', match: ct => !CATEGORISED_CONTENT_TYPES.has(ct) },
+  { key: 'json',  label: 'JSON', match: ct => contentFilterMatches('json', ct) },
+  { key: 'html',  label: 'HTML', match: ct => contentFilterMatches('html', ct) },
+  { key: 'js',    label: 'JS',   match: ct => contentFilterMatches('js', ct) },
+  { key: 'css',   label: 'CSS',  match: ct => contentFilterMatches('css', ct) },
+  { key: 'image', label: 'Image', match: ct => contentFilterMatches('image', ct) },
+  { key: 'font',  label: 'Font', match: ct => contentFilterMatches('font', ct) },
+  { key: 'xml',   label: 'XML',  match: ct => contentFilterMatches('xml', ct) },
+  { key: 'other', label: 'Other', match: ct => contentFilterMatches('other', ct) },
 ];
 
 export interface TrafficFilters {
@@ -343,24 +312,14 @@ export function applyClientFilters(entries: TrafficEntry[], filters: TrafficFilt
 
   // Response-size quick filter
   if (filters.size) {
-    result = result.filter(e => {
-      const bytes = getResponseSizeBytes(e.responseBody);
-      if (filters.size === 'gt100kb') return bytes > 100 * 1024;
-      if (filters.size === 'hasBody') return bytes > 0;
-      if (filters.size === 'empty') return bytes === 0;
-      return true;
-    });
+    const size = filters.size;
+    result = result.filter(e => sizeFilterMatches(size, getResponseSizeBytes(e.responseBody)));
   }
 
   // Text / regex filter on URL — the fast "Host / URL" filter
   if (filters.text) {
-    try {
-      const re = new RegExp(filters.text, 'i');
-      result = result.filter(e => re.test(e.requestUrl));
-    } catch {
-      const lower = filters.text.toLowerCase();
-      result = result.filter(e => e.requestUrl.toLowerCase().includes(lower));
-    }
+    const matchesUrl = compileUrlFilter(filters.text);
+    result = result.filter(e => matchesUrl(e.requestUrl));
   }
 
   // "Search all" — client-side fallback for consumers that don't push
@@ -381,34 +340,30 @@ export function applyClientFilters(entries: TrafficEntry[], filters: TrafficFilt
 }
 
 /**
- * Derives the `status` query param (a century string like '400') to send to
- * GET /v1/traffic/list from the current filters. The server only supports a
- * single century band per request (see backend/api/traffic.ts), so:
- *  - one or more exact status codes that all share a century: use it
- *  - exact codes spanning multiple centuries: no server-side narrowing
- *    (client-side filtering still applies to whatever page comes back)
- *  - otherwise, a single selected status-group pill maps directly
- *  - zero or 2+ status groups selected: no server-side narrowing
+ * The GET /v1/traffic/list params for a filter state. The server applies
+ * every deep filter in SQL (backend/api/traffic-filters.ts) with the same
+ * shared classifier the client uses, so pages and totals are exact.
  */
-export function deriveServerStatusCentury(filters: Pick<TrafficFilters, 'status' | 'exactStatuses'>): string {
-  const centuryOf = (code: number) => `${Math.floor(code / 100)}00`;
+export function trafficFiltersToListParams(filters: TrafficFilters): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  const byState = (state: MethodFilterState) =>
+    Array.from(filters.methodFilters.entries()).filter(([, v]) => v === state).map(([k]) => k);
+  const includes = byState('include');
+  const excludes = byState('exclude');
+  if (includes.length) out.push(['methodInclude', includes.join(',')]);
+  if (excludes.length) out.push(['methodExclude', excludes.join(',')]);
+  if (filters.exactStatuses.size > 0) out.push(['statusCodes', Array.from(filters.exactStatuses).join(',')]);
+  else if (filters.status.size > 0) out.push(['statusGroups', Array.from(filters.status).join(',')]);
+  if (filters.contentTypes.size > 0) out.push(['contentTypes', Array.from(filters.contentTypes).join(',')]);
+  if (filters.size) out.push(['size', filters.size]);
+  if (filters.text) out.push(['urlFilter', filters.text]);
+  if (filters.search) out.push(['search', filters.search]);
+  return out;
+}
 
-  if (filters.exactStatuses.size > 0) {
-    const codes = Array.from(filters.exactStatuses)
-      .map(c => parseInt(c, 10))
-      .filter(n => !isNaN(n));
-    if (codes.length === 0) return '';
-    const century = centuryOf(codes[0]);
-    return codes.every(c => centuryOf(c) === century) ? century : '';
-  }
-
-  if (filters.status.size === 1) {
-    const group = Array.from(filters.status)[0];
-    const map: Record<StatusGroupFilter, string> = { '2xx': '200', '3xx': '300', '4xx': '400', '5xx': '500' };
-    return map[group];
-  }
-
-  return '';
+/** True when nothing differs from createDefaultFilters(), so the URL can drop ?filters=. */
+export function isDefaultTrafficFilters(filters: TrafficFilters): boolean {
+  return serializeTrafficFilters(filters) === serializeTrafficFilters(createDefaultFilters());
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +380,19 @@ export interface SerializedTrafficFilters {
   search: string;
   contentTypes: string[];
   size: SizeFilter;
+}
+
+export function serializeTrafficFilters(filters: TrafficFilters): string {
+  return JSON.stringify({ methodFilters: Array.from(filters.methodFilters.entries()), status: Array.from(filters.status), exactStatuses: Array.from(filters.exactStatuses), text: filters.text, search: filters.search, contentTypes: Array.from(filters.contentTypes), size: filters.size });
+}
+
+export function deserializeTrafficFilters(raw: string | null): TrafficFilters | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<SerializedTrafficFilters>;
+    if (!Array.isArray(parsed.methodFilters) || !Array.isArray(parsed.status) || !Array.isArray(parsed.exactStatuses) || !Array.isArray(parsed.contentTypes)) return null;
+    return { methodFilters: new Map(parsed.methodFilters as [string, MethodFilterState][]), status: new Set(parsed.status as StatusGroupFilter[]), exactStatuses: new Set(parsed.exactStatuses as string[]), text: typeof parsed.text === 'string' ? parsed.text : '', search: typeof parsed.search === 'string' ? parsed.search : '', contentTypes: new Set(parsed.contentTypes as string[]), size: parsed.size === 'gt100kb' || parsed.size === 'hasBody' || parsed.size === 'empty' ? parsed.size : '' };
+  } catch { return null; }
 }
 
 export interface FilterPreset {

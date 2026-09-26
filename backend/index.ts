@@ -5,6 +5,7 @@ import { initDatabase } from './db/index';
 import { pruneOldData, cleanStaleSessions } from './db/prune';
 import { setupWebSocket, getWebSocketServer, setStartupPhase, broadcastToAll } from './websocket/index';
 import { createLoggers } from './logs';
+import { backfillTrafficFilterColumns } from './services/traffic-filter-backfill';
 import { DeviceManager } from './services/device-manager';
 import { ProxyRotator } from './services/proxy-rotator';
 import { PythonBridgeManager, ensureVenvAsync } from './services/python-bridge';
@@ -240,6 +241,27 @@ const pluginVerifier = new PluginVerifier(db);
     }
     log(`Hostname backfill complete (${filled} rows processed).`);
   }
+}
+
+// Classify pre-0099 traffic rows for the deep filters (content type, size,
+// GQL/PROTO). Runs in the background in yielding batches; unclassified rows
+// just don't match those filters until reached. Logs at most every 10%.
+{
+  let nextPct = 10;
+  const started = Date.now();
+  backfillTrafficFilterColumns(db, {
+    onProgress: ({ processed, total }) => {
+      const pct = Math.floor((processed / total) * 100);
+      if (pct < nextPct && processed < total) return;
+      nextPct = pct + 10;
+      const secs = (Date.now() - started) / 1000;
+      const rate = processed / Math.max(secs, 0.001);
+      const eta = Math.round((total - processed) / Math.max(rate, 1));
+      log(`Traffic filter backfill: ${pct}% (${processed}/${total} rows, ${Math.round(rate)} rows/s, ~${eta}s left)`);
+    },
+  })
+    .then(n => { if (n > 0) log(`Traffic filter backfill complete (${n} rows classified).`); })
+    .catch(err => error(`Traffic filter backfill failed: ${err instanceof Error ? err.message : String(err)}`));
 }
 
 // One-time backfill for failed diffs whose sides are now restorable

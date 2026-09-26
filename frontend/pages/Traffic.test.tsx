@@ -96,30 +96,42 @@ describe('Traffic page — server filter wiring', () => {
     }, { timeout: 2000 });
   });
 
-  it('derives a single-group status century and sends it to the server', async () => {
+  it('sends multi-group status pills to the server as statusGroups', async () => {
     const ws = renderPage();
     await waitFor(() => screen.getByRole('button', { name: /filters/i }));
     fireEvent.click(screen.getByRole('button', { name: /filters/i }));
     fireEvent.click(screen.getByText('4xx'));
+    fireEvent.click(screen.getByText('5xx'));
 
     await waitFor(() => {
-      const params = lastListUrl(ws);
-      expect(params.get('status')).toBe('400');
+      expect(lastListUrl(ws).get('statusGroups')).toBe('4xx,5xx');
     });
   });
 
-  it('still derives the correct method+type server params for a single included method (POST fix)', async () => {
+  it('sends method includes (including GQL) and the default excludes to the server', async () => {
+    const ws = renderPage();
+    await waitFor(() => screen.getByRole('button', { name: /filters/i }));
+    // The very first fetch already carries the default excludes.
+    expect(lastListUrl(ws).get('methodExclude')).toBe('DNS,CONNECT,TLS_FAIL');
+    fireEvent.click(screen.getByRole('button', { name: /filters/i }));
+    fireEvent.click(screen.getByTestId('filter-method-GQL').querySelector('.traffic-method-filter-btn') as HTMLElement);
+
+    await waitFor(() => {
+      expect(lastListUrl(ws).get('methodInclude')).toBe('GQL');
+    });
+  });
+
+  it('sends content-type and size filters to the server', async () => {
     const ws = renderPage();
     await waitFor(() => screen.getByRole('button', { name: /filters/i }));
     fireEvent.click(screen.getByRole('button', { name: /filters/i }));
-
-    const postFilter = screen.getByTestId('filter-method-POST');
-    fireEvent.click(postFilter.querySelector('.traffic-method-filter-btn') as HTMLElement);
+    fireEvent.click(screen.getByTestId('filter-contenttype-json'));
+    fireEvent.click(screen.getByTestId('filter-size-gt100kb'));
 
     await waitFor(() => {
-      const params = lastListUrl(ws);
-      expect(params.get('type')).toBe('http');
-      expect(params.get('method')).toBe('POST');
+      const p = lastListUrl(ws);
+      expect(p.get('contentTypes')).toBe('json');
+      expect(p.get('size')).toBe('gt100kb');
     });
   });
 
@@ -327,3 +339,92 @@ describe('Traffic page — Live/Saved toggle inside the Network workspace', () =
     expect(params().get('pane')).toBe('traffic');
   });
 });
+
+// Finding 7: the ?filters= param must capture every non-default filter,
+// including status-group pills and method excludes, and restore it on load.
+describe('Traffic page — filters in the URL', () => {
+  function LocationProbe() {
+    return <div data-testid="loc">{useLocation().search}</div>;
+  }
+  const urlFilters = () => new URLSearchParams(screen.getByTestId('loc').textContent!).get('filters');
+
+  function renderAt(path: string, ws = createMockWs()) {
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <MemoryRouter initialEntries={[path]}>
+          <Traffic />
+          <LocationProbe />
+        </MemoryRouter>
+      </WebSocketContext.Provider>,
+    );
+    return ws;
+  }
+
+  it('persists a status-group pill on its own', async () => {
+    renderAt('/ui/network?pane=traffic');
+    await waitFor(() => screen.getByRole('button', { name: /filters/i }));
+    fireEvent.click(screen.getByRole('button', { name: /filters/i }));
+    fireEvent.click(screen.getByText('4xx'));
+    await waitFor(() => expect(urlFilters()).not.toBeNull());
+    expect(JSON.parse(urlFilters()!).status).toEqual(['4xx']);
+    // Other workspace params survive.
+    expect(new URLSearchParams(screen.getByTestId('loc').textContent!).get('pane')).toBe('traffic');
+  });
+
+  it('persists a change to the method excludes', async () => {
+    renderAt('/ui/network');
+    await waitFor(() => screen.getByRole('button', { name: /filters/i }));
+    fireEvent.click(screen.getByRole('button', { name: /filters/i }));
+    // Cycle DNS off its default "exclude" state.
+    fireEvent.click(screen.getByTestId('filter-method-DNS').querySelector('.traffic-method-filter-btn') as HTMLElement);
+    await waitFor(() => expect(urlFilters()).not.toBeNull());
+  });
+
+  it('drops the param when filters return to the default', async () => {
+    renderAt('/ui/network');
+    await waitFor(() => screen.getByRole('button', { name: /filters/i }));
+    fireEvent.click(screen.getByRole('button', { name: /filters/i }));
+    fireEvent.click(screen.getByText('4xx'));
+    await waitFor(() => expect(urlFilters()).not.toBeNull());
+    fireEvent.click(screen.getByText('4xx'));
+    await waitFor(() => expect(urlFilters()).toBeNull());
+  });
+
+  it('restores filters from the URL and sends them on the first fetch', async () => {
+    const saved = JSON.stringify({ methodFilters: [['DNS', 'exclude']], status: ['5xx'], exactStatuses: [], text: '', search: '', contentTypes: ['image'], size: 'gt100kb' });
+    const ws = renderAt(`/ui/network?filters=${encodeURIComponent(saved)}`);
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalled());
+    const first = ws.sendRestApi.mock.calls.find(([, p]: [string, string]) => p.startsWith('/v1/traffic/list'))!;
+    const params = new URLSearchParams(first[1].split('?')[1]);
+    expect(params.get('statusGroups')).toBe('5xx');
+    expect(params.get('contentTypes')).toBe('image');
+    expect(params.get('size')).toBe('gt100kb');
+    expect(params.get('methodExclude')).toBe('DNS');
+  });
+});
+
+// Live rows are prepended only when they match the active filters, so the
+// page and its total stay consistent with what the server would return.
+describe('Traffic page — live rows respect filters', () => {
+  it('does not prepend or count a live entry the filters exclude', async () => {
+    // 50 total = exactly one page, so any miscount flips "Page 1 of 2".
+    const ws = createMockWs(mockEntries, 50);
+    const saved = JSON.stringify({ methodFilters: [], status: ['4xx'], exactStatuses: [], text: '', search: '', contentTypes: [], size: '' });
+    render(
+      <WebSocketContext.Provider value={ws}>
+        <MemoryRouter initialEntries={[`/ui/network?filters=${encodeURIComponent(saved)}`]}>
+          <Traffic />
+        </MemoryRouter>
+      </WebSocketContext.Provider>,
+    );
+    await waitFor(() => screen.getByTestId('traffic-row-2'));
+    expect(screen.getByText('Page 1 of 1')).toBeInTheDocument();
+    act(() => ws.pushTrafficEntry({ id: 99, requestMethod: 'GET', requestUrl: 'https://api.example.com/ok', responseStatus: 200, ...baseEntry }));
+    expect(screen.queryByTestId('traffic-row-99')).not.toBeInTheDocument();
+    expect(screen.getByText('Page 1 of 1')).toBeInTheDocument();
+    act(() => ws.pushTrafficEntry({ id: 100, requestMethod: 'GET', requestUrl: 'https://api.example.com/missing', responseStatus: 404, ...baseEntry }));
+    expect(await screen.findByTestId('traffic-row-100')).toBeInTheDocument();
+    expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
+  });
+});
+

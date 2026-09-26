@@ -46,6 +46,25 @@ All endpoints are available via HTTP REST and via WebSocket (using the `restapi`
 | POST | /v1/traffic/ws-end | Close WebSocket connection |
 | GET | /v1/traffic/ws-messages/:trafficId | List WebSocket frames for a connection |
 
+`GET /v1/traffic/list` query parameters. All filters run in SQL and combine with AND; `total` counts every matching row.
+
+| Param | Meaning |
+|-------|---------|
+| `limit`, `offset` | Page size (default 50) and offset |
+| `deviceId`, `sessionId` | Scope to one device or capture session |
+| `sortBy`, `sortDir` | `capturedAt` (default), `requestMethod`, `requestUrl`, `responseStatus`, `durationMs`, `bodySize`; `asc` / `desc` |
+| `search` | Substring over URL, bodies and headers |
+| `hostname`, `path` | Host substring or regex; path regex (tree navigator) |
+| `methodInclude`, `methodExclude` | Comma list of `GET POST PUT DELETE GQL PROTO CONNECT OPTIONS WS DNS TLS_FAIL`. GET/POST exclude GraphQL and protobuf; `TLS_FAIL` is a CONNECT with status 0 |
+| `statusCodes` | Comma list of exact codes. Takes priority over `statusGroups` |
+| `statusGroups` | Comma list of `1xx`..`5xx` |
+| `contentTypes` | Comma list of `json html js css image font xml other`. `other` is everything else, including GraphQL and WebSocket |
+| `size` | `gt100kb`, `hasBody` or `empty`, measured on the original response size (binary and truncated bodies report their real size) |
+| `urlFilter` | Case-insensitive RE2 regex on the URL; a pattern that doesn't compile matches as a substring |
+| `method`, `status`, `type` | Legacy single-value filters (one method, one status century, `http`/`websocket`) |
+
+Classification comes from `shared/lib/traffic-classify.ts`, the same code the Traffic table uses, and is stored per row at capture time. Unknown values in the comma lists are ignored.
+
 ### Saved Traffic
 
 | Method | Path | Description |
@@ -60,7 +79,7 @@ All endpoints are available via HTTP REST and via WebSocket (using the `restapi`
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | /v1/capture/start | Start traffic capture for a device |
-| POST | /v1/capture/stop | Stop traffic capture |
+| POST | /v1/capture/stop | Stop traffic capture. Optional `sessionId`: returns 409 without stopping if that isn't the device's live session |
 | GET | /v1/capture/status/:deviceId | Get capture status |
 
 ## Automations

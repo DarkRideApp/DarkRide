@@ -187,6 +187,12 @@ export const capturedTraffic = sqliteTable('captured_traffic', {
   durationMs: integer('duration_ms'),
   // Timing breakdown JSON: {dns,connect,tls,ttfb,download} in ms (each nullable).
   timings: text('timings'),
+  // Deep-filter classification from shared/lib/traffic-classify.ts, written
+  // at insert. NULL only for pre-0099 rows the startup backfill hasn't reached.
+  responseCategory: text('response_category'),
+  responseSizeBytes: integer('response_size_bytes'),
+  isGraphql: integer('is_graphql', { mode: 'boolean' }),
+  isProtobuf: integer('is_protobuf', { mode: 'boolean' }),
 });
 
 export const websocketMessages = sqliteTable('websocket_messages', {

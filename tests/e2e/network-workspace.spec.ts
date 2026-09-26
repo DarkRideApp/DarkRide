@@ -78,4 +78,23 @@ test.describe('Network workspace', () => {
     await expect(page.getByTestId('scope-device-select')).toBeVisible();
     await expect(page).toHaveURL(/scope=device/);
   });
+
+  test('traffic filters survive a reload via ?filters=', async ({ page }) => {
+    test.setTimeout(90_000);
+    await loginAsAdmin(page);
+    await page.goto('/ui/network?pane=traffic');
+    await page.waitForLoadState('networkidle');
+    await expect(page.getByTestId('traffic-page')).toBeVisible({ timeout: 15_000 });
+
+    await page.getByRole('button', { name: /filters/i }).click();
+    await page.locator('.traffic-status-pill.status-4xx').click();
+    await expect(page).toHaveURL(/filters=/);
+    await expect(page).toHaveURL(/pane=traffic/);
+
+    await page.reload();
+    await page.waitForLoadState('networkidle');
+    await page.getByRole('button', { name: /filters/i }).click();
+    await expect(page.locator('.traffic-status-pill.status-4xx')).toHaveClass(/active/);
+  });
 });
+
