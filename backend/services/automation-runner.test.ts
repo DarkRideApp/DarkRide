@@ -669,6 +669,158 @@ describe('AutomationRunner', () => {
       // No error thrown — just silently skips capture
     });
 
+    // Captures started by the script itself via device.setProxy() (issue #69).
+    // requiresHttpsCapture is false in all of these, so the only capture on
+    // the device is the one the script's proxyHandler started.
+    describe('script-started capture (device.setProxy)', () => {
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+      function setup() {
+        const mockMitm = createMockMitmproxyManager();
+        const mockDm = createMockDeviceManager();
+        const captureRunner = new AutomationRunner(db, bridgeManager, compiler, mockMitm as any, mockDm as any);
+        return { mockMitm, mockDm, captureRunner };
+      }
+
+      it('stops the capture when the script throws after setProxy', async () => {
+        const { mockMitm, mockDm, captureRunner } = setup();
+        const auto = createAutomation(`
+          export default async function(d: any) {
+            await d.setProxy('normal');
+            throw new Error('script failed mid-capture');
+          }
+        `);
+
+        const result = await captureRunner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(mockMitm.startCapture).toHaveBeenCalledTimes(1);
+        expect(mockMitm.stopCapture).toHaveBeenCalledWith('test-device');
+        expect(mockMitm.isCapturing('test-device')).toBe(false);
+        expect(mockDm.markIdle).toHaveBeenCalledWith('test-device');
+      });
+
+      it('deactivates the tunnel before stopping a script-started capture', async () => {
+        const { mockMitm, mockDm, captureRunner } = setup();
+        const auto = createAutomation(`
+          export default async function(d: any) {
+            await d.setProxy('normal');
+            throw new Error('boom');
+          }
+        `);
+
+        await captureRunner.runAutomation(auto.id, 'test-device', 'manual');
+
+        const deactivateOrders = mockDm.deactivateWireGuardTunnel.mock.invocationCallOrder;
+        const stopOrder = mockMitm.stopCapture.mock.invocationCallOrder[0];
+        expect(stopOrder).toBeDefined();
+        expect(Math.min(...deactivateOrders)).toBeLessThan(stopOrder);
+      });
+
+      it('stops the capture when the script times out after setProxy', async () => {
+        const { mockMitm, captureRunner } = setup();
+        const auto = createAutomation(`
+          export default async function(d: any) {
+            await d.setProxy('normal');
+            await new Promise(r => setTimeout(r, 60000));
+          }
+        `, { timeoutMs: 200 });
+
+        const result = await captureRunner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(mockMitm.stopCapture).toHaveBeenCalledWith('test-device');
+        expect(mockMitm.isCapturing('test-device')).toBe(false);
+      });
+
+      it('stops the capture when the run is cancelled after setProxy', async () => {
+        const { mockMitm, captureRunner } = setup();
+        const auto = createAutomation(`
+          export default async function(d: any) {
+            await d.setProxy('normal');
+            await new Promise(r => setTimeout(r, 60000));
+          }
+        `);
+
+        const runPromise = captureRunner.runAutomation(auto.id, 'test-device', 'manual');
+        await vi.waitFor(() => expect(mockMitm.isCapturing('test-device')).toBe(true));
+        const [sessionId] = captureRunner.getActiveRunSessionIds();
+        expect(captureRunner.cancelRun(sessionId)).toBe(true);
+        const result = await runPromise;
+
+        expect(result.success).toBe(false);
+        const session = db.select().from(schema.automationSessions)
+          .where(eq(schema.automationSessions.id, result.sessionId)).all()[0];
+        expect(session.status).toBe('cancelled');
+        expect(mockMitm.stopCapture).toHaveBeenCalledWith('test-device');
+        expect(mockMitm.isCapturing('test-device')).toBe(false);
+      });
+
+      it('does not stop again when the script already called setProxy("none")', async () => {
+        const { mockMitm, captureRunner } = setup();
+        const auto = createAutomation(`
+          export default async function(d: any) {
+            await d.setProxy('normal');
+            await d.setProxy('none');
+          }
+        `);
+
+        const result = await captureRunner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(true);
+        expect(mockMitm.stopCapture).toHaveBeenCalledTimes(1);
+      });
+
+      it('kills a timed-out script so it cannot start a capture after cleanup', async () => {
+        const { mockMitm, captureRunner } = setup();
+        const auto = createAutomation(`
+          export default async function(d: any) {
+            await new Promise(r => setTimeout(r, 400));
+            await d.setProxy('normal');
+          }
+        `, { timeoutMs: 100 });
+
+        const result = await captureRunner.runAutomation(auto.id, 'test-device', 'manual');
+        expect(result.success).toBe(false);
+        const session = db.select().from(schema.automationSessions)
+          .where(eq(schema.automationSessions.id, result.sessionId)).all()[0];
+        expect(session.status).toBe('failed');
+        expect(session.logs).toContain('timed out');
+
+        // Give a surviving isolate time to wake up and call setProxy.
+        await sleep(600);
+        expect(mockMitm.startCapture).not.toHaveBeenCalled();
+        expect(mockMitm.isCapturing('test-device')).toBe(false);
+      });
+
+      it('tears down a capture whose startup was still in flight when the run ended', async () => {
+        const { mockMitm, mockDm, captureRunner } = setup();
+        // startCapture takes longer than the automation timeout, so the
+        // runner's cleanup runs before mitmproxy reports it is capturing.
+        let capturing = false;
+        mockMitm.isCapturing.mockImplementation(() => capturing);
+        mockMitm.stopCapture.mockImplementation(async () => { capturing = false; });
+        mockMitm.startCapture.mockImplementation(async () => {
+          await sleep(400);
+          capturing = true;
+          return mockTunnelInfo;
+        });
+        const auto = createAutomation(`
+          export default async function(d: any) {
+            await d.setProxy('normal');
+          }
+        `, { timeoutMs: 100 });
+
+        const result = await captureRunner.runAutomation(auto.id, 'test-device', 'manual');
+        expect(result.success).toBe(false);
+
+        await vi.waitFor(() => expect(mockMitm.startCapture).toHaveBeenCalled());
+        await sleep(600);
+        expect(mockMitm.isCapturing('test-device')).toBe(false);
+        expect(mockDm.activateWireGuardTunnel).not.toHaveBeenCalled();
+      });
+    });
+
     it('passes interceptHooks=true in mitmproxy options', async () => {
       const mockMitm = createMockMitmproxyManager();
       const captureRunner = new AutomationRunner(db, bridgeManager, compiler, mockMitm as any);
