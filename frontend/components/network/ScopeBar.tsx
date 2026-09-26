@@ -7,7 +7,7 @@ interface Device { id: string; name?: string | null }
 interface Session { id: number; name?: string | null; deviceId?: string | null }
 interface ScopeBarProps {
   ws: {
-    sendRestApi: (method: string, path: string) => Promise<any>;
+    sendRestApi: (method: string, path: string, body?: unknown) => Promise<any>;
     subscribe?: (type: string, callback: (message: any) => void) => () => void;
   };
   scope: NetworkScope;
@@ -71,12 +71,23 @@ export function ScopeBar({ ws, scope, onScopeChange }: ScopeBarProps) {
     });
   }, [ws, targetDeviceId]);
 
+  // In session scope the control belongs to the viewed session only: the
+  // device may be live-capturing a different session, and Stop must not
+  // reach it. Device scope shows whatever session is live on the device.
+  const captureActive = captureStatus.capturing && !!targetDeviceId
+    && (scope.kind !== 'session' || captureStatus.sessionId === scope.sessionId);
+
   const stopCapture = useCallback(async () => {
     if (!targetDeviceId || stoppingCaptureRef.current) return;
     stoppingCaptureRef.current = true;
     setStoppingCapture(true);
     try {
-      await ws.sendRestApi('POST', '/v1/capture/stop', { deviceId: targetDeviceId });
+      // Pin the stop to the session the user saw. The server refuses (409) if
+      // the device has since moved on to another session.
+      await ws.sendRestApi('POST', '/v1/capture/stop', {
+        deviceId: targetDeviceId,
+        ...(captureStatus.sessionId != null ? { sessionId: captureStatus.sessionId } : {}),
+      });
       setCaptureStatus(prev => ({ ...prev, capturing: false }));
     } catch {
       // Keep the active state visible when the explicit stop request fails.
@@ -84,7 +95,7 @@ export function ScopeBar({ ws, scope, onScopeChange }: ScopeBarProps) {
       setStoppingCapture(false);
       stoppingCaptureRef.current = false;
     }
-  }, [ws, targetDeviceId]);
+  }, [ws, targetDeviceId, captureStatus.sessionId]);
 
   useEffect(() => {
     ws.sendRestApi('GET', '/v1/device/list')
@@ -178,7 +189,7 @@ export function ScopeBar({ ws, scope, onScopeChange }: ScopeBarProps) {
           </button>
         </div>
       )}
-      {captureStatus.capturing && targetDeviceId && (
+      {captureActive && (
         <div className="scope-capture-status" data-testid="scope-capture-status">
           <span>Capture active</span>
           {canManageTraffic && (
