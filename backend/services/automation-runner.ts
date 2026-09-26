@@ -422,17 +422,23 @@ export class AutomationRunner implements IAutomationRunner {
       // wired before execute() runs.
 
       let timeoutHandle: ReturnType<typeof setTimeout>;
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutHandle = setTimeout(
-          () => reject(new Error(`Automation timed out after ${timeoutMs}ms`)),
-          timeoutMs,
-        );
-      });
       // Per-run AbortController — lets cancelRun(sessionId) kill the
       // V8 isolate mid-flight. Stored on the runner so the API endpoint
       // and AI tool can reach it.
       const abortController = new AbortController();
       this.activeRuns.set(sessionId, abortController);
+      // On timeout, reject first so the run fails with the timeout message
+      // rather than as a cancel, then kill the isolate. Without the abort a
+      // timed-out script keeps running after cleanup has released the device.
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => {
+            reject(new Error(`Automation timed out after ${timeoutMs}ms`));
+            abortController.abort();
+          },
+          timeoutMs,
+        );
+      });
       try {
         await Promise.race([
           this.compiler.execute(compiled.code, apiForExecution, {
@@ -523,21 +529,25 @@ export class AutomationRunner implements IAutomationRunner {
         try { await deviceAPI.setATXFree(false); }
         catch (err: any) { error(`Failed to disable ATX-free mode: ${err.message}`); }
       }
-      if (deviceId && tunnelActivated && this.deviceManager) {
+      // Lock the script's proxy handlers first so a setProxy still in flight
+      // tears down its own capture instead of starting one after cleanup.
+      const scriptCaptureStarted = captureHandlers?.close() ?? false;
+      // Tunnel down before mitmproxy stops, so the device is never routed
+      // into a dead proxy. tunnelActivated only covers requiresHttpsCapture;
+      // a tunnel setProxy brought up is deactivated here too, ignoring the
+      // error when there was none.
+      if (deviceId && this.deviceManager) {
         try { await this.deviceManager.deactivateWireGuardTunnel(deviceId); }
-        catch (err: any) { error(`Failed to deactivate WireGuard tunnel: ${err.message}`); }
+        catch (err: any) {
+          if (tunnelActivated) error(`Failed to deactivate WireGuard tunnel: ${err.message}`);
+        }
       }
-      // Clean up mitmproxy — covers both requiresHttpsCapture and setProxy paths
-      // Only stop capture if THIS automation started it (captureStarted flag); prevents
-      // killing a user-initiated capture session that was already running before the automation.
-      if (captureStarted && deviceId && this.mitmproxyManager?.isCapturing(deviceId)) {
+      // Clean up mitmproxy for both requiresHttpsCapture and setProxy captures.
+      // Only stop a capture THIS run started; a user-initiated capture that was
+      // already running is left alone.
+      if ((captureStarted || scriptCaptureStarted) && deviceId && this.mitmproxyManager?.isCapturing(deviceId)) {
         try { await this.mitmproxyManager.stopCapture(deviceId); }
         catch (err: any) { error(`Failed to stop HTTPS capture: ${err.message}`); }
-      }
-      // Also deactivate WireGuard if setProxy activated it (tunnelActivated only covers requiresHttpsCapture)
-      if (deviceId && !tunnelActivated && this.deviceManager) {
-        try { await this.deviceManager.deactivateWireGuardTunnel(deviceId); }
-        catch (err: any) { /* tunnel may not have been activated by setProxy, ignore */ }
       }
       // Mark device as idle so standby timer can manage it again
       if (deviceId) {
@@ -723,13 +733,38 @@ export class AutomationRunner implements IAutomationRunner {
 
   /**
    * Create proxy and TLS profile handler closures that share state.
+   *
+   * The handlers remember whether the script started a capture itself via
+   * device.setProxy(), so the runner's cleanup can stop it on a throw,
+   * timeout, or cancel. close() ends the handlers' life: it reports that
+   * flag and makes any later or still-in-flight setProxy tear down what it
+   * started instead of leaving an orphaned capture on the device.
    */
   private createCaptureHandlers(deviceId: string, sessionId: number) {
     let currentTlsProfile: string = 'default';
+    let scriptCaptureStarted = false;
+    let closed = false;
+
+    // Called after each await in a capture start. Returns true when the run
+    // ended meanwhile, after undoing whatever this start set up.
+    const abandonIfClosed = async (): Promise<boolean> => {
+      if (!closed) return false;
+      try { await this.deviceManager?.deactivateWireGuardTunnel(deviceId); }
+      catch { /* tunnel may not be active */ }
+      if (this.mitmproxyManager?.isCapturing(deviceId)) {
+        try { await this.mitmproxyManager.stopCapture(deviceId); }
+        catch (err: any) { error(`Failed to stop capture started after run ended: ${err.message}`); }
+      }
+      log(`setProxy: run ${sessionId} ended during capture startup, tore it down for ${deviceId}`);
+      return true;
+    };
 
     const proxyHandler = async (mode: 'none' | 'normal' | 'nordvpn', options?: { country?: string }) => {
       if (!this.mitmproxyManager || !this.deviceManager) {
         throw new Error('Proxy infrastructure not available');
+      }
+      if (closed) {
+        throw new Error('Automation run has ended; setProxy is no longer available');
       }
 
       if (mode === 'none') {
@@ -740,6 +775,7 @@ export class AutomationRunner implements IAutomationRunner {
           catch { /* tunnel may not be active */ }
           log(`setProxy('none'): stopped proxy for ${deviceId}`);
         }
+        scriptCaptureStarted = false;
         return;
       }
 
@@ -775,27 +811,37 @@ export class AutomationRunner implements IAutomationRunner {
         mitmOptions.useProxy = true;
       }
 
+      // Mark before awaiting: if the run ends while mitmproxy is starting,
+      // cleanup must still treat this capture as the run's own.
+      scriptCaptureStarted = true;
+
       if (this.mitmproxyManager.isCapturing(deviceId)) {
         // Restart with new config
         const tunnelInfo = await this.mitmproxyManager.restartCapture(deviceId, mitmOptions);
+        if (await abandonIfClosed()) return;
         if (tunnelInfo) {
           try {
             await this.deviceManager.activateWireGuardTunnel(deviceId, tunnelInfo);
           } catch (err: any) {
             log(`WireGuard reactivation failed: ${err.message}`);
           }
+          if (await abandonIfClosed()) return;
         }
       } else {
         // First time — full WireGuard + mitmproxy startup
         const tunnelInfo = await this.mitmproxyManager.startCapture(deviceId, mitmOptions);
+        if (await abandonIfClosed()) return;
         if (tunnelInfo) {
           try {
             await this.deviceManager.injectMitmproxyCaCert(deviceId);
+            if (await abandonIfClosed()) return;
             await this.deviceManager.activateWireGuardTunnel(deviceId, tunnelInfo);
+            if (await abandonIfClosed()) return;
             await this.waitForInterceptReady(deviceId, sessionId);
           } catch (err: any) {
             log(`WireGuard tunnel setup failed: ${err.message}`);
           }
+          if (await abandonIfClosed()) return;
         }
       }
 
@@ -803,6 +849,9 @@ export class AutomationRunner implements IAutomationRunner {
     };
 
     const tlsProfileHandler = async (profile: string) => {
+      if (closed) {
+        throw new Error('Automation run has ended; setTlsProfile is no longer available');
+      }
       currentTlsProfile = profile;
 
       if (this.mitmproxyManager?.isCapturing(deviceId)) {
@@ -825,7 +874,13 @@ export class AutomationRunner implements IAutomationRunner {
       }
     };
 
-    return { proxyHandler, tlsProfileHandler, getTlsProfile: () => currentTlsProfile };
+    /** Lock the handlers and report whether the script left a capture of its own running. */
+    const close = (): boolean => {
+      closed = true;
+      return scriptCaptureStarted;
+    };
+
+    return { proxyHandler, tlsProfileHandler, getTlsProfile: () => currentTlsProfile, close };
   }
 
   /**
