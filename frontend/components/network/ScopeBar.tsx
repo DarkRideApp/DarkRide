@@ -19,6 +19,9 @@ interface ScopeBarProps {
 export function ScopeBar({ ws, scope, onScopeChange }: ScopeBarProps) {
   const [devices, setDevices] = useState<Device[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
+  // Until the list arrives there is no session to pick, and a click would
+  // otherwise fall through to { kind: 'all' } and look like a no-op.
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -27,7 +30,8 @@ export function ScopeBar({ ws, scope, onScopeChange }: ScopeBarProps) {
       .catch(() => setDevices([]));
     ws.sendRestApi('GET', '/v1/automation/sessions?triggerType=capture&limit=100')
       .then(res => setSessions(res.body?.data?.items ?? res.body?.data?.sessions ?? res.body?.data ?? []))
-      .catch(() => setSessions([]));
+      .catch(() => setSessions([]))
+      .finally(() => setSessionsLoaded(true));
   }, [ws]);
 
   const copyLink = useCallback(() => {
@@ -59,7 +63,9 @@ export function ScopeBar({ ws, scope, onScopeChange }: ScopeBarProps) {
         <button
           className={`scope-kind-btn${scope.kind === 'session' ? ' active' : ''}`}
           data-testid="scope-kind-session"
-          onClick={() => onScopeChange(sessions[0] ? { kind: 'session', sessionId: sessions[0].id } : { kind: 'all' })}
+          disabled={!sessionsLoaded || sessions.length === 0}
+          title={sessionsLoaded && sessions.length === 0 ? 'No capture sessions yet' : undefined}
+          onClick={() => { if (sessions[0]) onScopeChange({ kind: 'session', sessionId: sessions[0].id }); }}
         >
           <Layers size={13} /> Session
         </button>

@@ -80,7 +80,9 @@ const CORE_NAV_GROUPS: NavGroup[] = [
     items: [
       // Unified workspace — Traffic / Intercept / Repeater / Catalogue live
       // here behind a scope selector. The old separate entries now redirect in.
-      { to: '/ui/network', label: 'Network', icon: Activity, requiredScope: 'core.traffic:read' },
+      // No requiredScope: Repeater and Catalogue were never traffic-gated, so
+      // the workspace hides the traffic-gated panes itself (NetworkWorkspace).
+      { to: '/ui/network', label: 'Network', icon: Activity },
     ],
   },
   {

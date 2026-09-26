@@ -52,7 +52,37 @@ describe('ScopeBar', () => {
   it('selects a session from the production items response shape', async () => {
     const onScopeChange = vi.fn();
     render(<ScopeBar ws={mockWs() as any} scope={{ kind: 'all' }} onScopeChange={onScopeChange} />);
-    fireEvent.click(await screen.findByTestId("scope-kind-session'));
-    expect(onScopeChange).toHaveBeenCalledWith({ kind: "session", sessionId: 5 });
+    const btn = await screen.findByTestId('scope-kind-session');
+    await waitFor(() => expect(btn).toBeEnabled());
+    fireEvent.click(btn);
+    expect(onScopeChange).toHaveBeenCalledWith({ kind: 'session', sessionId: 5 });
+  });
+
+  it('keeps the Session button disabled until the session list has loaded', async () => {
+    let resolveSessions: (v: unknown) => void = () => {};
+    const sendRestApi = vi.fn().mockImplementation((_m: string, path: string) => {
+      if (path.startsWith('/v1/automation/sessions')) return new Promise(r => { resolveSessions = r; });
+      return Promise.resolve({ body: { data: [] } });
+    });
+    const onScopeChange = vi.fn();
+    render(<ScopeBar ws={{ sendRestApi }} scope={{ kind: 'all' }} onScopeChange={onScopeChange} />);
+    const btn = screen.getByTestId('scope-kind-session');
+    expect(btn).toBeDisabled();
+    // A click during loading must not silently bounce the scope to "all".
+    fireEvent.click(btn);
+    expect(onScopeChange).not.toHaveBeenCalled();
+    resolveSessions({ body: { data: { items: [{ id: 9, name: 'run', deviceId: 'dev-1' }] } } });
+    await waitFor(() => expect(btn).toBeEnabled());
+    fireEvent.click(btn);
+    expect(onScopeChange).toHaveBeenCalledWith({ kind: 'session', sessionId: 9 });
+  });
+
+  it('disables the Session button when there are no capture sessions', async () => {
+    const sendRestApi = vi.fn().mockResolvedValue({ body: { data: { items: [] } } });
+    render(<ScopeBar ws={{ sendRestApi }} scope={{ kind: 'all' }} onScopeChange={() => {}} />);
+    const btn = screen.getByTestId('scope-kind-session');
+    await waitFor(() => expect(sendRestApi).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(btn).toHaveAttribute('title', 'No capture sessions yet'));
+    expect(btn).toBeDisabled();
   });
 });
