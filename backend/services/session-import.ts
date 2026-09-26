@@ -4,6 +4,7 @@ import { automationSessions, capturedTraffic, websocketMessages, screenshots, de
 import { eq } from 'drizzle-orm';
 import type { AppDatabase } from '../db/index';
 import { safeJoinInside } from '../utils/safe-path';
+import { deriveTrafficColumns } from '../../shared/lib/traffic-classify';
 
 interface ImportResult {
   sessionId: number;
@@ -63,17 +64,23 @@ function importHarEntries(
     let hostname: string | null = null;
     try { hostname = new URL(req.url).hostname; } catch {}
 
+    const requestHeaders = harHeadersToJson(req.headers);
+    const requestBody = req.postData?.text || null;
+    const responseHeaders = harHeadersToJson(resp?.headers);
+    const responseBody = resp?.content?.text || null;
+
     const result = db.insert(capturedTraffic).values({
       sessionId,
       deviceId: null,
       requestMethod: req.method,
       requestUrl: req.url,
       hostname,
-      requestHeaders: harHeadersToJson(req.headers),
-      requestBody: req.postData?.text || null,
+      requestHeaders,
+      requestBody,
       responseStatus: resp?.status ?? null,
-      responseHeaders: harHeadersToJson(resp?.headers),
-      responseBody: resp?.content?.text || null,
+      responseHeaders,
+      responseBody,
+      ...deriveTrafficColumns({ type, requestMethod: req.method, requestUrl: req.url, requestHeaders, requestBody, responseHeaders, responseBody }),
       type,
       wsCloseCode: null,
       wsCloseReason: null,

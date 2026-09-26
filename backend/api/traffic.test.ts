@@ -9,6 +9,7 @@ import { registerTrafficEndpoints, resetFilterRules, wsFlowMap } from './traffic
 import { TrafficHookRegistry } from '../services/traffic-hook-registry';
 import { importSessionHar } from '../services/session-import';
 import { createTestDb } from '../test-utils/create-test-db';
+import { deriveTrafficColumns } from '../../shared/lib/traffic-classify';
 
 // Mock broadcastToAll
 const mockBroadcastToAll = vi.fn();
@@ -323,6 +324,19 @@ describe('Traffic API Endpoints', () => {
 
       expect(res.body.data.items).toHaveLength(1);
       expect(res.body.data.items[0].requestUrl).toBe('https://api.example.com/data');
+    });
+
+    it('applies deep filters before pagination', async () => {
+      const row = {
+        requestMethod: 'GET', requestUrl: 'https://api.example.com/large', responseStatus: 404,
+        responseHeaders: JSON.stringify({ 'content-type': 'application/json' }),
+        responseBody: 'x'.repeat(120 * 1024),
+      };
+      db.insert(capturedTraffic).values({ ...row, ...deriveTrafficColumns(row), capturedAt: new Date() }).run();
+      const res = await request(app).get('/v1/traffic/list?statusCodes=404&contentTypes=json&size=gt100kb&limit=1&offset=0');
+      expect(res.body.data.total).toBe(1);
+      expect(res.body.data.items).toHaveLength(1);
+      expect(res.body.data.items[0].requestUrl).toContain('/large');
     });
 
     it('should sort by bodySize', async () => {

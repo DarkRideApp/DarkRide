@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import { SkeletonTable } from '@darkrideapp/plugin-sdk/react';
@@ -13,7 +13,7 @@ import { ConfirmDialog } from '@darkrideapp/plugin-sdk/react';
 import type { CapturedTrafficEntry, WebSocketMessageEntry } from '../../shared/types/api';
 import type { TrafficEntry } from '../components/traffic/TrafficEntryRow';
 import type { TrafficFilters } from '../components/traffic/trafficUtils';
-import { deriveServerStatusCentury } from '../components/traffic/trafficUtils';
+import { applyClientFilters, createDefaultFilters, deserializeTrafficFilters, isDefaultTrafficFilters, serializeTrafficFilters, trafficFiltersToListParams } from '../components/traffic/trafficUtils';
 import { useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { AccessDenied } from '../components/auth/AccessDenied';
 import { InterceptHoldPanel, InterceptArmControl } from '../components/intercept/InterceptHoldPanel';
@@ -177,6 +177,9 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
 
   const tabParam = searchParams.get('tab') as TrafficTab | null;
   const activeTab: TrafficTab = tabParam && TRAFFIC_TABS.includes(tabParam) ? tabParam : 'live';
+  // Filters restored from the ?filters= deep link. Read once: after mount the
+  // table owns filter state and writes changes back to the URL.
+  const [initialFilters] = useState(() => deserializeTrafficFilters(searchParams.get('filters')));
   const setActiveTab = useCallback((tab: TrafficTab) => {
     // Only touch ?tab= so the Network workspace's ?pane= / ?scope= survive.
     setSearchParams(prev => {
@@ -197,20 +200,12 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
   const [pendingLiveCount, setPendingLiveCount] = useState(0);
   const [showBlocklist, setShowBlocklist] = useState(false);
 
-  // Server-side filter state (derived from TrafficFilters in handleFilterChange below).
-  // - serverType/serverMethod: derived from the tri-state method picks (unchanged).
-  // - serverStatusCentury: a single century string ('200'/'300'/'400'/'500') derived
-  //   via deriveServerStatusCentury() from the (now multi-select) status pills +
-  //   exact status codes. The API only supports one century band per request, so
-  //   when 0 or 2+ groups are active this stays '' and the deep filters (content
-  //   type, size, exact status, multi-group status, search-fallback) are applied
-  //   client-side on top of whatever page comes back — see clientSideFilter below.
-  // - serverSearch: the "Search all" field, sent as the server `search` param
-  //   (matches URL + body + headers per backend/api/traffic.ts).
-  const [serverType, setServerType] = useState('');
-  const [serverStatusCentury, setServerStatusCentury] = useState('');
-  const [serverMethod, setServerMethod] = useState('');
-  const [serverSearch, setServerSearch] = useState('');
+  // The table's filter state, mirrored here to drive the server query. Every
+  // deep filter (method pills, status, content type, size, URL regex, search)
+  // is applied server-side in SQL with the same shared classifier the table
+  // uses (shared/lib/traffic-classify.ts), so pages and totals are exact.
+  const [serverFilters, setServerFilters] = useState<TrafficFilters>(() => initialFilters ?? createDefaultFilters());
+  const serverSearch = serverFilters.search;
   // Host/path narrowing driven by the tree navigator (precise, server-side,
   // across all pages via the /list hostname + path params).
   const [serverHostname, setServerHostname] = useState('');
@@ -238,10 +233,7 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
       const params = new URLSearchParams();
       params.set('limit', String(LIMIT));
       params.set('offset', String(page * LIMIT));
-      if (serverType) params.set('type', serverType);
-      if (serverMethod) params.set('method', serverMethod);
-      if (serverStatusCentury) params.set('status', serverStatusCentury);
-      if (serverSearch) params.set('search', serverSearch);
+      for (const [k, v] of trafficFiltersToListParams(serverFilters)) params.set(k, v);
       if (serverHostname) params.set('hostname', serverHostname);
       if (serverPath) params.set('path', serverPath);
       if (scopeDeviceId) params.set('deviceId', scopeDeviceId);
@@ -265,7 +257,7 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
     } finally {
       setLoading(false);
     }
-  }, [ws, page, serverType, serverMethod, serverStatusCentury, serverSearch, serverHostname, serverPath, scopeDeviceId, scopeSessionId, sortBy, sortDir]);
+  }, [ws, page, serverFilters, serverHostname, serverPath, scopeDeviceId, scopeSessionId, sortBy, sortDir]);
 
   useEffect(() => {
     if (ws.connected && activeTab === 'live') fetchTraffic();
@@ -299,6 +291,9 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
         timings: e.timings ?? null,
       };
       if (activeTab !== 'live') return;
+      // Same predicate the server applied to this page: a row the filters
+      // exclude must not be prepended or counted.
+      if (applyClientFilters([entry as TrafficEntry], serverFilters).length === 0) return;
       // Prepend live only when the current view IS the live head: page 0 in the
       // default newest-first order with no active search. In any other view
       // (paged away, custom sort, or searching) the entry doesn't belong at the
@@ -337,45 +332,34 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
     });
 
     return () => { unsubEntry(); unsubFrame(); unsubClosed(); };
-  }, [ws, page, activeTab, sortBy, sortDir, serverSearch, serverHostname, serverPath, scopeDeviceId, scopeSessionId]);
+  }, [ws, page, activeTab, sortBy, sortDir, serverFilters, serverSearch, serverHostname, serverPath, scopeDeviceId, scopeSessionId]);
 
   const handleFilterChange = useCallback((filters: TrafficFilters) => {
-    // Derive server-side filters from the tri-state method picks. When exactly
-    // one method is actively included we can push BOTH type (http|websocket)
-    // AND the concrete HTTP method down to the server — gets the correct rows
-    // back immediately instead of relying on client-side pruning, which was
-    // the "filter on POST does nothing / sometimes works after a delay"
-    // report.
-    const includes = Array.from(filters.methodFilters.entries())
-      .filter(([, v]) => v === 'include')
-      .map(([k]) => k);
-    let type = '';
-    let method = '';
-    if (includes.length === 1) {
-      const key = includes[0];
-      if (key === 'WS') {
-        type = 'websocket';
-      } else if (['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'].includes(key)) {
-        type = 'http';
-        method = key;
-      } else if (key === 'CONNECT' || key === 'DNS') {
-        // These have dedicated requestMethod values server-side.
-        method = key;
-      }
-      // GQL / PROTO / TLS_FAIL: can't be reduced to a single server-side
-      // predicate without body/header inspection — fall back to client-side
-      // filtering by leaving both type/method empty.
-    }
-    setServerType(type);
-    setServerMethod(method);
-    setServerStatusCentury(deriveServerStatusCentury(filters));
-    setServerSearch(filters.search);
-    setPage(0);
+    // Skip no-op notifications (the table reports its state on mount) so the
+    // first fetch isn't repeated and page/selection aren't reset.
+    setServerFilters(prev => serializeTrafficFilters(prev) === serializeTrafficFilters(filters) ? prev : filters);
+    // Any non-default state is shareable via ?filters=; the default drops it.
+    // Functional update so the workspace's ?pane= / ?scope= are never clobbered.
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev);
+      if (isDefaultTrafficFilters(filters)) next.delete('filters');
+      else next.set('filters', serializeTrafficFilters(filters));
+      return next.toString() === prev.toString() ? prev : next;
+    }, { replace: true });
     // NOTE: selection is intentionally NOT force-cleared here. TrafficTable
     // clears it itself (via its own effect) once the previously-selected row
     // no longer appears in the filtered set — otherwise every filter tweak
     // during triage would kick the user out of the row they're inspecting.
-  }, []);
+  }, [setSearchParams]);
+
+  // A real filter change starts from the first page.
+  const filtersKey = serializeTrafficFilters(serverFilters);
+  const prevFiltersKey = useRef(filtersKey);
+  useEffect(() => {
+    if (prevFiltersKey.current === filtersKey) return;
+    prevFiltersKey.current = filtersKey;
+    setPage(0);
+  }, [filtersKey]);
 
   const handleSortChange = useCallback((newSortBy: string, newSortDir: 'asc' | 'desc') => {
     setSortBy(newSortBy);
@@ -607,17 +591,12 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
           wsFrames={wsFrames}
           selectedId={selectedId}
           onSelectEntry={setSelectedId}
-          // Client-side filtering runs on top of whatever the server already
-          // narrowed down (type/method/status-century/search). This is what
-          // makes the Host/URL text filter, content-type pills, size quick
-          // filters, exact-status chips, and multi-group status selection
-          // actually take effect on this page — previously this was false,
-          // which silently made the "Filter by host or regex" box a no-op.
-          // Known trade-off: filters that can't be pushed server-side only
-          // narrow the currently-fetched page, not the full result set
-          // across pages (the API has no OR-across-century or content-type
-          // params). Acceptable for a 50-row page; documented for reviewers.
+          // The server already filtered this page with the shared classifier,
+          // so client-side filtering is a no-op for fetched rows. It stays on
+          // for rows that arrive between fetches (live prepends, frame
+          // updates), which the same predicate keeps consistent.
           clientSideFilter={true}
+          initialFilters={initialFilters ?? undefined}
           footer={pagination}
           onSortChange={handleSortChange}
           sortBy={sortBy}

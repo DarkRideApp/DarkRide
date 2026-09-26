@@ -8,6 +8,8 @@ import { upsertEndpoint, shouldSkipForCatalogue } from '../services/api-catalogu
 import { createLoggers } from '../logs';
 import type { TrafficEntryMessage, TrafficRequestStartedMessage, WebSocketFrameMessage, WebSocketConnectionClosedMessage } from '../../shared/types/websocket';
 import type { TrafficHookRegistry } from '../services/traffic-hook-registry';
+import { deriveTrafficColumns } from '../../shared/lib/traffic-classify';
+import { deepFilterConditions, parseDeepFilters } from './traffic-filters';
 
 const { log, error: logError } = createLoggers('traffic-api');
 
@@ -287,6 +289,7 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
         durationMs,
         timings,
         capturedAt,
+        ...deriveTrafficColumns({ requestMethod, requestUrl, requestHeaders, requestBody, responseHeaders, responseBody }),
       })
       .run();
 
@@ -348,7 +351,9 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
     const sortDir = (req.query.sortDir as string | undefined) === 'asc' ? 'asc' : 'desc';
     const search = req.query.search as string | undefined;
 
-    const conditions: any[] = [];
+    // Deep filters (method pills, status groups/codes, content type, size,
+    // URL regex) run in SQL over the stored classification columns.
+    const conditions: any[] = deepFilterConditions(db, parseDeepFilters(req.query));
 
     if (deviceId) {
       conditions.push(eq(capturedTraffic.deviceId, deviceId));
@@ -790,6 +795,7 @@ export function registerTrafficEndpoints(db: AppDatabase, hookRegistry?: Traffic
       type: 'websocket',
       wsMessageCount: 0,
       capturedAt,
+      ...deriveTrafficColumns({ type: 'websocket', requestMethod: 'GET', requestUrl: url, requestHeaders: headers ? JSON.stringify(headers) : null }),
     }).run();
 
     const insertedId = Number(result.lastInsertRowid);

@@ -13,7 +13,9 @@ import {
   COLUMNS,
   loadColumnPrefs,
   saveColumnPrefs,
-  deriveServerStatusCentury,
+  trafficFiltersToListParams,
+  isDefaultTrafficFilters,
+  getContentType,
   type TrafficFilters,
 } from './trafficUtils';
 
@@ -177,30 +179,63 @@ describe('applyClientFilters — search (client fallback)', () => {
   });
 });
 
-describe('deriveServerStatusCentury', () => {
-  it('returns empty when nothing is selected', () => {
-    expect(deriveServerStatusCentury({ status: new Set(), exactStatuses: new Set() })).toBe('');
+describe('trafficFiltersToListParams', () => {
+  const params = (f: ReturnType<typeof createDefaultFilters>) => Object.fromEntries(trafficFiltersToListParams(f));
+
+  it('default filters send only the default method excludes', () => {
+    expect(params(createDefaultFilters())).toEqual({ methodExclude: 'DNS,CONNECT,TLS_FAIL' });
   });
 
-  it('maps a single selected status group to its century', () => {
-    expect(deriveServerStatusCentury({ status: new Set(['4xx']), exactStatuses: new Set() })).toBe('400');
-    expect(deriveServerStatusCentury({ status: new Set(['2xx']), exactStatuses: new Set() })).toBe('200');
+  it('maps every deep filter to its server param', () => {
+    const f = createDefaultFilters();
+    f.methodFilters = new Map([['GQL', 'include'], ['GET', 'include'], ['DNS', 'exclude']]);
+    f.status = new Set(['4xx', '5xx']);
+    f.contentTypes = new Set(['json', 'other']);
+    f.size = 'gt100kb';
+    f.text = 'api\\.example';
+    f.search = 'token';
+    expect(params(f)).toEqual({
+      methodInclude: 'GQL,GET',
+      methodExclude: 'DNS',
+      statusGroups: '4xx,5xx',
+      contentTypes: 'json,other',
+      size: 'gt100kb',
+      urlFilter: 'api\\.example',
+      search: 'token',
+    });
   });
 
-  it('returns empty when multiple status groups are selected (server has no OR)', () => {
-    expect(deriveServerStatusCentury({ status: new Set(['4xx', '5xx']), exactStatuses: new Set() })).toBe('');
+  it('exact status codes are sent instead of the group pills', () => {
+    const f = createDefaultFilters();
+    f.status = new Set(['2xx']);
+    f.exactStatuses = new Set(['404', '429']);
+    const p = params(f);
+    expect(p.statusCodes).toBe('404,429');
+    expect(p.statusGroups).toBeUndefined();
+  });
+});
+
+describe('isDefaultTrafficFilters', () => {
+  it('is true only for the untouched default', () => {
+    expect(isDefaultTrafficFilters(createDefaultFilters())).toBe(true);
+    const groups = createDefaultFilters();
+    groups.status = new Set(['4xx']);
+    expect(isDefaultTrafficFilters(groups)).toBe(false);
+    const noExcludes = createDefaultFilters();
+    noExcludes.methodFilters = new Map();
+    expect(isDefaultTrafficFilters(noExcludes)).toBe(false);
+  });
+});
+
+describe('client/server classification parity', () => {
+  it('uses the shared classifier: GraphQL is graphql, header case is ignored', () => {
+    const gql = { type: 'http', requestMethod: 'POST', requestUrl: 'https://x/graphql', requestBody: JSON.stringify({ query: 'query A { a }' }), responseHeaders: JSON.stringify({ 'content-type': 'application/json' }) };
+    expect(getContentType(gql as any)).toBe('graphql');
+    expect(getContentType({ type: 'http', requestMethod: 'GET', requestUrl: 'https://x', requestBody: null, responseHeaders: JSON.stringify({ 'CONTENT-TYPE': 'Application/JSON' }) } as any)).toBe('json');
   });
 
-  it('derives the century from a single exact status code, taking priority over the group pills', () => {
-    expect(deriveServerStatusCentury({ status: new Set(['2xx']), exactStatuses: new Set(['404']) })).toBe('400');
-  });
-
-  it('derives a shared century from multiple exact codes in the same band', () => {
-    expect(deriveServerStatusCentury({ status: new Set(), exactStatuses: new Set(['404', '429']) })).toBe('400');
-  });
-
-  it('returns empty when exact codes span multiple centuries', () => {
-    expect(deriveServerStatusCentury({ status: new Set(), exactStatuses: new Set(['404', '500']) })).toBe('');
+  it('counts UTF-8 bytes', () => {
+    expect(getResponseSizeBytes('é')).toBe(2);
   });
 });
 
