@@ -106,6 +106,48 @@ describe('Capture API Endpoints', () => {
       expect(res.body.success).toBe(false);
     });
 
+    // A UI viewing one session must not be able to stop a newer session that
+    // replaced it on the same device between the status read and the click.
+    it('stops when the supplied sessionId is the live session', async () => {
+      mockManager.getSessionId.mockReturnValue(5);
+      const res = await request(app)
+        .post('/v1/capture/stop')
+        .send({ deviceId: 'DEV001', sessionId: 5 });
+
+      expect(res.status).toBe(200);
+      expect(mockManager.stopCapture).toHaveBeenCalledWith('DEV001');
+    });
+
+    it('returns 409 and does not stop when the supplied sessionId is not the live session', async () => {
+      mockManager.getSessionId.mockReturnValue(9);
+      const res = await request(app)
+        .post('/v1/capture/stop')
+        .send({ deviceId: 'DEV001', sessionId: 5 });
+
+      expect(res.status).toBe(409);
+      expect(res.body.success).toBe(false);
+      expect(mockManager.stopCapture).not.toHaveBeenCalled();
+    });
+
+    it('returns 409 when a sessionId is supplied but nothing is capturing', async () => {
+      mockManager.getSessionId.mockReturnValue(undefined);
+      const res = await request(app)
+        .post('/v1/capture/stop')
+        .send({ deviceId: 'DEV001', sessionId: 5 });
+
+      expect(res.status).toBe(409);
+      expect(mockManager.stopCapture).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 for a non-integer sessionId', async () => {
+      const res = await request(app)
+        .post('/v1/capture/stop')
+        .send({ deviceId: 'DEV001', sessionId: 'abc' });
+
+      expect(res.status).toBe(400);
+      expect(mockManager.stopCapture).not.toHaveBeenCalled();
+    });
+
     it('should return 500 on manager error', async () => {
       mockManager.stopCapture.mockRejectedValue(new Error('stop failed'));
 

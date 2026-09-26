@@ -40,12 +40,32 @@ export function registerCaptureEndpoints(captureManager: CaptureSessionManager):
   }, { requires: ['core.traffic:manage'] });
 
   // POST /v1/capture/stop — stop traffic capture for a device
+  // Optional sessionId: stop only if that session is still the device's live
+  // one. A UI that read the status earlier must not stop a newer session that
+  // replaced it on the same device in the meantime.
   registerEndpoint('POST', '/v1/capture/stop', async (req, res) => {
-    const { deviceId } = req.body;
+    const { deviceId, sessionId } = req.body;
 
     if (!deviceId) {
       res.status(400).json({ success: false, error: 'deviceId is required' });
       return;
+    }
+
+    if (sessionId !== undefined && sessionId !== null) {
+      if (!Number.isInteger(sessionId)) {
+        res.status(400).json({ success: false, error: 'sessionId must be an integer' });
+        return;
+      }
+      const liveSessionId = captureManager.getSessionId(deviceId);
+      if (liveSessionId !== sessionId) {
+        res.status(409).json({
+          success: false,
+          error: liveSessionId === undefined
+            ? `Session ${sessionId} is no longer capturing`
+            : `Device is capturing session ${liveSessionId}, not ${sessionId}`,
+        });
+        return;
+      }
     }
 
     try {
