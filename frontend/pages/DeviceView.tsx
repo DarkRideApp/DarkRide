@@ -1259,6 +1259,16 @@ function CaptureLiveTrafficView({
       data-testid="capture-live-traffic"
       style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}
     >
+      <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '4px 8px' }}>
+        <Link
+          className="btn btn-sm"
+          data-testid="open-in-network"
+          to={sessionId != null ? `/ui/network?scope=session:${sessionId}` : `/ui/network?scope=device:${deviceId}`}
+          title="Open this capture in the Network workspace (filter, tree, intercept, replay)"
+        >
+          Open in Network
+        </Link>
+      </div>
       <TrafficTable
         entries={entries}
         loading={loading}

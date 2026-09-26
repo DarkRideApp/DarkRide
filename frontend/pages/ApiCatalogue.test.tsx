@@ -1,7 +1,7 @@
 import React from 'react';
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { ApiCatalogue } from './ApiCatalogue';
 import { WebSocketContext } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
@@ -199,5 +199,46 @@ describe('ApiCatalogue', () => {
     await waitFor(() => {
       expect(screen.getByTestId('group-search-input')).toBeInTheDocument();
     });
+  });
+});
+
+// Inside the Network workspace the catalogue shares the URL with the workspace
+// (?pane=catalogue&scope=...). Switching catalogue views must only touch ?view=,
+// otherwise the workspace falls back to the Traffic pane.
+describe('ApiCatalogue — view switching inside the Network workspace', () => {
+  function LocationProbe() {
+    const loc = useLocation();
+    return <div data-testid="loc">{loc.search}</div>;
+  }
+  const params = () => new URLSearchParams(screen.getByTestId('loc').textContent!);
+
+  it('preserves pane and scope when switching to Manage and back', async () => {
+    render(
+      <WebSocketContext.Provider value={createMockWs()}>
+        <MemoryRouter initialEntries={['/ui/network?pane=catalogue&scope=device:dev-1']}>
+          <ApiCatalogue />
+          <LocationProbe />
+        </MemoryRouter>
+      </WebSocketContext.Provider>,
+    );
+    fireEvent.click(await screen.findByTestId('manage-groups-btn'));
+    expect(params().get('view')).toBe('manage');
+    expect(params().get('pane')).toBe('catalogue');
+    expect(params().get('scope')).toBe('device:dev-1');
+  });
+
+  it('clearing the view drops only ?view=', async () => {
+    render(
+      <WebSocketContext.Provider value={createMockWs()}>
+        <MemoryRouter initialEntries={['/ui/network?pane=catalogue&scope=session:4&view=manage']}>
+          <ApiCatalogue />
+          <LocationProbe />
+        </MemoryRouter>
+      </WebSocketContext.Provider>,
+    );
+    fireEvent.click(await screen.findByText(/Back to Groups/));
+    expect(params().has('view')).toBe(false);
+    expect(params().get('pane')).toBe('catalogue');
+    expect(params().get('scope')).toBe('session:4');
   });
 });

@@ -83,9 +83,16 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[b]` already built (pr
   rows w/ a `truncated` flag). Clicking a host/path narrows the table server-side via the existing
   /list hostname+path params across all pages; paths load lazily; toggle persisted to localStorage.
   Design: `docs/specs/2026-07-19-traffic-host-tree-design.md`.)*
-- `[ ]` **Unify the surface.** Fold the per-device Capture live view, the global Traffic page, and
+- `[x]` **Unify the surface.** Fold the per-device Capture live view, the global Traffic page, and
   Intercept into one workspace with a device/scope selector, so replay and interception happen
   without page hops. Five nav entries for one workflow is the root of most friction.
+  *(Landed on `feat/network-workspace`: `/ui/network` `NetworkWorkspace` with a scope bar
+  (All / device / capture session, incl. HAR/ZIP export + share link for a session) and four panes
+  (Traffic scoped, Intercept, Repeater, Catalogue) reusing the existing surfaces. The four old
+  Network nav entries collapse to one "Network"; `/ui/{traffic,proxied-requests,request-builder,
+  api-catalogue}` redirect into the matching pane; the device Capture tab gets an "Open in Network"
+  deep link. Design/plan: `docs/specs/2026-07-19-unify-network-surfaces-{design,plan}.md`. Follow-up:
+  per-pane polish (drop duplicate PageHeaders on Repeater/Catalogue; scope-propagate Catalogue).)*
 - `[x]` **Virtualize the list; raise/soften the 500-row cap** (`TrafficInspector.tsx:9` `MAX_ENTRIES`).
   Also fix that the global page stops appending live entries when not on page 0
   (`Traffic.tsx:249`) — under heavy capture you lose the live feed by paging.

@@ -8368,3 +8368,34 @@ body.live-log-open .ai-chat-fab {
   border-left: 2px solid var(--accent, #4a9eff);
 }
 .intercept-scope-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Network workspace — scope bar + pane tabs. */
+.network-workspace { display: flex; flex-direction: column; min-height: 0; }
+.network-topbar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 24px 0;
+  border-bottom: 1px solid var(--border-color, #333);
+}
+.scope-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.scope-kind-group { display: inline-flex; border: 1px solid var(--border-color, #333); border-radius: 6px; overflow: hidden; }
+.scope-kind-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px; font-size: 12px; background: transparent;
+  border: none; border-right: 1px solid var(--border-color, #333);
+  color: var(--text-secondary, #aaa); cursor: pointer;
+}
+.scope-kind-btn:last-child { border-right: none; }
+.scope-kind-btn.active { background: color-mix(in srgb, var(--accent, #4a9eff) 16%, transparent); color: var(--accent, #4a9eff); }
+.scope-select { max-width: 260px; }
+.scope-session-controls { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.network-pane-tabs { display: flex; gap: 2px; }
+.network-pane-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 14px; font-size: 13px; background: transparent; border: none;
+  border-bottom: 2px solid transparent; color: var(--text-secondary, #aaa); cursor: pointer;
+}
+.network-pane-tab.active { color: var(--text-primary, #fff); border-bottom-color: var(--accent, #4a9eff); }
+.network-pane-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.network-pane-body > * { flex: 1; min-height: 0; }

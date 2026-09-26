@@ -58,7 +58,9 @@ describe('AppLayout', () => {
     expect(screen.getByText('Dashboard')).toBeInTheDocument();
     expect(screen.getByText('Devices')).toBeInTheDocument();
     expect(screen.getByText('Automations')).toBeInTheDocument();
-    expect(screen.getByText('Traffic')).toBeInTheDocument();
+    // "Network" is both the nav group label and the unified workspace item.
+    expect(screen.getAllByText('Network').length).toBeGreaterThan(0);
+    expect(screen.getByRole('link', { name: 'Network' })).toHaveAttribute('href', '/ui/network');
     expect(screen.getByText('Selector Debugger')).toBeInTheDocument();
     expect(screen.getByText('Settings')).toBeInTheDocument();
   });
@@ -147,5 +149,14 @@ describe('AppLayout', () => {
       const automationsLink = screen.getByText('Automations').closest('a');
       expect(automationsLink).toHaveClass('active');
     });
+  });
+
+  // Request Builder and API Catalogue had no scope requirement before they
+  // moved into the Network workspace. The single Network entry must stay
+  // reachable for a user without core.traffic:read (the workspace hides the
+  // traffic-gated panes itself).
+  it('shows the Network entry to a user without core.traffic:read', () => {
+    renderWithRouter('/ui/', { auth: mockAuth });
+    expect(screen.getByText('Network', { selector: 'a *, a' })).toBeInTheDocument();
   });
 });

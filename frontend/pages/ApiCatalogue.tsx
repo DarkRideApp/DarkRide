@@ -99,12 +99,14 @@ export function ApiCatalogue() {
   // view: '' = group browser (default), 'ungrouped' = endpoints filtered to ungrouped, 'manage' = groups management
   const view = searchParams.get('view') || '';
 
+  // Only touch ?view=. Inside the Network workspace the URL also carries
+  // ?pane= and ?scope=, and wiping them would bounce the user to Traffic.
   const setView = (v: string) => {
-    if (v) {
-      setSearchParams({ view: v });
-    } else {
-      setSearchParams({});
-    }
+    setSearchParams(prev => {
+      const p = new URLSearchParams(prev);
+      if (v) p.set('view', v); else p.delete('view');
+      return p;
+    });
   };
 
   // Endpoints state
