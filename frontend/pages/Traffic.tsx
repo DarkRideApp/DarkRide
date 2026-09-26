@@ -178,7 +178,12 @@ export function Traffic({ scopeDeviceId = null, scopeSessionId = null }: Traffic
   const tabParam = searchParams.get('tab') as TrafficTab | null;
   const activeTab: TrafficTab = tabParam && TRAFFIC_TABS.includes(tabParam) ? tabParam : 'live';
   const setActiveTab = useCallback((tab: TrafficTab) => {
-    setSearchParams(tab === 'live' ? {} : { tab }, { replace: false });
+    // Only touch ?tab= so the Network workspace's ?pane= / ?scope= survive.
+    setSearchParams(prev => {
+      const p = new URLSearchParams(prev);
+      if (tab === 'live') p.delete('tab'); else p.set('tab', tab);
+      return p;
+    }, { replace: false });
   }, [setSearchParams]);
 
   const [entries, setEntries] = useState<CapturedTrafficEntry[]>([]);

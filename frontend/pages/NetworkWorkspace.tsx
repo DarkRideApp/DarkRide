@@ -1,7 +1,7 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
-import { useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
+import { useDocumentTitle, useAuthOptional } from '@darkrideapp/plugin-sdk/react';
 import { Activity, ShieldAlert, Repeat, BookOpen, Send } from 'lucide-react';
 import { NetworkScopeProvider, useNetworkScope } from '../components/network/NetworkScopeContext';
 import { ScopeBar } from '../components/network/ScopeBar';
@@ -12,12 +12,14 @@ import { CataloguePane } from '../components/network/panes/CataloguePane';
 import { OutboundRequestsPane } from '../components/network/panes/OutboundRequestsPane';
 
 type PaneKey = 'traffic' | 'intercept' | 'repeater' | 'catalogue' | 'outbound';
-const PANES: Array<{ key: PaneKey; label: string; icon: React.ReactNode }> = [
-  { key: 'traffic', label: 'Traffic', icon: <Activity size={14} /> },
-  { key: 'intercept', label: 'Intercept', icon: <ShieldAlert size={14} /> },
+// requiredScope mirrors what each pane's backend routes enforce. Repeater and
+// Catalogue have none, matching the old standalone nav entries.
+const PANES: Array<{ key: PaneKey; label: string; icon: React.ReactNode; requiredScope?: string }> = [
+  { key: 'traffic', label: 'Traffic', icon: <Activity size={14} />, requiredScope: 'core.traffic:read' },
+  { key: 'intercept', label: 'Intercept', icon: <ShieldAlert size={14} />, requiredScope: 'core.traffic:read' },
   { key: 'repeater', label: 'Repeater', icon: <Repeat size={14} /> },
   { key: 'catalogue', label: 'Catalogue', icon: <BookOpen size={14} /> },
-  { key: 'outbound', label: 'Outbound', icon: <Send size={14} /> },
+  { key: 'outbound', label: 'Outbound', icon: <Send size={14} />, requiredScope: 'core.traffic:read' },
 ];
 
 /**
@@ -39,8 +41,14 @@ function NetworkWorkspaceInner() {
   const { scope, setScope } = useNetworkScope();
   const [searchParams, setSearchParams] = useSearchParams();
 
+  const auth = useAuthOptional();
+  const panes = useMemo(
+    () => PANES.filter(p => !p.requiredScope || (auth?.hasScope(p.requiredScope) ?? true)),
+    [auth],
+  );
+
   const paneParam = searchParams.get('pane');
-  const pane: PaneKey = PANES.some(p => p.key === paneParam) ? (paneParam as PaneKey) : 'traffic';
+  const pane: PaneKey = panes.find(p => p.key === paneParam)?.key ?? panes[0].key;
 
   const setPane = useCallback((next: PaneKey) => {
     setSearchParams(prev => {
@@ -55,7 +63,7 @@ function NetworkWorkspaceInner() {
       <div className="network-topbar">
         <ScopeBar ws={ws} scope={scope} onScopeChange={setScope} />
         <div className="network-pane-tabs" role="tablist">
-          {PANES.map(p => (
+          {panes.map(p => (
             <button
               key={p.key}
               role="tab"

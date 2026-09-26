@@ -1,7 +1,7 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { Traffic } from './Traffic';
 import { WebSocketContext } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
@@ -296,5 +296,34 @@ describe('Traffic page — host/path tree', () => {
       const last = listCalls[listCalls.length - 1][1] as string;
       expect(new URLSearchParams(last.split('?')[1]).get('hostname')).toBe('api.example.com');
     });
+  });
+});
+
+// Inside the Network workspace, Traffic shares the URL with the workspace
+// (?pane=traffic&scope=...). The Live/Saved toggle must only touch ?tab=.
+describe('Traffic page — Live/Saved toggle inside the Network workspace', () => {
+  function LocationProbe() {
+    return <div data-testid="loc">{useLocation().search}</div>;
+  }
+  const params = () => new URLSearchParams(screen.getByTestId('loc').textContent!);
+
+  it('switching tabs preserves pane and scope', async () => {
+    render(
+      <WebSocketContext.Provider value={createMockWs()}>
+        <MemoryRouter initialEntries={['/ui/network?pane=traffic&scope=session:3']}>
+          <Traffic scopeSessionId={3} />
+          <LocationProbe />
+        </MemoryRouter>
+      </WebSocketContext.Provider>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Saved' }));
+    expect(params().get('tab')).toBe('saved');
+    expect(params().get('scope')).toBe('session:3');
+    expect(params().get('pane')).toBe('traffic');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Live' }));
+    expect(params().has('tab')).toBe(false);
+    expect(params().get('scope')).toBe('session:3');
+    expect(params().get('pane')).toBe('traffic');
   });
 });

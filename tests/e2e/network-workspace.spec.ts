@@ -49,6 +49,24 @@ test.describe('Network workspace', () => {
     await page.goto('/ui/api-catalogue');
     await page.waitForLoadState('networkidle');
     await expect(page).toHaveURL(/pane=catalogue/);
+
+    // Old routes keep their query string (Traffic's Replay button links to
+    // /ui/request-builder?replay=1; bookmarks use /ui/traffic?tab=saved).
+    await page.goto('/ui/request-builder?replay=1');
+    await expect(page).toHaveURL(/\/ui\/network\?pane=repeater&replay=1/);
+    await page.goto('/ui/traffic?tab=saved');
+    await expect(page).toHaveURL(/\/ui\/network\?pane=traffic&tab=saved/);
+  });
+
+  test('catalogue view switches stay in the catalogue pane', async ({ page }) => {
+    test.setTimeout(90_000);
+    await loginAsAdmin(page);
+    await page.goto('/ui/network?pane=catalogue');
+    await page.waitForLoadState('networkidle');
+    await page.getByTestId('manage-groups-btn').click();
+    await expect(page).toHaveURL(/pane=catalogue/);
+    await expect(page).toHaveURL(/view=manage/);
+    await expect(page.getByTestId('pane-catalogue')).toBeVisible();
   });
 
   test('scope bar can switch to the Device scope', async ({ page }) => {

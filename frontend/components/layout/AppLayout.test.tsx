@@ -150,4 +150,13 @@ describe('AppLayout', () => {
       expect(automationsLink).toHaveClass('active');
     });
   });
+
+  // Request Builder and API Catalogue had no scope requirement before they
+  // moved into the Network workspace. The single Network entry must stay
+  // reachable for a user without core.traffic:read (the workspace hides the
+  // traffic-gated panes itself).
+  it('shows the Network entry to a user without core.traffic:read', () => {
+    renderWithRouter('/ui/', { auth: mockAuth });
+    expect(screen.getByText('Network', { selector: 'a *, a' })).toBeInTheDocument();
+  });
 });
