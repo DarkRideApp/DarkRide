@@ -1,13 +1,18 @@
 // backend/services/ai/__tests__/openai-chat.dialect.test.ts
 // fixtures: hand-written from https://platform.openai.com/docs/api-reference/chat-streaming (wire shape only)
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { openAiChatDialect, __resetOpenAiChatMemo } from '../dialects/openai-chat';
 import { makeCtx } from '../test-ctx';
 import { sseResponse, sseBody, chunkedResponse, collect } from '../test-helpers';
 import { OutputLimitError, AiProviderError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiToolDefinition } from '../../../../shared/types/ai-chat';
 
-beforeEach(() => __resetOpenAiChatMemo());
+const { logSpy } = vi.hoisted(() => ({ logSpy: vi.fn() }));
+vi.mock('../../../logs', () => ({
+  createLoggers: () => ({ log: logSpy, error: vi.fn() }),
+}));
+
+beforeEach(() => { __resetOpenAiChatMemo(); logSpy.mockClear(); });
 
 const run = (res: Response, id = 'openai-compatible') => collect(openAiChatDialect.parseStream(res, makeCtx(id)));
 const chunk = (o: unknown) => ({ data: JSON.stringify(o) });
@@ -94,11 +99,11 @@ describe('parseStream', () => {
     expect(events).toEqual([{ type: 'text', text: 'Hel' }, { type: 'text', text: 'lo' }, { type: 'usage', inputTokens: 11, outputTokens: 4 }]);
   });
 
-  it('parallel tool calls keyed by index, arguments concatenated, emitted in index order', async () => {
+  it('parallel tool calls keyed by index: interleaved fragments are concatenated per call, emitted in the order the calls started', async () => {
     const events = await run(sseResponse([
-      delta(tc({ index: 1, id: 'b', name: 'second', args: '{"y"' })),
       delta(tc({ index: 0, id: 'a', name: 'first', args: '{"x":' })),
-      delta(tc({ index: 0, args: '1}' })), delta(tc({ index: 1, args: ':2}' })),
+      delta(tc({ index: 1, id: 'b', name: 'second', args: '{"y"' })),
+      delta(tc({ index: 1, args: ':2}' })), delta(tc({ index: 0, args: '1}' })),
       delta({}, 'tool_calls'), { data: '[DONE]' },
     ]));
     expect(events).toEqual([
@@ -107,7 +112,29 @@ describe('parseStream', () => {
     ]);
   });
 
-  it('review focus 5: no index, id repeated on every fragment, no [DONE] -> one call', async () => {
+  it('emits calls in the order they started, not by index number', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 1, id: 'b', name: 'second', args: '{"y"' })),
+      delta(tc({ index: 0, id: 'a', name: 'first', args: '{"x":' })),
+      delta(tc({ index: 0, args: '1}' })), delta(tc({ index: 1, args: ':2}' })),
+      delta({}, 'tool_calls'), { data: '[DONE]' },
+    ]));
+    expect(events.map((e: any) => e.name)).toEqual(['second', 'first']);
+    expect(events).toContainEqual({ type: 'tool_use', id: 'a', name: 'first', input: { x: 1 } });
+    expect(events).toContainEqual({ type: 'tool_use', id: 'b', name: 'second', input: { y: 2 } });
+  });
+
+  it('a re-keyed index does not jump the queue: 0:x, 0:y, 1:z come out x, y, z', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, id: 'x', name: 'one', args: '{}' })),
+      delta(tc({ index: 0, id: 'y', name: 'two', args: '{}' })),
+      delta(tc({ index: 1, id: 'z', name: 'three', args: '{}' })),
+      delta({}, 'tool_calls'),
+    ]));
+    expect(events.map((e: any) => e.id)).toEqual(['x', 'y', 'z']);
+  });
+
+  it('no index, id repeated on every fragment, no [DONE] -> one call', async () => {
     const events = await run(sseResponse([
       delta(tc({ id: 'call_1', name: 'get_apps', args: '{"q"' })),
       delta(tc({ id: 'call_1', args: ':"a"}' })),
@@ -156,6 +183,109 @@ describe('parseStream', () => {
       { type: 'tool_use', id: 'x', name: 'one', input: { a: 1 } },
       { type: 'tool_use', id: 'y', name: 'two', input: { b: 2 } },
     ]);
+  });
+
+  it('a late real id replaces a synthesised one instead of splitting the call (index)', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, name: 'f', args: '{"a"' })),
+      delta(tc({ index: 0, id: 'real', args: ':1}' })),
+      delta({}, 'tool_calls'),
+    ]));
+    expect(events).toEqual([{ type: 'tool_use', id: 'real', name: 'f', input: { a: 1 } }]);
+  });
+
+  it('a late real id replaces a synthesised one instead of splitting the call (no index)', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ name: 'f', args: '{"a"' })),
+      delta(tc({ id: 'real', args: ':1}' })),
+      delta({}, 'tool_calls'),
+    ]));
+    expect(events).toEqual([{ type: 'tool_use', id: 'real', name: 'f', input: { a: 1 } }]);
+  });
+
+  it('a synthesised id is not adopted by a fragment that opens another named call', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, name: 'one', args: '{}' })),
+      delta(tc({ index: 0, id: 'real', name: 'two', args: '{}' })),
+      delta({}, 'tool_calls'),
+    ]));
+    expect(events).toEqual([
+      { type: 'tool_use', id: 'id-1', name: 'one', input: {} },
+      { type: 'tool_use', id: 'real', name: 'two', input: {} },
+    ]);
+  });
+
+  it('a server-sent id is never replaced by a later, different id', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, id: 'x', name: 'one', args: '{"a":1}' })), delta(tc({ index: 0, id: 'y', args: '{}' })),
+      delta({}, 'tool_calls'),
+    ]));
+    expect(events).toEqual([{ type: 'tool_use', id: 'x', name: 'one', input: { a: 1 } }]);
+  });
+
+  it('finish_reason before the last argument fragment: the incomplete call waits for the rest', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, id: 'a', name: 'f', args: '{"q":' })),
+      delta({}, 'tool_calls'),
+      delta(tc({ index: 0, args: '"v"}' })),
+      { data: '[DONE]' },
+    ]));
+    expect(events).toEqual([{ type: 'tool_use', id: 'a', name: 'f', input: { q: 'v' } }]);
+  });
+
+  it('finish_reason before the last fragment, no [DONE]: flushed at the end of the stream', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, id: 'a', name: 'f', args: '{"q":' })),
+      delta({}, 'tool_calls'),
+      delta(tc({ index: 0, args: '"v"}' })),
+    ]));
+    expect(events).toEqual([{ type: 'tool_use', id: 'a', name: 'f', input: { q: 'v' } }]);
+  });
+
+  it('finish_reason with one complete and one incomplete call: the complete one is emitted at once, the other later', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, id: 'a', name: 'done', args: '{"k":1}' })),
+      delta(tc({ index: 1, id: 'b', name: 'late', args: '{"q":' })),
+      delta({}, 'tool_calls'),
+      delta(tc({ index: 1, args: '2}' })),
+      { data: '[DONE]' },
+    ]));
+    expect(events).toEqual([
+      { type: 'tool_use', id: 'a', name: 'done', input: { k: 1 } },
+      { type: 'tool_use', id: 'b', name: 'late', input: { q: 2 } },
+    ]);
+  });
+
+  it('a call that is complete at finish_reason is emitted before the trailing usage chunk is read', async () => {
+    const enc = new TextEncoder();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let i = 0;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (i === 0) { controller.enqueue(enc.encode(sseBody([delta(tc({ index: 0, id: 'a', name: 'f', args: '{}' })), delta({}, 'tool_calls')]))); i++; }
+        else if (i === 1) { await gate; controller.enqueue(enc.encode(sseBody([chunk({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } }), { data: '[DONE]' }]))); i++; }
+        else controller.close();
+      },
+    });
+    const it2 = openAiChatDialect.parseStream(new Response(body), makeCtx('openai-compatible'))[Symbol.asyncIterator]();
+    const first = await it2.next();                       // would hang here if the call waited for the usage chunk
+    expect(first.value).toEqual({ type: 'tool_use', id: 'a', name: 'f', input: {} });
+    release();
+    const rest: any[] = [];
+    for (let n = await it2.next(); !n.done; n = await it2.next()) rest.push(n.value);
+    expect(rest).toEqual([{ type: 'usage', inputTokens: 1, outputTokens: 1 }]);
+  });
+
+  it('logs when plain text is cut off by the output token limit', async () => {
+    const events = await run(sseResponse([delta({ content: 'cut off' }, 'length')]), 'openrouter');
+    expect(events).toEqual([{ type: 'text', text: 'cut off' }]);
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('OpenRouter response was cut off by the output token limit'));
+  });
+
+  it('does not log a cut-off line for a normal stop', async () => {
+    await run(sseResponse([delta({ content: 'fine' }, 'stop')]), 'openrouter');
+    expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining('cut off'));
   });
 
   it('synthesises an id when the server sends none', async () => {
@@ -215,7 +345,7 @@ describe('parseStream', () => {
     expect(events).toEqual([{ type: 'text', text: 'hi' }]);
   });
 
-  describe('review focus 4: abort', () => {
+  describe('caller abort', () => {
     /** Deliver `chunk` as one network read and abort from the consumer on the first text event. */
     async function abortOnFirstText(chunk: string, signal?: AbortSignal) {
       const ac = new AbortController();

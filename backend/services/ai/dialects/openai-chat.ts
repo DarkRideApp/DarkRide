@@ -62,12 +62,19 @@ function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError
   return new AiProviderError(text, opts);
 }
 
-interface Buf { id: string; name: string; args: string }
+/** One tool call being assembled. `synthetic` marks an id we made up because the server had not sent one yet. */
+interface Buf { id: string; synthetic: boolean; name: string; args: string }
+
+function argsComplete(args: string): boolean {
+  if (args.trim() === '') return true;
+  try { JSON.parse(args); return true; } catch { return false; }
+}
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   const shortName = ctx.descriptor.shortName;
   if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
 
+  /** Insertion order is the order the calls started, which is the order they are emitted in. */
   const bufs = new Map<number, Buf>();
   /** Wire `index` -> key of the buffer now receiving that index's fragments (re-pointed when a server reuses an index for a new call). */
   const keyByIndex = new Map<number, number>();
@@ -78,9 +85,16 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   let sawContent = false;
   let usage: { input: number; output: number } | undefined;
 
-  function* flush(): Generator<AiStreamEvent> {
-    for (const key of [...bufs.keys()].sort((a, b) => a - b)) {
-      const b = bufs.get(key)!;
+  /**
+   * Emit finished tool calls. A non-final flush (at finish_reason) keeps a buffer whose arguments do not parse yet,
+   * because some servers send finish_reason before the last argument fragment. The final flush (end of stream, or a
+   * 'length' finish) emits everything: unparsable arguments become `{}`, or an OutputLimitError after truncation.
+   */
+  function* flush(final: boolean): Generator<AiStreamEvent> {
+    for (const [key, b] of [...bufs]) {
+      if (!final && !argsComplete(b.args)) continue;
+      bufs.delete(key);
+      if (key === newest) newest = undefined;
       if (!b.name) continue;
       let input: Record<string, any> = {};
       if (b.args.trim() !== '') {
@@ -94,9 +108,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
       sawContent = true;
       yield { type: 'tool_use', id: b.id, name: b.name, input };
     }
-    bufs.clear();
-    keyByIndex.clear();
-    newest = undefined;
+    if (final) { bufs.clear(); keyByIndex.clear(); newest = undefined; }
   }
 
   for await (const sse of parseSSEStream(res.body, signal)) {
@@ -115,19 +127,25 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     if (d?.content) { sawContent = true; yield { type: 'text', text: d.content }; }
 
     for (const call of d?.tool_calls ?? []) {
+      // A server-sent id that differs from the buffer's own id starts a new call. A fragment that carries a real id for a
+      // buffer whose id we made up completes that buffer's id instead, unless it opens another named call.
+      const startsNew = (cur: Buf | undefined): boolean => {
+        if (!cur || !call.id || cur.id === call.id) return false;
+        if (cur.synthetic && !(call.function?.name && cur.name)) return false;
+        return true;
+      };
       let key: number;
       if (typeof call.index === 'number') {
         const mapped = keyByIndex.get(call.index) ?? call.index;
-        const existing = bufs.get(mapped);
-        key = existing && call.id && existing.id !== call.id ? nextSynthetic++ : mapped;
+        key = startsNew(bufs.get(mapped)) ? nextSynthetic++ : mapped;
         keyByIndex.set(call.index, key);
-      } else if (call.id && (newest === undefined || bufs.get(newest)?.id !== call.id)) {
-        key = nextSynthetic++;
       } else {
-        key = newest ?? nextSynthetic++;
+        const cur = newest === undefined ? undefined : bufs.get(newest);
+        key = newest !== undefined && cur && !startsNew(cur) ? newest : nextSynthetic++;
       }
       let b = bufs.get(key);
-      if (!b) { b = { id: call.id || ctx.newId(), name: '', args: '' }; bufs.set(key, b); }
+      if (!b) { b = { id: call.id || ctx.newId(), synthetic: !call.id, name: '', args: '' }; bufs.set(key, b); }
+      else if (call.id && b.synthetic) { b.id = call.id; b.synthetic = false; }
       newest = key;
       if (call.function?.name) b.name = call.function.name;
       if (call.function?.arguments) b.args += call.function.arguments;
@@ -135,7 +153,8 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
 
     if (choice.finish_reason) {
       finish = choice.finish_reason;
-      yield* flush(); // keep reading afterwards: the usage chunk follows finish_reason
+      yield* flush(finish === 'length'); // keep reading afterwards: the usage chunk (and any late argument fragment) follows
+      if (finish === 'length') log(`${shortName} response was cut off by the output token limit`);
     }
   }
 
@@ -147,7 +166,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     if (bufs.size === 0 && !sawContent) throw new AiProviderError(`${shortName} returned an empty response`, { provider: ctx.descriptor.id });
     log(`${shortName} stream ended without finish_reason or [DONE]; flushing what arrived`);
   }
-  yield* flush();
+  yield* flush(true);
   if (usage) yield { type: 'usage', inputTokens: usage.input, outputTokens: usage.output };
 }
 
