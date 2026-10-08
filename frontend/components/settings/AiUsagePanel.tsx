@@ -9,6 +9,13 @@ const WINDOWS = [7, 30, 90] as const;
 const DEFAULT_WINDOW = 30;
 /** A day with any cost at all stays at least this tall (percent), so it does not vanish next to a big day. */
 const MIN_VISIBLE_BAR_PERCENT = 2;
+/** By-day bars: capped width so a single day is not a wide block, a floor so 90 days scroll instead of shrinking away. */
+const BAR_MAX_WIDTH = 24;
+const BAR_MIN_WIDTH = 8;
+const BAR_GAP = 2;
+const STRIP_HEIGHT = 72;
+/** Narrowest the strip gets, so the first and last date labels still fit when there are only a few days. */
+const STRIP_MIN_WIDTH = 140;
 /** Longest date range the by-day strip will fill with empty days; beyond this it only draws days that have data. */
 const MAX_FILLED_DAYS = 400;
 
@@ -56,6 +63,25 @@ function formatDateTime(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
   return new Intl.DateTimeFormat(userLocale(), { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+}
+
+/** The date half of a timestamp, so the table can stack date over time in a narrow column. */
+function formatDatePart(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return new Intl.DateTimeFormat(userLocale(), { dateStyle: 'medium' }).format(date);
+}
+
+function formatTimePart(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat(userLocale(), { timeStyle: 'short' }).format(date);
+}
+
+/** `turns / tool calls`, or a single n/a when neither was recorded. */
+function formatTurnsAndTools(turns: number | null | undefined, toolCalls: number | null | undefined): string {
+  if (turns == null && toolCalls == null) return NA;
+  return `${formatCount(turns)} / ${formatCount(toolCalls)}`;
 }
 
 /** `YYYY-MM-DD` as a local calendar day, or null when it is not one. Built from parts so no timezone shifts it. */
@@ -161,6 +187,18 @@ const numberCell: React.CSSProperties = { textAlign: 'right', fontVariantNumeric
 // `cursor: default` switches off the host's sortable-header hover, these headers do not sort.
 const plainHeader: React.CSSProperties = { cursor: 'default' };
 const plainNumberHeader: React.CSSProperties = { cursor: 'default', textAlign: 'right', whiteSpace: 'nowrap' };
+
+// The recent runs table has to fit the settings card without sideways scrolling, so its cells are tighter than
+// the host default, numbers never wrap, and the long columns (time, models) are kept short.
+const runCellPadding: React.CSSProperties = { padding: '4px 6px' };
+const runCell: React.CSSProperties = { ...runCellPadding, verticalAlign: 'middle' };
+const runNumberCell: React.CSSProperties = { ...runCellPadding, ...numberCell, verticalAlign: 'middle' };
+const runHeader: React.CSSProperties = { ...runCellPadding, ...plainHeader };
+const runNumberHeader: React.CSSProperties = { ...runCellPadding, cursor: 'default', textAlign: 'right' };
+/** Model ids stay on one line; what does not fit is cut with an ellipsis and the full list is in the tooltip. */
+const modelListStyle: React.CSSProperties = {
+  display: 'block', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+};
 
 // ── Panel ────────────────────────────────────────────────────────────────
 
@@ -279,9 +317,10 @@ function SummaryCards({ totals }: { totals: AiUsageResponse['totals'] }) {
   // The summary sits inside the section's own card, so these are plain tiles (the host's stat typography
   // without a second bordered card); every tile gets the same value colour instead of the first-child accent.
   const value: React.CSSProperties = { fontSize: 22, color: 'var(--text-primary)' };
-  const tile: React.CSSProperties = { background: 'var(--bg-secondary)', borderRadius: 6 };
+  const tile: React.CSSProperties = { background: 'var(--bg-secondary)', borderRadius: 6, padding: '12px 8px' };
+  // Four tiles fit in one row at the width of the settings card; narrower widths wrap to two rows.
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 12 }}>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 12 }}>
       <div className="stat-card" style={tile} data-testid="ai-usage-total-runs">
         <div className="stat-value" style={value}>{formatCount(totals.runs)}</div>
         <div className="stat-label">Runs</div>
@@ -296,7 +335,8 @@ function SummaryCards({ totals }: { totals: AiUsageResponse['totals'] }) {
         <div className="stat-value" style={value}>{formatPercent(totals.cacheHitRate)}</div>
         <div className="stat-label">Cache hit rate</div>
         <div className="stat-detail">
-          {formatCount(totals.cacheReadTokens)} read, {formatCount(totals.cacheWriteTokens)} written
+          <span style={{ whiteSpace: 'nowrap' }}>{formatCount(totals.cacheReadTokens)} read,</span>{' '}
+          <span style={{ whiteSpace: 'nowrap' }}>{formatCount(totals.cacheWriteTokens)} written</span>
         </div>
       </div>
       <div className="stat-card" style={tile} data-testid="ai-usage-cost">
@@ -384,36 +424,44 @@ function ByDayChart({ rows }: { rows: AiUsageDay[] }) {
     <div data-testid="ai-usage-by-day">
       <h5 style={subHeading}>By day</h5>
       <div style={{ ...mutedSmall, marginBottom: 6 }}>{caption} (busiest day {peakText})</div>
+      {/* The scrolling box is only as wide as its bars (up to the card), and the date labels live inside it,
+          so they stay under the first and last bar, also when 90 days scroll sideways. */}
       <div
-        role="group"
-        aria-label={caption}
         data-testid="ai-usage-day-strip"
-        style={{ display: 'flex', alignItems: 'stretch', gap: 2, height: 96, overflowX: 'auto', paddingBottom: 2 }}
+        style={{ width: '100%', maxWidth: Math.max(buckets.length * (BAR_MAX_WIDTH + BAR_GAP), STRIP_MIN_WIDTH), overflowX: 'auto' }}
       >
-        {buckets.map((b) => (
+        <div style={{ minWidth: buckets.length * (BAR_MIN_WIDTH + BAR_GAP) }}>
           <div
-            key={b.date}
-            role="img"
-            aria-label={label(b)}
-            title={label(b)}
-            data-testid="ai-usage-day-bar"
-            style={{
-              flex: '1 0 8px', minWidth: 8, maxWidth: 28,
-              display: 'flex', alignItems: 'flex-end',
-              background: 'var(--bg-secondary)', borderRadius: 2,
-            }}
+            role="group"
+            aria-label={caption}
+            style={{ display: 'flex', alignItems: 'stretch', gap: BAR_GAP, height: STRIP_HEIGHT }}
           >
-            <div
-              aria-hidden="true"
-              data-testid="ai-usage-day-fill"
-              style={{ width: '100%', height: heightPercent(b), background: 'var(--accent)', borderRadius: 2 }}
-            />
+            {buckets.map((b) => (
+              <div
+                key={b.date}
+                role="img"
+                aria-label={label(b)}
+                title={label(b)}
+                data-testid="ai-usage-day-bar"
+                style={{
+                  flex: `1 0 ${BAR_MIN_WIDTH}px`, minWidth: BAR_MIN_WIDTH, maxWidth: BAR_MAX_WIDTH,
+                  display: 'flex', alignItems: 'flex-end',
+                  background: 'var(--bg-secondary)', borderRadius: 2,
+                }}
+              >
+                <div
+                  aria-hidden="true"
+                  data-testid="ai-usage-day-fill"
+                  style={{ width: '100%', height: heightPercent(b), background: 'var(--accent)', borderRadius: 2 }}
+                />
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-      <div style={{ ...mutedSmall, display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
-        <span>{formatDay(buckets[0].date, 'short')}</span>
-        <span>{formatDay(buckets[buckets.length - 1].date, 'short')}</span>
+          <div style={{ ...mutedSmall, display: 'flex', justifyContent: 'space-between', marginTop: 2, whiteSpace: 'nowrap' }}>
+            <span>{formatDay(buckets[0].date, 'short')}</span>
+            {buckets.length > 1 && <span>{formatDay(buckets[buckets.length - 1].date, 'short')}</span>}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -439,45 +487,44 @@ function RecentRunsTable({ runs }: { runs: AiUsageRun[] }) {
         <table className="data-table" data-density="compact">
           <thead>
             <tr>
-              <th style={plainHeader}>Time</th>
-              <th style={plainHeader}>Purpose</th>
-              <th style={plainHeader}>Models</th>
-              <th style={plainNumberHeader}>Turns</th>
-              <th style={plainNumberHeader}>Tool calls</th>
-              <th style={plainNumberHeader}>Tokens in</th>
-              <th style={plainNumberHeader}>Tokens out</th>
-              <th style={plainNumberHeader}>Cache read</th>
-              <th style={plainNumberHeader}>Cache write</th>
-              <th style={plainNumberHeader}>Est. cost</th>
-              <th style={plainHeader}>Outcome</th>
+              <th style={runHeader}>Time</th>
+              <th style={runHeader}>Purpose</th>
+              <th style={runHeader}>Models</th>
+              <th style={runNumberHeader}>Est. cost</th>
+              <th style={runNumberHeader} title="Model turns / tool calls">Turns / tools</th>
+              <th style={runNumberHeader} title="Tokens sent / tokens received">Tokens in / out</th>
+              <th style={runNumberHeader} title="Tokens read from the cache / tokens written to the cache">Cache read / written</th>
+              <th style={runHeader}>Outcome</th>
             </tr>
           </thead>
           <tbody>
             {runs.map((run) => (
               <tr key={run.id} data-testid={`ai-usage-run-${run.id}`}>
-                <td style={{ whiteSpace: 'nowrap' }}>{formatDateTime(run.startedAt)}</td>
-                <td>{run.label}</td>
-                <td style={{ overflowWrap: 'anywhere' }}>
-                  {run.models.length > 0 ? run.models.join(', ') : NA}
+                <td style={{ ...runCell, whiteSpace: 'nowrap' }} title={formatDateTime(run.startedAt)}>
+                  {formatDatePart(run.startedAt)}
+                  <span style={{ ...mutedSmall, display: 'block' }}>{formatTimePart(run.startedAt)}</span>
+                </td>
+                <td style={runCell}>{run.label}</td>
+                <td style={runCell}>
+                  {run.models.length > 0 ? (
+                    <span title={run.models.join(', ')} style={modelListStyle}>{run.models.join(', ')}</span>
+                  ) : NA}
                   {run.fallbackRequests > 0 && (
                     <span
                       className="badge badge-warning badge-sm"
                       data-testid="ai-usage-run-fallback"
                       title={fallbackText(run.fallbackRequests)}
-                      style={{ marginLeft: 6 }}
+                      style={{ display: 'inline-block', whiteSpace: 'nowrap', marginTop: 2 }}
                     >
                       fallback
                     </span>
                   )}
                 </td>
-                <td style={numberCell}>{formatCount(run.turns)}</td>
-                <td style={numberCell}>{formatCount(run.toolCalls)}</td>
-                <td style={numberCell}>{formatCount(run.inputTokens)}</td>
-                <td style={numberCell}>{formatCount(run.outputTokens)}</td>
-                <td style={numberCell}>{formatCount(run.cacheReadTokens)}</td>
-                <td style={numberCell}>{formatCount(run.cacheWriteTokens)}</td>
-                <td style={numberCell}>{formatUsd(run.costUsd)}</td>
-                <td>
+                <td style={runNumberCell}>{formatUsd(run.costUsd)}</td>
+                <td style={runNumberCell}>{formatTurnsAndTools(run.turns, run.toolCalls)}</td>
+                <td style={runNumberCell}>{formatCount(run.inputTokens)} / {formatCount(run.outputTokens)}</td>
+                <td style={runNumberCell}>{formatCount(run.cacheReadTokens)} / {formatCount(run.cacheWriteTokens)}</td>
+                <td style={runCell}>
                   {run.outcome == null ? NA : (
                     <span
                       className={`badge badge-sm ${outcomeBadgeClass(run.outcome)}`}

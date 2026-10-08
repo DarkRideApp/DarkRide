@@ -394,6 +394,53 @@ describe('AiUsagePanel: by day', () => {
     expect(screen.getByTestId('ai-usage-by-day')).toHaveTextContent(/tokens per day/i);
   });
 
+  it('shows the date once when there is only one day', async () => {
+    renderPanel(makeWs(() => ok(usage({ byDay: [day({ date: '2026-10-01' })] }))));
+    const chart = await screen.findByTestId('ai-usage-by-day');
+    expect(bars()).toHaveLength(1);
+    expect(within(chart).getAllByText('Oct 1')).toHaveLength(1);
+  });
+
+  it('labels the first and last day under the strip when there are several', async () => {
+    const byDay = [day({ date: '2026-10-01' }), day({ date: '2026-10-03' })];
+    renderPanel(makeWs(() => ok(usage({ byDay }))));
+    const chart = await screen.findByTestId('ai-usage-by-day');
+    expect(within(chart).getAllByText('Oct 1')).toHaveLength(1);
+    expect(within(chart).getAllByText('Oct 3')).toHaveLength(1);
+  });
+
+  it('keeps the date labels inside the scrolling strip, so they stay under the first and last bar', async () => {
+    const byDay = Array.from({ length: 30 }, (_, i) => day({ date: `2026-09-${String(i + 1).padStart(2, '0')}` }));
+    renderPanel(makeWs(() => ok(usage({ byDay }))));
+    const strip = (await screen.findByTestId('ai-usage-by-day')).querySelector('[data-testid="ai-usage-day-strip"]') as HTMLElement;
+    expect(within(strip).getByText('Sep 1')).toBeInTheDocument();
+    expect(within(strip).getByText('Sep 30')).toBeInTheDocument();
+  });
+
+  it('shrinks the strip to its bars when there are few days, and lets it fill the card when there are many', async () => {
+    const widthFor = async (count: number) => {
+      const byDay = Array.from({ length: count }, (_, i) => day({ date: `2026-08-${String(i + 1).padStart(2, '0')}` }));
+      const { unmount } = renderPanel(makeWs(() => ok(usage({ byDay }))));
+      const strip = (await screen.findByTestId('ai-usage-by-day')).querySelector('[data-testid="ai-usage-day-strip"]') as HTMLElement;
+      const result = { maxWidth: parseInt(strip.style.maxWidth, 10), width: strip.style.width };
+      unmount();
+      return result;
+    };
+    const few = await widthFor(3);
+    const many = await widthFor(30);
+    expect(few.width).toBe('100%');
+    expect(few.maxWidth).toBeLessThan(many.maxWidth);
+    expect(many.maxWidth).toBeGreaterThan(400);
+  });
+
+  it('caps the width of a bar so a single day is not drawn as a wide block', async () => {
+    renderPanel(makeWs(() => ok(usage())));
+    await screen.findByTestId('ai-usage-by-day');
+    const widest = parseInt(bars()[0].style.maxWidth, 10);
+    expect(widest).toBeGreaterThan(0);
+    expect(widest).toBeLessThanOrEqual(36);
+  });
+
   it('keeps a day with a tiny but nonzero cost visible', async () => {
     const byDay = [
       day({ date: '2026-10-01', costUsd: 1 }),
@@ -424,7 +471,7 @@ describe('AiUsagePanel: by day', () => {
 });
 
 describe('AiUsagePanel: recent runs', () => {
-  it('shows time, purpose, models, turns, tool calls, tokens, cache, cost and outcome for a run', async () => {
+  it('shows time, purpose, models, cost, turns and tool calls, tokens, cache and outcome for a run, with cost right after models', async () => {
     const runs = [run({
       id: 41, label: 'APK analysis', models: ['claude-sonnet-4-5', 'claude-haiku-4-5'],
       turns: 4, toolCalls: 7, inputTokens: 120_000, outputTokens: 3_500,
@@ -435,23 +482,33 @@ describe('AiUsagePanel: recent runs', () => {
 
     const headers = within(table).getAllByRole('columnheader').map((h) => h.textContent);
     expect(headers).toEqual([
-      'Time', 'Purpose', 'Models', 'Turns', 'Tool calls', 'Tokens in', 'Tokens out',
-      'Cache read', 'Cache write', 'Est. cost', 'Outcome',
+      'Time', 'Purpose', 'Models', 'Est. cost', 'Turns / tools', 'Tokens in / out', 'Cache read / written', 'Outcome',
     ]);
 
-    const cells = within(within(table).getByTestId('ai-usage-run-41')).getAllByRole('cell').map((c) => c.textContent);
-    const expectedTime = new Date('2026-10-07T10:15:00.000Z').toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
-    expect(cells[0]).toBe(expectedTime);
+    const when = new Date('2026-10-07T10:15:00.000Z');
+    const expectedDate = when.toLocaleDateString('en-US', { dateStyle: 'medium' });
+    const expectedTime = when.toLocaleTimeString('en-US', { timeStyle: 'short' });
+    const cellElements = within(within(table).getByTestId('ai-usage-run-41')).getAllByRole('cell');
+    const cells = cellElements.map((c) => c.textContent);
+    expect(cells[0]).toContain(expectedDate);
+    expect(cells[0]).toContain(expectedTime);
+    expect(cellElements[0]).toHaveAttribute('title', when.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }));
     expect(cells[1]).toBe('APK analysis');
     expect(cells[2]).toBe('claude-sonnet-4-5, claude-haiku-4-5');
-    expect(cells[3]).toBe('4');
-    expect(cells[4]).toBe('7');
-    expect(cells[5]).toBe('120,000');
-    expect(cells[6]).toBe('3,500');
-    expect(cells[7]).toBe('90,000');
-    expect(cells[8]).toBe('10,000');
-    expect(cells[9]).toBe('$0.0421');
-    expect(cells[10]).toBe('success');
+    expect(cells[3]).toBe('$0.0421');
+    expect(cells[4]).toBe('4 / 7');
+    expect(cells[5]).toBe('120,000 / 3,500');
+    expect(cells[6]).toBe('90,000 / 10,000');
+    expect(cells[7]).toBe('success');
+    expect(cells).toHaveLength(8);
+  });
+
+  it('explains the merged column headers in their tooltips', async () => {
+    renderPanel(makeWs(() => ok(usage())));
+    const table = await screen.findByTestId('ai-usage-runs');
+    expect(within(table).getByRole('columnheader', { name: 'Turns / tools' })).toHaveAttribute('title', 'Model turns / tool calls');
+    expect(within(table).getByRole('columnheader', { name: 'Tokens in / out' })).toHaveAttribute('title', 'Tokens sent / tokens received');
+    expect(within(table).getByRole('columnheader', { name: 'Cache read / written' })).toHaveAttribute('title', 'Tokens read from the cache / tokens written to the cache');
   });
 
   it('shows n/a for a run recorded before turns, tool calls or cost were tracked', async () => {
@@ -461,8 +518,31 @@ describe('AiUsagePanel: recent runs', () => {
     expect(cells[2]).toBe('n/a');
     expect(cells[3]).toBe('n/a');
     expect(cells[4]).toBe('n/a');
-    expect(cells[9]).toBe('n/a');
-    expect(cells[10]).toBe('n/a');
+    expect(cells[7]).toBe('n/a');
+  });
+
+  it('shows what is known when only one of turns and tool calls was recorded', async () => {
+    const runs = [run({ id: 6, turns: 3, toolCalls: null })];
+    renderPanel(makeWs(() => ok(usage({ recentRuns: runs }))));
+    const cells = within(await screen.findByTestId('ai-usage-run-6')).getAllByRole('cell').map((c) => c.textContent);
+    expect(cells[4]).toBe('3 / n/a');
+  });
+
+  it('keeps the model list on one line with the full list in a tooltip, and the fallback marker unbroken', async () => {
+    const runs = [
+      run({ id: 11, models: ['claude-sonnet-4-5', 'claude-haiku-4-5'], fallbackRequests: 2 }),
+      run({ id: 12, models: [] }),
+    ];
+    renderPanel(makeWs(() => ok(usage({ recentRuns: runs }))));
+    const row = await screen.findByTestId('ai-usage-run-11');
+    const list = within(row).getByText('claude-sonnet-4-5, claude-haiku-4-5');
+    expect(list).toHaveAttribute('title', 'claude-sonnet-4-5, claude-haiku-4-5');
+    expect(list.style.whiteSpace).toBe('nowrap');
+    expect(list.style.textOverflow).toBe('ellipsis');
+    expect(list.style.overflow).toBe('hidden');
+    expect(within(row).getByTestId('ai-usage-run-fallback').style.whiteSpace).toBe('nowrap');
+    // A run with no recorded models has nothing to put in a tooltip.
+    expect(within(within(screen.getByTestId('ai-usage-run-12')).getAllByRole('cell')[2]).queryByTitle(/./)).toBeNull();
   });
 
   it('marks only the runs that were served after a fallback', async () => {
