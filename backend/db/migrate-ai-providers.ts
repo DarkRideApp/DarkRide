@@ -5,6 +5,9 @@ import { createLoggers } from '../logs';
 
 const { log } = createLoggers('migrate-ai-providers');
 
+/** Provider types whose stored Base URL was never used before the provider registry. */
+const TYPES_THAT_IGNORED_BASE_URL = new Set(['openrouter', 'gemini']);
+
 /**
  * Idempotent data migration: moves credentials from ai_models rows into
  * deduplicated ai_providers entries, and migrates legacy settings keys.
@@ -46,6 +49,14 @@ export function migrateAiProviders(db: AppDatabase): void {
     `SELECT id, name, provider, api_key, base_url
      FROM ai_models WHERE provider_id IS NULL`
   ).all();
+
+  // OpenRouter and Gemini ignored the Base URL before the provider registry, but the old settings form
+  // posted whatever was in the field, so these rows can hold a stale URL (often a retyped Ollama one).
+  // The registry honours the field, so carrying it over would send live traffic, with the key, to that
+  // URL. Same list as migration 0100, which clears it on providers that already existed.
+  for (const m of orphanedModels) {
+    if (TYPES_THAT_IGNORED_BASE_URL.has(m.provider)) m.base_url = null;
+  }
 
   if (orphanedModels.length > 0) {
     // Group by (provider, api_key, base_url) to deduplicate

@@ -248,6 +248,11 @@ export function registerAiModelEndpoints(
     }
 
     db.update(aiModels).set(updates).where(eq(aiModels.id, id)).run();
+    // A cooldown belongs to the provider and upstream model it was earned on. Once either changes, the
+    // row points somewhere else, so the old cooldown must not keep it out of rotation.
+    const relinked = (updates.providerId !== undefined && updates.providerId !== existing.providerId)
+      || (updates.model !== undefined && updates.model !== existing.model);
+    if (relinked) rateLimitCache.clear([id]);
 
     const updatedRows = db.select({
       id: aiModels.id,

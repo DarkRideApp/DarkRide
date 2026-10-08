@@ -213,6 +213,63 @@ describe('AISection — provider form is driven by the catalog', () => {
     expect(screen.queryByText(/optional, uses provider default/i)).toBeNull();
   });
 
+  const editProvider = async (provider: Record<string, unknown>) => {
+    const ws = wsWith((m, p) => (m === 'GET' && p === '/v1/ai/providers'
+      ? restOk({ success: true, data: [{ id: 7, name: 'Saved', hasApiKey: false, createdAt: 0, updatedAt: 0, ...provider }] })
+      : undefined));
+    renderAISection(ws);
+    const row = await screen.findByTestId('ai-provider-row-7');
+    fireEvent.click(within(row).getByRole('button', { name: 'Edit' }));
+    return ws;
+  };
+
+  it('editing a provider whose type is no longer offered shows that type and keeps it on save', async () => {
+    const ws = await editProvider({ type: 'retired-type', baseUrl: null });
+    const select = screen.getByTestId('provider-type-select') as HTMLSelectElement;
+    expect(select.value).toBe('retired-type');
+    const unknown = within(select).getByRole('option', { name: 'Unknown type: retired-type' }) as HTMLOptionElement;
+    expect(unknown.disabled).toBe(true);
+    expect(select.selectedOptions[0]).toBe(unknown);
+    fireEvent.click(screen.getByTestId('save-provider-btn'));
+    await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledWith('PUT', '/v1/ai/providers/7', expect.objectContaining({ type: 'retired-type' })));
+    // Once another type is chosen, the placeholder option goes away.
+    fireEvent.click(within(await screen.findByTestId('ai-provider-row-7')).getByRole('button', { name: 'Edit' }));
+    pickType('anthropic');
+    expect(within(screen.getByTestId('provider-type-select')).queryByRole('option', { name: /Unknown type/ })).toBeNull();
+  });
+
+  it('switching the type away and back restores the saved Base URL', async () => {
+    await editProvider({ type: 'ollama', baseUrl: 'http://192.168.1.5:11434' });
+    const baseUrl = () => (screen.getByTestId('provider-base-url-input') as HTMLInputElement).value;
+    expect(baseUrl()).toBe('http://192.168.1.5:11434');
+    pickType('openrouter');
+    expect(baseUrl()).toBe('');                                     // a different type starts empty
+    pickType('ollama');
+    expect(baseUrl()).toBe('http://192.168.1.5:11434');
+  });
+
+  it('a required Base URL that is empty shows its message at once, linked to the field', async () => {
+    await openAddProvider();
+    pickType('openai-compatible');
+    const input = screen.getByTestId('provider-base-url-input');
+    const message = screen.getByTestId('provider-base-url-error');
+    expect(message.id).not.toBe('');
+    expect(input.getAttribute('aria-describedby')).toBe(message.id);
+    expect(input).toHaveAttribute('aria-invalid', 'true');
+    fireEvent.change(input, { target: { value: 'http://127.0.0.1:1234' } });
+    expect(screen.queryByTestId('provider-base-url-error')).toBeNull();
+    expect(input).not.toHaveAttribute('aria-describedby');
+  });
+
+  it('announces that the saved key will be cleared', async () => {
+    renderAISection();
+    const row = await screen.findByTestId('ai-provider-row-1');
+    fireEvent.click(within(row).getByRole('button', { name: 'Edit' }));
+    expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.change(screen.getByTestId('provider-base-url-input'), { target: { value: 'https://proxy.test' } });
+    expect(screen.getByRole('alert')).toHaveTextContent(/clears the saved key/i);
+  });
+
   it('the custom model input hints at a neutral example, not a specific model id', async () => {
     const ws = wsWith((m, p) => (m === 'GET' && p === '/v1/ai/providers'
       ? restOk({ success: true, data: [{ id: 3, name: 'Local', type: 'openai-compatible', baseUrl: 'http://127.0.0.1:1234/v1', hasApiKey: false, createdAt: 0, updatedAt: 0 }] })

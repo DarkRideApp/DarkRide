@@ -34,6 +34,13 @@ const CLI_SKIP_REASON = 'uses claude-cli which does not support HTTP streaming';
 /** True when the caller's own signal has fired: whatever the provider threw or returned, it is not a provider failure. */
 const callerAborted = (signal: AbortSignal | undefined): boolean => signal?.aborted === true;
 
+/** True when two reads of a provider row describe the same credential and endpoint. */
+const sameCredential = (a: ProviderRow, b: ProviderRow): boolean =>
+  a.type === b.type
+  && (a.apiKey ?? null) === (b.apiKey ?? null)
+  && (a.baseUrl ?? null) === (b.baseUrl ?? null)
+  && a.updatedAt?.getTime() === b.updatedAt?.getTime();
+
 // ── Rate limit cache ─────────────────────────────────────────────────
 
 interface RateLimitEntry {
@@ -256,6 +263,14 @@ export class AiModelRouter {
    * down only the model. Overload is transient and starts none.
    */
   private recordFailure(model: ModelRow, row: ProviderRow, err: unknown): void {
+    // `row` is the provider entry as it was when the attempt started. If the user has since saved a
+    // different key, URL, or type (or deleted the entry), this failure belongs to the old credential
+    // and must not cool down the corrected one.
+    const current = this.db.select().from(aiProviders).where(eq(aiProviders.id, row.id)).all()[0];
+    if (!current || !sameCredential(row, current)) {
+      log(`Model "${model.name}" failure predates a change to its provider, no cooldown started`);
+      return;
+    }
     if (err instanceof QuotaExhaustedError || err instanceof AuthError) {
       for (const sibling of this.db.select().from(aiModels).where(eq(aiModels.providerId, row.id)).all()) {
         this.rateLimitCache.record429(sibling.id);
@@ -354,8 +369,8 @@ export class AiModelRouter {
         const text = await complete.call(provider, req);
         // A drained stream returns its partial text when the caller aborts; that is not a success.
         signal?.throwIfAborted();
+        // No success log here: inline completion calls this on every pause in typing.
         this.rateLimitCache.recordSuccess(model.id, provider.lastResponseHeaders, row.type);
-        log(`Completion served by model "${model.name}" (${row.type})`);
         return text;
       } catch (err) {
         signal?.throwIfAborted();

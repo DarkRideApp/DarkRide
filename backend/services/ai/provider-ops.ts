@@ -13,6 +13,8 @@ export type TestResult = { success: true; model: string } | { success: false; er
 export interface ProviderRow { type: string; apiKey: string | null; baseUrl: string | null }
 
 const MAX_PAGES = 10;
+/** More models than any real catalogue offers; a longer list is treated as a broken or hostile endpoint. */
+const MAX_MODELS = 50_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const CLI_MISSING = 'Claude CLI not found or not working';
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
@@ -56,7 +58,7 @@ async function withTimeout<T>(ctx: DialectContext, run: (signal: AbortSignal) =>
 
 /**
  * List a provider's models: the descriptor's static list, or the listing endpoint, following pagination for at
- * most 10 pages. A failed listing is classified like any other request, so a bad key reads as a typed AuthError
+ * most 10 pages and 50,000 models. A failed listing is classified like any other request, so a bad key reads as a typed AuthError
  * with the provider's hint, and a 200 that is not JSON is an AiProviderError rather than a SyntaxError.
  */
 export async function listModels(row: ProviderRow): Promise<{ id: string; name: string }[]> {
@@ -77,7 +79,11 @@ export async function listModels(row: ProviderRow): Promise<{ id: string; name: 
       return readJson(res, ctx, signal);
     });
     const parsed = parseModels.call(dialect, json);
-    all.push(...parsed.models);
+    // A loop rather than a spread: spreading a very long array overflows the call stack.
+    if (all.length + parsed.models.length > MAX_MODELS) {
+      throw new AiProviderError(`${d.shortName} model list is too large`, { provider: d.id });
+    }
+    for (const m of parsed.models) all.push(m);
     if (!parsed.next) break;
     page = parsed.next;
   }

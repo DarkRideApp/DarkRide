@@ -190,6 +190,30 @@ describe('listModels', () => {
     stubFetch(() => textResponse('<html>sign in</html>', 200));
     await expect(listModels(row('openai-compatible', { baseUrl: 'http://127.0.0.1:1234' }))).rejects.toThrow(/not JSON/);
   });
+  describe('a very large model list', () => {
+    // Each body is built once by repetition so the test stays small in memory.
+    const page = (count: number, more: boolean) =>
+      `{"data":[${'{"id":"m"},'.repeat(count - 1)}{"id":"m"}],"has_more":${more},"last_id":"m"}`;
+    it('a single page of 400,000 entries fails with a clear error, not a RangeError', async () => {
+      const body = page(400_000, false);
+      stubFetch(() => textResponse(body, 200));
+      const err: any = await listModels(row('anthropic')).catch((e) => e);
+      expect(err).toMatchObject({ name: 'AiProviderError', message: 'Anthropic model list is too large' });
+    });
+    it('stops once several pages pass 50,000 models in total', async () => {
+      const body = page(15_000, true);
+      const stub = stubFetch(() => textResponse(body, 200));
+      const err: any = await listModels(row('anthropic')).catch((e) => e);
+      expect(err).toMatchObject({ name: 'AiProviderError', message: 'Anthropic model list is too large' });
+      expect(stub.calls).toHaveLength(4);
+    });
+    it('a list of exactly 50,000 models is returned in full', async () => {
+      const body = page(10_000, true);
+      let n = 0;
+      stubFetch(() => textResponse(++n === 5 ? body.replace('"has_more":true', '"has_more":false') : body, 200));
+      expect(await listModels(row('anthropic'))).toHaveLength(50_000);
+    });
+  });
   it('an invalid stored Base URL fails clearly before any request', async () => {
     const stub = stubFetch(() => jsonResponse({}));
     await expect(listModels(row('openai-compatible', { baseUrl: 'localhost:1234' }))).rejects.toThrow(/invalid Base URL/);

@@ -935,6 +935,79 @@ describe('AiModelRouter', () => {
       expect(cache.isInCooldown(byName.A2, 10)).toBe(false);   // a rate limit is per model
     });
 
+    describe('a failure that arrives after the provider was edited', () => {
+      // A provider whose stream for model A runs `midFlight` and then throws `err`, as a request
+      // sent with the old key would when the user saves a corrected key while it is in flight.
+      const editing = (err: unknown, midFlight: () => void) => {
+        const base = scripted(scripts);
+        return vi.fn((type: string, cfg: any) => cfg.model !== 'A' ? base(type, cfg) : {
+          name: 'x',
+          createStreamingRequest: async function* () { midFlight(); throw err; },
+          complete: async () => { midFlight(); throw err; },
+        }) as any;
+      };
+      const ids = () => Object.fromEntries(r.getModels().map((m) => [m.name, m.id]));
+
+      it('starts no cooldown when the key changed while the request was in flight', async () => {
+        insertModel(db, { name: 'A2', model: 'A2', priority: 2, tierId: highTierId, _providerId: defaultProviderId });
+        two([], [{ type: 'text', value: 'B' }]);
+        r = new AiModelRouter(db as any, cache, { providerFactory: editing(new AuthError('bad key'), () => {
+          db.update(aiProviders).set({ apiKey: 'corrected-placeholder' }).where(eq(aiProviders.id, defaultProviderId)).run();
+        }) });
+        logger.log.mockClear();
+        expect(await run()).toEqual([{ type: 'text', text: 'B' }]);
+        expect(cache.isInCooldown(ids().A, 10)).toBe(false);
+        expect(cache.isInCooldown(ids().A2, 10)).toBe(false);
+        expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('predates a change to its provider'));
+      });
+
+      it('starts no cooldown when the base URL or type changed, or the provider was deleted, on either path', async () => {
+        const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+        const edits: Array<() => void> = [
+          () => db.update(aiProviders).set({ baseUrl: 'http://127.0.0.1:9/v1' }).where(eq(aiProviders.id, defaultProviderId)).run(),
+          () => db.update(aiProviders).set({ type: 'gemini' }).where(eq(aiProviders.id, defaultProviderId)).run(),
+        ];
+        for (const edit of edits) {
+          db.update(aiProviders).set({ type: 'openrouter', baseUrl: null }).where(eq(aiProviders.id, defaultProviderId)).run();
+          two([], [{ type: 'text', value: 'B' }]);
+          r = new AiModelRouter(db as any, cache, { providerFactory: editing(new ConnectionError('refused'), edit) });
+          await run();
+          expect(cache.isInCooldown(ids().A, 10)).toBe(false);
+        }
+        // completeText path with a quota failure on a provider that is renamed only: still cools down.
+        db.update(aiModels).set({ tierId: low.id }).run();
+        cache.getAll().clear();
+        r = new AiModelRouter(db as any, cache, { providerFactory: editing(new QuotaExhaustedError('no credits'), () => {
+          db.update(aiProviders).set({ name: 'Renamed only' }).where(eq(aiProviders.id, defaultProviderId)).run();
+        }) });
+        await r.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true });
+        expect(cache.isInCooldown(ids().A, 10)).toBe(true);
+        // completeText path with the key changed: no cooldown.
+        cache.getAll().clear();
+        r = new AiModelRouter(db as any, cache, { providerFactory: editing(new QuotaExhaustedError('no credits'), () => {
+          db.update(aiProviders).set({ apiKey: 'another-placeholder' }).where(eq(aiProviders.id, defaultProviderId)).run();
+        }) });
+        await r.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true });
+        expect(cache.isInCooldown(ids().A, 10)).toBe(false);
+        // Deleted provider: the failure cannot be attributed to the current credential either.
+        r = new AiModelRouter(db as any, cache, { providerFactory: editing(new AuthError('bad key'), () => {
+          db.update(aiModels).set({ providerId: null }).where(eq(aiModels.providerId, defaultProviderId)).run();
+          db.delete(aiProviders).where(eq(aiProviders.id, defaultProviderId)).run();
+        }) });
+        await r.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true });
+        expect(cache.isInCooldown(ids().A, 10)).toBe(false);
+      });
+
+      it('still cools down when the provider is unchanged', async () => {
+        insertModel(db, { name: 'A2', model: 'A2', priority: 2, tierId: highTierId, _providerId: defaultProviderId });
+        two([], [{ type: 'text', value: 'B' }]);
+        r = new AiModelRouter(db as any, cache, { providerFactory: editing(new AuthError('bad key'), () => undefined) });
+        expect(await run()).toEqual([{ type: 'text', text: 'B' }]);
+        expect(cache.isInCooldown(ids().A, 10)).toBe(true);
+        expect(cache.isInCooldown(ids().A2, 10)).toBe(true);
+      });
+    });
+
     it('a model cooled down by a credential failure is skipped on the next request', async () => {
       two([{ type: 'throw', value: new QuotaExhaustedError('no credits') }], [{ type: 'throw', value: new OverloadedError('busy') }]);
       await run().catch(() => undefined);
@@ -1227,6 +1300,14 @@ describe('AiModelRouter', () => {
       expect(await rr.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true })).toBe('done:B');
       const idA = rr.getModels().find((m) => m.name === 'A')!.id;
       expect(cache.isInCooldown(idA, 10)).toBe(true);
+    });
+    it('a successful completeText writes no log line, since inline completion runs on every pause in typing', async () => {
+      const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+      insertModel(db, { name: 'A', model: 'A', priority: 0, tierId: low.id, _providerId: defaultProviderId });
+      const rr = new AiModelRouter(db as any, cache, { providerFactory: scripted({}) });
+      logger.log.mockClear();
+      expect(await rr.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true })).toBe('done:A');
+      expect(logger.log).not.toHaveBeenCalled();
     });
     it('completeText rethrows a non-eligible error without trying the next model', async () => {
       const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;

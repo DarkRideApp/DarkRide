@@ -12,7 +12,7 @@ import {
 import type { AiModelConfig } from '../../../shared/types/ai-models';
 import type { AiProviderConfig, AiProviderType } from '../../../shared/types/ai-providers';
 import type { AiTier } from '@darkrideapp/plugin-sdk/react';
-import { AI_PROVIDER_CATALOG, getProviderDescriptor, sameEffectiveBaseUrl } from '../../../shared/lib/ai-provider-catalog';
+import { AI_PROVIDER_CATALOG, getProviderDescriptor, isKnownProviderType, sameEffectiveBaseUrl } from '../../../shared/lib/ai-provider-catalog';
 import { providerFormShape, validateProviderForm } from '../../../shared/lib/ai-provider-form';
 
 export function AISection() {
@@ -837,9 +837,18 @@ export function AISection() {
                 id="settings-llm-type"
                 className="form-input"
                 value={providerForm.type}
-                onChange={e => setProviderForm(f => ({ ...f, type: e.target.value as AiProviderType, baseUrl: '' }))}
+                onChange={e => {
+                  const type = e.target.value as AiProviderType;
+                  // Back on the saved type, the saved Base URL returns; otherwise saving would store none.
+                  const baseUrl = editingProvider && type === editingProvider.type ? savedBaseUrl : '';
+                  setProviderForm(f => ({ ...f, type, baseUrl }));
+                }}
                 data-testid="provider-type-select"
               >
+                {/* A stored type that is no longer offered still needs an option, or the select shows the first one. */}
+                {!isKnownProviderType(providerForm.type) && (
+                  <option value={providerForm.type} disabled>Unknown type: {providerForm.type}</option>
+                )}
                 {PROVIDER_TYPE_OPTIONS.map(o => (
                   <option key={o.value} value={o.value}>{o.label}</option>
                 ))}
@@ -909,10 +918,16 @@ export function AISection() {
                   onChange={e => setProviderForm(f => ({ ...f, baseUrl: e.target.value }))}
                   placeholder={shape.baseUrlPlaceholder || 'http://localhost:1234/v1'}
                   aria-invalid={baseUrlError ? true : undefined}
+                  aria-describedby={baseUrlError ? 'settings-llm-base-url-error' : undefined}
                   data-testid="provider-base-url-input"
                 />
-                {baseUrlError && providerForm.baseUrl.trim() !== '' && (
-                  <div style={{ fontSize: 12, color: 'var(--status-error, #ef4444)', marginTop: 4 }} data-testid="provider-base-url-error">
+                {baseUrlError && (
+                  <div
+                    id="settings-llm-base-url-error"
+                    aria-live="polite"
+                    style={{ fontSize: 12, color: 'var(--status-error, #ef4444)', marginTop: 4 }}
+                    data-testid="provider-base-url-error"
+                  >
                     {baseUrlError}
                   </div>
                 )}
@@ -920,7 +935,7 @@ export function AISection() {
             )}
 
             {keyWillBeCleared && (
-              <div style={{ fontSize: 12, color: 'var(--warning, #f59e0b)' }} data-testid="provider-key-clear-notice">
+              <div role="alert" style={{ fontSize: 12, color: 'var(--warning, #f59e0b)' }} data-testid="provider-key-clear-notice">
                 Changing the type or Base URL clears the saved key unless you enter a new one.
               </div>
             )}

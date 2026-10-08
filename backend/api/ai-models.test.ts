@@ -319,6 +319,43 @@ describe('AI Models API Endpoints', () => {
       expect(res.body.data.tierId).toBe(highTierId);
     });
 
+    describe('cooldown after relinking', () => {
+      const setup = () => {
+        const otherId = insertProvider(db, { name: 'Working Provider', apiKey: 'other-placeholder' });
+        insertModel(db, defaultProviderId, { name: 'Cooling', model: 'vendor/a' });
+        const id = db.select().from(aiModels).all()[0].id;
+        cache.record429(id);
+        return { id, otherId };
+      };
+
+      it('moving a cooled-down model to another provider clears its cooldown', async () => {
+        const { id, otherId } = setup();
+        const res = await request(app).put(`/v1/ai/models/${id}`).send({ providerId: otherId });
+        expect(res.status).toBe(200);
+        expect(cache.isInCooldown(id, 10)).toBe(false);
+      });
+
+      it('changing the model name sent upstream clears its cooldown', async () => {
+        const { id } = setup();
+        await request(app).put(`/v1/ai/models/${id}`).send({ model: 'vendor/b' });
+        expect(cache.isInCooldown(id, 10)).toBe(false);
+      });
+
+      it('a rename that resends the same provider and model keeps the cooldown', async () => {
+        const { id } = setup();
+        const res = await request(app).put(`/v1/ai/models/${id}`)
+          .send({ name: 'Renamed', providerId: defaultProviderId, model: ' vendor/a ' });
+        expect(res.status).toBe(200);
+        expect(cache.isInCooldown(id, 10)).toBe(true);
+      });
+
+      it('a rejected edit keeps the cooldown', async () => {
+        const { id } = setup();
+        await request(app).put(`/v1/ai/models/${id}`).send({ providerId: 999 });
+        expect(cache.isInCooldown(id, 10)).toBe(true);
+      });
+    });
+
     it('should default to High tier when tierId is explicitly null (the orphan-bug fix)', async () => {
       // Symmetrical to the POST behaviour: a PUT body with tierId: null
       // must not orphan the model. Mirrors the UI form's loading-state hazard.
