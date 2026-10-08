@@ -313,6 +313,50 @@ Success: `200` with `{ "success": true, "data": { "completion": "..." } }`. `com
 
 If the client disconnects, the upstream request is cancelled and nothing is written.
 
+## AI Usage
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | /v1/ai/usage | Token, cache and estimated cost totals for recorded agent runs |
+
+Needs the `core.settings:read` scope. The Usage panel in Settings → AI reads it.
+
+Query parameters, both optional:
+
+- `days`: window length, an integer from 1 to 90 (default 30). A run is included when it started at or after now minus `days` × 24 hours.
+- `limit`: number of entries in `recentRuns`, an integer from 1 to 200 (default 50). Totals always cover the whole window.
+
+Success: `200` with `{ "success": true, "data": { ... } }`, where `data` is an `AiUsageResponse` from [`shared/types/ai-usage.ts`](../shared/types/ai-usage.ts):
+
+- `days`, `generatedAt` (ISO 8601).
+- `totals`: `runs`, `failedRuns` (outcome `error`), `inputTokens` (prompt tokens including cache reads and writes), `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `cacheHitRate` (`cacheReadTokens / inputTokens`, `null` with no input), `costUsd`, `unpricedRuns`.
+- `byPurpose`: the same totals per purpose plus `purpose`, `label`, `medianCostUsd`, `p90CostUsd` (per run, over priced runs only) and `medianTurns`. Percentiles use the nearest-rank method, so the median of two runs is the lower one. Sorted by cost, highest first, with purposes that have no priced run last, then by run count.
+- `byDay`: one entry per local calendar day and purpose (`date` as `YYYY-MM-DD` in the server's timezone, `purpose`, `runs`, `inputTokens`, `outputTokens`, `costUsd`), oldest day first.
+- `recentRuns`: newest first. Each has `id`, `startedAt`, `durationMs` (`null` while running), `purpose`, `label`, `models` (distinct model ids in first-use order), `turns`, `toolCalls`, the four token counts, `costUsd`, `outcome` (`success`, `error`, `aborted` or `null`), `error` (cut to 500 characters) and `fallbackRequests` (requests served after one or more models were skipped or failed).
+
+Purpose keys:
+
+| `purpose` | `label` | Runs |
+|-----------|---------|------|
+| `apk-analysis` | APK analysis | core service `apk-analyzer` |
+| `apk-diff` | APK diff | core service `apk-diff-engine` |
+| `service:<name>` | Service: &lt;name&gt; | any other core service |
+| `plugin:<name>` | Plugin: &lt;name&gt; | a plugin, or a plugin acting for a user |
+| `chat` | Chat | a user's own chat |
+| `other` | Other | anything else |
+
+Notes:
+
+- Costs are estimates in USD from a built-in price table ([`shared/lib/ai-model-pricing.ts`](../shared/lib/ai-model-pricing.ts)). A request on a model with no known price has a `null` cost, never zero. A run with any such request counts in `unpricedRuns`, and its `costUsd` covers only its priced requests. Add or replace prices with the `ai_model_prices` setting: a JSON object keyed by model id, each value `{ "input", "output", "cacheRead", "cacheWrite" }` in USD per million tokens.
+- Tokens are what providers billed, including requests whose output the agent discarded and context compaction requests.
+- Inline completion (`POST /v1/ai/complete`) is not included: it records no usage.
+- Only runs recorded after usage recording shipped have per-request detail. Older runs report their stored input and output totals, zero cache tokens, no models and a `null` cost, and count as unpriced.
+
+| Status | `error` | When |
+|--------|---------|------|
+| 400 | `days must be an integer from 1 to 90` | `days` is empty, repeated, not a whole number, or out of range |
+| 400 | `limit must be an integer from 1 to 200` | `limit` is empty, repeated, not a whole number, or out of range |
+
 ## Plugin Endpoints
 
 Plugins can register their own REST endpoints using `ctx.api()` in their `start()` hook. Endpoints added this way are available over both HTTP and the WebSocket-REST transport (the `restapi` action), exactly like core endpoints. For full details see [docs/plugins/backend.md — API Endpoints](plugins/backend.md#api-endpoints).

@@ -75,6 +75,7 @@ import { migrateAiProviders } from './db/migrate-ai-providers';
 import { registerAiModelEndpoints } from './api/ai-models';
 import { registerAiProviderEndpoints } from './api/ai-providers';
 import { registerAiTiersRoutes } from './api/ai-tiers';
+import { registerAiUsageEndpoints } from './api/ai-usage';
 import { AiTierStore } from './services/ai-tier-store';
 import { ApkDiffEngine, DEFAULT_DIFF_PROMPT } from './services/apk-diff-engine';
 import { registerApkDiffEndpoints } from './api/diff';
@@ -529,6 +530,8 @@ const aiModelRouter = new AiModelRouter(db, rateLimitCache);
 registerAiModelEndpoints(db, aiModelRouter, rateLimitCache);
 // Completion registers after the router exists so its cooldowns are shared.
 registerAiCompleteEndpoints(db, aiModelRouter);
+// Usage report over recorded agent runs (read-only).
+registerAiUsageEndpoints(db);
 
 // Router-based provider facade: delegates createStreamingRequest to the router.
 // When `tier` is provided, the facade injects it into every createStreamingRequest
