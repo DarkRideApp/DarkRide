@@ -4,7 +4,7 @@ import {
 } from './errors';
 import type { BuiltRequest, Dialect, DialectContext, AiRequest } from './dialect';
 
-// ── SSE / NDJSON readers (moved verbatim from ai-provider.ts) ─────────
+// ── SSE / NDJSON readers ──────────────────────────────────────────────
 
 export async function* parseSSEStream(
   body: ReadableStream<Uint8Array>,

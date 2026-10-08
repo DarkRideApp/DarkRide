@@ -3,7 +3,7 @@ import type { BlockedDomain, HiddenDomain } from '../../../shared/types/api';
 import type { AiModelConfig } from '../../../shared/types/ai-models';
 import type { AiProviderConfig, AiProviderType } from '../../../shared/types/ai-providers';
 import { ConfirmDialog } from '@darkrideapp/plugin-sdk/react';
-import { isCliProvider } from '../../../shared/lib/ai-provider-catalog';
+import { isCliProvider, isKnownProviderType } from '../../../shared/lib/ai-provider-catalog';
 import { providerNeedsKeyBadge, providerTypeOptions } from '../../../shared/lib/ai-provider-form';
 
 export const PROVIDER_TYPE_OPTIONS: { value: AiProviderType; label: string }[] = providerTypeOptions();
@@ -108,6 +108,10 @@ export function ProviderTypeBadge({ type }: { type: string }) {
 }
 
 export function ProviderStatusBadge({ provider }: { provider: AiProviderConfig }) {
+  // A stored type this build does not know (for example a retired provider) cannot be used by the router.
+  if (!isKnownProviderType(provider.type)) {
+    return <StatusBadge color="var(--warning, #f59e0b)" bg="rgba(245,158,11,0.12)" text="Unknown type" />;
+  }
   if (providerNeedsKeyBadge(provider.type, provider.hasApiKey)) {
     return <StatusBadge color="var(--status-error, #ef4444)" bg="rgba(239,68,68,0.1)" text="No Key" />;
   }

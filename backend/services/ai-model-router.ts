@@ -283,7 +283,7 @@ export class AiModelRouter {
     messages: AiMessage[],
     systemPrompt: string,
     tools: AiToolDefinition[],
-    options?: AiStreamOptions & { tier?: string },
+    options?: AiStreamOptions,
   ): AsyncIterable<AiStreamEvent> {
     const signal = options?.signal;
     signal?.throwIfAborted();
@@ -384,7 +384,8 @@ export class AiModelRouter {
       throw new Error(`AI model with id ${modelId} not found`);
     }
 
-    if (isCliProvider(model.provider)) {
+    const providerRow = this.providerRowOf(model);
+    if (isCliProvider(providerRow?.type ?? model.provider)) {
       throw new Error(`Model "${model.name}" uses claude-cli which does not support HTTP streaming. Use ClaudeCliAgent instead.`);
     }
 
@@ -392,17 +393,24 @@ export class AiModelRouter {
       throw new Error(`AI model "${model.name}" has no provider linked`);
     }
 
-    const providerRow = this.db
-      .select()
-      .from(aiProviders)
-      .where(eq(aiProviders.id, model.providerId))
-      .all()[0];
-
     if (!providerRow) {
       throw new Error(`Provider for AI model "${model.name}" not found`);
     }
 
     return this.createProviderForModel(model, providerRow);
+  }
+
+  /**
+   * Whether a model runs through the CLI rather than HTTP. The linked provider row's type is
+   * authoritative; `model.provider` is a denormalised copy used only when no row is linked or found.
+   */
+  isCliModel(model: ModelRow): boolean {
+    return isCliProvider(this.providerRowOf(model)?.type ?? model.provider);
+  }
+
+  private providerRowOf(model: ModelRow): ProviderRow | undefined {
+    if (!model.providerId) return undefined;
+    return this.db.select().from(aiProviders).where(eq(aiProviders.id, model.providerId)).all()[0];
   }
 
   private createProviderForModel(model: ModelRow, providerRow: ProviderRow): AiProvider {

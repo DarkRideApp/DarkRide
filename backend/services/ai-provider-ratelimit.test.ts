@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { RateLimitError, parseRateLimitHeaders } from './ai-provider';
+import { RateLimitError } from './ai/errors';
+import { parseRateLimitHeaders } from './ai/rate-limit';
 
 describe('RateLimitError', () => {
   it('should be an instance of Error', () => {

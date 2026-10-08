@@ -17,7 +17,7 @@ const num = (v: string | null): number | null => {
 };
 
 // A lookup table, not an if-chain: the scheme name 'anthropic' equals a provider id, and the provider-id guard
-// (backend/test-utils/provider-branch-scan.test.ts) flags comparisons against provider-id literals outside the
+// (backend/services/ai/__tests__/provider-branch-guard.test.ts) flags comparisons against provider-id literals outside the
 // catalog and the dialects.
 const PARSERS: Record<'anthropic' | 'x-ratelimit' | 'none', (h: Headers) => ParsedRateLimitHeaders> = {
   anthropic: (headers) => {

@@ -67,6 +67,7 @@ import { registerAllTools } from './services/ai-tool-definitions';
 import { AiAgent, type AiAgentInterface, type TierConfig } from './services/ai-agent';
 import { ClaudeCliAgent } from './services/claude-cli-agent';
 import type { AiStreamingProvider } from './services/ai/dialect';
+import { getProviderDescriptor } from '../shared/lib/ai-provider-catalog';
 import { registerAiChatEndpoints } from './websocket/ai-chat-handlers';
 import { AiModelRouter, RateLimitCache } from './services/ai-model-router';
 import { migrateAiSettingsToModels } from './db/migrate-ai-models';
@@ -549,7 +550,7 @@ function getAiAgent(options?: { tier?: string }): AiAgentInterface | null {
     if (models.length === 0) return null;
 
     const topModel = models[0];
-    if (topModel.provider === 'claude-cli') {
+    if (aiModelRouter.isCliModel(topModel)) {
       const cli = claudeCliProvider;
       if (!cli) { log('claude-cli model configured but CLI not available'); return null; }
       if (topModel.providerId) {
@@ -558,7 +559,7 @@ function getAiAgent(options?: { tier?: string }): AiAgentInterface | null {
       } else {
         cli.setOauthToken(undefined);
       }
-      return new ClaudeCliAgent(db, cli, topModel.model || 'sonnet');
+      return new ClaudeCliAgent(db, cli, topModel.model || getProviderDescriptor('claude-cli')!.defaultModel!);
     }
 
     const provider = getAiProvider(options?.tier);
@@ -584,7 +585,7 @@ function getTierConfig(writeToolNames: string[]): TierConfig | null {
     const writeModel = writeModels[0];
 
     // TierConfig is not supported for claude-cli models (inherits prior behaviour).
-    if (researchModel.provider === 'claude-cli' || writeModel.provider === 'claude-cli') return null;
+    if (aiModelRouter.isCliModel(researchModel) || aiModelRouter.isCliModel(writeModel)) return null;
 
     return {
       researchProvider: aiModelRouter.createProviderForModelId(researchModel.id),

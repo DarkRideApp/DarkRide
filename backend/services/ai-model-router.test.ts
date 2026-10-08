@@ -732,6 +732,51 @@ describe('AiModelRouter', () => {
       router.createProviderForModelId(router.getModels()[0].id);
       expect(factory.mock.calls[0][0]).toBe('gemini');
     });
+
+    it('rejects a model whose provider row is the CLI even when model.provider holds a stale HTTP type', () => {
+      const cli = insertProvider(db, { name: 'CLI', type: 'claude-cli', apiKey: null });
+      insertModel(db, { name: 'Stale CLI', provider: 'openrouter', _providerId: cli });
+      const factory = scripted({});
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
+      expect(() => router.createProviderForModelId(router.getModels()[0].id))
+        .toThrow('uses claude-cli which does not support HTTP streaming');
+      expect(factory).not.toHaveBeenCalled();
+    });
+
+    it('builds an HTTP provider when model.provider says CLI but the provider row is HTTP', () => {
+      const gem = insertProvider(db, { name: 'G', type: 'gemini', apiKey: 'k' });
+      insertModel(db, { name: 'Stale HTTP', provider: 'claude-cli', _providerId: gem });
+      const factory = scripted({});
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
+      router.createProviderForModelId(router.getModels()[0].id);
+      expect(factory.mock.calls[0][0]).toBe('gemini');
+    });
+
+    it('falls back to model.provider for the CLI check when no provider is linked', () => {
+      insertModel(db, { name: 'Unlinked CLI', provider: 'claude-cli', _providerId: undefined as any });
+      expect(() => router.createProviderForModelId(router.getModels()[0].id))
+        .toThrow('uses claude-cli which does not support HTTP streaming');
+    });
+  });
+
+  describe('isCliModel', () => {
+    it('reads the provider row type over the denormalised model.provider', () => {
+      const cli = insertProvider(db, { name: 'CLI', type: 'claude-cli', apiKey: null });
+      const gem = insertProvider(db, { name: 'G', type: 'gemini', apiKey: 'k' });
+      insertModel(db, { name: 'Row CLI', provider: 'openrouter', priority: 0, _providerId: cli });
+      insertModel(db, { name: 'Row HTTP', provider: 'claude-cli', priority: 1, _providerId: gem });
+      const [rowCli, rowHttp] = router.getModels();
+      expect(router.isCliModel(rowCli)).toBe(true);
+      expect(router.isCliModel(rowHttp)).toBe(false);
+    });
+
+    it('uses model.provider when the model has no provider row', () => {
+      insertModel(db, { name: 'Unlinked CLI', provider: 'claude-cli', priority: 0, _providerId: undefined as any });
+      insertModel(db, { name: 'Orphan', provider: 'openrouter', priority: 1, providerId: 9999 } as any);
+      const [unlinked, orphan] = router.getModels();
+      expect(router.isCliModel(unlinked)).toBe(true);
+      expect(router.isCliModel(orphan)).toBe(false);
+    });
   });
 
   describe('fallback policy', () => {
