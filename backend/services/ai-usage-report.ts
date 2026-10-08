@@ -11,7 +11,7 @@ import type {
 
 /**
  * Aggregates recorded agent runs (`ai_call_log`) and their model requests (`ai_call_request`) into the
- * `GET /v1/ai/usage` report. Pure reads plus arithmetic: the only clock is the injected `now`.
+ * `GET /v1/ai/usage/report` response. Pure reads plus arithmetic: the only clock is the injected `now`.
  *
  * A run's tokens and cost come from its request rows. Runs recorded before per-request logging existed (or
  * runs that never got a usage event) have no request rows; they fall back to the run's own input/output token

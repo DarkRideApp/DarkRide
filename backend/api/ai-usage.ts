@@ -22,8 +22,9 @@ function intParam(
 }
 
 export function registerAiUsageEndpoints(db: AppDatabase): void {
-  // GET /v1/ai/usage: token, cache and estimated cost totals for recorded agent runs
-  registerEndpoint('GET', '/v1/ai/usage', (req, res) => {
+  // GET /v1/ai/usage/report: token, cache and estimated cost totals for recorded agent runs.
+  // GET /v1/ai/usage itself is the older per-conversation token summary in ai-chat.ts.
+  registerEndpoint('GET', '/v1/ai/usage/report', (req, res) => {
     const days = intParam(req.query.days, DAYS);
     if (!days.ok) {
       res.status(400).json({ success: false, error: days.error });

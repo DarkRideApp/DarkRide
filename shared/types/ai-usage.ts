@@ -1,5 +1,6 @@
 /**
- * Response shape of `GET /v1/ai/usage`. Costs are estimates from a price table; they are `null` when a model
+ * Response shape of `GET /v1/ai/usage/report` (not `GET /v1/ai/usage`, which is the older per-conversation
+ * token summary). Costs are estimates from a price table; they are `null` when a model
  * has no known price, never zero.
  */
 

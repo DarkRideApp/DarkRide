@@ -53,7 +53,7 @@ function makeWs(overrides?: Partial<WebSocketContextValue>): WebSocketContextVal
           ] },
         });
       }
-      if (method === 'GET' && path.startsWith('/v1/ai/usage')) {
+      if (method === 'GET' && path.startsWith('/v1/ai/usage/report')) {
         // A valid response with no runs, so the usage card shows its empty state (not an error).
         return Promise.resolve({ type: 'restapi', id: 'u', status: 200, body: EMPTY_USAGE });
       }

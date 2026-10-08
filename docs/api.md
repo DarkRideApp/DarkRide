@@ -317,9 +317,12 @@ If the client disconnects, the upstream request is cancelled and nothing is writ
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | /v1/ai/usage | Token, cache and estimated cost totals for recorded agent runs |
+| GET | /v1/ai/usage/report | Token, cache and estimated cost totals for recorded agent runs |
+| GET | /v1/ai/usage | Older per-conversation token summary (`?pageContext=`, `?from=`, `?to=` in ms) |
 
-Needs the `core.settings:read` scope. The Usage panel in Settings → AI reads it.
+`GET /v1/ai/usage/report` needs the `core.settings:read` scope. The Usage panel in Settings → AI reads it. The rest of this section describes it.
+
+`GET /v1/ai/usage` is a separate, older endpoint: it sums the input and output tokens stored on chat conversations and returns `{ totalInputTokens, totalOutputTokens, conversationCount, byContext, conversations }`. It has no cache tokens, costs or agent runs.
 
 Query parameters, both optional:
 

@@ -114,7 +114,7 @@ function renderPanel(ws: WebSocketContextValue) {
 }
 
 const usagePaths = (ws: WebSocketContextValue) =>
-  (ws.sendRestApi as any).mock.calls.filter((c: any[]) => String(c[1]).startsWith('/v1/ai/usage')).map((c: any[]) => c[1]);
+  (ws.sendRestApi as any).mock.calls.filter((c: any[]) => String(c[1]).startsWith('/v1/ai/usage/report')).map((c: any[]) => c[1]);
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -129,8 +129,8 @@ describe('AiUsagePanel: loading and window', () => {
     const panel = screen.getByTestId('ai-usage-panel');
     expect(screen.getByRole('heading', { name: 'AI usage' })).toBeInTheDocument();
     expect(panel.closest('#section-ai-usage')).not.toBeNull();
-    await waitFor(() => expect(usagePaths(ws)).toEqual(['/v1/ai/usage?days=30']));
-    expect(ws.sendRestApi).toHaveBeenCalledWith('GET', '/v1/ai/usage?days=30');
+    await waitFor(() => expect(usagePaths(ws)).toEqual(['/v1/ai/usage/report?days=30']));
+    expect(ws.sendRestApi).toHaveBeenCalledWith('GET', '/v1/ai/usage/report?days=30');
     expect((screen.getByTestId('ai-usage-window') as HTMLSelectElement).value).toBe('30');
   });
 
@@ -166,11 +166,11 @@ describe('AiUsagePanel: loading and window', () => {
     await screen.findByTestId('ai-usage-total-runs');
 
     fireEvent.change(screen.getByTestId('ai-usage-window'), { target: { value: '7' } });
-    await waitFor(() => expect(usagePaths(ws)).toEqual(['/v1/ai/usage?days=30', '/v1/ai/usage?days=7']));
+    await waitFor(() => expect(usagePaths(ws)).toEqual(['/v1/ai/usage/report?days=30', '/v1/ai/usage/report?days=7']));
 
     fireEvent.change(screen.getByTestId('ai-usage-window'), { target: { value: '90' } });
     await waitFor(() => expect(usagePaths(ws)).toEqual([
-      '/v1/ai/usage?days=30', '/v1/ai/usage?days=7', '/v1/ai/usage?days=90',
+      '/v1/ai/usage/report?days=30', '/v1/ai/usage/report?days=7', '/v1/ai/usage/report?days=90',
     ]));
     expect((screen.getByTestId('ai-usage-window') as HTMLSelectElement).value).toBe('90');
   });
@@ -179,12 +179,12 @@ describe('AiUsagePanel: loading and window', () => {
     const pending: Record<string, (r: Reply) => void> = {};
     const ws = makeWs((path) => new Promise<Reply>((resolve) => { pending[path] = resolve; }));
     renderPanel(ws);
-    await waitFor(() => expect(pending['/v1/ai/usage?days=30']).toBeDefined());
+    await waitFor(() => expect(pending['/v1/ai/usage/report?days=30']).toBeDefined());
     fireEvent.change(screen.getByTestId('ai-usage-window'), { target: { value: '7' } });
-    await waitFor(() => expect(pending['/v1/ai/usage?days=7']).toBeDefined());
+    await waitFor(() => expect(pending['/v1/ai/usage/report?days=7']).toBeDefined());
 
-    await act(async () => { pending['/v1/ai/usage?days=7']({ status: 200, body: usage({ days: 7, totals: totals({ runs: 7 }) }) }); });
-    await act(async () => { pending['/v1/ai/usage?days=30']({ status: 200, body: usage({ days: 30, totals: totals({ runs: 30 }) }) }); });
+    await act(async () => { pending['/v1/ai/usage/report?days=7']({ status: 200, body: usage({ days: 7, totals: totals({ runs: 7 }) }) }); });
+    await act(async () => { pending['/v1/ai/usage/report?days=30']({ status: 200, body: usage({ days: 30, totals: totals({ runs: 30 }) }) }); });
 
     expect(screen.getByTestId('ai-usage-total-runs')).toHaveTextContent('7');
     expect(screen.getByTestId('ai-usage-total-runs')).not.toHaveTextContent('30');
@@ -539,7 +539,7 @@ describe('AiUsagePanel: empty and error states', () => {
     fireEvent.click(within(error).getByRole('button', { name: 'Retry' }));
     expect(await screen.findByTestId('ai-usage-total-runs')).toHaveTextContent('12');
     expect(screen.queryByTestId('ai-usage-error')).toBeNull();
-    expect(usagePaths(ws)).toEqual(['/v1/ai/usage?days=30', '/v1/ai/usage?days=30']);
+    expect(usagePaths(ws)).toEqual(['/v1/ai/usage/report?days=30', '/v1/ai/usage/report?days=30']);
   });
 
   it('shows the error when the request itself fails', async () => {
@@ -565,19 +565,19 @@ describe('AiUsagePanel: empty and error states', () => {
     renderPanel(ws);
     await screen.findByTestId('ai-usage-error');
     fireEvent.change(screen.getByTestId('ai-usage-window'), { target: { value: '7' } });
-    await waitFor(() => expect(usagePaths(ws)).toContain('/v1/ai/usage?days=7'));
+    await waitFor(() => expect(usagePaths(ws)).toContain('/v1/ai/usage/report?days=7'));
     await screen.findByTestId('ai-usage-error');
     fail = false;
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await screen.findByTestId('ai-usage-total-runs');
-    expect(usagePaths(ws).at(-1)).toBe('/v1/ai/usage?days=7');
+    expect(usagePaths(ws).at(-1)).toBe('/v1/ai/usage/report?days=7');
   });
 });
 
 describe('AiUsagePanel: placement in the AI settings', () => {
   it('is its own card after the AI Models card, not nested inside it, with the same heading pattern', async () => {
     const ws = makeWs((path) => {
-      if (path.startsWith('/v1/ai/usage')) return ok(usage());
+      if (path.startsWith('/v1/ai/usage/report')) return ok(usage());
       if (path === '/v1/ai/tiers') return ok([]);
       return ok({ success: true, data: [] });
     });
@@ -608,7 +608,7 @@ describe('AiUsagePanel: placement in the AI settings', () => {
 
   it('appears in the AI section after the model list, and asks for the default window', async () => {
     const ws = makeWs((path) => {
-      if (path.startsWith('/v1/ai/usage')) return ok(usage());
+      if (path.startsWith('/v1/ai/usage/report')) return ok(usage());
       if (path === '/v1/ai/tiers') return ok([]);
       return ok({ success: true, data: [] });
     });
@@ -625,6 +625,6 @@ describe('AiUsagePanel: placement in the AI settings', () => {
     expect(panel.closest('#section-ai')).not.toBeNull();
     expect(screen.getByTestId('add-tier-btn').compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(await screen.findByTestId('ai-usage-total-runs')).toBeInTheDocument();
-    expect(usagePaths(ws)).toEqual(['/v1/ai/usage?days=30']);
+    expect(usagePaths(ws)).toEqual(['/v1/ai/usage/report?days=30']);
   });
 });

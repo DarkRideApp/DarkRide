@@ -182,7 +182,7 @@ export function AiUsagePanel() {
     const mine = ++latestRequest.current;
     setState((s) => ({ ...s, loading: true, error: null }));
     try {
-      const res = await sendRestApi('GET', `/v1/ai/usage?days=${windowDays}`);
+      const res = await sendRestApi('GET', `/v1/ai/usage/report?days=${windowDays}`);
       if (mine !== latestRequest.current) return;
       const result = readUsage(res);
       setState('data' in result
