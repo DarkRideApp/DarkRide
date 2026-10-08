@@ -44,6 +44,7 @@
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest watch",
     "test:frontend": "vitest run --config vitest.config.frontend.ts",
+    "test:ai-live": "vitest run --config vitest.live.config.ts",
     "lint": "eslint backend/ shared/ plugins/ --ext .ts,.js",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
