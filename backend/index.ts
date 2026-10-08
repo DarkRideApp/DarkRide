@@ -66,8 +66,7 @@ import { ClaudeCliProvider, writeMcpConfig } from './services/claude-cli-provide
 import { registerAllTools } from './services/ai-tool-definitions';
 import { AiAgent, type AiAgentInterface, type TierConfig } from './services/ai-agent';
 import { ClaudeCliAgent } from './services/claude-cli-agent';
-import { createProvider } from './services/ai-provider';
-import type { AiProvider } from './services/ai-provider';
+import type { AiStreamingProvider } from './services/ai/dialect';
 import { registerAiChatEndpoints } from './websocket/ai-chat-handlers';
 import { AiModelRouter, RateLimitCache } from './services/ai-model-router';
 import { migrateAiSettingsToModels } from './db/migrate-ai-models';
@@ -531,14 +530,12 @@ registerAiModelEndpoints(db, aiModelRouter, rateLimitCache);
 // Router-based provider facade: delegates createStreamingRequest to the router.
 // When `tier` is provided, the facade injects it into every createStreamingRequest
 // call so the router picks models from the correct tier (not the default 'High').
-function getAiProvider(tier?: string): AiProvider | null {
+function getAiProvider(tier?: string): AiStreamingProvider | null {
   const models = aiModelRouter.getEnabledModels();
   if (models.length === 0) return null;
 
   return {
     name: 'router',
-    buildHeaders: () => ({}),
-    formatTools: (tools) => tools,
     createStreamingRequest: (messages, systemPrompt, tools, options) =>
       aiModelRouter.createStreamingRequest(messages, systemPrompt, tools, { ...options, tier: tier ?? options?.tier }),
   };

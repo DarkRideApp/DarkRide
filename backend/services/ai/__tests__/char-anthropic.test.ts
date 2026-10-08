@@ -1,8 +1,9 @@
-// Step 0 characterization: Anthropic behind createProvider, observed only through the
-// wire request it sends and the events it yields. Written against the old ai-provider.ts.
+// Characterization: Anthropic behind createProvider, observed only through the wire request it
+// sends and the events it yields. First written against the previous single-file implementation;
+// every assertion that changed with the dialect rewrite says what the old behaviour was.
 // fixtures: hand-written from https://docs.anthropic.com/en/api/messages-streaming
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { createProvider } from '../../ai-provider';
+import { createProvider } from '../registry';
 import { sseResponse, chunkedResponse, textResponse, okStream, stubFetch, callHeader, collect } from '../test-helpers';
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 
@@ -32,34 +33,37 @@ describe('AnthropicProvider', () => {
       expect(call.init.method).toBe('POST');
     });
 
-    it('sends the Messages API body to the default host and model', async () => { // new in Step 0
+    it('sends the Messages API body to the default host and model', async () => {
       const stub = stubFetch(() => okStream('anthropic'));
       await run(msgs, 'sys prompt');
       const call = stub.calls[0];
       expect(call.url).toBe('https://api.anthropic.com/v1/messages');
       expect(call.body).toEqual({
-        model: 'claude-sonnet-4-20250514', // BC-01 changes the default model
-        max_tokens: 8192, // BC-02 changes max_tokens
-        system: 'sys prompt', // BC-03 adds top-level cache_control on the agent path
+        model: 'claude-sonnet-5-5', // was claude-sonnet-4-20250514; the blank-model default moved to the current Sonnet
+        max_tokens: 16000, // was 8192; thinking-on models count thinking toward this limit
+        system: 'sys prompt',
         messages: [{ role: 'user', content: 'hello' }],
         stream: true,
+        cache_control: { type: 'ephemeral' }, // new: the agent path turns on prompt caching
       });
     });
 
-    it('honours model and baseUrl from config', async () => { // new in Step 0
+    it('honours model and baseUrl from config', async () => {
       const stub = stubFetch(() => okStream('anthropic'));
       await run(msgs, 's', noTools, { apiKey: 'k', model: 'm1', baseUrl: 'https://proxy.test' });
       expect(stub.calls[0].url).toBe('https://proxy.test/v1/messages');
       expect(stub.calls[0].body.model).toBe('m1');
     });
 
-    it('sends an empty x-api-key when no key is configured', async () => { // new in Step 0
+    it('sends an empty x-api-key when no key is configured', async () => {
+      // Unchanged on purpose: the key is required for Anthropic, so the connection test refuses a keyless
+      // provider before any request, and a chat request without one gets a 401 that is now an AuthError.
       const stub = stubFetch(() => okStream('anthropic'));
       await run(msgs, 's', noTools, {});
       expect(callHeader(stub.calls[0], 'x-api-key')).toBe('');
     });
 
-    it('omits tools when none are given', async () => { // new in Step 0
+    it('omits tools when none are given', async () => {
       const stub = stubFetch(() => okStream('anthropic'));
       await run();
       expect(stub.calls[0].body).not.toHaveProperty('tools');
@@ -121,7 +125,8 @@ describe('AnthropicProvider', () => {
       const usageEvents = events.filter((e) => e.type === 'usage');
       expect(usageEvents).toHaveLength(2);
       expect(usageEvents[0]).toMatchObject({ inputTokens: 10, outputTokens: 0 });
-      expect(usageEvents[1]).toMatchObject({ inputTokens: 0, outputTokens: 5 }); // BC-04 differences cumulative output
+      // message_delta output_tokens is cumulative; the dialect emits the difference since the last report.
+      expect(usageEvents[1]).toMatchObject({ inputTokens: 0, outputTokens: 5 });
 
       // Full ordered sequence, so a reordering or an extra event is caught too.
       expect(events).toEqual([
@@ -163,24 +168,26 @@ describe('AnthropicProvider', () => {
       await expect(run()).rejects.toThrow('Anthropic response reached its context window limit');
     });
 
-    it('treats a refusal stop as a normal end of stream', async () => { // new in Step 0
+    it('treats a refusal stop as a normal end of stream, with a visible message', async () => {
       stubFetch(() => sseResponse([
         ev('message_delta', { delta: { stop_reason: 'refusal' } }),
         stop(),
       ]));
-      // BC-05 makes a refusal stop produce a visible message; today it is a silent empty reply.
-      expect(await run()).toEqual([]);
+      // Was a silent empty reply; a refusal now shows a message and still ends without an error.
+      expect(await run()).toEqual([{ type: 'text', text: 'Claude declined this request.' }]);
     });
 
     it('surfaces an Anthropic SSE error event', async () => {
       stubFetch(() => sseResponse([
         ev('error', { error: { type: 'overloaded_error', message: 'Capacity is temporarily unavailable' } }),
       ]));
-      // BC-07 turns in-stream overload into a typed error the router can fall back on.
-      await expect(run()).rejects.toThrow('Anthropic stream error: Capacity is temporarily unavailable');
+      // Same message as before; the error is now an OverloadedError, so the router can fall back.
+      const err: any = await run().catch((e) => e);
+      expect(err.message).toBe('Anthropic stream error: Capacity is temporarily unavailable');
+      expect(err.name).toBe('OverloadedError');
     });
 
-    it('surfaces an in-stream error after content has streamed', async () => { // new in Step 0
+    it('surfaces an in-stream error after content has streamed', async () => {
       stubFetch(() => sseResponse([
         ev('message_start', { message: { usage: { input_tokens: 1 } } }),
         textDelta('partial'),
@@ -216,7 +223,7 @@ describe('AnthropicProvider', () => {
       });
     });
 
-    it('yields empty input for a tool_use block with unparseable JSON', async () => { // new in Step 0
+    it('yields empty input for a tool_use block with unparseable JSON', async () => {
       stubFetch(() => sseResponse([
         ev('content_block_start', { content_block: { type: 'tool_use', id: 'toolu_bad', name: 'broken' } }),
         ev('content_block_delta', { delta: { type: 'input_json_delta', partial_json: '{"a":' } }),
@@ -226,7 +233,7 @@ describe('AnthropicProvider', () => {
       expect(await run()).toEqual([{ type: 'tool_use', id: 'toolu_bad', name: 'broken', input: {} }]);
     });
 
-    it('reassembles an event whose JSON is split across network chunks', async () => { // new in Step 0
+    it('reassembles an event whose JSON is split across network chunks', async () => {
       const full = 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"split ok"}}\n\n';
       const cut = full.indexOf('"text":"') + 4;
       stubFetch(() => chunkedResponse([
@@ -238,7 +245,7 @@ describe('AnthropicProvider', () => {
       expect(await run()).toEqual([{ type: 'text', text: 'split ok' }]);
     });
 
-    it('parses CRLF line endings, including a CRLF split across chunks', async () => { // new in Step 0
+    it('parses CRLF line endings, including a CRLF split across chunks', async () => {
       stubFetch(() => chunkedResponse([
         'event: content_block_delta\r\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"crlf"}}\r',
         '\n\r\n',
@@ -254,14 +261,19 @@ describe('AnthropicProvider', () => {
       await expect(p).rejects.toThrow(/429/);
       await expect(p).rejects.toMatchObject({ name: 'RateLimitError' });
       const err: any = await p.catch((e) => e);
-      expect(err.message).toBe('Anthropic rate limited (429)');
+      // Was exactly "Anthropic rate limited (429)"; a 429 now uses the common error wording with the body text.
+      expect(err.message).toBe('Anthropic API error (429): rate limited');
       expect(err.headers.get('anthropic-ratelimit-requests-remaining')).toBe('0');
     });
 
-    it('throws on non-2xx with status and body in the message', async () => { // new in Step 0
+    it('throws on non-2xx with status and the provider message', async () => {
       stubFetch(() => textResponse('{"error":{"message":"bad key"}}', 401));
-      // BC-06 / BC-17 replace this plain Error with a typed AuthError.
-      await expect(run()).rejects.toThrow('Anthropic API error (401): {"error":{"message":"bad key"}}');
+      // Was a plain Error carrying the raw JSON body. Now the provider's own message is extracted from the
+      // JSON, and a 401 is an AuthError, so the router can fall back to the next model.
+      const err: any = await run().catch((e) => e);
+      expect(err.message).toBe('Anthropic API error (401): bad key');
+      expect(err.name).toBe('AuthError');
+      expect(err.status).toBe(401);
     });
 
     it('should throw when response body is null', async () => {
@@ -270,7 +282,7 @@ describe('AnthropicProvider', () => {
       await expect(run(msgs, 'sys')).rejects.toThrow('Anthropic response has no body');
     });
 
-    it('rejects with the abort error when the signal is already aborted', async () => { // new in Step 0
+    it('rejects with the abort error when the signal is already aborted', async () => {
       stubFetch(() => okStream('anthropic'));
       const ac = new AbortController();
       ac.abort();
@@ -278,7 +290,7 @@ describe('AnthropicProvider', () => {
         .rejects.toMatchObject({ name: 'AbortError' });
     });
 
-    it('ends quietly without the truncation error when aborted mid-stream', async () => { // new in Step 0
+    it('ends quietly without the truncation error when aborted mid-stream', async () => {
       stubFetch(() => chunkedResponse([
         'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":4}}}\n\n',
         'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}\n\n',

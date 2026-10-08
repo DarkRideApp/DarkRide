@@ -1,9 +1,10 @@
-// Step 0 characterization: the OpenAI-compatible providers (OpenRouter, Codestral), the
-// createProvider factory, and error responses across all providers, observed only through
-// createProvider in, wire request and events out. Written against the old ai-provider.ts.
+// Characterization: the OpenAI-compatible providers (OpenRouter, Codestral) and error responses
+// across all providers, observed only through createProvider in, wire request and events out.
+// First written against the previous single-file implementation; every assertion that changed with
+// the dialect rewrite says what the old behaviour was. The factory cases live in provider.test.ts.
 // fixtures: hand-written from https://platform.openai.com/docs/api-reference/chat-streaming
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { createProvider } from '../../ai-provider';
+import { createProvider } from '../registry';
 import { sseResponse, chunkedResponse, textResponse, okStream, stubFetch, callHeader, collect } from '../test-helpers';
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 
@@ -42,64 +43,6 @@ const fullHistoryWire = [
   { role: 'tool', content: 'out', tool_call_id: 'tc1' },
 ];
 
-// ── Factory ──────────────────────────────────────────────────────────
-
-describe('createProvider', () => {
-  it('creates a provider named anthropic', () => { // reworded from 'returns AnthropicProvider for "anthropic"'
-    expect(createProvider('anthropic', { apiKey: 'test-key' }).name).toBe('anthropic');
-  });
-
-  it('creates a provider named gemini', () => { // reworded from 'returns GeminiProvider for "gemini"'
-    expect(createProvider('gemini', { apiKey: 'test-key' }).name).toBe('gemini');
-  });
-
-  it('creates a provider named ollama', () => { // reworded from 'returns OllamaProvider for "ollama"'
-    expect(createProvider('ollama', { baseUrl: 'http://localhost:11434' }).name).toBe('ollama');
-  });
-
-  it('creates a provider named openrouter', () => { // reworded from 'returns OpenRouterProvider for "openrouter"'
-    expect(createProvider('openrouter', { apiKey: 'test-key' }).name).toBe('openrouter');
-  });
-
-  it('creates a provider named codestral', () => { // reworded from 'returns CodestralProvider for "codestral"'
-    expect(createProvider('codestral', { apiKey: 'test-key' }).name).toBe('codestral');
-  });
-
-  it('throws for unknown provider', () => {
-    expect(() => createProvider('unknown', {})).toThrow('Unknown AI provider: unknown');
-  });
-
-  it('throws for empty string provider', () => {
-    expect(() => createProvider('', {})).toThrow('Unknown AI provider: ');
-  });
-
-  it('should throw for unknown provider name "invalid"', () => {
-    expect(() => createProvider('invalid', { apiKey: 'key' })).toThrow('Unknown AI provider: invalid');
-  });
-
-  it('should create each provider type via loop', () => {
-    // Was an instanceof check per class; now the public name and the streaming entry point.
-    const configs: Array<{ name: string; config: Record<string, any> }> = [
-      { name: 'anthropic', config: { apiKey: 'k' } },
-      { name: 'gemini', config: { apiKey: 'k' } },
-      { name: 'ollama', config: { baseUrl: 'http://localhost:11434' } },
-      { name: 'openrouter', config: { apiKey: 'k' } },
-      { name: 'codestral', config: { apiKey: 'k' } },
-    ];
-    for (const { name, config } of configs) {
-      const provider = createProvider(name, config);
-      expect(provider.name).toBe(name);
-      expect(typeof provider.createStreamingRequest).toBe('function');
-    }
-  });
-
-  it('does not touch the network when constructing a provider', () => { // new in Step 0
-    const stub = stubFetch(() => okStream('openai-chat'));
-    createProvider('openrouter', { apiKey: 'k' });
-    expect(stub.calls).toHaveLength(0);
-  });
-});
-
 // ── OpenRouterProvider ──────────────────────────────────────────────
 
 describe('OpenRouterProvider', () => {
@@ -136,35 +79,38 @@ describe('OpenRouterProvider', () => {
     });
   });
 
-  describe('request', () => { // new in Step 0
-    it('posts to the hardcoded OpenRouter URL with the default model', async () => { // new in Step 0
+  describe('request', () => {
+    it('posts to the default OpenRouter URL with the default model', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('openrouter', { apiKey: 'k' });
       const call = stub.calls[0];
       expect(call.url).toBe('https://openrouter.ai/api/v1/chat/completions');
       expect(call.init.method).toBe('POST');
       expect(call.body).toEqual({
-        model: 'google/gemini-2.0-flash-001', // BC-01 changes the default to openrouter/auto
+        model: 'openrouter/auto', // was google/gemini-2.0-flash-001, which is retired
         messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hello' }],
         stream: true,
+        stream_options: { include_usage: true }, // new: asks for the usage chunk at the end of the stream
       });
     });
 
-    it('ignores baseUrl and honours model', async () => { // new in Step 0
+    it('honours baseUrl and model', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('openrouter', { apiKey: 'k', baseUrl: 'https://proxy.test', model: 'vendor/model' });
-      // BC-09 makes OpenRouter honour baseUrl.
-      expect(stub.calls[0].url).toBe('https://openrouter.ai/api/v1/chat/completions');
+      // Was ignored: the request always went to openrouter.ai. A configured Base URL is now used, and a
+      // bare host gets the provider's default path.
+      expect(stub.calls[0].url).toBe('https://proxy.test/api/v1/chat/completions');
       expect(stub.calls[0].body.model).toBe('vendor/model');
     });
 
-    it('sends the literal "Bearer undefined" when no key is configured', async () => { // new in Step 0
+    it('sends no Authorization header when no key is configured', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('openrouter', {});
-      expect(callHeader(stub.calls[0], 'Authorization')).toBe('Bearer undefined');
+      // Was the literal header "Bearer undefined". Now the header is left out.
+      expect(callHeader(stub.calls[0], 'Authorization')).toBeUndefined();
     });
 
-    it('formats assistant tool calls and tool results', async () => { // new in Step 0
+    it('formats assistant tool calls and tool results', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('openrouter', { apiKey: 'k' }, fullHistory);
       expect(stub.calls[0].body.messages).toEqual(fullHistoryWire);
@@ -208,27 +154,31 @@ describe('CodestralProvider', () => {
     });
   });
 
-  describe('request', () => { // new in Step 0
-    it('posts to api.mistral.ai with mistral-large-latest by default', async () => { // new in Step 0
+  describe('request', () => {
+    it('posts to api.mistral.ai with codestral-latest by default', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('codestral', { apiKey: 'k' });
-      // BC-08 changes the Codestral host and default model.
+      // Chat already used api.mistral.ai, and still does. The blank-model default was mistral-large-latest;
+      // it is now codestral-latest, matching the connection test, model list, and completion.
       expect(stub.calls[0].url).toBe('https://api.mistral.ai/v1/chat/completions');
       expect(stub.calls[0].body).toEqual({
-        model: 'mistral-large-latest',
+        model: 'codestral-latest',
         messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hello' }],
         stream: true,
+        // New: usage is requested where the server accepts it. A server that rejects stream_options is
+        // retried once without it and remembered.
+        stream_options: { include_usage: true },
       });
     });
 
-    it('honours baseUrl and model', async () => { // new in Step 0
+    it('honours baseUrl and model', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('codestral', { apiKey: 'k', baseUrl: 'https://codestral.mistral.ai', model: 'codestral-latest' });
       expect(stub.calls[0].url).toBe('https://codestral.mistral.ai/v1/chat/completions');
       expect(stub.calls[0].body.model).toBe('codestral-latest');
     });
 
-    it('formats assistant tool calls and tool results', async () => { // new in Step 0
+    it('formats assistant tool calls and tool results', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('codestral', { apiKey: 'k' }, fullHistory);
       expect(stub.calls[0].body.messages).toEqual(fullHistoryWire);
@@ -335,31 +285,28 @@ describe('OpenAI-compatible tool call buffering', () => {
     });
   });
 
-  it('should emit top-level usage events when no choices present', async () => {
+  it('treats a stream that carries only usage, with no content and no terminator, as an empty response', async () => {
     stubFetch(() => sseResponse([chunk({ usage: { prompt_tokens: 42, completion_tokens: 7 } })]));
-    const events = await runWith('openrouter', { apiKey: 'test' });
-
-    // BC-12 changes usage handling for a usage-only stream.
-    expect(events).toEqual([
-      { type: 'usage', inputTokens: 42, outputTokens: 7 },
-    ]);
+    // Was a single usage event and a silent empty reply. A stream with no content and neither [DONE] nor a
+    // finish_reason is now an error, so the router can tell it apart from a real (if short) answer.
+    await expect(runWith('openrouter', { apiKey: 'test' })).rejects.toThrow('OpenRouter returned an empty response');
   });
 
-  it('yields every usage-bearing chunk, not just the last', async () => { // new in Step 0
+  it('emits usage once, from the last usage-bearing chunk', async () => {
     stubFetch(() => sseResponse([
       chunk({ choices: [{ delta: { content: 'a' } }], usage: { prompt_tokens: 5, completion_tokens: 1 } }),
       chunk({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 2 } }),
       { data: '[DONE]' },
     ]));
-    // BC-12 emits usage once.
+    // Was one usage event per usage-bearing chunk, which consumers summed (over-counting). Usage events are
+    // additive, so the stream now reports once, at the end.
     expect(await runWith('openrouter', { apiKey: 'k' })).toEqual([
       { type: 'text', text: 'a' },
-      { type: 'usage', inputTokens: 5, outputTokens: 1 },
       { type: 'usage', inputTokens: 5, outputTokens: 2 },
     ]);
   });
 
-  it('flushes buffered tool calls on finish_reason stop', async () => { // new in Step 0
+  it('flushes buffered tool calls on finish_reason stop', async () => {
     stubFetch(() => sseResponse([
       toolDelta([{ index: 0, id: 'c1', function: { name: 't', arguments: '{"k":1}' } }]),
       finish('stop'),
@@ -368,41 +315,48 @@ describe('OpenAI-compatible tool call buffering', () => {
     expect(await runWith('codestral', { apiKey: 'k' })).toEqual([{ type: 'tool_use', id: 'c1', name: 't', input: { k: 1 } }]);
   });
 
-  it('drops buffered tool calls when the stream ends without [DONE] or a finish_reason', async () => { // new in Step 0
+  it('flushes buffered tool calls when the stream ends without [DONE] or a finish_reason', async () => {
     stubFetch(() => sseResponse([
       chunk({ choices: [{ delta: { content: 'thinking' } }] }),
-      toolDelta([{ index: 0, id: 'lost', function: { name: 't', arguments: '{}' } }]),
+      toolDelta([{ index: 0, id: 'kept', function: { name: 't', arguments: '{}' } }]),
     ]));
-    // BC-12 makes EOF lenient (flushes complete calls; a truncated call throws OutputLimitError).
-    expect(await runWith('openrouter', { apiKey: 'k' })).toEqual([{ type: 'text', text: 'thinking' }]);
+    // Was: the buffered call was dropped. End of stream is now lenient: a complete call is flushed (and a
+    // warning logged); only a call truncated by the output limit is an error.
+    expect(await runWith('openrouter', { apiKey: 'k' })).toEqual([
+      { type: 'text', text: 'thinking' },
+      { type: 'tool_use', id: 'kept', name: 't', input: {} },
+    ]);
   });
 
-  it('treats a missing index as 0 and restarts the buffer whenever an id repeats', async () => { // new in Step 0
+  it('keeps appending to one call when a delta has no index and repeats its id', async () => {
     stubFetch(() => sseResponse([
       toolDelta([{ id: 'same', function: { name: 'echo', arguments: '{"v":' } }]),
       toolDelta([{ id: 'same', function: { arguments: '"x"}' } }]),
       finish('tool_calls'),
     ]));
-    // BC-12 keys buffers by index and keeps appending when the id repeats. Today the second
-    // fragment replaces the first (and its name), so the call loses its name and input.
-    expect(await runWith('openrouter', { apiKey: 'k' })).toEqual([{ type: 'tool_use', id: 'same', name: '', input: {} }]);
+    // Was: a repeated id restarted the buffer, so the second fragment replaced the first and the call lost
+    // its name and input. A repeated id now continues the same call.
+    expect(await runWith('openrouter', { apiKey: 'k' })).toEqual([{ type: 'tool_use', id: 'same', name: 'echo', input: { v: 'x' } }]);
   });
 
-  it('ignores continuation fragments for an index that was never started', async () => { // new in Step 0
+  it('starts a call from a fragment for an index it has not seen, with a generated id', async () => {
     stubFetch(() => sseResponse([
       toolDelta([{ index: 3, function: { name: 'orphan', arguments: '{}' } }]),
       finish('tool_calls'),
     ]));
-    expect(await runWith('openrouter', { apiKey: 'k' })).toEqual([]);
+    // Was: ignored, because only a fragment carrying an id could start a call. Calls are now created on first
+    // sight of their index, and a missing id comes from the provider's id generator.
+    const events = await collect(createProvider('openrouter', { apiKey: 'k' }, { newId: () => 'call-1' }).createStreamingRequest(msgs, 'sys', noTools));
+    expect(events).toEqual([{ type: 'tool_use', id: 'call-1', name: 'orphan', input: {} }]);
   });
 
-  it('reassembles a chunk split across network reads, with CRLF endings', async () => { // new in Step 0
+  it('reassembles a chunk split across network reads, with CRLF endings', async () => {
     const line = 'data: {"choices":[{"delta":{"content":"split ok"}}]}\r\n\r\n';
     stubFetch(() => chunkedResponse([line.slice(0, 15), line.slice(15, line.length - 3), line.slice(line.length - 3), 'data: [DONE]\r\n\r\n']));
     expect(await runWith('openrouter', { apiKey: 'k' })).toEqual([{ type: 'text', text: 'split ok' }]);
   });
 
-  it('stops quietly when aborted mid-stream and drops a half-built tool call', async () => { // new in Step 0
+  it('stops quietly when aborted mid-stream and drops a half-built tool call', async () => {
     stubFetch(() => chunkedResponse([
       'data: {"choices":[{"delta":{"content":"first","tool_calls":[{"index":0,"id":"c1","function":{"name":"t","arguments":"{"}}]}}]}\n\n',
       'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}\n\n',
@@ -417,7 +371,7 @@ describe('OpenAI-compatible tool call buffering', () => {
     expect(seen).toEqual([{ type: 'text', text: 'first' }]);
   });
 
-  it('rejects with the abort error when the signal is already aborted', async () => { // new in Step 0
+  it('rejects with the abort error when the signal is already aborted', async () => {
     stubFetch(() => okStream('openai-chat'));
     const ac = new AbortController();
     ac.abort();
@@ -433,30 +387,36 @@ describe('Error responses across providers', () => {
     stubFetch(() => textResponse('Unauthorized', 401));
     const p = runWith('openrouter', { apiKey: 'bad' });
     await expect(p).rejects.toThrow(/401/);
-    // BC-06 / BC-17 replace this plain Error with a typed AuthError.
+    // Same message as before; it was a plain Error and is now an AuthError, so the router can fall back.
     await expect(p).rejects.toThrow('OpenRouter API error (401): Unauthorized');
+    await expect(p).rejects.toMatchObject({ name: 'AuthError', status: 401 });
   });
 
   it('Codestral should throw on 429', async () => {
     stubFetch(() => textResponse('rate limited', 429, { 'x-ratelimit-remaining-requests': '0' }));
     const p = runWith('codestral', { apiKey: 'test' });
     await expect(p).rejects.toThrow(/429/);
-    await expect(p).rejects.toMatchObject({ name: 'RateLimitError', message: 'Codestral rate limited (429)' });
+    // Was exactly "Codestral rate limited (429)"; a 429 now uses the common error wording with the body text.
+    await expect(p).rejects.toMatchObject({ name: 'RateLimitError', message: 'Codestral API error (429): rate limited' });
   });
 
-  it('OpenRouter throws a RateLimitError carrying the response headers on 429', async () => { // new in Step 0
+  it('OpenRouter throws a RateLimitError carrying the response headers on 429', async () => {
     stubFetch(() => textResponse('slow', 429, { 'x-ratelimit-remaining-requests': '0' }));
     const err: any = await runWith('openrouter', { apiKey: 'k' }).catch((e) => e);
     expect(err.name).toBe('RateLimitError');
-    expect(err.message).toBe('OpenRouter rate limited (429)');
+    // Was exactly "OpenRouter rate limited (429)".
+    expect(err.message).toBe('OpenRouter API error (429): slow');
     expect(err.headers.get('x-ratelimit-remaining-requests')).toBe('0');
   });
 
-  it('Gemini should throw on 403 with error body', async () => {
+  it('Gemini should throw on 403 with the provider message', async () => {
     stubFetch(() => textResponse('{"error":"forbidden"}', 403));
     const p = runWith('gemini', { apiKey: 'bad' });
     await expect(p).rejects.toThrow(/403/);
-    await expect(p).rejects.toThrow('Gemini API error (403): {"error":"forbidden"}');
+    // Was a plain Error carrying the raw JSON body. Now the provider's message is extracted from the JSON,
+    // and a 403 is an AuthError.
+    await expect(p).rejects.toThrow('Gemini API error (403): forbidden');
+    await expect(p).rejects.toMatchObject({ name: 'AuthError' });
   });
 
   it('Ollama should throw on 500 with error body', async () => {
@@ -480,10 +440,13 @@ describe('Error responses across providers', () => {
     await expect(p).rejects.toThrow('Codestral response has no body');
   });
 
-  it('passes a network failure from fetch through unchanged', async () => { // new in Step 0
+  it('wraps a network failure from fetch in a ConnectionError that keeps the original as its cause', async () => {
     const boom = new TypeError('fetch failed');
     stubFetch(() => { throw boom; });
-    // BC-06 classifies connection failures so the router can fall back.
-    await expect(runWith('openrouter', { apiKey: 'k' })).rejects.toBe(boom);
+    // Was: the TypeError passed through unchanged. It is now a ConnectionError, so the router can fall back.
+    const err: any = await runWith('openrouter', { apiKey: 'k' }).catch((e) => e);
+    expect(err.name).toBe('ConnectionError');
+    expect(err.message).toBe('OpenRouter request failed: fetch failed');
+    expect(err.cause).toBe(boom);
   });
 });

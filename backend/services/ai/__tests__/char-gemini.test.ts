@@ -1,8 +1,9 @@
-// Step 0 characterization: Gemini behind createProvider, observed only through the
-// wire request it sends and the events it yields. Written against the old ai-provider.ts.
+// Characterization: Gemini behind createProvider, observed only through the wire request it
+// sends and the events it yields. First written against the previous single-file implementation;
+// every assertion that changed with the dialect rewrite says what the old behaviour was.
 // fixtures: hand-written from https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { createProvider } from '../../ai-provider';
+import { createProvider } from '../registry';
 import { sseResponse, chunkedResponse, textResponse, okStream, stubFetch, callHeader, collect } from '../test-helpers';
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 
@@ -12,7 +13,7 @@ const msgs: AiMessage[] = [{ role: 'user', content: 'hello' }];
 const noTools: AiToolDefinition[] = [];
 
 const chunk = (payload: unknown) => ({ data: JSON.stringify(payload) });
-const gemini = (cfg: Record<string, any> = { apiKey: 'test-key' }) => createProvider('gemini', cfg);
+const gemini = (cfg: Record<string, any> = { apiKey: 'test-key' }, newId?: () => string) => createProvider('gemini', cfg, { newId });
 const run = (messages: AiMessage[] = msgs, system = 'system', tools: AiToolDefinition[] = noTools, cfg?: Record<string, any>) =>
   collect(gemini(cfg).createStreamingRequest(messages, system, tools));
 
@@ -24,30 +25,31 @@ describe('GeminiProvider', () => {
       expect(callHeader(stub.calls[0], 'Content-Type')).toBe('application/json');
     });
 
-    it('puts the key in the URL and sends no auth header', async () => { // new in Step 0
+    it('sends the key in the x-goog-api-key header, never in the URL', async () => {
       const stub = stubFetch(() => okStream('gemini'));
       await run(msgs, 's', noTools, { apiKey: 'sk-test-placeholder' });
       const call = stub.calls[0];
-      // BC-10 moves the key to x-goog-api-key; BC-11 changes the default model to gemini-2.5-flash.
+      // Was `&key=<key>` in the query string (so the key landed in any logged URL) with gemini-2.0-flash,
+      // which Google has shut down. Now the key is a header and the default model is gemini-2.5-flash.
       expect(call.url).toBe(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=sk-test-placeholder',
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
       );
+      expect(call.url).not.toContain('sk-test-placeholder');
       expect(callHeader(call, 'authorization')).toBeUndefined();
-      expect(callHeader(call, 'x-goog-api-key')).toBeUndefined();
-      expect(Object.keys(call.headers)).toEqual(['Content-Type']);
+      expect(callHeader(call, 'x-goog-api-key')).toBe('sk-test-placeholder');
+      // Was an exact key-order check on the header object; header names are case-insensitive, so look them up by name.
+      expect(callHeader(call, 'content-type')).toBe('application/json');
       expect(call.init.method).toBe('POST');
     });
 
-    it('uses the configured model and ignores baseUrl', async () => { // new in Step 0
+    it('uses the configured model and honours baseUrl', async () => {
       const stub = stubFetch(() => okStream('gemini'));
       await run(msgs, 's', noTools, { apiKey: 'k', model: 'gemini-x', baseUrl: 'https://proxy.test' });
-      // BC-09 makes Gemini honour baseUrl.
-      expect(stub.calls[0].url).toBe(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-x:streamGenerateContent?alt=sse&key=k',
-      );
+      // Was ignored: the request always went to Google's host. A configured Base URL is now used.
+      expect(stub.calls[0].url).toBe('https://proxy.test/v1beta/models/gemini-x:streamGenerateContent?alt=sse');
     });
 
-    it('sends systemInstruction and contents, and omits tools when none are given', async () => { // new in Step 0
+    it('sends systemInstruction and contents, and omits tools when none are given', async () => {
       const stub = stubFetch(() => okStream('gemini'));
       await run(msgs, 'sys prompt');
       expect(stub.calls[0].body).toEqual({
@@ -104,7 +106,7 @@ describe('GeminiProvider', () => {
       const toolResultMsg = body.contents[2];
       expect(toolResultMsg.role).toBe('user');
       expect(toolResultMsg.parts[0].functionResponse).toEqual({
-        name: 'tool_result', // BC-11 sends the real function name
+        name: 'get_info', // was the literal 'tool_result'; now the name of the call this result answers
         response: { result: 'tool output here' },
       });
 
@@ -117,7 +119,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('sends each tool result as its own user turn and keeps empty assistant text parts', async () => { // new in Step 0
+    it('merges consecutive tool results into one user turn and drops empty assistant text parts', async () => {
       const stub = stubFetch(() => okStream('gemini'));
       const messages: AiMessage[] = [
         { role: 'user', content: 'go' },
@@ -133,25 +135,30 @@ describe('GeminiProvider', () => {
         { role: 'tool_result', toolUseId: 'b', content: 'rb' },
       ];
       await run(messages);
-      // BC-11 merges consecutive tool results into one turn with real names.
+      // Was: an empty { text: '' } part kept in the model turn, and one user turn per result, each named
+      // 'tool_result'. Now empty text parts are dropped and the results share one turn with real names.
       expect(stub.calls[0].body.contents).toEqual([
         { role: 'user', parts: [{ text: 'go' }] },
         {
           role: 'model',
           parts: [
-            { text: '' },
             { functionCall: { name: 'tool_a', args: {} } },
             { functionCall: { name: 'tool_b', args: { n: 1 } } },
           ],
         },
-        { role: 'user', parts: [{ functionResponse: { name: 'tool_result', response: { result: 'ra' } } }] },
-        { role: 'user', parts: [{ functionResponse: { name: 'tool_result', response: { result: 'rb' } } }] },
+        {
+          role: 'user',
+          parts: [
+            { functionResponse: { name: 'tool_a', response: { result: 'ra' } } },
+            { functionResponse: { name: 'tool_b', response: { result: 'rb' } } },
+          ],
+        },
       ]);
     });
   });
 
-  describe('streaming', () => { // new in Step 0
-    it('yields text, a synthesised tool id, and usage on every chunk that carries it', async () => { // new in Step 0
+  describe('streaming', () => {
+    it('yields text, a tool call with an id from the id generator, and usage once at the end', async () => {
       stubFetch(() => sseResponse([
         chunk({ candidates: [{ content: { parts: [{ text: 'Hel' }] } }], usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 1 } }),
         chunk({ candidates: [{ content: { parts: [{ text: 'lo' }] } }], usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 2 } }),
@@ -160,33 +167,37 @@ describe('GeminiProvider', () => {
           usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 4 },
         }),
       ]));
-      const events = await run();
-      const tool = events.find((e) => e.type === 'tool_use') as Extract<AiStreamEvent, { type: 'tool_use' }>;
-      expect(tool.id).toMatch(/^gemini-\d+-[a-z0-9]+$/);
-      // BC-11 emits usage once; today every chunk with usageMetadata yields a usage event.
+      const events = await collect(gemini({ apiKey: 'k' }, () => 'call-1').createStreamingRequest(msgs, 's', noTools));
+      // Was: an id of the form gemini-<timestamp>-<random>, and a usage event on every chunk carrying
+      // usageMetadata (which consumers summed, over-counting). Now ids come from the provider's id
+      // generator, and usage is emitted once, from the last chunk.
       expect(events).toEqual([
         { type: 'text', text: 'Hel' },
-        { type: 'usage', inputTokens: 9, outputTokens: 1 },
         { type: 'text', text: 'lo' },
-        { type: 'usage', inputTokens: 9, outputTokens: 2 },
-        { type: 'tool_use', id: tool.id, name: 'get_apps', input: { q: 'x' } },
+        { type: 'tool_use', id: 'call-1', name: 'get_apps', input: { q: 'x' } },
         { type: 'usage', inputTokens: 9, outputTokens: 4 },
       ]);
     });
 
-    it('defaults missing functionCall args to an empty object', async () => { // new in Step 0
+    it('generates a non-empty tool-call id by default', async () => {
+      stubFetch(() => sseResponse([chunk({ candidates: [{ content: { parts: [{ functionCall: { name: 'f', args: {} } }] } }] })]));
+      const [tool] = (await run()) as Extract<AiStreamEvent, { type: 'tool_use' }>[];
+      expect(tool.id).toMatch(/^call_[0-9a-f]{24}$/);
+    });
+
+    it('defaults missing functionCall args to an empty object', async () => {
       stubFetch(() => sseResponse([chunk({ candidates: [{ content: { parts: [{ functionCall: { name: 'noargs' } }] } }] })]));
       const events = await run();
       expect(events).toMatchObject([{ type: 'tool_use', name: 'noargs', input: {} }]);
     });
 
-    it('ends quietly on a safety stop with no parts', async () => { // new in Step 0
+    it('ends without an error on a safety stop with no parts, and says why', async () => {
       stubFetch(() => sseResponse([chunk({ candidates: [{ finishReason: 'SAFETY' }] })]));
-      // BC-05 makes safety, blocked, and malformed-call stops produce a visible message.
-      expect(await run()).toEqual([]);
+      // Was a silent empty reply; safety, blocked, and malformed-call stops now show a message.
+      expect(await run()).toEqual([{ type: 'text', text: 'Gemini stopped this response (reason: SAFETY).' }]);
     });
 
-    it('skips unparseable data lines and accepts a stream with no terminator', async () => { // new in Step 0
+    it('skips unparseable data lines and accepts a stream with no terminator', async () => {
       stubFetch(() => sseResponse([
         { data: 'not json' },
         chunk({ candidates: [{ content: { parts: [{ text: 'fine' }] } }] }),
@@ -194,23 +205,24 @@ describe('GeminiProvider', () => {
       expect(await run()).toEqual([{ type: 'text', text: 'fine' }]);
     });
 
-    it('reassembles a chunk split across network reads, with CRLF endings', async () => { // new in Step 0
+    it('reassembles a chunk split across network reads, with CRLF endings', async () => {
       const line = 'data: {"candidates":[{"content":{"parts":[{"text":"split ok"}]}}]}\r\n\r\n';
       stubFetch(() => chunkedResponse([line.slice(0, 20), line.slice(20, line.length - 3), line.slice(line.length - 3)]));
       expect(await run()).toEqual([{ type: 'text', text: 'split ok' }]);
     });
 
-    it('throws a RateLimitError on 429', async () => { // new in Step 0
+    it('throws a RateLimitError on 429', async () => {
       stubFetch(() => textResponse('quota', 429));
-      await expect(run()).rejects.toMatchObject({ name: 'RateLimitError', message: 'Gemini rate limited (429)' });
+      // Was exactly "Gemini rate limited (429)"; a 429 now uses the common error wording with the body text.
+      await expect(run()).rejects.toMatchObject({ name: 'RateLimitError', message: 'Gemini API error (429): quota' });
     });
 
-    it('throws when the response has no body', async () => { // new in Step 0
+    it('throws when the response has no body', async () => {
       stubFetch(() => new Response(null, { status: 200 }));
       await expect(run()).rejects.toThrow('Gemini response has no body');
     });
 
-    it('stops quietly when aborted mid-stream', async () => { // new in Step 0
+    it('stops quietly when aborted mid-stream', async () => {
       stubFetch(() => chunkedResponse([
         'data: {"candidates":[{"content":{"parts":[{"text":"first"}]}}]}\n\n',
         'data: {"candidates":[{"content":{"parts":[{"text":"never seen"}]}}]}\n\n',
