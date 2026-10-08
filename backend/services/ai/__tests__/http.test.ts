@@ -170,6 +170,25 @@ describe('sendChat', () => {
     await expect(sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }))
       .rejects.toThrow(/redirect/i);
   });
+  it('the raw fetch error attached as cause carries no key or URL userinfo in its message or stack', async () => {
+    const leaky = `bad ${'sk-test-placeholder'} at https://u:p@host.test/x`;
+    const make: Array<() => Error> = [
+      () => new TypeError(leaky),                                                       // generic "request failed" branch
+      () => Object.assign(new TypeError(leaky), { cause: new Error('unexpected redirect') }),   // redirect branch
+    ];
+    for (const build of make) {
+      const raw = build();
+      stubFetch(() => { throw raw; });
+      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      expect(err).toBeInstanceOf(ConnectionError);
+      expect(err.cause).toBe(raw);
+      for (const text of [(err.cause as Error).message, (err.cause as Error).stack ?? '', err.message]) {
+        expect(text).not.toContain('sk-test-placeholder');
+        expect(text).not.toContain('u:p@');
+      }
+      vi.unstubAllGlobals();
+    }
+  });
   it('does not send anything for an already-aborted signal and passes the abort through', async () => {
     const stub = stubFetch(() => jsonResponse({}));
     const ac = new AbortController(); ac.abort();
@@ -424,6 +443,44 @@ describe('classifyHttpError: dialect classifyError hook results are normalised c
     const msg = `Gemini API error (400): ${'u'.repeat(500)}`;
     expect(run(withHook(() => new AuthError(msg)), 400).message).toBe(msg);
   });
+  describe('a hook error that cannot be edited degrades to a plain AiProviderError and never throws', () => {
+    const msg = `bad key ${KEY} at https://u:p@host.test/x`;
+    const expectPlain = (e: AiProviderError, original: AiProviderError, status: number) => {
+      expect(e).toBeInstanceOf(AiProviderError);
+      expect(e).not.toBe(original);
+      expect(e.constructor).toBe(AiProviderError);
+      expect(e.message).toBe('bad key *** at https://***@host.test/x');
+      expect(e.provider).toBe('openai');
+      expect(e.status).toBe(status);
+      expect(e.cause).toBeUndefined();                          // the raw cause is never attached to the fallback
+      expect(e.stack ?? '').not.toContain(KEY);
+    };
+
+    it('a frozen error', () => {
+      const frozen = Object.freeze(new AuthError(msg, { cause: new Error(`boom ${KEY}`) }));
+      expectPlain(run(withHook(() => frozen), 401), frozen, 401);
+    });
+    it('a non-writable message', () => {
+      const original = new RateLimitError(msg, new Headers(), { status: 429 });
+      Object.defineProperty(original, 'message', { writable: false });
+      expectPlain(run(withHook(() => original), 429), original, 429);
+    });
+  });
+
+  describe('cause on a hook error is redacted (one level)', () => {
+    it('an Error cause has its message and stack redacted in place', () => {
+      const cause = new Error(`boom ${KEY}`);
+      const e = run(withHook(() => new AuthError('x', { cause })), 401);
+      expect(e.cause).toBe(cause);
+      expect(cause.message).toBe('boom ***');
+      expect(cause.stack ?? '').not.toContain(KEY);
+    });
+    it('a string cause is redacted', () => {
+      const e = run(withHook(() => new AuthError('x', { cause: `raw ${KEY} at https://u:p@host.test/x` })), 401);
+      expect(e.cause).toBe('raw *** at https://***@host.test/x');
+    });
+  });
+
   it('a hook returning undefined falls through to the generic path unchanged', () => {
     const hook = vi.fn(() => undefined);
     const e = run(withHook(hook), 500, 'oops');

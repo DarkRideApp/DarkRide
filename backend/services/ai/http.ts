@@ -150,22 +150,55 @@ const OPENAI_QUOTA_CODES = new Set([
 ]);
 
 /**
+ * Redact (and cap) an error's message and stack in place. Throws if a property it has to change is not writable.
+ * V8 bakes the construction-time message into the stack header, so the stack is scrubbed too.
+ */
+function scrubError(err: Error, apiKey: string | undefined, maxChars: number): void {
+  const original = err.message;
+  const message = redact(original, apiKey).slice(0, maxChars);
+  if (message !== original) err.message = message;
+  if (typeof err.stack === 'string') {
+    const stack = redact(message !== original ? err.stack.split(original).join(message) : err.stack, apiKey);
+    if (stack !== err.stack) err.stack = stack;
+  }
+}
+
+/** One level of `cause`: a string is redacted, an Error has its message and stack redacted in place. Throws if it cannot. */
+function scrubCause(holder: { cause?: unknown }, apiKey: string | undefined): void {
+  const cause = holder.cause;
+  if (typeof cause === 'string') {
+    const redacted = redact(cause, apiKey);
+    if (redacted !== cause) holder.cause = redacted;
+  } else if (cause instanceof Error) {
+    scrubError(cause, apiKey, Infinity);
+  }
+}
+
+/** `err` made safe to attach as a `cause` (message and stack redacted in place), or undefined if that is not possible. */
+function redactedCause(err: unknown, apiKey: string | undefined): unknown {
+  const holder = { cause: err };
+  try { scrubCause(holder, apiKey); return holder.cause; } catch { return undefined; }
+}
+
+/**
  * A dialect's classifyError hook has no DialectContext, so it cannot redact or tag its own errors. Do it here, once,
- * for every dialect: mask the key and URL userinfo (BEFORE the cap), cap the message, fill in provider and status
- * if the hook left them unset. The error object is mutated in place, so its class (and e.g. a RateLimitError's
- * headers) and identity are preserved.
+ * for every dialect: mask the key and URL userinfo (BEFORE the cap) in the message, stack and cause, cap the message,
+ * and fill in provider and status if the hook left them unset. The error is edited in place, so its class (and e.g. a
+ * RateLimitError's headers) and identity are preserved. If it cannot be edited (frozen or read-only) the result is a
+ * plain AiProviderError built from the redacted message, without the cause. Never throws.
  */
 function normaliseHookError(err: AiProviderError, ctx: DialectContext, status: number): AiProviderError {
-  const original = err.message;
-  const message = redact(original, ctx.apiKey).slice(0, MAX_ERROR_MESSAGE_CHARS);
-  if (message !== original) {
-    err.message = message;
-    // V8 bakes the construction-time message into the stack header; keep the raw text out of logged stacks too.
-    if (typeof err.stack === 'string') err.stack = err.stack.split(original).join(message);
+  try {
+    scrubError(err, ctx.apiKey, MAX_ERROR_MESSAGE_CHARS);
+    scrubCause(err, ctx.apiKey);
+    err.provider ??= ctx.descriptor.id;
+    err.status ??= status;
+    return err;
+  } catch {
+    let raw = '';
+    try { raw = String(err.message ?? ''); } catch { /* unreadable message */ }
+    return new AiProviderError(redact(raw, ctx.apiKey).slice(0, MAX_ERROR_MESSAGE_CHARS), { status, provider: ctx.descriptor.id });
   }
-  err.provider ??= ctx.descriptor.id;
-  err.status ??= status;
-  return err;
 }
 
 export function classifyHttpError(
@@ -247,18 +280,19 @@ export async function sendBuilt(
       redirect: 'error',
     });
   } catch (err: any) {
+    const cause = redactedCause(err, ctx.apiKey);   // the raw fetch error may echo the URL or key in its message or stack
     if (timedOut) {
-      throw new ConnectionError(`${d.shortName} did not respond within ${formatDuration(timeoutMs)}`, { provider: d.id, cause: err });
+      throw new ConnectionError(`${d.shortName} did not respond within ${formatDuration(timeoutMs)}`, { provider: d.id, cause });
     }
     if (signal?.aborted) throw err;
     const causeMsg = String(err?.cause?.message ?? err?.message ?? err);
     if (/redirect/i.test(causeMsg)) {
       throw new ConnectionError(
         `${d.shortName} answered with a redirect. Redirects are not followed because they could forward the API key. Use the final URL as Base URL.`,
-        { provider: d.id, cause: err },
+        { provider: d.id, cause },
       );
     }
-    throw new ConnectionError(`${d.shortName} request failed: ${redact(causeMsg, ctx.apiKey).slice(0, MAX_UPSTREAM_CHARS)}`, { provider: d.id, cause: err });
+    throw new ConnectionError(`${d.shortName} request failed: ${redact(causeMsg, ctx.apiKey).slice(0, MAX_UPSTREAM_CHARS)}`, { provider: d.id, cause });
   } finally {
     clearTimeout(timer);
   }
