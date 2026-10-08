@@ -70,6 +70,14 @@ export interface AiStreamUsageEvent {
   outputTokens: number;
   /** Prompt tokens served from the provider's cache (reads only). */
   cachedInputTokens?: number;
+  /** Prompt tokens written to the provider's cache on this request (Anthropic `cache_creation_input_tokens`). */
+  cacheCreationInputTokens?: number;
+  /** Model id the request actually ran on, for example `claude-opus-5-5`. Set by the provider layer. */
+  model?: string;
+  /** Provider type id the request ran on, for example `anthropic`. Set by the provider layer. */
+  providerType?: string;
+  /** Models skipped or failed before this one served the request, with a short reason. Set by the router. */
+  fallbacks?: Array<{ model: string; error: string }>;
 }
 
 /** Events emitted by the LLM provider during streaming */
