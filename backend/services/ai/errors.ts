@@ -21,12 +21,18 @@ export class RateLimitError extends AiProviderError {
 export class QuotaExhaustedError extends AiProviderError {}
 export class OverloadedError extends AiProviderError {}
 export class AuthError extends AiProviderError {}
+/**
+ * A 403 that does not prove the key is bad: the key lacks access to this model, a moderation or guardrail block, a
+ * region or organisation restriction. Another model may still work, so the router tries the next one, but nothing is
+ * put on cooldown.
+ */
+export class PermissionDeniedError extends AiProviderError {}
 export class ConnectionError extends AiProviderError {}
 export class OutputLimitError extends AiProviderError {}
 export class UnknownProviderError extends AiProviderError {}
 
 export class NoModelsConfiguredError extends Error {
-  constructor(message = 'No AI models configured. Add one in Settings → Integrations.') {
+  constructor(message = 'No AI models configured. Add one in Settings → AI.') {
     super(message);
     this.name = 'NoModelsConfiguredError';
   }
@@ -50,6 +56,7 @@ export function isFallbackEligible(err: unknown): boolean {
     err instanceof QuotaExhaustedError ||
     err instanceof OverloadedError ||
     err instanceof AuthError ||
+    err instanceof PermissionDeniedError ||
     err instanceof ConnectionError
   );
 }

@@ -1,6 +1,6 @@
 import type { AiProviderDescriptor } from '../../../shared/lib/ai-provider-catalog';
 import {
-  AiProviderError, AuthError, ConnectionError, OverloadedError, QuotaExhaustedError, RateLimitError,
+  AiProviderError, AuthError, ConnectionError, OverloadedError, PermissionDeniedError, QuotaExhaustedError, RateLimitError,
 } from './errors';
 import type { BuiltRequest, Dialect, DialectContext, AiRequest } from './dialect';
 
@@ -331,8 +331,9 @@ export function classifyHttpError(
   const retryAfter = headers.get('retry-after');
 
   // Only a 401 proves the credentials are wrong. A 403 refuses one request or resource (a moderation or guardrail
-  // block, a key without access to one model, a region or organisation restriction): it falls through to the
-  // rules below and usually ends as a plain error, so it does not put the whole provider on cooldown.
+  // block, a key without access to one model, a region or organisation restriction): another model may still work,
+  // so it is a PermissionDeniedError (below, after the quota markers), which falls back without putting anything on
+  // cooldown.
   if (status === 401) {
     return new AuthError(d.authHint ? `${base} Hint: ${d.authHint}` : base, opts);
   }
@@ -351,6 +352,7 @@ export function classifyHttpError(
   }
   if (status === 429) return new RateLimitError(base, headers, opts);
   if (OVERLOADED_STATUSES.includes(status)) return new OverloadedError(base, opts);
+  if (status === 403) return new PermissionDeniedError(base, opts);
   return new AiProviderError(base, opts);
 }
 

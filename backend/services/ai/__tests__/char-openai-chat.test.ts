@@ -414,10 +414,10 @@ describe('Error responses across providers', () => {
     const p = runWith('gemini', { apiKey: 'bad' });
     await expect(p).rejects.toThrow(/403/);
     // Was a plain Error carrying the raw JSON body. Now the provider's message is extracted from the JSON.
-    // Was: a 403 was an AuthError. Now: a 403 without a credential marker is a plain AiProviderError, because it
-    // refuses one request or resource rather than proving the key is bad, so it must not cool the provider down.
+    // Was: a plain AiProviderError. Now: a 403 without a credential marker is a PermissionDeniedError, which lets the
+    // router try the next model but starts no cooldown, because it does not prove the key is bad.
     await expect(p).rejects.toThrow('Gemini API error (403): forbidden');
-    await expect(p).rejects.toMatchObject({ name: 'AiProviderError', status: 403 });
+    await expect(p).rejects.toMatchObject({ name: 'PermissionDeniedError', status: 403 });
   });
 
   it('Ollama should throw on 500 with error body', async () => {

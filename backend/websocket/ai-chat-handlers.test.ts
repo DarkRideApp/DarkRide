@@ -53,6 +53,7 @@ describe('AI Chat Handlers', () => {
   });
 
   describe('ai:message', () => {
+    // Was: the message pointed at "Settings > Integrations". Now: AI providers are added under Settings > AI.
     it('should send ai:error when no agent is configured', async () => {
       const socket = createMockSocket();
       const handler = getWebsocketHandler('ai:message')!.handler;
@@ -64,7 +65,7 @@ describe('AI Chat Handlers', () => {
       expect(sent).toEqual({
         type: 'ai:error',
         conversationId: 1,
-        error: 'No AI provider configured. Add a provider in Settings > Integrations.',
+        error: 'No AI provider configured. Add a provider in Settings > AI.',
       });
     });
 
@@ -79,7 +80,7 @@ describe('AI Chat Handlers', () => {
       expect(sent).toEqual({
         type: 'ai:error',
         conversationId: 2,
-        error: 'No AI provider configured. Add a provider in Settings > Integrations.',
+        error: 'No AI provider configured. Add a provider in Settings > AI.',
       });
     });
 

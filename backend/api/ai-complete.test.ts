@@ -15,7 +15,7 @@ import { completeHandler, registerAiCompleteEndpoints } from './ai-complete';
 import { createTestDb } from '../test-utils/create-test-db';
 import { stubFetch, jsonResponse, textResponse, okStream, callHeader } from '../services/ai/test-helpers';
 import { AiModelRouter, RateLimitCache } from '../services/ai-model-router';
-import { AuthError, ConnectionError, QuotaExhaustedError } from '../services/ai/errors';
+import { AuthError, ConnectionError, PermissionDeniedError, QuotaExhaustedError } from '../services/ai/errors';
 import { getRecentLogs } from '../logs';
 import { buildAiReferencePrompt } from '../../shared/api-reference';
 
@@ -177,6 +177,20 @@ describe('AI Complete API Endpoint', () => {
       expect(res.status).toBe(502);
       expect(calls).toBe(1);
       expect(res.body.error).toContain('B: in cooldown');
+    });
+
+    it('a 403 tries the other models on the same key, cools none down, and is a 502 naming each reason', async () => {
+      let calls = 0;
+      const router = routerWith({ low: ['A', 'B'] }, { complete: async () => {
+        calls++;
+        throw new PermissionDeniedError('OpenRouter API error (403): no access to this model', { status: 403, provider: 'openrouter' });
+      } });
+      const res = await request(createApp(db, router)).post('/v1/ai/complete').send({ prefix: 'a' });
+      expect(res.status).toBe(502);
+      expect(calls).toBe(2);
+      expect(res.body.error).toContain('A: OpenRouter API error (403): no access to this model');
+      expect(res.body.error).toContain('B: OpenRouter API error (403): no access to this model');
+      expect(res.body.error).not.toContain('in cooldown');
     });
 
     it('falls back to the next Low model on a connection failure', async () => {

@@ -3,7 +3,14 @@ import {
   classifyHttpError, redact, safeText, upstreamMessage, sendChat, sendChecked, parseSSEStream, parseNDJSONStream, readJson,
   MAX_JSON_BODY_BYTES, MAX_STREAM_LINE_CHARS, LineTooLongError,
 } from '../http';
-import { AuthError, QuotaExhaustedError, RateLimitError, OverloadedError, ConnectionError, AiProviderError, isFallbackEligible } from '../errors';
+import {
+  AuthError, QuotaExhaustedError, RateLimitError, OverloadedError, ConnectionError, AiProviderError, PermissionDeniedError,
+  isFallbackEligible,
+} from '../errors';
+import { openAiChatDialect } from '../dialects/openai-chat';
+import { anthropicDialect } from '../dialects/anthropic-messages';
+import { geminiDialect } from '../dialects/gemini-generate';
+import { ollamaDialect } from '../dialects/ollama-chat';
 import { getProviderDescriptor } from '../../../../shared/lib/ai-provider-catalog';
 import type { Dialect, DialectContext } from '../dialect';
 import { stubFetch, jsonResponse, textResponse, sseResponse, chunkedResponse } from '../test-helpers';
@@ -32,17 +39,52 @@ describe('classifyHttpError', () => {
     expect(e.message).toContain('Hint:');
     expect(e.message).toContain('codestral.mistral.ai');
   });
-  it('403 -> plain AiProviderError: a refusal for one request or resource, not a bad key', () => {
-    // Was: a 403 was an AuthError like a 401, which put the whole provider on cooldown.
-    // Now: only a 401 is a credential failure. A 403 (a moderation or guardrail block, a key without access to one
-    // model, a region or organisation restriction) fails this request only, with no fallback and no cooldown.
+  it('403 -> PermissionDeniedError: a refusal for one model or request, not a bad key', () => {
+    // Was: a plain AiProviderError, so the request failed with no fallback.
+    // Now: a PermissionDeniedError. The next model is tried, but no cooldown starts, because a 403 (a moderation or
+    // guardrail block, a key without access to one model, a region or organisation restriction) does not prove the
+    // key is bad.
     for (const id of ['openrouter', 'anthropic', 'openai', 'codestral']) {
       const e = cls(403, '{"error":{"message":"flagged by moderation"}}', {}, id);
-      expect(e.constructor).toBe(AiProviderError);
+      expect(e.constructor).toBe(PermissionDeniedError);
+      expect(e).not.toBeInstanceOf(AuthError);
       expect(e.status).toBe(403);
       expect(e.provider).toBe(id);
       expect(e.message).toBe(`${getProviderDescriptor(id)!.shortName} API error (403): flagged by moderation`);
-      expect(isFallbackEligible(e)).toBe(false);
+      expect(e.message).not.toContain('Hint:');
+      expect(isFallbackEligible(e)).toBe(true);
+    }
+  });
+  it('a 403 carrying a quota marker is still a QuotaExhaustedError', () => {
+    expect(cls(403, '{"error":{"code":"insufficient_quota","message":"x"}}')).toBeInstanceOf(QuotaExhaustedError);
+    expect(cls(403, 'Your credit balance is too low', {}, 'anthropic')).toBeInstanceOf(QuotaExhaustedError);
+  });
+  it('403 through each real dialect: PermissionDeniedError, except a Gemini PERMISSION_DENIED which is an AuthError', () => {
+    const body = '{"error":{"message":"no access to this model"}}';
+    const cases: [Dialect, string][] = [
+      [openAiChatDialect, 'openai'], [anthropicDialect, 'anthropic'], [geminiDialect, 'gemini'], [ollamaDialect, 'ollama'],
+    ];
+    for (const [dialect, id] of cases) {
+      const e = classifyHttpError(dialect, ctxFor(id), 403, new Headers(), body);
+      expect(e.constructor).toBe(PermissionDeniedError);
+      expect(e.status).toBe(403);
+      expect(e.provider).toBe(id);
+      expect(e.message).toBe(`${getProviderDescriptor(id)!.shortName} API error (403): no access to this model`);
+    }
+    const denied = JSON.stringify({ error: { code: 403, message: 'key disabled', status: 'PERMISSION_DENIED' } });
+    const keyLevel = classifyHttpError(geminiDialect, ctxFor('gemini'), 403, new Headers(), denied);
+    expect(keyLevel).toBeInstanceOf(AuthError);
+    expect(keyLevel).not.toBeInstanceOf(PermissionDeniedError);
+  });
+  it('401 through each real dialect stays an AuthError', () => {
+    const cases: [Dialect, string][] = [
+      [openAiChatDialect, 'openai'], [anthropicDialect, 'anthropic'], [geminiDialect, 'gemini'], [ollamaDialect, 'ollama'],
+    ];
+    for (const [dialect, id] of cases) {
+      const e = classifyHttpError(dialect, ctxFor(id), 401, new Headers(), '{"error":{"message":"bad key"}}');
+      expect(e).toBeInstanceOf(AuthError);
+      expect(e).not.toBeInstanceOf(PermissionDeniedError);
+      expect(e.status).toBe(401);
     }
   });
   it('402 -> Quota, but 402 with Retry-After -> RateLimit', () => {

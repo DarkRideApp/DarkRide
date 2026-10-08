@@ -271,7 +271,8 @@ export class AiModelRouter {
   /**
    * Start the cooldown an eligible failure calls for. Quota and auth belong to the credential, so
    * every model on the same provider entry cools down. Rate limits and connection failures cool
-   * down only the model. Overload is transient and starts none.
+   * down only the model. Overload is transient and starts none, and so does a permission denial
+   * (a 403), which refuses one model or request without proving the key is bad.
    */
   private recordFailure(model: ModelRow, row: ProviderRow, err: unknown): void {
     // `row` is the provider entry as it was when the attempt started. If the user has since saved a
@@ -300,7 +301,7 @@ export class AiModelRouter {
 
   /**
    * Stream from the first usable model of the tier, falling back to the next on a quota, rate-limit,
-   * overload, auth, or connection failure, but only while nothing has been yielded: once text or a
+   * overload, auth, permission, or connection failure, but only while nothing has been yielded: once text or a
    * tool call went out, a fallback would duplicate output, so the error is rethrown. Usage events are
    * held until the first content event (or the normal end of the stream) and discarded if the stream
    * fails first, so a fallback never double counts. A caller abort is never treated as a provider

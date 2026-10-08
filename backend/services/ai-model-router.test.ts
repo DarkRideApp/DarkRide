@@ -9,7 +9,7 @@ import { createProvider } from './ai/registry';
 import { createTestDb } from '../test-utils/create-test-db';
 import {
   QuotaExhaustedError, AuthError, OverloadedError, ConnectionError, OutputLimitError, AllModelsFailedError,
-  NoModelsConfiguredError, UnknownProviderError, RateLimitError as RLE,
+  NoModelsConfiguredError, UnknownProviderError, PermissionDeniedError, RateLimitError as RLE,
 } from './ai/errors';
 
 const { aiModels, aiProviders } = schema;
@@ -1032,6 +1032,65 @@ describe('AiModelRouter', () => {
       expect(cache.isInCooldown(r.getModels()[0].id, 10)).toBe(false);
     });
 
+    describe('a 403 (PermissionDeniedError)', () => {
+      const denied = () => new PermissionDeniedError('OpenRouter API error (403): no access to this model', { status: 403, provider: 'openrouter' });
+      const idOf = (name: string) => r.getModels().find((m) => m.name === name)!.id;
+
+      it('falls back to the next model and starts no cooldown on the model or its credential', async () => {
+        insertModel(db, { name: 'A2', model: 'A2', priority: 2, tierId: highTierId, _providerId: defaultProviderId });
+        const factory = scripted(scripts);
+        r = new AiModelRouter(db as any, cache, { providerFactory: factory });
+        two([{ type: 'throw', value: denied() }], [{ type: 'text', value: 'from B' }]);
+        expect(await run()).toEqual([{ type: 'text', text: 'from B' }]);
+        expect(cache.get(idOf('A'))).toBeUndefined();
+        expect(cache.get(idOf('A2'))).toBeUndefined();
+        expect(cache.isInCooldown(idOf('A'), 10)).toBe(false);
+
+        // The next request tries A again, and A serves it once it is allowed.
+        scripts.A = [{ type: 'text', value: 'from A' }];
+        expect(await run()).toEqual([{ type: 'text', text: 'from A' }]);
+        expect(factory.mock.calls.map((c) => c[1].model)).toEqual(['A', 'B', 'A']);
+      });
+
+      it('a tier where every model answers 403 fails with each reason listed', async () => {
+        two([{ type: 'throw', value: denied() }], [{ type: 'throw', value: denied() }]);
+        const err: any = await run().catch((e) => e);
+        expect(err).toBeInstanceOf(AllModelsFailedError);
+        expect(err.attempts).toEqual([
+          { model: 'A', error: 'OpenRouter API error (403): no access to this model' },
+          { model: 'B', error: 'OpenRouter API error (403): no access to this model' },
+        ]);
+        expect(err.cause).toBeInstanceOf(PermissionDeniedError);
+        expect(cache.getAll().size).toBe(0);
+      });
+
+      it('after content was yielded it is rethrown, with no fallback and no cooldown', async () => {
+        const factory = scripted(scripts);
+        r = new AiModelRouter(db as any, cache, { providerFactory: factory });
+        two([{ type: 'text', value: 'partial' }, { type: 'throw', value: denied() }], [{ type: 'text', value: 'B' }]);
+        await expect(run()).rejects.toBeInstanceOf(PermissionDeniedError);
+        expect(factory.mock.calls.map((c) => c[1].model)).toEqual(['A']);
+        expect(cache.getAll().size).toBe(0);
+      });
+
+      it('completeText falls back the same way and starts no cooldown', async () => {
+        const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+        db.update(aiModels).set({ tierId: low.id }).run();
+        scripts.A = [{ type: 'throw', value: denied() }];
+        expect(await r.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true })).toBe('done:B');
+        expect(cache.get(idOf('A'))).toBeUndefined();
+
+        scripts.B = [{ type: 'throw', value: denied() }];
+        const err: any = await r.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true }).catch((e) => e);
+        expect(err).toBeInstanceOf(AllModelsFailedError);
+        expect(err.attempts.map((a: any) => a.error)).toEqual([
+          'OpenRouter API error (403): no access to this model', 'OpenRouter API error (403): no access to this model',
+        ]);
+        expect(cache.get(idOf('A'))).toBeUndefined();
+        expect(cache.isInCooldown(idOf('B'), 10)).toBe(false);
+      });
+    });
+
     it('a connection failure cools the model down and falls back', async () => {
       two([{ type: 'throw', value: new ConnectionError('refused') }], [{ type: 'text', value: 'B' }]);
       expect(await run()).toEqual([{ type: 'text', text: 'B' }]);
@@ -1493,10 +1552,11 @@ describe('AiModelRouter', () => {
         .catch((e) => e);
       expect(completeErr?.name).toBe('AbortError');
     });
-    it('NoModelsConfiguredError keeps the legacy message for the non-strict path', () => {
+    it('NoModelsConfiguredError points at Settings → AI for the non-strict path', () => {
       const rr = new AiModelRouter(db as any, cache, { providerFactory: scripted({}) });
       expect(() => rr.getModelsForTier('High')).toThrow(NoModelsConfiguredError);
-      expect(() => rr.getModelsForTier('High')).toThrow('No AI models configured. Add one in Settings → Integrations.');
+      // Was: "Add one in Settings → Integrations.". Now: AI providers and models live under Settings → AI.
+      expect(() => rr.getModelsForTier('High')).toThrow('No AI models configured. Add one in Settings → AI.');
     });
   });
 });

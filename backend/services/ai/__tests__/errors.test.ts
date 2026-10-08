@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   AiProviderError, RateLimitError, QuotaExhaustedError, OverloadedError, AuthError, ConnectionError,
-  OutputLimitError, AllModelsFailedError, NoModelsConfiguredError, isFallbackEligible,
+  OutputLimitError, AllModelsFailedError, NoModelsConfiguredError, PermissionDeniedError, isFallbackEligible,
 } from '../errors';
 
 describe('errors', () => {
@@ -28,6 +28,7 @@ describe('errors', () => {
     expect(isFallbackEligible(new OverloadedError('x'))).toBe(true);
     expect(isFallbackEligible(new AuthError('x'))).toBe(true);
     expect(isFallbackEligible(new ConnectionError('x'))).toBe(true);
+    expect(isFallbackEligible(new PermissionDeniedError('x'))).toBe(true);
     expect(isFallbackEligible(new OutputLimitError('x'))).toBe(false);
     expect(isFallbackEligible(new AiProviderError('x'))).toBe(false);
     expect(isFallbackEligible(new Error('x'))).toBe(false);
@@ -39,7 +40,8 @@ describe('errors', () => {
     expect(e.message).toBe('All AI models are rate-limited or unavailable:\na: rate limited\nb: Anthropic API error (401): bad key');
     expect(e.attempts).toHaveLength(2);
   });
-  it('NoModelsConfiguredError default message is unchanged from today', () => {
-    expect(new NoModelsConfiguredError().message).toBe('No AI models configured. Add one in Settings → Integrations.');
+  it('NoModelsConfiguredError default message points at Settings → AI', () => {
+    // Was: "Add one in Settings → Integrations.". Now: AI providers and models are managed under Settings → AI.
+    expect(new NoModelsConfiguredError().message).toBe('No AI models configured. Add one in Settings → AI.');
   });
 });
