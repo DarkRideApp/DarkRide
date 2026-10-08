@@ -40,6 +40,10 @@ describe('buildChat', () => {
     const built = openAiChatDialect.buildChat(makeCtx('openai-compatible', { apiKey: undefined }), req, { stream: true });
     expect(built.headers.Authorization).toBeUndefined();
   });
+  it('omits Authorization when the key is an empty string', () => {
+    const built = openAiChatDialect.buildChat(makeCtx('openai-compatible', { apiKey: '' }), req, { stream: true });
+    expect(built.headers.Authorization).toBeUndefined();
+  });
   it('maps assistant tool_use and tool_result messages', () => {
     const built: any = openAiChatDialect.buildChat(makeCtx('openai-compatible'), {
       ...req,
@@ -256,6 +260,62 @@ describe('parseStream', () => {
     ]);
   });
 
+  it('a deferred call never lets a later complete call jump ahead of it (start order is kept)', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, id: 'a', name: 'first', args: '{"x":' })),
+      delta(tc({ index: 1, id: 'b', name: 'second', args: '{}' })),
+      delta({}, 'tool_calls'),
+      delta(tc({ index: 0, args: '1}' })),
+      { data: '[DONE]' },
+    ]));
+    expect(events).toEqual([
+      { type: 'tool_use', id: 'a', name: 'first', input: { x: 1 } },
+      { type: 'tool_use', id: 'b', name: 'second', input: {} },
+    ]);
+  });
+
+  it('a complete call that started after an incomplete one waits at finish_reason', async () => {
+    const enc = new TextEncoder();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let i = 0;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (i === 0) {
+          controller.enqueue(enc.encode(sseBody([
+            delta(tc({ index: 0, id: 'a', name: 'first', args: '{"x":' })),
+            delta(tc({ index: 1, id: 'b', name: 'second', args: '{}' })),
+            delta({}, 'tool_calls'),
+          ])));
+          i++;
+        } else if (i === 1) { await gate; controller.enqueue(enc.encode(sseBody([delta(tc({ index: 0, args: '1}' })), { data: '[DONE]' }]))); i++; }
+        else controller.close();
+      },
+    });
+    const it2 = openAiChatDialect.parseStream(new Response(body), makeCtx('openai-compatible'))[Symbol.asyncIterator]();
+    const pending = it2.next();
+    const early = await Promise.race([pending, new Promise<'waiting'>((r) => setTimeout(() => r('waiting'), 30))]);
+    expect(early).toBe('waiting');                          // nothing is emitted while the first call is still incomplete
+    release();
+    const names: string[] = [];
+    for (let n = await pending; !n.done; n = await it2.next()) names.push((n.value as any).name);
+    expect(names).toEqual(['first', 'second']);
+  });
+
+  it('usage is emitted once at the end, after a call that was deferred past finish_reason', async () => {
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, id: 'a', name: 'f', args: '{"q":' })),
+      delta({}, 'tool_calls'),
+      chunk({ choices: [], usage: { prompt_tokens: 7, completion_tokens: 3 } }),
+      delta(tc({ index: 0, args: '"v"}' })),
+      { data: '[DONE]' },
+    ]));
+    expect(events).toEqual([
+      { type: 'tool_use', id: 'a', name: 'f', input: { q: 'v' } },
+      { type: 'usage', inputTokens: 7, outputTokens: 3 },
+    ]);
+  });
+
   it('a call that is complete at finish_reason is emitted before the trailing usage chunk is read', async () => {
     const enc = new TextEncoder();
     let release!: () => void;
@@ -373,6 +433,33 @@ describe('parseStream', () => {
     it('abort mid-stream does not emit the held usage event', async () => {
       const out = await abortOnFirstText(sseBody([delta({ content: 'a' }), chunk({ choices: [], usage: { prompt_tokens: 9, completion_tokens: 9 } })]));
       expect(out).toEqual([{ type: 'text', text: 'a' }]);
+    });
+
+    it('abort on the text event of a chunk that also finishes the turn emits no tool_use', async () => {
+      const out = await abortOnFirstText(sseBody([
+        delta(tc({ index: 0, id: 'c', name: 'f', args: '{}' })),
+        delta({ content: 'a' }, 'tool_calls'),
+        chunk({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+      ]));
+      expect(out).toEqual([{ type: 'text', text: 'a' }]);
+    });
+
+    it('abort on the first tool_use of a multi-call flush stops the rest and the usage event', async () => {
+      const ac = new AbortController();
+      const res = chunkedResponse([sseBody([
+        delta(tc({ index: 0, id: 'a', name: 'one', args: '{}' })),
+        delta(tc({ index: 1, id: 'b', name: 'two', args: '{}' })),
+        delta(tc({ index: 2, id: 'c', name: 'three', args: '{}' })),
+        delta({}, 'tool_calls'),
+        chunk({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+        { data: '[DONE]' },
+      ])]);
+      const out: any[] = [];
+      for await (const e of openAiChatDialect.parseStream(res, makeCtx('openai-compatible'), ac.signal)) {
+        out.push(e);
+        if (e.type === 'tool_use') ac.abort();
+      }
+      expect(out).toEqual([{ type: 'tool_use', id: 'a', name: 'one', input: {} }]);
     });
 
     it('events already buffered in the same read are dropped after an abort (no flush, no OutputLimitError)', async () => {

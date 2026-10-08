@@ -86,13 +86,15 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   let usage: { input: number; output: number } | undefined;
 
   /**
-   * Emit finished tool calls. A non-final flush (at finish_reason) keeps a buffer whose arguments do not parse yet,
-   * because some servers send finish_reason before the last argument fragment. The final flush (end of stream, or a
-   * 'length' finish) emits everything: unparsable arguments become `{}`, or an OutputLimitError after truncation.
+   * Emit finished tool calls in the order they started. A non-final flush (at finish_reason) stops at the first buffer
+   * whose arguments do not parse yet, because some servers send finish_reason before the last argument fragment, and a
+   * later call must not overtake it. The final flush (end of stream, or a 'length' finish) emits everything: unparsable
+   * arguments become `{}`, or an OutputLimitError after truncation. Returns early once the caller has aborted.
    */
   function* flush(final: boolean): Generator<AiStreamEvent> {
     for (const [key, b] of [...bufs]) {
-      if (!final && !argsComplete(b.args)) continue;
+      if (signal?.aborted) return;
+      if (!final && !argsComplete(b.args)) break;
       bufs.delete(key);
       if (key === newest) newest = undefined;
       if (!b.name) continue;
@@ -124,7 +126,11 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     if (choice.finish_reason === 'error') throw classifyStreamError({ error: choice.error ?? p.error ?? { message: 'upstream error' } }, ctx);
 
     const d = choice.delta;
-    if (d?.content) { sawContent = true; yield { type: 'text', text: d.content }; }
+    if (d?.content) {
+      sawContent = true;
+      yield { type: 'text', text: d.content };
+      if (signal?.aborted) return;
+    }
 
     for (const call of d?.tool_calls ?? []) {
       // A server-sent id that differs from the buffer's own id starts a new call. A fragment that carries a real id for a
@@ -154,6 +160,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     if (choice.finish_reason) {
       finish = choice.finish_reason;
       yield* flush(finish === 'length'); // keep reading afterwards: the usage chunk (and any late argument fragment) follows
+      if (signal?.aborted) return;
       if (finish === 'length') log(`${shortName} response was cut off by the output token limit`);
     }
   }
@@ -167,6 +174,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     log(`${shortName} stream ended without finish_reason or [DONE]; flushing what arrived`);
   }
   yield* flush(true);
+  if (signal?.aborted) return;
   if (usage) yield { type: 'usage', inputTokens: usage.input, outputTokens: usage.output };
 }
 
