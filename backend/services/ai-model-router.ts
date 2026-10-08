@@ -2,13 +2,19 @@ import { and, asc, eq } from 'drizzle-orm';
 import type { AppDatabase } from '../db/index';
 import { aiModels, aiProviders, aiTiers } from '../db/schema';
 import {
-  createProvider,
+  AllModelsFailedError,
+  AuthError,
+  ConnectionError,
+  NoModelsConfiguredError,
+  QuotaExhaustedError,
   RateLimitError,
-  parseRateLimitHeaders,
-  type AiProvider,
-  type AiProviderConfig,
-  type ParsedRateLimitHeaders,
-} from './ai-provider';
+  UnknownProviderError,
+  isFallbackEligible,
+} from './ai/errors';
+import { parseRateLimitHeaders, type ParsedRateLimitHeaders } from './ai/rate-limit';
+import { createProvider } from './ai/registry';
+import type { AiCompleteRequest, AiProvider, AiProviderConfig, AiStreamOptions } from './ai/dialect';
+import { isCliProvider, isKnownProviderType } from '../../shared/lib/ai-provider-catalog';
 import type {
   AiMessage,
   AiToolDefinition,
@@ -18,6 +24,15 @@ import type { AiRateLimitInfo } from '../../shared/types/ai-models';
 import { createLoggers } from '../logs';
 
 const { log, error } = createLoggers('ai-model-router');
+
+type ModelRow = typeof aiModels.$inferSelect;
+type ProviderRow = typeof aiProviders.$inferSelect;
+interface Attempt { model: string; error: string }
+
+const CLI_SKIP_REASON = 'uses claude-cli which does not support HTTP streaming';
+
+/** True when the caller's own signal has fired: whatever the provider threw or returned, it is not a provider failure. */
+const callerAborted = (signal: AbortSignal | undefined): boolean => signal?.aborted === true;
 
 // ── Rate limit cache ─────────────────────────────────────────────────
 
@@ -136,107 +151,195 @@ export class AiModelRouter {
    * empty. An unknown tier name is treated as "empty" and follows the
    * same fallback path.
    */
-  getModelsForTier(tierName: string) {
+  getModelsForTier(tierName: string, opts: { strict?: boolean } = {}): ModelRow[] {
     const allTiers = this.db.select().from(aiTiers).orderBy(asc(aiTiers.sortOrder)).all();
-    if (allTiers.length === 0) {
-      throw new Error('No AI models configured. Add one in Settings → Integrations.');
-    }
+    if (allTiers.length === 0) throw new NoModelsConfiguredError();
 
     const requested = allTiers.find(t => t.name === tierName);
-    const orderedFallback: typeof allTiers = [];
-    if (requested) {
-      orderedFallback.push(requested);
-      orderedFallback.push(...allTiers.filter(t => t.sortOrder > requested.sortOrder).sort((a, b) => a.sortOrder - b.sortOrder));
-      orderedFallback.push(...allTiers.filter(t => t.sortOrder < requested.sortOrder).sort((a, b) => b.sortOrder - a.sortOrder));
+    let order: typeof allTiers;
+    if (opts.strict) {
+      // Only the named tier: completion must never drift to a slower, more expensive tier.
+      order = requested ? [requested] : [];
+    } else if (requested) {
+      order = [
+        requested,
+        ...allTiers.filter(t => t.sortOrder > requested.sortOrder).sort((a, b) => a.sortOrder - b.sortOrder),
+        ...allTiers.filter(t => t.sortOrder < requested.sortOrder).sort((a, b) => b.sortOrder - a.sortOrder),
+      ];
     } else {
-      orderedFallback.push(...allTiers);
+      order = allTiers;
     }
 
-    for (const tier of orderedFallback) {
-      const models = this.db.select().from(aiModels)
+    const typeById = new Map(this.db.select().from(aiProviders).all().map((p) => [p.id, p.type as string]));
+    const typeOf = (m: ModelRow): string => (m.providerId ? typeById.get(m.providerId) : undefined) ?? m.provider;
+
+    for (const tier of order) {
+      let models = this.db.select().from(aiModels)
         .where(and(eq(aiModels.tierId, tier.id), eq(aiModels.enabled, true)))
         .orderBy(asc(aiModels.priority))
         .all();
+      // The CLI has no HTTP completion, so a strict tier holding only CLI models has nothing usable.
+      if (opts.strict) models = models.filter((m) => !isCliProvider(typeOf(m)));
       if (models.length > 0) return models;
     }
 
-    throw new Error('No AI models configured. Add one in Settings → Integrations.');
+    throw new NoModelsConfiguredError();
   }
 
+  /**
+   * Walk the models in order and yield one built provider per usable model. Every model that is
+   * passed over gets a line in `attempts`, which becomes part of the all-failed message. The type
+   * comes from the provider row, which is authoritative; `ai_models.provider` is a denormalised copy.
+   */
+  private *candidates(
+    models: ModelRow[],
+    attempts: Attempt[],
+  ): Generator<{ model: ModelRow; row: ProviderRow; provider: AiProvider }> {
+    const providerMap = new Map(this.db.select().from(aiProviders).all().map((p) => [p.id, p]));
+    for (const model of models) {
+      const row = model.providerId ? providerMap.get(model.providerId) : undefined;
+      const typeId: string = row?.type ?? model.provider;
+      if (isCliProvider(typeId)) {
+        attempts.push({ model: model.name, error: CLI_SKIP_REASON });
+        continue;
+      }
+      const cooldownMins = model.cooldownMinutes ?? 10;
+      if (this.rateLimitCache.isInCooldown(model.id, cooldownMins)) {
+        const endsAt = this.rateLimitCache.cooldownEndsAt(model.id, cooldownMins);
+        const minsLeft = endsAt ? Math.ceil((endsAt - Date.now()) / 60000) : '?';
+        attempts.push({ model: model.name, error: `in cooldown (${minsLeft}m left)` });
+        continue;
+      }
+      if (!model.providerId) {
+        attempts.push({ model: model.name, error: 'no provider linked' });
+        continue;
+      }
+      if (!row) {
+        attempts.push({ model: model.name, error: 'provider not found' });
+        continue;
+      }
+      if (!isKnownProviderType(row.type)) {
+        error(`Model "${model.name}" skipped: unknown provider type "${row.type}"`);
+        attempts.push({ model: model.name, error: `unknown provider type "${row.type}"` });
+        continue;
+      }
+      let provider: AiProvider;
+      try {
+        provider = this.createProviderForModel(model, row);
+      } catch (err) {
+        if (!(err instanceof UnknownProviderError)) throw err;
+        error(`Model "${model.name}" skipped: ${err.message}`);
+        attempts.push({ model: model.name, error: err.message });
+        continue;
+      }
+      yield { model, row, provider };
+    }
+  }
+
+  /**
+   * Start the cooldown an eligible failure calls for. Quota and auth belong to the credential, so
+   * every model on the same provider entry cools down. Rate limits and connection failures cool
+   * down only the model. Overload is transient and starts none.
+   */
+  private recordFailure(model: ModelRow, row: ProviderRow, err: unknown): void {
+    if (err instanceof QuotaExhaustedError || err instanceof AuthError) {
+      for (const sibling of this.db.select().from(aiModels).where(eq(aiModels.providerId, row.id)).all()) {
+        this.rateLimitCache.record429(sibling.id);
+      }
+    } else if (err instanceof RateLimitError) {
+      this.rateLimitCache.record429(model.id, err.headers, row.type);
+    } else if (err instanceof ConnectionError) {
+      this.rateLimitCache.record429(model.id);
+    }
+  }
+
+  private describeAttempt(err: unknown): string {
+    if (err instanceof RateLimitError) return 'rate limited';
+    return err instanceof Error ? err.message : String(err);
+  }
+
+  /**
+   * Stream from the first usable model of the tier, falling back to the next on a quota, rate-limit,
+   * overload, auth, or connection failure, but only while nothing has been yielded: once text or a
+   * tool call went out, a fallback would duplicate output, so the error is rethrown. Usage events are
+   * held until the first content event (or the normal end of the stream) and discarded if the stream
+   * fails first, so a fallback never double counts. A caller abort is never treated as a provider
+   * failure: it is rethrown with no fallback, no cooldown, and no held usage released.
+   */
   async *createStreamingRequest(
     messages: AiMessage[],
     systemPrompt: string,
     tools: AiToolDefinition[],
-    options?: { signal?: AbortSignal; tier?: string },
+    options?: AiStreamOptions & { tier?: string },
   ): AsyncIterable<AiStreamEvent> {
+    const signal = options?.signal;
     const models = this.getModelsForTier(options?.tier ?? 'High');
+    const attempts: Attempt[] = [];
+    let lastError: unknown;
 
-    // Preload all providers into a map for efficient lookup
-    const allProviders = this.db.select().from(aiProviders).all();
-    const providerMap = new Map<number, typeof aiProviders.$inferSelect>();
-    for (const p of allProviders) providerMap.set(p.id, p);
-
-    const errors: string[] = [];
-
-    for (const model of models) {
-      const cooldownMins = model.cooldownMinutes ?? 10;
-
-      // Skip claude-cli models — they use ClaudeCliAgent, not HTTP streaming
-      if (model.provider === 'claude-cli') {
-        errors.push(`${model.name}: uses claude-cli which does not support HTTP streaming`);
-        continue;
-      }
-
-      // Skip models in cooldown
-      if (this.rateLimitCache.isInCooldown(model.id, cooldownMins)) {
-        const endsAt = this.rateLimitCache.cooldownEndsAt(model.id, cooldownMins);
-        const minsLeft = endsAt ? Math.ceil((endsAt - Date.now()) / 60000) : '?';
-        errors.push(`${model.name}: in cooldown (${minsLeft}m left)`);
-        continue;
-      }
-
-      // Skip models without a linked provider
-      if (!model.providerId) {
-        errors.push(`${model.name}: no provider linked`);
-        continue;
-      }
-
-      const providerRow = providerMap.get(model.providerId);
-      if (!providerRow) {
-        errors.push(`${model.name}: provider not found`);
-        continue;
-      }
-
+    for (const { model, row, provider } of this.candidates(models, attempts)) {
+      signal?.throwIfAborted();
+      let yielded = false;
+      const held: AiStreamEvent[] = [];
       try {
-        const provider = this.createProviderForModel(model, providerRow);
-        const stream = provider.createStreamingRequest(messages, systemPrompt, tools, options);
-
-        // Yield all events from the stream
-        for await (const event of stream) {
+        for await (const event of provider.createStreamingRequest(messages, systemPrompt, tools, options)) {
+          if (!yielded) {
+            if (event.type === 'usage') { held.push(event); continue; }
+            yielded = true;
+            const release = held.splice(0);
+            for (const u of release) yield u;
+          }
           yield event;
         }
+      } catch (err) {
+        if (yielded || callerAborted(signal) || !isFallbackEligible(err)) throw err;
+        log(`Model "${model.name}" (${row.type}) failed with ${(err as Error).name}, trying next...`);
+        this.recordFailure(model, row, err);
+        attempts.push({ model: model.name, error: this.describeAttempt(err) });
+        lastError = err;
+        continue;
+      }
+      // A stream that stopped because the caller aborted says nothing about the provider, and the
+      // usage it reported before content belongs to a turn the caller abandoned.
+      if (callerAborted(signal)) return;
+      for (const u of held) yield u;   // a stream that produced only usage still reports it
+      this.rateLimitCache.recordSuccess(model.id, provider.lastResponseHeaders, row.type);
+      log(`Request served by model "${model.name}" (${row.type})`);
+      return;
+    }
 
-        // Success — capture response headers
-        this.rateLimitCache.recordSuccess(model.id, provider.lastResponseHeaders, model.provider);
-        log(`Request served by model "${model.name}" (${model.provider})`);
-        return;
-      } catch (err: any) {
-        if (err instanceof RateLimitError) {
-          log(`Model "${model.name}" rate limited (429), trying next...`);
-          this.rateLimitCache.record429(model.id, err.headers, model.provider);
-          errors.push(`${model.name}: rate limited`);
-          continue;
-        }
+    signal?.throwIfAborted();
+    throw new AllModelsFailedError(attempts, lastError !== undefined ? { cause: lastError } : {});
+  }
 
-        // Non-rate-limit error — don't try fallback, rethrow
-        throw err;
+  /**
+   * One-shot text completion over the named tier with the same fallback and abort policy as
+   * streaming. With `strict`, only that tier is considered.
+   */
+  async completeText(req: AiCompleteRequest, opts: { tier: string; strict?: boolean }): Promise<string> {
+    const signal = req.signal;
+    const models = this.getModelsForTier(opts.tier, { strict: opts.strict });
+    const attempts: Attempt[] = [];
+    let lastError: unknown;
+
+    for (const { model, row, provider } of this.candidates(models, attempts)) {
+      signal?.throwIfAborted();
+      try {
+        const text = await provider.complete(req);
+        this.rateLimitCache.recordSuccess(model.id, provider.lastResponseHeaders, row.type);
+        log(`Completion served by model "${model.name}" (${row.type})`);
+        return text;
+      } catch (err) {
+        if (callerAborted(signal) || !isFallbackEligible(err)) throw err;
+        log(`Model "${model.name}" (${row.type}) failed with ${(err as Error).name}, trying next...`);
+        this.recordFailure(model, row, err);
+        attempts.push({ model: model.name, error: this.describeAttempt(err) });
+        lastError = err;
       }
     }
 
-    // All models exhausted
-    throw new Error(
-      `All AI models are rate-limited or unavailable:\n${errors.join('\n')}`,
-    );
+    signal?.throwIfAborted();
+    throw new AllModelsFailedError(attempts, lastError !== undefined ? { cause: lastError } : {});
   }
 
   /**
@@ -254,7 +357,7 @@ export class AiModelRouter {
       throw new Error(`AI model with id ${modelId} not found`);
     }
 
-    if (model.provider === 'claude-cli') {
+    if (isCliProvider(model.provider)) {
       throw new Error(`Model "${model.name}" uses claude-cli which does not support HTTP streaming. Use ClaudeCliAgent instead.`);
     }
 
@@ -275,17 +378,12 @@ export class AiModelRouter {
     return this.createProviderForModel(model, providerRow);
   }
 
-  private createProviderForModel(
-    model: typeof aiModels.$inferSelect,
-    providerRow: typeof aiProviders.$inferSelect,
-  ): AiProvider {
-    const db = this.db;
+  private createProviderForModel(model: ModelRow, providerRow: ProviderRow): AiProvider {
     const config: AiProviderConfig = {
       apiKey: providerRow.apiKey ?? undefined,
       baseUrl: providerRow.baseUrl ?? undefined,
       model: model.model ?? undefined,
     };
-
-    return this.makeProvider(model.provider, config);
+    return this.makeProvider(providerRow.type, config);
   }
 }

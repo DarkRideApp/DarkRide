@@ -1,12 +1,33 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
+import { eq } from 'drizzle-orm';
 import { BetterSQLite3Database, drizzle } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
 import { RateLimitCache, AiModelRouter } from './ai-model-router';
-import { RateLimitError } from './ai-provider';
+import { RateLimitError } from './ai/errors';
 import { createTestDb } from '../test-utils/create-test-db';
+import {
+  QuotaExhaustedError, AuthError, OverloadedError, ConnectionError, OutputLimitError, AllModelsFailedError,
+  NoModelsConfiguredError, UnknownProviderError, RateLimitError as RLE,
+} from './ai/errors';
 
 const { aiModels, aiProviders } = schema;
+
+type Script = Array<{ type: 'text' | 'usage' | 'throw'; value?: any }>;
+/** A provider whose stream plays the script; keyed by the model name via the config.model field. */
+function scripted(scripts: Record<string, Script>) {
+  return vi.fn((_type: string, cfg: any) => ({
+    name: 'x',
+    createStreamingRequest: async function* () {
+      for (const step of scripts[cfg.model] ?? []) {
+        if (step.type === 'throw') throw step.value;
+        if (step.type === 'text') yield { type: 'text' as const, text: step.value };
+        if (step.type === 'usage') yield { type: 'usage' as const, inputTokens: step.value[0], outputTokens: step.value[1] };
+      }
+    },
+    complete: async () => { const s = scripts[cfg.model]?.find((x) => x.type === 'throw'); if (s) throw s.value; return 'done:' + cfg.model; },
+  }) as any);
+}
 
 vi.mock('../logs', () => ({
   createLoggers: () => ({ log: vi.fn(), error: vi.fn() }),
@@ -678,6 +699,380 @@ describe('AiModelRouter', () => {
 
       const provider = router.createProviderForModelId(models[0].id);
       expect(provider).toBeDefined();
+    });
+
+    it('builds the provider from the provider row type, not the denormalised model.provider', () => {
+      const gem = insertProvider(db, { name: 'G', type: 'gemini', apiKey: 'k' });
+      insertModel(db, { name: 'Stale', provider: 'openrouter', _providerId: gem });
+      const factory = scripted({});
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
+      router.createProviderForModelId(router.getModels()[0].id);
+      expect(factory.mock.calls[0][0]).toBe('gemini');
+    });
+  });
+
+  describe('fallback policy', () => {
+    // A and B sit on different provider entries (credentials). Quota and auth failures cool down
+    // every model that shares a credential, so a same-credential fallback target would be skipped.
+    let r: AiModelRouter;
+    const scripts: Record<string, Script> = {};
+    let providerB: number;
+    beforeEach(() => {
+      for (const k of Object.keys(scripts)) delete scripts[k];
+      providerB = insertProvider(db, { name: 'Second', type: 'openrouter', apiKey: 'k2' });
+      insertModel(db, { name: 'A', model: 'A', priority: 0, tierId: highTierId, _providerId: defaultProviderId });
+      insertModel(db, { name: 'B', model: 'B', priority: 1, tierId: highTierId, _providerId: providerB });
+      r = new AiModelRouter(db as any, cache, { providerFactory: scripted(scripts) });
+    });
+    const two = (a: Script, b: Script) => { scripts.A = a; scripts.B = b; cache.getAll().clear(); };
+    const run = () => collectAsyncIterator(r.createStreamingRequest([{ role: 'user', content: 'x' }], 's', []));
+
+    it('falls back on quota, overload, auth, and connection errors before any content', async () => {
+      for (const err of [new QuotaExhaustedError('no credits'), new OverloadedError('busy'), new AuthError('bad key'), new ConnectionError('refused')]) {
+        cache.getAll().clear();
+        two([{ type: 'throw', value: err }], [{ type: 'text', value: 'from B' }]);
+        expect(await run()).toEqual([{ type: 'text', text: 'from B' }]);
+      }
+    });
+
+    it('does not fall back once content was yielded', async () => {
+      two([{ type: 'text', value: 'partial' }, { type: 'throw', value: new OverloadedError('mid-stream') }], [{ type: 'text', value: 'B' }]);
+      await expect(run()).rejects.toBeInstanceOf(OverloadedError);
+    });
+
+    it('does not fall back on an output-limit error, abort, or a generic error', async () => {
+      for (const err of [new OutputLimitError('long'), new DOMException('aborted', 'AbortError'), new Error('boom')]) {
+        two([{ type: 'throw', value: err }], [{ type: 'text', value: 'B' }]);
+        await expect(run()).rejects.toBe(err);
+      }
+    });
+
+    it('holds usage until content and discards it when the stream fails first', async () => {
+      two([{ type: 'usage', value: [100, 0] }, { type: 'throw', value: new QuotaExhaustedError('no credits') }],
+        [{ type: 'usage', value: [7, 0] }, { type: 'text', value: 'B' }, { type: 'usage', value: [0, 3] }]);
+      const events = await run();
+      const inTokens = events.filter((e: any) => e.type === 'usage').reduce((n: number, e: any) => n + e.inputTokens, 0);
+      expect(inTokens).toBe(7);
+    });
+
+    it('releases held usage ahead of the first content event, in order', async () => {
+      two([{ type: 'usage', value: [5, 0] }, { type: 'text', value: 'hi' }], []);
+      expect(await run()).toEqual([{ type: 'usage', inputTokens: 5, outputTokens: 0 }, { type: 'text', text: 'hi' }]);
+    });
+
+    it('a stream that produced only usage still reports it', async () => {
+      two([{ type: 'usage', value: [5, 1] }], []);
+      expect(await run()).toEqual([{ type: 'usage', inputTokens: 5, outputTokens: 1 }]);
+    });
+
+    it('throws AllModelsFailedError carrying each reason, starting with the legacy text', async () => {
+      two([{ type: 'throw', value: new RLE('x', new Headers()) }], [{ type: 'throw', value: new AuthError('Anthropic API error (401): bad key') }]);
+      const err: any = await run().catch((e) => e);
+      expect(err).toBeInstanceOf(AllModelsFailedError);
+      expect(err.message).toBe('All AI models are rate-limited or unavailable:\nA: rate limited\nB: Anthropic API error (401): bad key');
+      expect(err.attempts).toHaveLength(2);
+      expect(err.cause).toBeInstanceOf(AuthError);
+    });
+
+    it('quota and auth errors cool down every model on the same credential; rate limits only the model', async () => {
+      insertModel(db, { name: 'A2', model: 'A2', priority: 2, tierId: highTierId, _providerId: defaultProviderId });
+      scripts.A2 = [{ type: 'text', value: 'A2' }];
+      const byName = Object.fromEntries(r.getModels().map((m) => [m.name, m.id]));
+      for (const err of [new QuotaExhaustedError('no credits'), new AuthError('bad key')]) {
+        two([{ type: 'throw', value: err }], [{ type: 'text', value: 'B' }]);
+        expect(await run()).toEqual([{ type: 'text', text: 'B' }]);
+        expect(cache.isInCooldown(byName.A, 10)).toBe(true);
+        expect(cache.isInCooldown(byName.A2, 10)).toBe(true);    // same credential as A
+        expect(cache.isInCooldown(byName.B, 10)).toBe(false);
+      }
+
+      two([{ type: 'throw', value: new RLE('x', new Headers()) }], [{ type: 'text', value: 'B' }]);
+      await run();
+      expect(cache.isInCooldown(byName.A, 10)).toBe(true);
+      expect(cache.isInCooldown(byName.A2, 10)).toBe(false);   // a rate limit is per model
+    });
+
+    it('a model cooled down by a credential failure is skipped on the next request', async () => {
+      two([{ type: 'throw', value: new QuotaExhaustedError('no credits') }], [{ type: 'throw', value: new OverloadedError('busy') }]);
+      await run().catch(() => undefined);
+      scripts.A = [{ type: 'text', value: 'A' }];
+      const err: any = await run().catch((e) => e);
+      expect(err).toBeInstanceOf(AllModelsFailedError);
+      expect(err.message).toMatch(/\nA: in cooldown \(\d+m left\)\nB: busy$/);
+    });
+
+    it('overload starts no cooldown', async () => {
+      two([{ type: 'throw', value: new OverloadedError('busy') }], [{ type: 'text', value: 'B' }]);
+      await run();
+      expect(cache.isInCooldown(r.getModels()[0].id, 10)).toBe(false);
+    });
+
+    it('a connection failure cools the model down and falls back', async () => {
+      two([{ type: 'throw', value: new ConnectionError('refused') }], [{ type: 'text', value: 'B' }]);
+      expect(await run()).toEqual([{ type: 'text', text: 'B' }]);
+      expect(cache.isInCooldown(r.getModels().find((m) => m.name === 'A')!.id, 10)).toBe(true);
+    });
+
+    it('cooldowns honour each model\'s own cooldownMinutes', async () => {
+      const id = r.getModels().find((m) => m.name === 'A')!.id;
+      db.update(aiModels).set({ cooldownMinutes: 1 }).where(eq(aiModels.id, id)).run();
+      two([{ type: 'throw', value: new ConnectionError('refused') }], [{ type: 'text', value: 'B' }]);
+      await run();
+      const endsAt = r.getRateLimits().find((l) => l.modelId === id)!.cooldownEndsAt!;
+      expect(endsAt - Date.now()).toBeLessThanOrEqual(60_000);
+      expect(endsAt - Date.now()).toBeGreaterThan(55_000);
+    });
+
+    it('abort passes through, does not fall back, and drops usage that was being held', async () => {
+      const abort = new DOMException('aborted', 'AbortError');
+      two([{ type: 'usage', value: [100, 0] }, { type: 'throw', value: abort }], [{ type: 'text', value: 'B' }]);
+      const seen: any[] = [];
+      await expect((async () => { for await (const e of r.createStreamingRequest([{ role: 'user', content: 'x' }], 's', [])) seen.push(e); })())
+        .rejects.toBe(abort);
+      expect(seen).toEqual([]);                      // the held usage event was never emitted
+    });
+
+    it('reports claude-cli rows in the failure message with the legacy text', async () => {
+      const cli = insertProvider(db, { name: 'CLI', type: 'claude-cli', apiKey: null });
+      insertModel(db, { name: 'C', provider: 'claude-cli', priority: -1, tierId: highTierId, _providerId: cli });
+      two([{ type: 'throw', value: new QuotaExhaustedError('no credits') }], [{ type: 'throw', value: new OverloadedError('busy') }]);
+      const err: any = await run().catch((e) => e);
+      expect(err).toBeInstanceOf(AllModelsFailedError);
+      expect(err.message).toContain('C: uses claude-cli which does not support HTTP streaming');
+    });
+
+    it('skips a claude-cli provider row even when model.provider holds a stale HTTP type', async () => {
+      const cli = insertProvider(db, { name: 'CLI', type: 'claude-cli', apiKey: null });
+      insertModel(db, { name: 'C', provider: 'openrouter', priority: -1, tierId: highTierId, _providerId: cli });
+      const factory = scripted(scripts);
+      r = new AiModelRouter(db as any, cache, { providerFactory: factory });
+      two([{ type: 'text', value: 'A' }], []);
+      expect(await run()).toEqual([{ type: 'text', text: 'A' }]);
+      expect(factory).toHaveBeenCalledTimes(1);
+    });
+
+    it('skips unknown provider types with an error line instead of throwing', async () => {
+      const weird = insertProvider(db, { name: 'Weird', type: 'retired-type' as any });
+      insertModel(db, { name: 'W', provider: 'retired-type', priority: -1, tierId: highTierId, _providerId: weird });
+      two([{ type: 'text', value: 'A' }], []);
+      expect(await run()).toEqual([{ type: 'text', text: 'A' }]);   // W sorts first and is skipped
+    });
+
+    it('lists an unknown provider type in the failure message', async () => {
+      const weird = insertProvider(db, { name: 'Weird', type: 'retired-type' as any });
+      insertModel(db, { name: 'W', provider: 'retired-type', priority: -1, tierId: highTierId, _providerId: weird });
+      two([{ type: 'throw', value: new OverloadedError('busy') }], [{ type: 'throw', value: new OverloadedError('busy') }]);
+      const err: any = await run().catch((e) => e);
+      expect(err.message).toContain('W: unknown provider type "retired-type"');
+    });
+
+    it('skips a model whose provider cannot be built with UnknownProviderError', async () => {
+      const base = scripted(scripts);
+      const factory = vi.fn((type: string, cfg: any) => {
+        if (cfg.model === 'A') throw new UnknownProviderError('Unknown AI provider: x');
+        return base(type, cfg);
+      });
+      r = new AiModelRouter(db as any, cache, { providerFactory: factory as any });
+      two([], [{ type: 'text', value: 'B' }]);
+      expect(await run()).toEqual([{ type: 'text', text: 'B' }]);
+    });
+
+    it('uses the provider row type, not the denormalised model.provider', async () => {
+      const gem = insertProvider(db, { name: 'G', type: 'gemini', apiKey: 'k' });
+      insertModel(db, { name: 'M', provider: 'stale-value', priority: -1, tierId: highTierId, _providerId: gem });
+      const factory = scripted(scripts);
+      r = new AiModelRouter(db as any, cache, { providerFactory: factory });
+      two([], []);
+      await run();
+      expect(factory.mock.calls[0][0]).toBe('gemini');
+    });
+  });
+
+  describe('caller abort', () => {
+    // A caller abort is never a provider failure: no fallback, no cooldown, no aggregate error, no usage.
+    const calls: string[] = [];
+    let seenOptions: any[];
+    let seenRequests: any[];
+    let behaviour: Record<string, (signal: AbortSignal | undefined, ctl: AbortController) => AsyncGenerator<any>>;
+    let ctl: AbortController;
+    let r: AiModelRouter;
+    let idA: number;
+    let idB: number;
+
+    beforeEach(() => {
+      calls.length = 0;
+      seenOptions = [];
+      seenRequests = [];
+      behaviour = {};
+      ctl = new AbortController();
+      const providerB = insertProvider(db, { name: 'Second', type: 'openrouter', apiKey: 'k2' });
+      insertModel(db, { name: 'A', model: 'A', priority: 0, tierId: highTierId, _providerId: defaultProviderId });
+      insertModel(db, { name: 'B', model: 'B', priority: 1, tierId: highTierId, _providerId: providerB });
+      const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+      insertModel(db, { name: 'LA', model: 'A', priority: 0, tierId: low.id, _providerId: defaultProviderId });
+      insertModel(db, { name: 'LB', model: 'B', priority: 1, tierId: low.id, _providerId: providerB });
+      const ids = Object.fromEntries(db.select().from(aiModels).all().map((m) => [m.name, m.id]));
+      idA = ids.A;
+      idB = ids.B;
+      r = new AiModelRouter(db as any, cache, {
+        providerFactory: ((_t: string, cfg: any) => ({
+          name: 'x',
+          createStreamingRequest: (_m: any, _s: any, _tools: any, options: any) => {
+            calls.push(cfg.model);
+            seenOptions.push(options);
+            return (behaviour[cfg.model] ?? (async function* () { yield { type: 'text', text: cfg.model }; }))(options?.signal, ctl);
+          },
+          complete: async (req: any) => {
+            calls.push(cfg.model);
+            seenRequests.push(req);
+            if (cfg.model === 'A') { ctl.abort(); throw new QuotaExhaustedError('no credits'); }
+            return 'done:' + cfg.model;
+          },
+        })) as any,
+      });
+    });
+    const run = (extra: Record<string, unknown> = {}) => {
+      const seen: any[] = [];
+      const p = (async () => {
+        for await (const e of r.createStreamingRequest([{ role: 'user', content: 'x' }], 's', [], { signal: ctl.signal, ...extra })) seen.push(e);
+      })();
+      return { seen, p };
+    };
+    const noCooldown = () => {
+      expect(cache.isInCooldown(idA, 10)).toBe(false);
+      expect(cache.isInCooldown(idB, 10)).toBe(false);
+    };
+
+    it('passes the caller signal object through to the provider unchanged', async () => {
+      const { p } = run({ maxOutputTokens: 99 });
+      await p;
+      expect(seenOptions[0].signal).toBe(ctl.signal);
+      expect(seenOptions[0].maxOutputTokens).toBe(99);
+    });
+
+    it('passes the completion request, with its signal, through to the provider unchanged', async () => {
+      const lowOnlyB = new AiModelRouter(db as any, cache, {
+        providerFactory: ((_t: string, cfg: any) => ({
+          name: 'x', createStreamingRequest: async function* () {},
+          complete: async (req: any) => { seenRequests.push(req); return 'done:' + cfg.model; },
+        })) as any,
+      });
+      const req = { prefix: 'a', suffix: 'b', signal: ctl.signal };
+      expect(await lowOnlyB.completeText(req, { tier: 'Low', strict: true })).toBe('done:A');
+      expect(seenRequests[0]).toBe(req);
+      expect(seenRequests[0].signal).toBe(ctl.signal);
+    });
+
+    it('an already-aborted signal sends no request and is not an all-models failure', async () => {
+      ctl.abort();
+      const { seen, p } = run();
+      const err: any = await p.catch((e) => e);
+      expect(err?.name).toBe('AbortError');
+      expect(err).not.toBeInstanceOf(AllModelsFailedError);
+      expect(calls).toEqual([]);
+      expect(seen).toEqual([]);
+      noCooldown();
+    });
+
+    it('an eligible error raised after the caller aborted does not fall back or cool down', async () => {
+      const failure = new ConnectionError('socket closed');
+      behaviour.A = async function* (_s, c) { yield { type: 'usage', inputTokens: 50, outputTokens: 0 }; c.abort(); throw failure; };
+      const { seen, p } = run();
+      await expect(p).rejects.toBe(failure);
+      expect(calls).toEqual(['A']);
+      expect(seen).toEqual([]);
+      noCooldown();
+    });
+
+    it('a stream that ends silently because of the abort emits no held usage and does not fall back', async () => {
+      behaviour.A = async function* (_s, c) { yield { type: 'usage', inputTokens: 50, outputTokens: 0 }; c.abort(); };
+      const { seen, p } = run();
+      const err: any = await p.catch((e) => e);
+      expect(err === undefined || err?.name === 'AbortError').toBe(true);
+      expect(err).not.toBeInstanceOf(AllModelsFailedError);
+      expect(calls).toEqual(['A']);
+      expect(seen).toEqual([]);
+      noCooldown();
+      expect(cache.get(idA)).toBeUndefined();   // not recorded as a success either
+    });
+
+    it('an abort mid-stream after content keeps the content and does not fall back', async () => {
+      behaviour.A = async function* (_s, c) { yield { type: 'text', text: 'part' }; c.abort(); throw new DOMException('aborted', 'AbortError'); };
+      const { seen, p } = run();
+      await expect(p).rejects.toMatchObject({ name: 'AbortError' });
+      expect(seen).toEqual([{ type: 'text', text: 'part' }]);
+      expect(calls).toEqual(['A']);
+      noCooldown();
+    });
+
+    it('completeText does not fall back or cool down when the caller aborted', async () => {
+      const lowA = db.select().from(aiModels).all().find((m) => m.name === 'LA')!.id;
+      await expect(r.completeText({ prefix: 'a', suffix: 'b', signal: ctl.signal }, { tier: 'Low', strict: true }))
+        .rejects.toBeInstanceOf(QuotaExhaustedError);
+      expect(calls).toEqual(['A']);
+      expect(cache.isInCooldown(lowA, 10)).toBe(false);
+    });
+
+    it('completeText with an already-aborted signal sends no request', async () => {
+      ctl.abort();
+      const err: any = await r.completeText({ prefix: 'a', suffix: 'b', signal: ctl.signal }, { tier: 'Low', strict: true }).catch((e) => e);
+      expect(err?.name).toBe('AbortError');
+      expect(calls).toEqual([]);
+    });
+  });
+
+  describe('strict tier and completion', () => {
+    it('strict considers only the named tier; an empty Low tier throws NoModelsConfiguredError even when High has models', () => {
+      insertModel(db, { name: 'H', priority: 0, tierId: highTierId, _providerId: defaultProviderId });
+      const rr = new AiModelRouter(db as any, cache, { providerFactory: scripted({}) });
+      expect(() => rr.getModelsForTier('Low', { strict: true })).toThrow(NoModelsConfiguredError);
+      expect(rr.getModelsForTier('Low').length).toBe(1);   // non-strict still falls across tiers
+    });
+    it('strict with an unknown tier name throws NoModelsConfiguredError', () => {
+      insertModel(db, { name: 'H', priority: 0, tierId: highTierId, _providerId: defaultProviderId });
+      const rr = new AiModelRouter(db as any, cache, { providerFactory: scripted({}) });
+      expect(() => rr.getModelsForTier('Nope', { strict: true })).toThrow(NoModelsConfiguredError);
+    });
+    it('a strict tier holding only claude-cli models counts as empty', () => {
+      const cli = insertProvider(db, { name: 'CLI', type: 'claude-cli', apiKey: null });
+      const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+      insertModel(db, { name: 'C', provider: 'claude-cli', priority: 0, tierId: low.id, _providerId: cli });
+      const rr = new AiModelRouter(db as any, cache, { providerFactory: scripted({}) });
+      expect(() => rr.getModelsForTier('Low', { strict: true })).toThrow(NoModelsConfiguredError);
+    });
+    it('completeText iterates with the same fallback policy', async () => {
+      const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+      const other = insertProvider(db, { name: 'Other', type: 'openrouter', apiKey: 'k2' });
+      insertModel(db, { name: 'A', model: 'A', priority: 0, tierId: low.id, _providerId: defaultProviderId });
+      insertModel(db, { name: 'B', model: 'B', priority: 1, tierId: low.id, _providerId: other });
+      const rr = new AiModelRouter(db as any, cache, { providerFactory: scripted({ A: [{ type: 'throw', value: new QuotaExhaustedError('no credits') }] }) });
+      expect(await rr.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true })).toBe('done:B');
+      const idA = rr.getModels().find((m) => m.name === 'A')!.id;
+      expect(cache.isInCooldown(idA, 10)).toBe(true);
+    });
+    it('completeText rethrows a non-eligible error without trying the next model', async () => {
+      const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+      const other = insertProvider(db, { name: 'Other', type: 'openrouter', apiKey: 'k2' });
+      insertModel(db, { name: 'A', model: 'A', priority: 0, tierId: low.id, _providerId: defaultProviderId });
+      insertModel(db, { name: 'B', model: 'B', priority: 1, tierId: low.id, _providerId: other });
+      const boom = new Error('boom');
+      const factory = scripted({ A: [{ type: 'throw', value: boom }] });
+      const rr = new AiModelRouter(db as any, cache, { providerFactory: factory });
+      await expect(rr.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true })).rejects.toBe(boom);
+      expect(factory).toHaveBeenCalledTimes(1);
+    });
+    it('completeText throws AllModelsFailedError when every candidate fails', async () => {
+      const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+      insertModel(db, { name: 'A', model: 'A', priority: 0, tierId: low.id, _providerId: defaultProviderId });
+      const rr = new AiModelRouter(db as any, cache, { providerFactory: scripted({ A: [{ type: 'throw', value: new OverloadedError('busy') }] }) });
+      const err: any = await rr.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true }).catch((e) => e);
+      expect(err).toBeInstanceOf(AllModelsFailedError);
+      expect(err.message).toBe('All AI models are rate-limited or unavailable:\nA: busy');
+    });
+    it('NoModelsConfiguredError keeps the legacy message for the non-strict path', () => {
+      const rr = new AiModelRouter(db as any, cache, { providerFactory: scripted({}) });
+      expect(() => rr.getModelsForTier('High')).toThrow(NoModelsConfiguredError);
+      expect(() => rr.getModelsForTier('High')).toThrow('No AI models configured. Add one in Settings → Integrations.');
     });
   });
 });
