@@ -250,6 +250,17 @@ The AI agent already exposes 40+ tools but most are read-only or capture-oriente
 - **Rule generation** — AI can suggest capture-rule triggers and actions based on the user's stated intent and a sample of captured traffic
 - **Safe-by-default** — AI-proposed changes land as a diff the user accepts/rejects, not as silent edits
 
+### AI Decision Maker
+
+A small, fast, cheap model that makes the small typed decisions around the agent, instead of hard-coded rules or the main model. It answers with one of a fixed set of options plus a probability, not free text. Dedicated decision models are starting to appear (for example TypeSafe's Jev), and Anthropic and OpenAI may ship their own, so the design keeps the engine pluggable. Parked for now; the order below is the intended plan.
+
+- **Decision service**: one typed `decide(input, options)` contract with pluggable engines. The first engine is an ordinary LLM using structured output; dedicated decision models plug in later as adapters. Every decision is logged (input, options, probabilities, engine, outcome) so its choices can be audited and tuned.
+- **Tool gating**: before a tool runs, return allow, deny or ask a human, with a confidence. This needs risk metadata on tools and a gate in the tool registry, so every path is covered (chat, Claude CLI through MCP, automation `ctx.tools`, REST) and not only the chat agent. When nobody can be asked, deny.
+- **Model choice**: each model carries a cost and a short description, and the Decision Maker picks the model for each step. Its probabilities double as the fallback order.
+- **Tool choice**: pick the right tool or tool context for a task, for example which approach to use for a reverse-engineering step.
+- **Ground rules**: deterministic cases never call it (read-only tools, an explicit user choice). Latency-sensitive paths such as inline completion use a cached or default model. Gating fails closed; routing fails open to a default model.
+- **Retiring tiers**: the High/Low tiers go once automatic choice has proven itself. Tiers are part of the public plugin SDK (`useAiTiers`, `TierPicker`, `ctx.ai.listTiers()`), so removal needs a deprecation period and a major SDK version. Staged order: decision service, tool gating, automatic model choice with tiers as the fallback, then retire tiers.
+
 ### Advanced Automation
 
 - **Automation debugger** — breakpoints, variable inspector, step-through, live DOM overlay
