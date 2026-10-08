@@ -22,7 +22,7 @@ test.describe('AI Tiers', () => {
 
   test('seeded High and Low tiers are visible in Integrations', async ({ page }) => {
     await loginAsAdmin(page);
-    await page.goto('/ui/settings?section=integrations');
+    await page.goto('/ui/settings/ai');
     await page.waitForLoadState('networkidle');
 
     await expect(page.getByText('High', { exact: true })).toBeVisible({ timeout: 15_000 });
@@ -31,7 +31,7 @@ test.describe('AI Tiers', () => {
 
   test('add a user-added tier, rename it, then delete it', async ({ page }) => {
     await loginAsAdmin(page);
-    await page.goto('/ui/settings?section=integrations');
+    await page.goto('/ui/settings/ai');
     await page.waitForLoadState('networkidle');
 
     // Wait for the tiers section to load (High tier must be visible first)
@@ -78,7 +78,7 @@ test.describe('AI Tiers', () => {
 
   test('hardcoded tiers do not expose Rename or Delete controls', async ({ page }) => {
     await loginAsAdmin(page);
-    await page.goto('/ui/settings?section=integrations');
+    await page.goto('/ui/settings/ai');
     await page.waitForLoadState('networkidle');
 
     // Wait for tiers to load
