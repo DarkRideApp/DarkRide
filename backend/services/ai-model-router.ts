@@ -54,7 +54,9 @@ export class RateLimitCache {
 
   record429(modelId: number, headers?: Headers, provider?: string): void {
     const existing = this.cache.get(modelId);
-    const parsed = headers && provider ? parseRateLimitHeaders(provider, headers) : null;
+    // A rate limit reported inside a stream has an empty Headers object. Parsing it would give an all-null
+    // result that wipes the last known limits, so only parse headers that actually hold something.
+    const parsed = headers && provider && [...headers.keys()].length > 0 ? parseRateLimitHeaders(provider, headers) : null;
     this.cache.set(modelId, {
       headers: parsed ?? existing?.headers ?? null,
       last429At: Date.now(),

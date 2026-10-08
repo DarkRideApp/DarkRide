@@ -80,6 +80,21 @@ describe('parseStream', () => {
     const events = await run([{ message: { tool_calls: [{ function: { name: 'f', arguments: args } }] } }]);
     expect(events).toEqual([{ type: 'tool_use', id: 'id-1', name: 'f', input: {} }]);
   });
+  it('skips lines that are valid JSON but not an object (null, a number, a string) and keeps the real chunks', async () => {
+    const events = await run([
+      { message: { content: 'a' } },
+      null,
+      7,
+      'str',
+      { message: { content: 'b' } },
+      { done: true, prompt_eval_count: 4, eval_count: 2 },
+    ]);
+    expect(events).toEqual([
+      { type: 'text', text: 'a' },
+      { type: 'text', text: 'b' },
+      { type: 'usage', inputTokens: 4, outputTokens: 2 },
+    ]);
+  });
   it('a {"error": "..."} line throws', async () => {
     await expect(run([{ error: 'model "x" not found' }])).rejects.toThrow(/Ollama stream error: model "x" not found/);
     await expect(run([{ error: 'x' }])).rejects.toBeInstanceOf(AiProviderError);

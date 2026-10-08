@@ -55,6 +55,8 @@ function toolInput(args: unknown): Record<string, any> {
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   if (!res.body) throw new AiProviderError(`${ctx.descriptor.shortName} response has no body`);
   for await (const chunk of parseNDJSONStream(res.body, signal)) {
+    // A line can be valid JSON without being an object (null, 7, "text"); there is nothing to read from it.
+    if (!chunk || typeof chunk !== 'object') continue;
     if (chunk.error) throw classifyStreamError(chunk, ctx);
     if (chunk.message?.content) yield { type: 'text', text: chunk.message.content };
     for (const tc of chunk.message?.tool_calls ?? []) {

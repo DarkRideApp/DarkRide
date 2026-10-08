@@ -176,6 +176,31 @@ describe('RateLimitCache', () => {
       const entry = cache.get(1);
       expect(entry!.headers!.requestsLimit).toBe(500);
     });
+
+    it('keeps the last known headers when the 429 carries an empty Headers object, but still sets last429At', () => {
+      // A rate limit reported inside a stream has no HTTP headers to read, so its Headers object is empty.
+      cache.recordSuccess(1, new Headers({
+        'anthropic-ratelimit-requests-limit': '50',
+        'anthropic-ratelimit-requests-remaining': '40',
+      }), 'anthropic');
+      const before = Date.now();
+      cache.record429(1, new Headers(), 'anthropic');
+      const entry = cache.get(1);
+      expect(entry!.headers).toMatchObject({ requestsLimit: 50, requestsRemaining: 40 });
+      expect(entry!.last429At).toBeGreaterThanOrEqual(before);
+    });
+
+    it('replaces the last known headers when the 429 carries real headers', () => {
+      cache.recordSuccess(1, new Headers({
+        'anthropic-ratelimit-requests-limit': '50',
+        'anthropic-ratelimit-requests-remaining': '40',
+      }), 'anthropic');
+      cache.record429(1, new Headers({
+        'anthropic-ratelimit-requests-limit': '50',
+        'anthropic-ratelimit-requests-remaining': '0',
+      }), 'anthropic');
+      expect(cache.get(1)!.headers).toMatchObject({ requestsLimit: 50, requestsRemaining: 0 });
+    });
   });
 
   describe('recordSuccess', () => {

@@ -212,4 +212,15 @@ describe('AISection — provider form is driven by the catalog', () => {
     expect(screen.getByTestId('save-model-btn')).toBeDisabled();
     expect(screen.queryByText(/optional, uses provider default/i)).toBeNull();
   });
+
+  it('the custom model input hints at a neutral example, not a specific model id', async () => {
+    const ws = wsWith((m, p) => (m === 'GET' && p === '/v1/ai/providers'
+      ? restOk({ success: true, data: [{ id: 3, name: 'Local', type: 'openai-compatible', baseUrl: 'http://127.0.0.1:1234/v1', hasApiKey: false, createdAt: 0, updatedAt: 0 }] })
+      : undefined));
+    renderAISection(ws);
+    await waitFor(() => expect(screen.getByTestId('add-ai-model-btn')).toBeEnabled());
+    fireEvent.click(screen.getByTestId('add-ai-model-btn'));
+    fireEvent.change(screen.getByTestId('model-provider-select'), { target: { value: '3' } });
+    expect(screen.getByTestId('model-model-input')).toHaveAttribute('placeholder', "e.g. a model id from the provider's list");
+  });
 });

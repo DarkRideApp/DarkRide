@@ -1043,7 +1043,7 @@ export function AISection() {
                   className="form-input"
                   value={modelForm.model}
                   onChange={e => setModelForm(f => ({ ...f, model: e.target.value }))}
-                  placeholder="e.g. claude-sonnet-4-20250514"
+                  placeholder="e.g. a model id from the provider's list"
                   data-testid="model-model-input"
                 />
               )}

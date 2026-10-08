@@ -61,6 +61,8 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     if (!sse.data || sse.data === '[DONE]') continue;
     let p: any;
     try { p = JSON.parse(sse.data); } catch { continue; }
+    // Valid JSON that is not an object (null, 7, "text") carries no event to act on.
+    if (!p || typeof p !== 'object') continue;
 
     if (p.type === 'error') throw classifyStreamError(p, ctx);
 

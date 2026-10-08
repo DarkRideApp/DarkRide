@@ -121,6 +121,16 @@ describe('parseStream content', () => {
     ]);
     expect(events.filter((e) => e.type === 'text')).toEqual([{ type: 'text', text: 'answer' }]);
   });
+  it('skips events whose data is valid JSON but not an object (null, a number, a string) and keeps the real events', async () => {
+    const events = await run([
+      start(), text('a'),
+      { event: 'content_block_delta', data: 'null' },
+      { event: 'content_block_delta', data: '7' },
+      { event: 'content_block_delta', data: '"str"' },
+      text('b'), msgDelta('end_turn', 2), stop(),
+    ]);
+    expect(events.filter((e) => e.type === 'text')).toEqual([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]);
+  });
   it('a refusal becomes one visible message and does not throw', async () => {
     const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'cyber' } }), stop()]);
     const t = events.filter((e) => e.type === 'text') as any[];
