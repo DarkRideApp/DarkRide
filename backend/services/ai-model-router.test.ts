@@ -5,6 +5,7 @@ import { BetterSQLite3Database, drizzle } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
 import { RateLimitCache, AiModelRouter } from './ai-model-router';
 import { RateLimitError } from './ai/errors';
+import { createProvider } from './ai/registry';
 import { createTestDb } from '../test-utils/create-test-db';
 import {
   QuotaExhaustedError, AuthError, OverloadedError, ConnectionError, OutputLimitError, AllModelsFailedError,
@@ -28,6 +29,13 @@ function scripted(scripts: Record<string, Script>) {
     },
     complete: async () => { const s = scripts[cfg.model]?.find((x) => x.type === 'throw'); if (s) throw s.value; return 'done:' + cfg.model; },
   }) as any);
+}
+
+/** Any network request in a test that expects none fails loudly and is counted. */
+function stubFetchForRouter() {
+  const fn = vi.fn(async () => { throw new Error('unexpected request'); });
+  vi.stubGlobal('fetch', fn);
+  return fn;
 }
 
 const logger = vi.hoisted(() => ({ log: vi.fn(), error: vi.fn() }));
@@ -295,6 +303,7 @@ describe('AiModelRouter', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   describe('getModels', () => {
@@ -1135,6 +1144,87 @@ describe('AiModelRouter', () => {
       two([], []);
       await run();
       expect(factory.mock.calls[0][0]).toBe('gemini');
+    });
+  });
+
+  describe('a model whose stored configuration cannot be used', () => {
+    // Broken rows are built by the real registry so the real validate() runs; the healthy row is scripted.
+    let r: AiModelRouter;
+    let factory: ReturnType<typeof vi.fn>;
+    const scripts: Record<string, Script> = {};
+    let lowTierId: number;
+    const realTypes = new Set(['mistral', 'ollama']);
+    beforeEach(() => {
+      for (const k of Object.keys(scripts)) delete scripts[k];
+      lowTierId = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!.id;
+      const mistral = insertProvider(db, { name: 'Mistral', type: 'mistral', apiKey: 'k-placeholder' });
+      const ollama = insertProvider(db, { name: 'Ollama', type: 'ollama', apiKey: null, baseUrl: 'http://169.254.10.5:11434' });
+      for (const tierId of [highTierId, lowTierId]) {
+        const p = tierId === highTierId ? '' : 'L';
+        insertModel(db, { name: `${p}NoModel`, provider: 'mistral', model: null, priority: 0, tierId, _providerId: mistral });
+        insertModel(db, { name: `${p}BadUrl`, provider: 'ollama', model: 'llama3.1', priority: 1, tierId, _providerId: ollama });
+      }
+      const base = scripted(scripts);
+      factory = vi.fn((type: string, cfg: any) => (realTypes.has(type) ? createProvider(type, cfg) : base(type, cfg)));
+      r = new AiModelRouter(db as any, cache, { providerFactory: factory as any });
+      logger.error.mockClear();
+    });
+    const addHealthy = (tierId: number) => {
+      const ok = insertProvider(db, { name: 'Healthy', type: 'openrouter', apiKey: 'k2' });
+      insertModel(db, { name: 'Healthy', model: 'H', priority: 2, tierId, _providerId: ok });
+      scripts.H = [{ type: 'text', value: 'from H' }];
+    };
+    const stream = () => collectAsyncIterator(r.createStreamingRequest([{ role: 'user', content: 'x' }], 's', []));
+    const complete = () => r.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true });
+    /** Rate-limit cache entries that belong to a broken row (there should be none). */
+    const brokenEntries = () => {
+      const broken = new Set(r.getModels().filter((m) => m.name !== 'Healthy').map((m) => m.id));
+      return [...cache.getAll().keys()].filter((id) => broken.has(id));
+    };
+
+    it('streaming skips it and the next healthy model serves, with no cooldown and no request', async () => {
+      const stub = stubFetchForRouter();
+      addHealthy(highTierId);
+      expect(await stream()).toEqual([{ type: 'text', text: 'from H' }]);
+      expect(stub).not.toHaveBeenCalled();
+      expect(brokenEntries()).toEqual([]);   // only the healthy model's success is recorded
+      expect(logger.error).toHaveBeenCalledWith('Model "NoModel" skipped: No model selected for Mistral. Choose a model in the model settings.');
+      expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/^Model "BadUrl" skipped: Ollama: invalid Base URL\. /));
+      expect(logger.error).toHaveBeenCalledTimes(2);
+    });
+
+    it('completeText skips it and the next healthy model serves, with no cooldown', async () => {
+      const stub = stubFetchForRouter();
+      addHealthy(lowTierId);
+      expect(await complete()).toBe('done:H');
+      expect(stub).not.toHaveBeenCalled();
+      expect(brokenEntries()).toEqual([]);
+      expect(logger.error).toHaveBeenCalledWith('Model "LNoModel" skipped: No model selected for Mistral. Choose a model in the model settings.');
+    });
+
+    it('streaming over a tier of only broken rows fails with the real reasons in the message', async () => {
+      const err: any = await stream().catch((e) => e);
+      expect(err).toBeInstanceOf(AllModelsFailedError);
+      expect(err.attempts.map((a: any) => a.model)).toEqual(['NoModel', 'BadUrl']);
+      expect(err.message).toContain('NoModel: No model selected for Mistral. Choose a model in the model settings.');
+      expect(err.message).toMatch(/BadUrl: Ollama: invalid Base URL\. .*link-local/);
+      expect(cache.getAll().size).toBe(0);
+    });
+
+    it('completeText over a tier of only broken rows fails with the real reasons in the message', async () => {
+      const err: any = await complete().catch((e) => e);
+      expect(err).toBeInstanceOf(AllModelsFailedError);
+      expect(err.message).toContain('LNoModel: No model selected for Mistral. Choose a model in the model settings.');
+      expect(err.message).toMatch(/LBadUrl: Ollama: invalid Base URL\./);
+    });
+
+    it('a validate() that throws something other than an AiProviderError is not swallowed', async () => {
+      const bug = new TypeError('bug in validate');
+      r = new AiModelRouter(db as any, cache, {
+        providerFactory: (() => ({ name: 'x', createStreamingRequest: async function* () {}, complete: async () => '', validate: () => { throw bug; } })) as any,
+      });
+      await expect(stream()).rejects.toBe(bug);
+      await expect(complete()).rejects.toBe(bug);
     });
   });
 

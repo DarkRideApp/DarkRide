@@ -50,6 +50,33 @@ describe('createProvider', () => {
   });
 });
 
+describe('DialectProvider.validate', () => {
+  it('throws for a blank model on a provider with no default, without any request', () => {
+    const stub = stubFetch(oneOk);
+    for (const model of [undefined, '', '   ']) {
+      const p = createProvider('mistral', { apiKey: 'k', model });
+      expect(() => p.validate!()).toThrow(AiProviderError);
+      expect(() => p.validate!()).toThrow('No model selected for Mistral. Choose a model in the model settings.');
+    }
+    expect(stub.calls).toHaveLength(0);
+  });
+  it('throws for a stored Base URL that is blocked or malformed, without any request', () => {
+    const stub = stubFetch(oneOk);
+    expect(() => createProvider('ollama', { baseUrl: 'http://169.254.10.5:11434', model: 'llama3.1' }).validate!())
+      .toThrow(/^Ollama: invalid Base URL\. .*link-local/);
+    expect(() => createProvider('ollama', { baseUrl: 'not a url', model: 'llama3.1' }).validate!())
+      .toThrow(/^Ollama: invalid Base URL\./);
+    expect(stub.calls).toHaveLength(0);
+  });
+  it('passes for a usable configuration and makes no request', () => {
+    const stub = stubFetch(oneOk);
+    expect(() => createProvider('mistral', { apiKey: 'k', model: 'mistral-small-latest' }).validate!()).not.toThrow();
+    expect(() => createProvider('ollama', { baseUrl: 'http://127.0.0.1:11434', model: 'llama3.1' }).validate!()).not.toThrow();
+    expect(() => createProvider('openrouter', { apiKey: 'k' }).validate!()).not.toThrow();   // catalog default model
+    expect(stub.calls).toHaveLength(0);
+  });
+});
+
 describe('DialectProvider', () => {
   const msgs = [{ role: 'user' as const, content: 'hi' }];
 

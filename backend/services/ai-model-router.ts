@@ -2,6 +2,7 @@ import { and, asc, eq } from 'drizzle-orm';
 import type { AppDatabase } from '../db/index';
 import { aiModels, aiProviders, aiTiers } from '../db/schema';
 import {
+  AiProviderError,
   AllModelsFailedError,
   AuthError,
   ConnectionError,
@@ -249,6 +250,16 @@ export class AiModelRouter {
         provider = this.createProviderForModel(model, row);
       } catch (err) {
         if (!(err instanceof UnknownProviderError)) throw err;
+        error(`Model "${model.name}" skipped: ${err.message}`);
+        attempts.push({ model: model.name, error: err.message });
+        continue;
+      }
+      // A stored configuration that cannot be used is skipped like a missing provider: it is not a
+      // provider failure, so it starts no cooldown and does not stop the rest of the tier.
+      try {
+        provider.validate?.();
+      } catch (err) {
+        if (!(err instanceof AiProviderError)) throw err;
         error(`Model "${model.name}" skipped: ${err.message}`);
         attempts.push({ model: model.name, error: err.message });
         continue;

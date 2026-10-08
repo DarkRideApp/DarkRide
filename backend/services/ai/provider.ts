@@ -53,6 +53,11 @@ export class DialectProvider implements AiProvider {
     return resolveContext(this.descriptor, this.config, this.newId);
   }
 
+  /** The same check every request runs first, with no request and no side effects. */
+  validate(): void {
+    this.ctx();
+  }
+
   async *createStreamingRequest(
     messages: AiMessage[], systemPrompt: string, tools: AiToolDefinition[], options?: AiStreamOptions,
   ): AsyncIterable<AiStreamEvent> {

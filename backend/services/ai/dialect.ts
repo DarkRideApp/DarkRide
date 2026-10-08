@@ -70,6 +70,11 @@ export interface AiProvider {
     options?: AiStreamOptions,
   ): AsyncIterable<AiStreamEvent>;
   complete(req: AiCompleteRequest): Promise<string>;
+  /**
+   * Check the stored configuration without sending anything. Throws an AiProviderError naming the
+   * problem (no model and no default, an invalid or blocked Base URL) when a request could not be built.
+   */
+  validate?(): void;
 }
 
 /** What ai-agent.ts, TierConfig, and the index.ts facade need. */
