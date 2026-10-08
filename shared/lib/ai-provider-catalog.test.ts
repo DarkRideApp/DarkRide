@@ -93,23 +93,75 @@ describe('normalizeBaseUrl', () => {
     expect(bad('ollama', 'https://host.test/#x')).toMatch(/fragment/);
     expect(bad('ollama', 'https://host.test/#')).toMatch(/fragment/);
   });
+  // Block-list cases assert the reason, so a URL parse failure cannot satisfy them by accident.
+  const blocked = (id: string, input: string) => {
+    expect(bad(id, input), input).toMatch(/link-local|metadata/);
+  };
+
   it('rejects link-local and metadata hosts but allows loopback and RFC1918', () => {
-    bad('ollama', 'http://169.254.169.254/latest');
-    bad('ollama', 'http://[fe80::1]:11434');
-    bad('ollama', 'http://[::ffff:a9fe:a9fe]/');       // IPv4-mapped 169.254.169.254
-    bad('ollama', 'http://[fd00:ec2::254]/');          // AWS IPv6 metadata
-    bad('ollama', 'http://metadata.google.internal');
+    blocked('ollama', 'http://169.254.169.254/latest');
+    blocked('ollama', 'http://[fe80::1]:11434');
+    blocked('ollama', 'http://[::ffff:a9fe:a9fe]/');       // IPv4-mapped 169.254.169.254
+    blocked('ollama', 'http://[fd00:ec2::254]/');          // AWS IPv6 metadata
+    blocked('ollama', 'http://metadata.google.internal');
     expect(ok('ollama', 'http://127.0.0.1:11434')).toBe('http://127.0.0.1:11434');
     expect(ok('ollama', 'http://192.168.1.20:11434')).toBe('http://192.168.1.20:11434');
   });
+  it('rejects numeric IPv4 spellings of 169.254.169.254 that URL normalises', () => {
+    blocked('ollama', 'http://2852039166/');               // single 32-bit decimal
+    blocked('ollama', 'http://0xa9fea9fe/');               // single 32-bit hex
+    blocked('ollama', 'http://0251.0376.0251.0376/');      // octal dotted quad
+    blocked('ollama', 'http://0xa9.0xfe.0xa9.0xfe/');      // hex dotted quad
+  });
   it('rejects trailing-dot (absolute FQDN) forms of blocked hosts', () => {
-    bad('ollama', 'http://metadata.google.internal./');
-    bad('ollama', 'http://metadata.google.internal../');
-    bad('ollama', 'http://metadata./');
-    bad('ollama', 'http://METADATA.GOOGLE.INTERNAL./');
-    bad('ollama', 'http://169.254.169.254./latest');
-    bad('ollama', 'http://[::ffff:a9fe:a9fe]./');       // not a valid URL; must stay rejected either way
-    bad('ollama', 'http://[::ffff:169.254.169.254]/');
+    blocked('ollama', 'http://metadata.google.internal./');
+    blocked('ollama', 'http://metadata.google.internal../');
+    blocked('ollama', 'http://metadata./');
+    blocked('ollama', 'http://METADATA.GOOGLE.INTERNAL./');
+    blocked('ollama', 'http://169.254.169.254./latest');
+    blocked('ollama', 'http://[::ffff:169.254.169.254]/');
+    // A dot after the closing bracket is not a valid URL at all: rejected by the parser, not the block list.
+    expect(bad('ollama', 'http://[::ffff:a9fe:a9fe]./')).toMatch(/full http or https URL/);
+  });
+  it('stays linear on long runs of dots and slashes (no quadratic regex backtracking)', () => {
+    const N = 100_000;
+    const timed = <T>(fn: () => T) => {
+      const t0 = performance.now();
+      const value = fn();
+      return { value, ms: performance.now() - t0 };
+    };
+    const norm = (input: string) => normalizeBaseUrl(d('ollama'), input);
+
+    // Long dot run in the host, followed by a character that stops the trailing-dot strip from matching.
+    const dotsShort = norm('http://' + '.'.repeat(3) + 'a/');
+    const dotsLong = timed(() => norm('http://' + '.'.repeat(N) + 'a/'));
+    expect(dotsLong.ms).toBeLessThan(500);
+    expect(dotsShort.ok).toBe(true);
+    expect(dotsLong.value.ok).toBe(true);
+
+    // Long slash run in the path, followed by a non-slash character, then one trailing slash.
+    const slashShort = norm('http://h.test/' + '/'.repeat(3) + 'a/');
+    const slashLong = timed(() => norm('http://h.test/' + '/'.repeat(N) + 'a/'));
+    expect(slashLong.ms).toBeLessThan(500);
+    expect(slashShort).toEqual({ ok: true, url: 'http://h.test' + '/'.repeat(4) + 'a' });
+    expect(slashLong.value).toEqual({ ok: true, url: 'http://h.test' + '/'.repeat(N + 1) + 'a' });
+
+    // Pure trailing runs still collapse and still block.
+    expect(norm('http://h.test' + '/'.repeat(N))).toEqual({ ok: true, url: 'http://h.test' });
+    const metaShort = norm('http://metadata.google.internal' + '.'.repeat(3) + '/');
+    const metaLong = timed(() => norm('http://metadata.google.internal' + '.'.repeat(N) + '/'));
+    expect(metaLong.ms).toBeLessThan(500);
+    expect(metaShort.ok).toBe(false);
+    expect(metaLong.value.ok).toBe(false);
+
+    // sameEffectiveBaseUrl normalises both sides, so it must be linear too.
+    const same = timed(() => sameEffectiveBaseUrl(
+      d('ollama'),
+      'http://h.test/' + '/'.repeat(N) + 'a/',
+      'http://' + '.'.repeat(N) + 'a/',
+    ));
+    expect(same.ms).toBeLessThan(500);
+    expect(same.value).toBe(false);
   });
   it('still accepts an ordinary host written with a trailing dot', () => {
     const r = normalizeBaseUrl(d('ollama'), 'http://localhost.:11434');

@@ -142,9 +142,20 @@ export type NormalizeResult = { ok: true; url: string | null } | { ok: false; er
 
 const METADATA_HOSTS = new Set(['metadata.google.internal', 'metadata']);
 
+/**
+ * Remove every trailing occurrence of one character. A scan from the end, not a `/x+$/` regex: that
+ * regex backtracks quadratically on a long run of `x` followed by something else, and this input is
+ * user-supplied.
+ */
+function trimTrailing(s: string, ch: string): string {
+  let end = s.length;
+  while (end > 0 && s[end - 1] === ch) end--;
+  return s.slice(0, end);
+}
+
 function isBlockedHost(hostname: string): boolean {
   // Strip IPv6 brackets and trailing dots: `metadata.google.internal.` is the same host as without the dot.
-  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase().replace(/\.+$/, '');
+  const host = trimTrailing(hostname.replace(/^\[|\]$/g, '').toLowerCase(), '.');
   if (METADATA_HOSTS.has(host)) return true;
   if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
   if (host.includes(':') && /^fe[89ab]/.test(host)) return true; // fe80::/10 link-local
@@ -181,7 +192,7 @@ export function normalizeBaseUrl(
   if (isBlockedHost(u.hostname)) {
     return { ok: false, error: 'Base URL points at a link-local or metadata address, which is not allowed' };
   }
-  let path = u.pathname.replace(/\/+$/, '');
+  let path = trimTrailing(u.pathname, '/');
   if (path === '' && descriptor.defaultPath) path = descriptor.defaultPath;
   return { ok: true, url: `${u.origin}${path}` };
 }
