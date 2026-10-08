@@ -34,6 +34,17 @@ describe('buildChat', () => {
     expect(plain.generationConfig).toBeUndefined();
     expect(plain.tools).toBeUndefined();
   });
+  it('an empty system prompt sends no systemInstruction at all', () => {
+    const body: any = geminiDialect.buildChat(makeCtx('gemini'), { ...req, systemPrompt: '' }, { stream: true }).body;
+    expect('systemInstruction' in body).toBe(false);
+  });
+  it('percent-encodes the model id so it cannot change the request path or add a query', () => {
+    const ctx = makeCtx('gemini', { model: 'tunedModels/my model?alt=json#x' });
+    const stream = geminiDialect.buildChat(ctx, req, { stream: true });
+    expect(stream.url).toBe('https://generativelanguage.googleapis.com/v1beta/models/tunedModels%2Fmy%20model%3Falt%3Djson%23x:streamGenerateContent?alt=sse');
+    const once = geminiDialect.buildChat(ctx, req, { stream: false });
+    expect(once.url).toBe('https://generativelanguage.googleapis.com/v1beta/models/tunedModels%2Fmy%20model%3Falt%3Djson%23x:generateContent');
+  });
   it('tool results carry the real function name and id, and parallel results merge into one user turn', () => {
     const body: any = geminiDialect.buildChat(makeCtx('gemini'), {
       ...req,
@@ -359,6 +370,8 @@ const quotaDetails = (...quotaIds: string[]) => [
 const QUOTA_CASES: Array<[string, object, boolean]> = [
   ['PerMinute quotaId beats billing wording', { message: BILLING_MSG, details: quotaDetails('GenerateRequestsPerMinutePerProjectPerModel-FreeTier') }, false],
   ['PerDay quotaId', { message: 'Quota exceeded for metric', details: quotaDetails('GenerateRequestsPerDayPerProjectPerModel-FreeTier') }, true],
+  ['PerMonth quotaId', { message: 'Quota exceeded for metric', details: quotaDetails('GenerateRequestsPerMonthPerProject-FreeTier') }, true],
+  ['Daily quotaId', { message: 'Quota exceeded for metric', details: quotaDetails('DailyRequestLimitPerProject-FreeTier') }, true],
   ['PerMinute and PerDay violated together', { message: 'Quota exceeded', details: quotaDetails('GenerateRequestsPerMinutePerProjectPerModel-FreeTier', 'GenerateRequestsPerDayPerProjectPerModel-FreeTier') }, true],
   ['unrecognised quotaId plus billing wording', { message: BILLING_MSG, details: quotaDetails('SomeNewQuotaName-FreeTier') }, false],
   ['transient text that mentions quota but not billing', { message: 'Resource has been exhausted (e.g. check quota).' }, false],

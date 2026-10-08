@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import request from 'supertest';
 import express from 'express';
 import { drizzle, BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { clearEndpoints, getApiRouter } from './api-service';
 import { registerAiModelEndpoints } from './ai-models';
@@ -453,6 +454,7 @@ describe('AI Models API Endpoints', () => {
   describe('POST /v1/ai/models/:id/test', () => {
     afterEach(() => {
       vi.restoreAllMocks();
+      vi.unstubAllGlobals();
     });
 
     it('should return 404 for non-existent model', async () => {
@@ -470,6 +472,29 @@ describe('AI Models API Endpoints', () => {
 
       const res = await request(app).post(`/v1/ai/models/${models[0].id}/test`);
       expect(res.body.success).toBe(true);
+    });
+
+    it('answers 200 with an error when the model has no linked provider', async () => {
+      insertModel(db, defaultProviderId);
+      const id = db.select().from(aiModels).all()[0].id;
+      db.update(aiModels).set({ providerId: null }).where(eq(aiModels.id, id)).run();
+      const { mock } = stubFetch(() => new Response('{}', { status: 200 }));
+      const res = await request(app).post(`/v1/ai/models/${id}/test`);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: false, error: 'Model has no linked provider' });
+      expect(mock).not.toHaveBeenCalled();
+    });
+
+    it('answers 200 with an error when the linked provider row no longer exists', async () => {
+      const gone = insertProvider(db, { name: 'Gone' });
+      insertModel(db, gone);
+      const id = db.select().from(aiModels).all()[0].id;
+      db.delete(aiProviders).where(eq(aiProviders.id, gone)).run();
+      const { mock } = stubFetch(() => new Response('{}', { status: 200 }));
+      const res = await request(app).post(`/v1/ai/models/${id}/test`);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: false, error: 'Linked provider not found' });
+      expect(mock).not.toHaveBeenCalled();
     });
 
     it('should treat 429 as successful connection test', async () => {
@@ -578,6 +603,27 @@ describe('AI Models API Endpoints', () => {
       const ok = await request(app).put(`/v1/ai/models/${id}`).send({ name: ' Renamed ' });
       expect(ok.status).toBe(200);
       expect(ok.body.data.name).toBe('Renamed');
+    });
+  });
+
+  describe('stored model name', () => {
+    it('POST trims the model name before storing it', async () => {
+      const res = await request(app).post('/v1/ai/models').send({ name: 'm', providerId: defaultProviderId, model: '  gpt-x\t' });
+      expect(res.status).toBe(200);
+      expect(res.body.data.model).toBe('gpt-x');
+      expect(db.select().from(aiModels).all()[0].model).toBe('gpt-x');
+    });
+
+    it('PUT trims the model name before storing it, and stores a blank one as null', async () => {
+      insertModel(db, defaultProviderId, { model: 'before' });
+      const id = db.select().from(aiModels).all()[0].id;
+      const trimmed = await request(app).put(`/v1/ai/models/${id}`).send({ model: ' \tgpt-y\n ' });
+      expect(trimmed.status).toBe(200);
+      expect(trimmed.body.data.model).toBe('gpt-y');
+      expect(db.select().from(aiModels).all()[0].model).toBe('gpt-y');
+      const blank = await request(app).put(`/v1/ai/models/${id}`).send({ model: ' \t ' });
+      expect(blank.status).toBe(200);
+      expect(db.select().from(aiModels).all()[0].model).toBeNull();
     });
   });
 

@@ -46,6 +46,8 @@ describe('catalog invariants', () => {
     expect(d('gemini')).toMatchObject({ dialect: 'gemini-generate', defaultModel: 'gemini-2.5-flash' });
     expect(d('ollama')).toMatchObject({ defaultBaseUrl: 'http://localhost:11434', defaultModel: 'llama3.1', headersTimeoutMs: 180000 });
     expect(d('codestral')).toMatchObject({ defaultBaseUrl: 'https://api.mistral.ai/v1', defaultModel: 'codestral-latest' });
+    // OpenRouter always honours stream_options.include_usage, so it is sent without a probe-and-retry.
+    expect(d('openrouter')).toMatchObject({ defaultBaseUrl: 'https://openrouter.ai/api/v1', defaultModel: 'openrouter/auto', streamUsage: 'always' });
     expect(d('openai')).toMatchObject({ maxTokensParam: 'max_completion_tokens', sendStop: false });
     expect(d('openai-compatible')).toMatchObject({ baseUrl: 'required', defaultPath: '/v1', streamUsage: 'try' });
   });
@@ -88,6 +90,8 @@ describe('normalizeBaseUrl', () => {
   });
   it('rejects credentials, query, and fragment (including a bare ? or #)', () => {
     expect(bad('ollama', 'https://user:pw@host.test')).toMatch(/credentials/);
+    expect(bad('ollama', 'https://user@host.test')).toMatch(/credentials/);
+    expect(bad('ollama', 'http://:secret@host.test')).toMatch(/credentials/);   // password only, empty username
     expect(bad('ollama', 'https://host.test/?key=abc')).toMatch(/query/);
     expect(bad('ollama', 'https://host.test/?')).toMatch(/query/);      // URL.search is '' for a bare ?
     expect(bad('ollama', 'https://host.test/#x')).toMatch(/fragment/);
@@ -106,6 +110,16 @@ describe('normalizeBaseUrl', () => {
     blocked('ollama', 'http://metadata.google.internal');
     expect(ok('ollama', 'http://127.0.0.1:11434')).toBe('http://127.0.0.1:11434');
     expect(ok('ollama', 'http://192.168.1.20:11434')).toBe('http://192.168.1.20:11434');
+  });
+  it('blocks the whole fe80::/10 link-local range and nothing above it', () => {
+    blocked('ollama', 'http://[fe80::1]:11434');
+    blocked('ollama', 'http://[fe90::1]:11434');
+    blocked('ollama', 'http://[fea0::1]:11434');
+    blocked('ollama', 'http://[febf::1]:11434');
+    blocked('ollama', 'http://[FEBF::1]:11434');
+    // fec0::/10 is the old site-local range, outside fe80::/10.
+    expect(ok('ollama', 'http://[fec0::1]:11434')).toBe('http://[fec0::1]:11434');
+    expect(ok('ollama', 'http://[fe7f::1]:11434')).toBe('http://[fe7f::1]:11434');
   });
   it('rejects numeric IPv4 spellings of 169.254.169.254 that URL normalises', () => {
     blocked('ollama', 'http://2852039166/');               // single 32-bit decimal

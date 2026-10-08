@@ -1047,6 +1047,30 @@ describe('AiModelRouter', () => {
       }
     });
 
+    it('a row with no cooldownMinutes is benched for 10 minutes, no more and no less', async () => {
+      vi.useFakeTimers({ now: new Date('2026-01-01T00:00:00Z') });
+      try {
+        const id = r.getModels().find((m) => m.name === 'A')!.id;
+        db.update(aiModels).set({ cooldownMinutes: null }).where(eq(aiModels.id, id)).run();
+        two([{ type: 'throw', value: new ConnectionError('refused') }], [{ type: 'text', value: 'B' }]);
+        expect(await run()).toEqual([{ type: 'text', text: 'B' }]);
+        const failedAt = Date.now();
+        scripts.A = [{ type: 'text', value: 'A' }];   // from here on A would answer, if it were tried
+        const limit = () => r.getRateLimits().find((l) => l.modelId === id)!;
+        expect(limit().cooldownEndsAt).toBe(failedAt + 10 * 60_000);
+
+        vi.setSystemTime(failedAt + 9 * 60_000);
+        expect(limit().inCooldown).toBe(true);
+        expect(await run()).toEqual([{ type: 'text', text: 'B' }]);   // still skipped
+
+        vi.setSystemTime(failedAt + 11 * 60_000);
+        expect(limit().inCooldown).toBe(false);
+        expect(await run()).toEqual([{ type: 'text', text: 'A' }]);   // back in rotation
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('abort passes through, does not fall back, and drops usage that was being held', async () => {
       const abort = new DOMException('aborted', 'AbortError');
       two([{ type: 'usage', value: [100, 0] }, { type: 'throw', value: abort }], [{ type: 'text', value: 'B' }]);
@@ -1308,6 +1332,23 @@ describe('AiModelRouter', () => {
       logger.log.mockClear();
       expect(await rr.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true })).toBe('done:A');
       expect(logger.log).not.toHaveBeenCalled();
+    });
+    it('completeText records the serving provider\'s rate-limit headers on success, as streaming does', async () => {
+      const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+      insertModel(db, { name: 'A', model: 'A', priority: 0, tierId: low.id, _providerId: defaultProviderId });
+      const factory = vi.fn().mockReturnValue({
+        name: 'openrouter',
+        lastResponseHeaders: new Headers({ 'x-ratelimit-remaining-requests': '999', 'x-ratelimit-limit-requests': '1000' }),
+        complete: async () => 'done',
+      });
+      const rr = new AiModelRouter(db as any, cache, { providerFactory: factory });
+      const id = rr.getModels()[0].id;
+      expect(cache.get(id)).toBeUndefined();
+      expect(await rr.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true })).toBe('done');
+      const entry = cache.get(id);
+      expect(entry).toMatchObject({ last429At: null });
+      expect(entry!.headers).toMatchObject({ requestsRemaining: 999, requestsLimit: 1000 });
+      expect(rr.getRateLimits()[0]).toMatchObject({ requestsRemaining: 999, requestsLimit: 1000, inCooldown: false });
     });
     it('completeText rethrows a non-eligible error without trying the next model', async () => {
       const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;

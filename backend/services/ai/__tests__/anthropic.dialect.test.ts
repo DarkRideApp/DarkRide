@@ -240,6 +240,11 @@ describe('models', () => {
     expect(anthropicDialect.buildListModels!(ctx, 'abc').url).toBe('https://api.anthropic.com/v1/models?limit=1000&after_id=abc');
     expect(anthropicDialect.parseModels!({ data: [{ id: 'm1', display_name: 'M1' }, { id: 'm2' }], has_more: true, last_id: 'm2' }))
       .toEqual({ models: [{ id: 'm1', name: 'M1' }, { id: 'm2', name: 'm2' }], next: 'm2' });
-    expect(anthropicDialect.parseModels!({ data: [], has_more: false }).next).toBeUndefined();
+  });
+  it('offers no next page once has_more is false, even though the last page carries last_id', () => {
+    // The API sends last_id on every non-empty page, including the final one.
+    const last = anthropicDialect.parseModels!({ data: [{ id: 'm8', display_name: 'M8' }, { id: 'm9' }], has_more: false, last_id: 'm9' });
+    expect(last).toEqual({ models: [{ id: 'm8', name: 'M8' }, { id: 'm9', name: 'm9' }], next: undefined });
+    expect(anthropicDialect.parseModels!({ data: [], has_more: false, first_id: null, last_id: null }).next).toBeUndefined();
   });
 });

@@ -270,6 +270,26 @@ describe('AISection — provider form is driven by the catalog', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(/clears the saved key/i);
   });
 
+  it('warns that changing the type of a saved provider clears its key, and drops the warning when the type is restored', async () => {
+    renderAISection();
+    const row = await screen.findByTestId('ai-provider-row-1');
+    fireEvent.click(within(row).getByRole('button', { name: 'Edit' }));
+    expect(screen.queryByTestId('provider-key-clear-notice')).toBeNull();
+    // Switching to ollama leaves the effective Base URL (the default) as it was: only the type differs.
+    pickType('ollama');
+    expect(screen.getByTestId('provider-key-clear-notice')).toHaveTextContent(
+      'Changing the type or Base URL clears the saved key unless you enter a new one.',
+    );
+    pickType('gemini');
+    expect(screen.queryByTestId('provider-key-clear-notice')).toBeNull();
+  });
+
+  it('shows no key-clearing warning for a saved provider that has no key', async () => {
+    await editProvider({ type: 'ollama', baseUrl: null, hasApiKey: false });
+    pickType('openrouter');
+    expect(screen.queryByTestId('provider-key-clear-notice')).toBeNull();
+  });
+
   it('the custom model input hints at a neutral example, not a specific model id', async () => {
     const ws = wsWith((m, p) => (m === 'GET' && p === '/v1/ai/providers'
       ? restOk({ success: true, data: [{ id: 3, name: 'Local', type: 'openai-compatible', baseUrl: 'http://127.0.0.1:1234/v1', hasApiKey: false, createdAt: 0, updatedAt: 0 }] })

@@ -374,10 +374,26 @@ describe('AI Providers API Endpoints', () => {
       expect(db.select().from(schema.aiProviders).all()).toHaveLength(1);
     });
 
+    it('a key with an inner control character gets the control-character message, not the non-ASCII one', async () => {
+      const CONTROL_MESSAGE = 'API key contains control characters. Re-copy it without line breaks.';
+      const cases: Record<string, string> = { bell: 'sk-test\u0007placeholder', 'inner tab': 'sk-test\tplaceholder', 'inner newline': 'sk-test\nplaceholder', DEL: 'sk-test\u007fplaceholder' };
+      const created = await post({ name: 'p', type: 'anthropic', apiKey: 'sk-test-placeholder' });
+      for (const [label, apiKey] of Object.entries(cases)) {
+        const onCreate = await post({ name: label, type: 'anthropic', apiKey });
+        expect(onCreate.status, label).toBe(400);
+        expect(onCreate.body, label).toEqual({ success: false, error: CONTROL_MESSAGE });
+        const onUpdate = await put(created.body.data.id, { apiKey });
+        expect(onUpdate.status, label).toBe(400);
+        expect(onUpdate.body, label).toEqual({ success: false, error: CONTROL_MESSAGE });
+      }
+      expect(rowOf(created.body.data.id).apiKey).toBe('sk-test-placeholder');
+      expect(db.select().from(schema.aiProviders).all()).toHaveLength(1);
+    });
+
     it('rejects keys with invisible, non-ASCII or inner whitespace characters, naming the problem', async () => {
       const cases: Record<string, string> = {
-        'zero-width space': 'sk-test​placeholder',
-        'line separator': 'sk-test placeholder',
+        'zero-width space': 'sk-test\u200bplaceholder',
+        'line separator': 'sk-test\u2028placeholder',
         'C1 next line': 'sk-test\u0085placeholder',
         'inner space': 'sk-test placeholder',
         'emoji': 'sk-test\u{1F511}placeholder',
@@ -390,7 +406,7 @@ describe('AI Providers API Endpoints', () => {
         expect(JSON.stringify(res.body), label).not.toContain('placeholder');
       }
       const created = await post({ name: 'p', type: 'anthropic', apiKey: 'sk-test-placeholder' });
-      const put400 = await put(created.body.data.id, { apiKey: 'sk-test​placeholder' });
+      const put400 = await put(created.body.data.id, { apiKey: 'sk-test\u200bplaceholder' });
       expect(put400.status).toBe(400);
       expect(rowOf(created.body.data.id).apiKey).toBe('sk-test-placeholder');
       expect(db.select().from(schema.aiProviders).all()).toHaveLength(1);
@@ -501,6 +517,7 @@ describe('AI Providers API Endpoints', () => {
       const created = await post({ name: 'c', type: 'openai-compatible', baseUrl: 'http://127.0.0.1:1234' });
       stubFetch(() => { throw Object.assign(new TypeError('fetch failed'), { cause: new Error('connect ECONNREFUSED') }); });
       const res = await request(app).get(`/v1/ai/providers/${created.body.data.id}/models`);
+      expect(res.status).toBe(200);   // a failed listing is a normal answer the form shows, not an HTTP error
       expect(res.body).toMatchObject({ success: false, data: [] });
       expect(res.body.error).toMatch(/OpenAI-compatible/);
     });
@@ -528,6 +545,19 @@ describe('AI Providers API Endpoints', () => {
       expect(res.status).toBe(200);
       expect(res.body.data.name).toBe('renamed');
       expect(rowOf(Number(r.lastInsertRowid)).apiKey).toBe('k');
+    });
+
+    it('PUT accepts a form that re-posts the stored retired type, but still rejects any other unknown type', async () => {
+      const now = new Date();
+      const r = db.insert(schema.aiProviders).values({ name: 'old', type: 'retired-type', apiKey: 'k', createdAt: now, updatedAt: now }).run();
+      const id = Number(r.lastInsertRowid);
+      const same = await put(id, { name: 'renamed', type: 'retired-type' });
+      expect(same.status).toBe(200);
+      expect(rowOf(id)).toMatchObject({ name: 'renamed', type: 'retired-type', apiKey: 'k' });   // same type: the key stays
+      const other = await put(id, { type: 'another-retired-type' });
+      expect(other.status).toBe(400);
+      expect(other.body.error).toMatch(/^Invalid type\. Must be one of: /);
+      expect(rowOf(id).type).toBe('retired-type');
     });
 
     it('PUT on a claude-cli row drops a stale base url without clearing its token', async () => {
