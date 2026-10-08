@@ -6,6 +6,7 @@ import type { AppDatabase } from '../db/index';
 import type { AiModelRouter } from '../services/ai-model-router';
 import { createProvider } from '../services/ai/registry';
 import { AiProviderError, NoModelsConfiguredError } from '../services/ai/errors';
+import { redact } from '../services/ai/http';
 import type { AiCompleteRequest, AiProvider } from '../services/ai/dialect';
 import { getProviderDescriptor } from '../../shared/lib/ai-provider-catalog';
 import { createLoggers } from '../logs';
@@ -51,6 +52,8 @@ const LEGACY: Record<string, LegacyConfig> = {
   // Legacy settings have no Base URL field, and these keys were issued for the Codestral host.
   codestral: { keySetting: 'codestral_api_key', model: 'codestral-latest', baseUrl: 'https://codestral.mistral.ai/v1' },
 };
+
+let warnedLegacy = false;
 
 type Legacy = { provider: AiProvider } | { status: number; error: string } | null;
 
@@ -116,7 +119,11 @@ export function completeHandler(db: AppDatabase, router: AiModelRouter) {
           res.status(legacy.status).json({ success: false, error: legacy.error });
           return;
         }
-        log('Using deprecated ai_provider settings for /v1/ai/complete; add a model to the Low tier instead');
+        // The editor asks for a completion every few hundred milliseconds while typing: say it once per process.
+        if (!warnedLegacy) {
+          warnedLegacy = true;
+          log('Using deprecated ai_provider settings for /v1/ai/complete; add a model to the Low tier instead');
+        }
         completion = await legacy.provider.complete(request);
       }
       // A provider that drains a stream returns partial text on abort; the client is gone either way.
@@ -130,7 +137,8 @@ export function completeHandler(db: AppDatabase, router: AiModelRouter) {
         return;
       }
       // Not a classified provider failure, so the message may hold anything: keep it in the server log only.
-      error(`Completion failed unexpectedly: ${err?.name ?? 'Error'}: ${err?.message ?? String(err)}`);
+      // Masked and capped anyway, since log lines are streamed to live log viewers.
+      error(`Completion failed unexpectedly: ${err?.name ?? 'Error'}: ${redact(String(err?.message ?? err)).slice(0, 500)}`);
       res.status(500).json({ success: false, error: 'Inline completion failed' });
     }
   };

@@ -17,6 +17,7 @@ import { stubFetch, jsonResponse, textResponse, okStream, callHeader } from '../
 import { AiModelRouter, RateLimitCache } from '../services/ai-model-router';
 import { AuthError, ConnectionError, QuotaExhaustedError } from '../services/ai/errors';
 import { getRecentLogs } from '../logs';
+import { buildAiReferencePrompt } from '../../shared/api-reference';
 
 const { settings } = schema;
 
@@ -44,7 +45,14 @@ function fakeRes() {
   return { res, writes };
 }
 
-const errorLogsFromCompletion = () => getRecentLogs().filter((l) => l.system === 'ai-complete' && l.severity === 'error');
+/** Composed the same way as the module, so a change to the wording or the reference suffix shows up here. */
+const EXPECTED_SYSTEM_PROMPT =
+  'You are a code completion engine for TypeScript automation scripts that control Android devices via a DeviceAPI. ' +
+  'You receive code context with a `<CURSOR>` marker. Return ONLY the code that should be inserted at the cursor position. ' +
+  'No explanations, no markdown fences, no repeating existing code.' +
+  buildAiReferencePrompt();
+
+const errorLogsFromCompletion =() => getRecentLogs().filter((l) => l.system === 'ai-complete' && l.severity === 'error');
 
 describe('AI Complete API Endpoint', () => {
   let db: BetterSQLite3Database<typeof schema>;
@@ -97,8 +105,27 @@ describe('AI Complete API Endpoint', () => {
       expect(res.status).toBe(200);
       expect(res.body.data.completion).toBe('inserted()');
       expect(calls[0]).toMatchObject({ prefix: 'foo(', suffix: ')', maxOutputTokens: 256, temperature: 0, stopSequences: ['\n\n\n'] });
-      expect(calls[0].systemPrompt).toContain('<CURSOR>');
-      expect(calls[0].systemPrompt).toContain('code completion engine');
+      expect(calls[0].systemPrompt).toBe(EXPECTED_SYSTEM_PROMPT);
+    });
+
+    it('falls back to legacy settings when the only Low tier model is disabled', async () => {
+      setSetting(db, 'ai_provider', 'anthropic'); setSetting(db, 'anthropic_api_key', 'sk-test-placeholder');
+      const router = routerWith({ low: ['L'] }, { complete: async () => 'from router' });
+      db.update(schema.aiModels).set({ enabled: false }).run();
+      const stub = stubFetch(() => okStream('anthropic'));
+      const res = await request(createApp(db, router)).post('/v1/ai/complete').send({ prefix: 'a' });
+      expect(res.body).toEqual({ success: true, data: { completion: 'ok' } });
+      expect(stub.calls[0].url).toBe('https://api.anthropic.com/v1/messages');
+    });
+
+    it('falls back to legacy settings when the Low tier holds only CLI models', async () => {
+      setSetting(db, 'ai_provider', 'anthropic'); setSetting(db, 'anthropic_api_key', 'sk-test-placeholder');
+      const router = routerWith({ low: ['L'] }, { complete: async () => 'from router' });
+      db.update(schema.aiProviders).set({ type: 'claude-cli' }).run();
+      const stub = stubFetch(() => okStream('anthropic'));
+      const res = await request(createApp(db, router)).post('/v1/ai/complete').send({ prefix: 'a' });
+      expect(res.body).toEqual({ success: true, data: { completion: 'ok' } });
+      expect(stub.calls[0].url).toBe('https://api.anthropic.com/v1/messages');
     });
 
     it('a missing prefix or suffix is sent as an empty string', async () => {
@@ -167,6 +194,22 @@ describe('AI Complete API Endpoint', () => {
       const res = await request(createApp(db, router)).post('/v1/ai/complete').send({ prefix: 'a' });
       expect(res.status).toBe(500);
       expect(res.body).toEqual({ success: false, error: 'Inline completion failed' });
+    });
+
+    it('logs an unexpected error with URL credentials masked and the detail capped', async () => {
+      const long = 'x'.repeat(2000);
+      const router = routerWith({ low: ['L'] }, { complete: async () => { throw new Error(`fetch https://u:p@host.test/x ${long}`); } });
+      const before = errorLogsFromCompletion().length;
+      const res = await request(createApp(db, router)).post('/v1/ai/complete').send({ prefix: 'a' });
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ success: false, error: 'Inline completion failed' });
+      const added = errorLogsFromCompletion().slice(before);
+      expect(added).toHaveLength(1);
+      const prefix = 'Completion failed unexpectedly: Error: ';
+      expect(added[0].message.startsWith(prefix)).toBe(true);
+      expect(added[0].message).toContain('https://***@host.test/x');
+      expect(added[0].message).not.toContain('u:p@');
+      expect(added[0].message.length).toBe(prefix.length + 500);
     });
 
     it('aborts the upstream call when the client disconnects', async () => {
@@ -290,6 +333,7 @@ describe('AI Complete API Endpoint', () => {
       expect(stub.calls[0].body.temperature).toBeUndefined();
       expect(stub.calls[0].body.cache_control).toBeUndefined();
       expect(JSON.stringify(stub.calls[0].body.messages)).toContain('await <CURSOR>;');
+      expect(stub.calls[0].body.system).toBe(EXPECTED_SYSTEM_PROMPT);
       expect(callHeader(stub.calls[0], 'x-api-key')).toBe('sk-test-placeholder');
     });
 
@@ -317,6 +361,7 @@ describe('AI Complete API Endpoint', () => {
       await request(createApp(db, emptyRouter())).post('/v1/ai/complete').send({ prefix: 'a' });
       expect(stub.calls[0].url).toBe('http://10.0.0.5:11434/api/chat');
       expect(stub.calls[0].body.model).toBe('mine');
+      expect(stub.calls[0].body.options).toMatchObject({ temperature: 0, num_predict: 256, stop: ['\n\n\n'] });
       db.delete(schema.settings).run();
       setSetting(db, 'ai_provider', 'openrouter'); setSetting(db, 'openrouter_api_key', 'sk-test-placeholder'); setSetting(db, 'openrouter_model', 'vendor/model');
       stub = stubFetch(() => okStream('openai-chat'));
@@ -338,6 +383,26 @@ describe('AI Complete API Endpoint', () => {
       db.delete(schema.settings).run();
       const b = await request(createApp(db, emptyRouter())).post('/v1/ai/complete').send({ prefix: 'a' });
       expect([b.status, b.body.error]).toEqual([400, 'No AI provider configured']);
+    });
+
+    it('logs the deprecation once per process, not on every completion', async () => {
+      setSetting(db, 'ai_provider', 'anthropic'); setSetting(db, 'anthropic_api_key', 'sk-test-placeholder');
+      stubFetch(() => okStream('anthropic'));
+      // Fresh module instances, so the once-per-process flag starts unset whatever ran before. The router,
+      // errors and logs modules must come from the same fresh graph for instanceof and the log buffer to line up.
+      vi.resetModules();
+      const fresh = await import('./ai-complete');
+      const freshRouter = await import('../services/ai-model-router');
+      const freshLogs = await import('../logs');
+      const router = new freshRouter.AiModelRouter(db as any, new freshRouter.RateLimitCache());
+      const deprecations = () => freshLogs.getRecentLogs().filter((l) => l.system === 'ai-complete' && l.message.includes('deprecated')).length;
+      const before = deprecations();
+      for (let i = 0; i < 2; i++) {
+        const { res, writes } = fakeRes();
+        await fresh.completeHandler(db as any, router)({ body: { prefix: 'a' } }, res);
+        expect(writes).toEqual([['json', { success: true, data: { completion: 'ok' } }]]);
+      }
+      expect(deprecations() - before).toBe(1);
     });
 
     it('a provider type that legacy settings never supported is unknown there', async () => {
