@@ -515,15 +515,15 @@ function getClaudeCliProvider(): ClaudeCliProvider | null {
 migrateAiSettingsToModels(db);
 migrateAiProviders(db);
 
-// AI Provider endpoints
-registerAiProviderEndpoints(db);
+// AI Provider endpoints (share the router's cache so saving a provider lifts its models' cooldowns)
+const rateLimitCache = new RateLimitCache();
+registerAiProviderEndpoints(db, rateLimitCache);
 
 // AI Tier endpoints
 const aiTierStore = new AiTierStore(db);
 registerAiTiersRoutes({ tierStore: aiTierStore, db });
 
 // AI Model Router (multi-model with rate limit fallback)
-const rateLimitCache = new RateLimitCache();
 const aiModelRouter = new AiModelRouter(db, rateLimitCache);
 registerAiModelEndpoints(db, aiModelRouter, rateLimitCache);
 // Completion registers after the router exists so its cooldowns are shared.

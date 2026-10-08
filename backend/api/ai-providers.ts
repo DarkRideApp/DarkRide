@@ -11,6 +11,10 @@ import type { RateLimitCache } from '../services/ai-model-router';
 
 // C0 controls and DEL. A pasted key with an inner line break or NUL would make `fetch` reject the header.
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+// Every real API key is printable ASCII. Anything else (an inner space, a zero-width or line-separator
+// character picked up when copying, a C1 control, an emoji) fails every request later with an opaque
+// "Cannot convert argument to a ByteString", so it is rejected on save with a message that says why.
+const NON_PRINTABLE_ASCII = /[^\x21-\x7e]/;
 const INVALID_TYPE = `Invalid type. Must be one of: ${AI_PROVIDER_IDS.join(', ')}`;
 
 type Clean<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -26,7 +30,19 @@ function cleanKey(raw: unknown): Clean<string | undefined> {
   const v = raw.trim();
   if (v === '') return { ok: false, error: 'API key is empty. Paste the key, or remove the saved one explicitly.' };
   if (CONTROL_CHARS.test(v)) return { ok: false, error: 'API key contains control characters. Re-copy it without line breaks.' };
+  if (NON_PRINTABLE_ASCII.test(v)) {
+    return {
+      ok: false,
+      error: 'API key contains spaces, invisible characters, or characters outside plain ASCII. Re-copy it from the provider.',
+    };
+  }
   return { ok: true, value: v };
+}
+
+/** A display name: a string, trimmed, non-empty. Shared with the model endpoints. */
+export function cleanName(raw: unknown): Clean<string> {
+  if (typeof raw !== 'string' || raw.trim() === '') return { ok: false, error: 'name must be a non-empty string' };
+  return { ok: true, value: raw.trim() };
 }
 
 /** A base URL in a request body is a string, null, or absent. Anything else would crash the normaliser. */
@@ -47,11 +63,11 @@ function providerToResponse(row: typeof aiProviders.$inferSelect): AiProviderCon
 }
 
 /**
- * `rateLimitCache` is optional so callers that do not run a router still compile. When given, every
- * successful PUT lifts the cooldowns of the provider's models: an auth failure cools down every model on the
- * credential, and a corrected key must work immediately rather than after the cooldown runs out.
+ * `rateLimitCache` is the router's cache, and it is required so that forgetting to wire it fails the type
+ * check. Every successful PUT lifts the cooldowns of the provider's models: an auth failure cools down every
+ * model on the credential, and a corrected key must work immediately rather than after the cooldown runs out.
  */
-export function registerAiProviderEndpoints(db: AppDatabase, rateLimitCache?: RateLimitCache): void {
+export function registerAiProviderEndpoints(db: AppDatabase, rateLimitCache: RateLimitCache): void {
   // GET /v1/ai/providers — list all (credentials masked)
   registerEndpoint('GET', '/v1/ai/providers', (_req, res) => {
     const providers = db.select().from(aiProviders).all();
@@ -64,6 +80,11 @@ export function registerAiProviderEndpoints(db: AppDatabase, rateLimitCache?: Ra
 
     if (!name || !type) {
       res.status(400).json({ success: false, error: 'name and type are required' });
+      return;
+    }
+    const cleanedName = cleanName(name);
+    if (!cleanedName.ok) {
+      res.status(400).json({ success: false, error: cleanedName.error });
       return;
     }
     if (!isKnownProviderType(type)) {
@@ -99,7 +120,7 @@ export function registerAiProviderEndpoints(db: AppDatabase, rateLimitCache?: Ra
 
     const now = new Date();
     const result = db.insert(aiProviders).values({
-      name,
+      name: cleanedName.value,
       type,
       apiKey: key.value || null,
       baseUrl: storedUrl,
@@ -142,7 +163,14 @@ export function registerAiProviderEndpoints(db: AppDatabase, rateLimitCache?: Ra
     }
 
     const updates: Record<string, any> = { updatedAt: new Date() };
-    if (name !== undefined) updates.name = name;
+    if (name !== undefined) {
+      const cleanedName = cleanName(name);
+      if (!cleanedName.ok) {
+        res.status(400).json({ success: false, error: cleanedName.error });
+        return;
+      }
+      updates.name = cleanedName.value;
+    }
     if (newType !== undefined) updates.type = newType;
 
     // urlChanged means "requests would now go to a different host or path", which is what clears the key.
@@ -194,10 +222,8 @@ export function registerAiProviderEndpoints(db: AppDatabase, rateLimitCache?: Ra
 
     // On every successful save, not only on a key change: cheap, and a type or URL fix can cure an auth
     // failure just as a new key can.
-    if (rateLimitCache) {
-      const modelIds = db.select({ id: aiModels.id }).from(aiModels).where(eq(aiModels.providerId, id)).all().map((m) => m.id);
-      if (modelIds.length > 0) rateLimitCache.clear(modelIds);
-    }
+    const modelIds = db.select({ id: aiModels.id }).from(aiModels).where(eq(aiModels.providerId, id)).all().map((m) => m.id);
+    if (modelIds.length > 0) rateLimitCache.clear(modelIds);
 
     const updated = db.select().from(aiProviders).where(eq(aiProviders.id, id)).get();
     res.json({ success: true, data: updated ? providerToResponse(updated) : null });

@@ -7,6 +7,7 @@ import type { RateLimitCache } from '../services/ai-model-router';
 import type { AiModelConfig } from '../../shared/types/ai-models';
 import { getProviderDescriptor } from '../../shared/lib/ai-provider-catalog';
 import { testModel } from '../services/ai/provider-ops';
+import { cleanName } from './ai-providers';
 
 /** A model name as stored: trimmed, with blank meaning "use the provider's default". */
 function storedModel(raw: unknown): string | null {
@@ -80,6 +81,11 @@ export function registerAiModelEndpoints(
       res.status(400).json({ success: false, error: 'name and providerId are required' });
       return;
     }
+    const cleanedName = cleanName(name);
+    if (!cleanedName.ok) {
+      res.status(400).json({ success: false, error: cleanedName.error });
+      return;
+    }
 
     // Lookup provider
     const provider = db.select().from(aiProviders).where(eq(aiProviders.id, providerId)).get();
@@ -110,7 +116,7 @@ export function registerAiModelEndpoints(
 
     const now = new Date();
     const result = db.insert(aiModels).values({
-      name,
+      name: cleanedName.value,
       provider: provider.type,
       providerId,
       model: modelName,
@@ -200,7 +206,14 @@ export function registerAiModelEndpoints(
     const updates: Record<string, any> = { updatedAt: new Date() };
     const { name, providerId, model, enabled, cooldownMinutes, tierId } = req.body;
 
-    if (name !== undefined) updates.name = name;
+    if (name !== undefined) {
+      const cleanedName = cleanName(name);
+      if (!cleanedName.ok) {
+        res.status(400).json({ success: false, error: cleanedName.error });
+        return;
+      }
+      updates.name = cleanedName.value;
+    }
     let finalProvider: typeof aiProviders.$inferSelect | undefined;
     if (providerId !== undefined) {
       finalProvider = db.select().from(aiProviders).where(eq(aiProviders.id, providerId)).get();

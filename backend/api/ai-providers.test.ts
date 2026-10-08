@@ -5,7 +5,7 @@ import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { stubFetch, jsonResponse } from '../services/ai/test-helpers';
-import type { RateLimitCache } from '../services/ai-model-router';
+import { RateLimitCache } from '../services/ai-model-router';
 import { clearEndpoints, getApiRouter } from './api-service';
 import { registerAiProviderEndpoints } from './ai-providers';
 import { createTestDb } from '../test-utils/create-test-db';
@@ -16,9 +16,9 @@ vi.mock('../logs', () => ({
   createLoggers: () => ({ log: vi.fn(), error: vi.fn() }),
 }));
 
-function createApp(db: BetterSQLite3Database<typeof schema>) {
+function createApp(db: BetterSQLite3Database<typeof schema>, cache: RateLimitCache = new RateLimitCache()) {
   clearEndpoints();
-  registerAiProviderEndpoints(db as any);
+  registerAiProviderEndpoints(db as any, cache);
   const app = express();
   app.use(express.json());
   app.use(getApiRouter());
@@ -325,20 +325,27 @@ describe('AI Providers API Endpoints', () => {
     });
 
     it('rejects credentials, query strings, fragments and metadata hosts in the base url', async () => {
-      for (const baseUrl of [
-        'http://user:pass@127.0.0.1:1234',
-        'http://127.0.0.1:1234/v1?token=x',
-        'http://127.0.0.1:1234/v1#frag',
-        'http://metadata.google.internal./',
-        'http://[::ffff:169.254.169.254]/',
-        'http://[fd00:ec2::254]/',
-        'http://[fe80::1]/',
-        'ftp://127.0.0.1/',
-      ]) {
+      const BLOCKED = 'Base URL points at a link-local or metadata address, which is not allowed';
+      const cases: [string, string][] = [
+        ['http://user:pass@127.0.0.1:1234', 'Base URL must not contain credentials. Put the key in the API Key field.'],
+        ['http://127.0.0.1:1234/v1?token=x', 'Base URL must not contain a query string'],
+        ['http://127.0.0.1:1234/v1#frag', 'Base URL must not contain a fragment'],
+        ['http://metadata.google.internal./', BLOCKED],
+        ['http://[::ffff:169.254.169.254]/', BLOCKED],
+        ['http://[fd00:ec2::254]/', BLOCKED],
+        ['http://[fe80::1]/', BLOCKED],
+        // Decimal, hex and octal spellings of 169.254.169.254; URL parsing canonicalises them to dotted form.
+        ['http://2852039166/', BLOCKED],
+        ['http://0xa9fea9fe/', BLOCKED],
+        ['http://0251.0376.0251.0376/', BLOCKED],
+        ['ftp://127.0.0.1/', 'Base URL must start with http:// or https://'],
+      ];
+      for (const [baseUrl, error] of cases) {
         const res = await post({ name: 'c', type: 'openai-compatible', baseUrl });
         expect(res.status, baseUrl).toBe(400);
-        expect(res.body.success).toBe(false);
+        expect(res.body, baseUrl).toEqual({ success: false, error });
       }
+      expect(db.select().from(schema.aiProviders).all()).toHaveLength(0);
       // RFC 1918 and loopback stay allowed: a LAN Ollama is a main use case.
       expect((await post({ name: 'lan', type: 'ollama', baseUrl: 'http://192.168.1.20:11434' })).status).toBe(200);
     });
@@ -367,6 +374,53 @@ describe('AI Providers API Endpoints', () => {
       expect(db.select().from(schema.aiProviders).all()).toHaveLength(1);
     });
 
+    it('rejects keys with invisible, non-ASCII or inner whitespace characters, naming the problem', async () => {
+      const cases: Record<string, string> = {
+        'zero-width space': 'sk-test​placeholder',
+        'line separator': 'sk-test placeholder',
+        'C1 next line': 'sk-test\u0085placeholder',
+        'inner space': 'sk-test placeholder',
+        'emoji': 'sk-test\u{1F511}placeholder',
+        'latin-1 letter': 'sk-testéplaceholder',
+      };
+      for (const [label, apiKey] of Object.entries(cases)) {
+        const res = await post({ name: label, type: 'anthropic', apiKey });
+        expect(res.status, label).toBe(400);
+        expect(res.body.error, label).toMatch(/API key contains/);
+        expect(JSON.stringify(res.body), label).not.toContain('placeholder');
+      }
+      const created = await post({ name: 'p', type: 'anthropic', apiKey: 'sk-test-placeholder' });
+      const put400 = await put(created.body.data.id, { apiKey: 'sk-test​placeholder' });
+      expect(put400.status).toBe(400);
+      expect(rowOf(created.body.data.id).apiKey).toBe('sk-test-placeholder');
+      expect(db.select().from(schema.aiProviders).all()).toHaveLength(1);
+    });
+
+    it('rejects a provider name that is not a non-empty string', async () => {
+      for (const name of ['', '   ', null, 42, { a: 1 }, ['x']]) {
+        const res = await post({ name, type: 'anthropic' });
+        expect(res.status, JSON.stringify(name)).toBe(400);
+        expect(res.body.success).toBe(false);
+      }
+      expect(db.select().from(schema.aiProviders).all()).toHaveLength(0);
+      const ok = await post({ name: '  Spaced  ', type: 'anthropic' });
+      expect(ok.body.data.name).toBe('Spaced');
+    });
+
+    it('PUT rejects a supplied provider name that is not a non-empty string', async () => {
+      const created = await post({ name: 'p', type: 'anthropic', apiKey: 'sk-test-placeholder' });
+      const id = created.body.data.id;
+      for (const name of [null, '', '   ', 42, { a: 1 }]) {
+        const res = await put(id, { name });
+        expect(res.status, JSON.stringify(name)).toBe(400);
+        expect(res.body.error).toBe('name must be a non-empty string');
+      }
+      expect(rowOf(id).name).toBe('p');
+      const ok = await put(id, { name: ' renamed ' });
+      expect(ok.status).toBe(200);
+      expect(rowOf(id).name).toBe('renamed');
+    });
+
     it('never echoes the key in a response', async () => {
       const created = await post({ name: 'k', type: 'anthropic', apiKey: 'sk-test-placeholder' });
       expect(JSON.stringify(created.body)).not.toContain('sk-test-placeholder');
@@ -381,13 +435,13 @@ describe('AI Providers API Endpoints', () => {
       const created = await post({ name: 'p', type: 'anthropic', apiKey: 'sk-test-placeholder' });
       const id = created.body.data.id;
       const keyOf = () => rowOf(id).apiKey;
-      await put(id, { name: 'renamed', type: 'anthropic', baseUrl: null });
+      expect((await put(id, { name: 'renamed', type: 'anthropic', baseUrl: null })).status).toBe(200);
       expect(keyOf()).toBe('sk-test-placeholder');                         // rename with unchanged effective URL keeps the key
-      await put(id, { baseUrl: 'https://api.anthropic.com/' });
+      expect((await put(id, { baseUrl: 'https://api.anthropic.com/' })).status).toBe(200);
       expect(keyOf()).toBe('sk-test-placeholder');                         // same effective URL
-      await put(id, { baseUrl: 'https://attacker.test' });
+      expect((await put(id, { baseUrl: 'https://attacker.test' })).status).toBe(200);
       expect(keyOf()).toBeNull();                                          // changed URL clears the key
-      await put(id, { baseUrl: 'https://proxy.test', apiKey: 'sk-test-new' });
+      expect((await put(id, { baseUrl: 'https://proxy.test', apiKey: 'sk-test-new' })).status).toBe(200);
       expect(keyOf()).toBe('sk-test-new');                                 // a supplied key is kept
       expect(rowOf(id).baseUrl).toBe('https://proxy.test');
     });
@@ -395,14 +449,14 @@ describe('AI Providers API Endpoints', () => {
     it('PUT clears the stored key when the type changes and no key is supplied', async () => {
       const created = await post({ name: 'p', type: 'anthropic', apiKey: 'sk-test-placeholder' });
       const id = created.body.data.id;
-      await put(id, { type: 'openrouter' });
+      expect((await put(id, { type: 'openrouter' })).status).toBe(200);
       expect(rowOf(id).apiKey).toBeNull();
     });
 
     it('PUT with the same type and an unchanged url keeps the key', async () => {
       const created = await post({ name: 'p', type: 'ollama', baseUrl: 'http://127.0.0.1:11434', apiKey: 'sk-test-placeholder' });
       const id = created.body.data.id;
-      await put(id, { name: 'renamed', type: 'ollama', baseUrl: 'http://127.0.0.1:11434/' });
+      expect((await put(id, { name: 'renamed', type: 'ollama', baseUrl: 'http://127.0.0.1:11434/' })).status).toBe(200);
       expect(rowOf(id).apiKey).toBe('sk-test-placeholder');
       expect(rowOf(id).name).toBe('renamed');
     });
@@ -426,7 +480,7 @@ describe('AI Providers API Endpoints', () => {
       const created = await post({ name: 'p', type: 'anthropic', apiKey: 'sk-test-placeholder' });
       const id = created.body.data.id;
       const keyOf = () => rowOf(id).apiKey;
-      await put(id, { name: 'renamed' });
+      expect((await put(id, { name: 'renamed' })).status).toBe(200);
       expect(keyOf()).toBe('sk-test-placeholder');
       expect((await put(id, { apiKey: '   ' })).status).toBe(400);
       expect(keyOf()).toBe('sk-test-placeholder');
@@ -506,53 +560,46 @@ describe('AI Providers API Endpoints', () => {
   });
 
   describe('saving a provider lifts its models\' cooldowns', () => {
-    let clear: ReturnType<typeof vi.fn>;
+    const COOLDOWN_MINUTES = 10;
+    let cache: RateLimitCache;
     let appWithCache: express.Express;
 
     beforeEach(() => {
-      clear = vi.fn();
-      clearEndpoints();
-      registerAiProviderEndpoints(db as any, { clear } as unknown as RateLimitCache);
-      appWithCache = express();
-      appWithCache.use(express.json());
-      appWithCache.use(getApiRouter());
+      cache = new RateLimitCache();
+      appWithCache = createApp(db, cache);
     });
 
     const addModel = (providerId: number, name: string) => {
       const now = new Date();
       return Number(db.insert(aiModels).values({ name, provider: 'anthropic', providerId, priority: 0, createdAt: now, updatedAt: now }).run().lastInsertRowid);
     };
+    const cooled = (id: number) => cache.isInCooldown(id, COOLDOWN_MINUTES);
 
-    it('clears exactly the edited provider\'s model ids after a key change', async () => {
+    it('lifts the cooldown of exactly the edited provider\'s models after a key change', async () => {
       const p1 = Number(insertProvider(db, { type: 'anthropic', apiKey: 'sk-test-old' }).lastInsertRowid);
       const p2 = Number(insertProvider(db, { type: 'anthropic', apiKey: 'sk-test-other' }).lastInsertRowid);
       const a = addModel(p1, 'a');
       const b = addModel(p1, 'b');
-      addModel(p2, 'c');
+      const c = addModel(p2, 'c');
+      for (const id of [a, b, c]) cache.record429(id);
+      expect([a, b, c].map(cooled)).toEqual([true, true, true]);
 
       const res = await request(appWithCache).put(`/v1/ai/providers/${p1}`).send({ apiKey: 'sk-test-placeholder' });
       expect(res.status).toBe(200);
-      expect(clear).toHaveBeenCalledTimes(1);
-      expect([...clear.mock.calls[0][0]].sort()).toEqual([a, b].sort());
+      expect([cooled(a), cooled(b)]).toEqual([false, false]);
+      expect(cooled(c)).toBe(true);                       // another provider's model keeps its cooldown
     });
 
-    it('clears nothing when the PUT fails validation', async () => {
+    it('keeps every cooldown when the PUT fails validation or the provider is missing', async () => {
       const p1 = Number(insertProvider(db, { type: 'anthropic', apiKey: 'sk-test-old' }).lastInsertRowid);
-      addModel(p1, 'a');
+      const a = addModel(p1, 'a');
+      cache.record429(a);
       expect((await request(appWithCache).put(`/v1/ai/providers/${p1}`).send({ apiKey: 'sk-test\nplaceholder' })).status).toBe(400);
       expect((await request(appWithCache).put(`/v1/ai/providers/${p1}`).send({ baseUrl: 'http://169.254.169.254' })).status).toBe(400);
       expect((await request(appWithCache).put(`/v1/ai/providers/${p1}`).send({ type: 'nope' })).status).toBe(400);
+      expect((await request(appWithCache).put(`/v1/ai/providers/${p1}`).send({ name: '' })).status).toBe(400);
       expect((await request(appWithCache).put('/v1/ai/providers/999').send({ apiKey: 'sk-test-placeholder' })).status).toBe(404);
-      expect(clear).not.toHaveBeenCalled();
-    });
-
-    it('works with no cache passed', async () => {
-      // The outer app registers the endpoints without a cache.
-      const p1 = Number(insertProvider(db, { type: 'anthropic', apiKey: 'sk-test-old' }).lastInsertRowid);
-      addModel(p1, 'a');
-      const res = await request(createApp(db)).put(`/v1/ai/providers/${p1}`).send({ apiKey: 'sk-test-placeholder' });
-      expect(res.status).toBe(200);
-      expect(clear).not.toHaveBeenCalled();
+      expect(cooled(a)).toBe(true);
     });
   });
 });

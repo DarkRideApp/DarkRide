@@ -516,6 +516,34 @@ describe('AI Models API Endpoints', () => {
     });
   });
 
+  describe('model name validation', () => {
+    it('POST rejects a name that is not a non-empty string', async () => {
+      for (const name of ['', '   ', null, 42, { a: 1 }]) {
+        const res = await request(app).post('/v1/ai/models').send({ name, providerId: defaultProviderId, model: 'x' });
+        expect(res.status, JSON.stringify(name)).toBe(400);
+        expect(res.body.success).toBe(false);
+      }
+      expect(db.select().from(aiModels).all()).toHaveLength(0);
+      const ok = await request(app).post('/v1/ai/models').send({ name: '  Spaced  ', providerId: defaultProviderId, model: 'x' });
+      expect(ok.status).toBe(200);
+      expect(ok.body.data.name).toBe('Spaced');
+    });
+
+    it('PUT rejects a supplied name that is not a non-empty string', async () => {
+      insertModel(db, defaultProviderId, { name: 'Original' });
+      const id = db.select().from(aiModels).all()[0].id;
+      for (const name of [null, '', '   ', 42, { a: 1 }]) {
+        const res = await request(app).put(`/v1/ai/models/${id}`).send({ name });
+        expect(res.status, JSON.stringify(name)).toBe(400);
+        expect(res.body.error).toBe('name must be a non-empty string');
+      }
+      expect(db.select().from(aiModels).all()[0].name).toBe('Original');
+      const ok = await request(app).put(`/v1/ai/models/${id}`).send({ name: ' Renamed ' });
+      expect(ok.status).toBe(200);
+      expect(ok.body.data.name).toBe('Renamed');
+    });
+  });
+
   describe('model required when the provider has no default', () => {
     afterEach(() => vi.unstubAllGlobals());
 
