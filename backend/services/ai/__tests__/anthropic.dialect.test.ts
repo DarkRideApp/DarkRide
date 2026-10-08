@@ -49,6 +49,12 @@ describe('buildChat', () => {
     expect((anthropicDialect.buildChat(makeCtx('anthropic', { model: 'claude-haiku-4-5-20251001' }), r, { stream: true }).body as any).output_config).toBeUndefined();
     expect((anthropicDialect.buildChat(makeCtx('anthropic', { model: 'claude-sonnet-4-6' }), r, { stream: true }).body as any).output_config).toBeUndefined();
   });
+  it('matches the effort model pattern on a version boundary only', () => {
+    const r = { ...req, effort: 'low' as const };
+    const effort = (model: string) => (anthropicDialect.buildChat(makeCtx('anthropic', { model }), r, { stream: true }).body as any).output_config;
+    for (const m of ['claude-opus-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-sonnet-5']) expect(effort(m)).toEqual({ effort: 'low' });
+    for (const m of ['claude-opus-50', 'claude-opus-500-1', 'claude-opus-4-5']) expect(effort(m)).toBeUndefined();
+  });
   it('merges consecutive tool results into one user message and keeps tool_use ids', () => {
     const body: any = anthropicDialect.buildChat(makeCtx('anthropic'), {
       ...req,
@@ -83,6 +89,12 @@ describe('parseStream usage', () => {
     const out = events.filter((e) => e.type === 'usage').reduce((n, e: any) => n + e.outputTokens, 0);
     expect(out).toBe(9);
   });
+  it('a lower cumulative output_tokens after a higher one never produces a negative delta', async () => {
+    const events = await run([start(), text('a'), msgDelta('end_turn', 9), msgDelta('end_turn', 5), stop()]);
+    const outs = events.filter((e) => e.type === 'usage').map((e: any) => e.outputTokens);
+    expect(outs.every((n) => n >= 0)).toBe(true);
+    expect(outs.reduce((n, x) => n + x, 0)).toBe(9);
+  });
   it('no cachedInputTokens key when nothing was read from cache', async () => {
     const events = await run([start(), msgDelta('end_turn', 1), stop()]);
     expect((events[0] as any).cachedInputTokens).toBeUndefined();
@@ -116,6 +128,70 @@ describe('parseStream content', () => {
     const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: null } }), stop()]);
     expect((events.find((e) => e.type === 'text') as any).text).toBe('Claude declined this request.');
   });
+  it('keeps the refusal category when a later usage-only message_delta arrives', async () => {
+    const events = await run([
+      start(),
+      msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'cyber' } }),
+      ev('message_delta', { delta: {}, usage: { output_tokens: 4 } }),
+      stop(),
+    ]);
+    const t = events.filter((e) => e.type === 'text') as any[];
+    expect(t).toHaveLength(1);
+    expect(t[0].text).toContain('(category: cyber)');
+    expect(t[0].text).toContain('Cyber Verification Program');
+  });
+  it('keeps the refusal category when a repeated refusal delta carries no stop_details', async () => {
+    const events = await run([
+      start(),
+      msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'cyber' } }),
+      msgDelta('refusal', 0),
+      stop(),
+    ]);
+    expect((events.find((e) => e.type === 'text') as any).text).toContain('(category: cyber)');
+  });
+  it('reads stop_details from the top level of the message_delta event as well as from delta', async () => {
+    const events = await run([
+      start(),
+      ev('message_delta', { delta: { stop_reason: 'refusal' }, stop_details: { type: 'refusal', category: 'cyber' }, usage: { output_tokens: 0 } }),
+      stop(),
+    ]);
+    const t = events.filter((e) => e.type === 'text') as any[];
+    expect(t).toHaveLength(1);
+    expect(t[0].text).toContain('(category: cyber)');
+    expect(t[0].text).toContain('Cyber Verification Program');
+  });
+  it('ignores a non-string refusal category', async () => {
+    for (const category of [42, { a: 1 }, ['cyber'], true]) {
+      const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category } }), stop()]);
+      expect((events.find((e) => e.type === 'text') as any).text).toBe('Claude declined this request.');
+    }
+  });
+  it('redacts the api key if it appears inside the refusal category', async () => {
+    const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'x-sk-test-placeholder-y' } }), stop()]);
+    const text = (events.find((e) => e.type === 'text') as any).text as string;
+    expect(text).not.toContain('sk-test-placeholder');
+    expect(text).toContain('(category: x-***-y)');
+  });
+  it('caps an oversized refusal category', async () => {
+    const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'a'.repeat(5000) } }), stop()]);
+    expect(((events.find((e) => e.type === 'text') as any).text as string).length).toBeLessThan(700);
+  });
+  it('a tool_use block with no input_json_delta yields an empty input object', async () => {
+    const events = await run([start(), toolStart('tu_1', 'get_apps'), blockStop(), msgDelta('tool_use', 3), stop()]);
+    expect(events.filter((e) => e.type === 'tool_use')).toEqual([{ type: 'tool_use', id: 'tu_1', name: 'get_apps', input: {} }]);
+  });
+  it('yields two separate tool_use events for back-to-back tool_use blocks', async () => {
+    const events = await run([
+      start(),
+      toolStart('tu_1', 'get_apps'), toolDelta('{"q":"a"}'), blockStop(),
+      toolStart('tu_2', 'get_devices'), toolDelta('{"q":"b"}'), blockStop(),
+      msgDelta('tool_use', 6), stop(),
+    ]);
+    expect(events.filter((e) => e.type === 'tool_use')).toEqual([
+      { type: 'tool_use', id: 'tu_1', name: 'get_apps', input: { q: 'a' } },
+      { type: 'tool_use', id: 'tu_2', name: 'get_devices', input: { q: 'b' } },
+    ]);
+  });
   it('max_tokens and context-window stops throw OutputLimitError with the legacy text', async () => {
     await expect(run([start(), text('x'), msgDelta('max_tokens', 9), stop()])).rejects.toThrow('Anthropic response reached its output token limit');
     await expect(run([start(), msgDelta('model_context_window_exceeded', 0), stop()])).rejects.toBeInstanceOf(OutputLimitError);
@@ -123,7 +199,7 @@ describe('parseStream content', () => {
   it('throws when the stream ends before message_stop', async () => {
     await expect(run([start(), text('x')])).rejects.toThrow(/before message_stop/);
   });
-  it('review focus 4: an abort between reads ends the stream quietly instead of reporting a truncated response', async () => {
+  it('an abort between reads ends the stream quietly instead of reporting a truncated response', async () => {
     const ac = new AbortController();
     const first = sseBody([start(), text('a')]);
     const second = sseBody([text('b'), msgDelta('end_turn', 2), stop()]);

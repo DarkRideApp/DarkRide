@@ -4,7 +4,7 @@ import { parseSSEStream, safeText } from '../http';
 import { AiProviderError, OutputLimitError, OverloadedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 
-const SUPPORTS_EFFORT = /^claude-(fable|mythos|opus|sonnet|haiku)-5/;
+const SUPPORTS_EFFORT = /^claude-(fable|mythos|opus|sonnet|haiku)-5(?:-|$)/;
 const CYBER_NOTE = " If this is legitimate security work, see Anthropic's Cyber Verification Program.";
 
 function formatTools(tools: AiToolDefinition[]): any[] {
@@ -54,7 +54,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   let toolId = '', toolName = '', toolJson = '';
   let messageStopped = false;
   let stopReason: string | undefined;
-  let refusalCategory: string | null | undefined;
+  let refusalCategory: string | undefined;
   let emittedOut = 0;
 
   for await (const sse of parseSSEStream(res.body, signal)) {
@@ -93,10 +93,11 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
         break;
       case 'message_delta': {
         if (typeof p.delta?.stop_reason === 'string') stopReason = p.delta.stop_reason;
-        if (stopReason === 'refusal') {
-          const details = p.delta?.stop_details ?? p.stop_details;
-          refusalCategory = details?.category ?? null;
-        }
+        // The stop_details location is not documented, so read it from delta and from the event itself.
+        // Only a string category from THIS event replaces the stored one, so a later usage-only
+        // message_delta cannot erase it.
+        const category = (p.delta?.stop_details ?? p.stop_details)?.category;
+        if (typeof category === 'string' && category) refusalCategory = category;
         const out = p.usage?.output_tokens;
         if (typeof out === 'number') {
           const delta = Math.max(0, out - emittedOut);
@@ -116,7 +117,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   if (stopReason === 'max_tokens') throw new OutputLimitError(`${shortName} response reached its output token limit`, { provider: ctx.descriptor.id });
   if (stopReason === 'model_context_window_exceeded') throw new OutputLimitError(`${shortName} response reached its context window limit`, { provider: ctx.descriptor.id });
   if (stopReason === 'refusal') {
-    const cat = refusalCategory ? ` (category: ${refusalCategory})` : '';
+    const cat = refusalCategory ? ` (category: ${safeText(refusalCategory, ctx)})` : '';
     yield { type: 'text', text: `Claude declined this request${cat}.${refusalCategory === 'cyber' ? CYBER_NOTE : ''}` };
   }
 }
