@@ -97,14 +97,18 @@ Provider failures fall into five classes:
 | Rate limit | HTTP 429, or 402 with a `Retry-After` header |
 | Exhausted credits or quota | HTTP 402, an `insufficient_quota` error, Anthropic's "credit balance is too low", a Gemini per-day quota |
 | Overload | HTTP 502, 503, 529, 408 |
-| Rejected key | HTTP 401, 403 |
-| Connection | network failure, no response headers in time, a redirect, a dropped connection while reading a model list or completion |
+| Rejected key | HTTP 401; for Gemini also a 403 with status `PERMISSION_DENIED` (a leaked, disabled or restricted key) and a 400 `API_KEY_INVALID` |
+| Connection | network failure, no response headers in time, a redirect, a dropped connection while a response is being read or streamed |
 
 Models in a tier are tried in priority order. The router moves to the next model when a call
 fails with one of these five classes **before any output has been produced**. After text or a
 tool call has been produced, the error is surfaced instead, because falling back would
-duplicate output. Any other error, such as a 400 or 404, is surfaced immediately. A caller
-cancel is never a provider failure: no fallback and no cooldown.
+duplicate output. Any other error, such as a 400, 403 or 404, is surfaced immediately. A 403
+is not treated as a rejected key because most providers use it for a blocked request or a
+model the key may not use (moderation, guardrails, permissions on one resource), which says
+nothing about the other models on the credential. A caller cancel is never a provider failure:
+no fallback and no cooldown. A failure that was already in flight when you saved the provider
+does not start a cooldown either.
 
 Cooldowns last the model's cooldown minutes (default 10):
 
@@ -126,9 +130,11 @@ Mistral and Codestral a rejected key adds a hint about the Codestral host.
 
 - Chat and completion requests fail with `<Name> did not respond within 60s` when no response
   headers arrive in time (180 s for Ollama). The limit covers the wait for headers only.
-- The connection test, the model test, and model listing have a 15 s limit for the whole
-  request, body included, and fail with `<Name> did not respond within 15s`. Model listing
-  follows pagination for at most 10 pages.
+- The connection test and the model test have a 15 s limit for the whole request, body
+  included, and fail with `<Name> did not respond within 15s`. Model listing applies the same
+  15 s limit to each page and follows pagination for at most 10 pages (so up to 150 s in the
+  worst case). A list over 50,000 models fails with `<Name> model list is too large`.
+- A single streamed line longer than 8 MB fails with `<Name> sent a line longer than 8 MB`.
 
 ## Testing a provider
 
@@ -168,7 +174,7 @@ Settings API still accepts them. They are read in two places:
 
 ## Adding a provider
 
-For an OpenAI-compatible API, add one entry to `AI_PROVIDER_CATALOG`:
+For an OpenAI-compatible API that takes a bearer token, add one entry to `AI_PROVIDER_CATALOG`:
 
 ```ts
 {
@@ -184,7 +190,17 @@ Then add one row to the golden table in
 `baseUrl` or `model` when the type has no default. The conformance suite checks request shape,
 streaming, error classification, and key redaction for every catalog entry. Nothing else
 changes: the settings form, model listing, connection test, and router all read the catalog.
-Provider ids may be compared only in the catalog and the dialects. A test enforces that.
+
+Only the `openai-chat` dialect reads `auth.scheme`, and it sends a bearer token. The Anthropic
+and Gemini dialects set their own key header and Ollama sends none, so a host that needs a
+different auth header or a key in the query string needs a change in the dialect, plus a
+golden-table row.
+
+Keep provider ids out of comparisons everywhere except the catalog and the dialects. A test
+(`backend/services/ai/__tests__/provider-branch-guard.test.ts`) catches direct comparisons such
+as `type === 'openai'` or a `case 'gemini':`. It does not catch lookups through a table, a
+`Set`, or a named constant, so treat it as a safety net and put provider-specific behaviour in
+the catalog or a dialect.
 
 If you only need to use a service yourself, the `openai-compatible` type works with no code
 change. Add a catalog entry when the service should be its own type with its own defaults.

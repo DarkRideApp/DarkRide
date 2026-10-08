@@ -271,7 +271,7 @@ Request fields: `name`, `type`, `apiKey`, `baseUrl`. `name` and `type` are requi
 
 On update, `baseUrl` is validated only when it changed or the `type` changed, so re-posting an old stored value does not block a rename.
 
-`POST /v1/ai/providers/:id/test` and `GET /v1/ai/providers/:id/models` answer 200 even when the provider fails. A test returns `{ "success": true, "model": "<model used>" }` (`"<n> models"` when it listed instead of generating, `"claude-cli"` for the CLI) or `{ "success": false, "error": "..." }`. A listing returns `{ "success": true, "data": [{ "id", "name" }] }` or `{ "success": false, "error": "...", "data": [] }`. Both give up after 15 s with `<Name> did not respond within 15s`.
+`POST /v1/ai/providers/:id/test` and `GET /v1/ai/providers/:id/models` answer 200 even when the provider fails. A test returns `{ "success": true, "model": "<model used>" }` (`"<n> models"` when it listed instead of generating, `"claude-cli"` for the CLI) or `{ "success": false, "error": "..." }`. A listing returns `{ "success": true, "data": [{ "id", "name" }] }` or `{ "success": false, "error": "...", "data": [] }`. A test gives up after 15 s with `<Name> did not respond within 15s`; a listing allows each page 15 s and follows at most 10 pages.
 
 ### Models
 
