@@ -294,7 +294,7 @@ describe('models', () => {
 
 // A key an upstream echoes back must be redacted BEFORE any length cap, or a key straddling the cut leaves a prefix behind.
 describe('key echoed by the upstream never survives, even straddling a cap (real dialect through classifyHttpError)', () => {
-  const KEY = 'AIzaSyPLACEHOLDERKEY1234567890abcd';
+  const KEY = 'zq7-placeholder-key-1234567890abcd';
   const bodies: Record<string, (message: string) => { status: number; body: string; cls: Function }> = {
     'bad-key 400': (message) => ({
       status: 400, cls: AuthError,
