@@ -6,6 +6,7 @@ import * as schema from '../db/schema';
 import { clearEndpoints, getApiRouter } from './api-service';
 import { registerAiCompleteEndpoints } from './ai-complete';
 import { createTestDb } from '../test-utils/create-test-db';
+import { stubFetch, jsonResponse, textResponse, callHeader } from '../services/ai/test-helpers';
 
 const { settings } = schema;
 
@@ -22,34 +23,27 @@ function setSetting(db: BetterSQLite3Database<typeof schema>, key: string, value
   db.insert(settings).values({ key, value }).run();
 }
 
+// Real Response objects, so the code under test exercises the same body-reading
+// path (json(), text(), status, headers) it uses against a live upstream.
 function mockFetchOk(responseBody: any) {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-    ok: true,
-    json: async () => responseBody,
-  }));
+  return stubFetch(() => jsonResponse(responseBody));
 }
 
 function mockFetchError(status: number, body: string) {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-    ok: false,
-    status,
-    text: async () => body,
-  }));
+  return stubFetch(() => textResponse(body, status));
 }
 
 describe('AI Complete API Endpoint', () => {
   let db: BetterSQLite3Database<typeof schema>;
   let app: express.Express;
-  let originalFetch: typeof global.fetch;
 
   beforeEach(() => {
     db = createTestDb();
     app = createApp(db);
-    originalFetch = global.fetch;
   });
 
   afterEach(() => {
-    global.fetch = originalFetch;
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -105,7 +99,7 @@ describe('AI Complete API Endpoint', () => {
       setSetting(db, 'ai_provider', 'anthropic');
       setSetting(db, 'anthropic_api_key', 'sk-test-key');
 
-      mockFetchOk({
+      const stub = mockFetchOk({
         content: [{ type: 'text', text: 'device.click({ text: "OK" })' }],
       });
 
@@ -117,14 +111,14 @@ describe('AI Complete API Endpoint', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.data.completion).toBe('device.click({ text: "OK" })');
 
-      const fetchCall = (global.fetch as any).mock.calls[0];
-      expect(fetchCall[0]).toBe('https://api.anthropic.com/v1/messages');
-      const body = JSON.parse(fetchCall[1].body);
+      const call = stub.calls[0];
+      expect(call.url).toBe('https://api.anthropic.com/v1/messages');
+      const body = call.body;
       expect(body.model).toBe('claude-haiku-4-5-20251001');
       expect(body.max_tokens).toBe(256);
       expect(body.temperature).toBe(0);
       expect(body.messages[0].content).toBe('await <CURSOR>;');
-      expect(fetchCall[1].headers['x-api-key']).toBe('sk-test-key');
+      expect(callHeader(call, 'x-api-key')).toBe('sk-test-key');
     });
 
     it('should return 502 when API returns error', async () => {
@@ -145,7 +139,7 @@ describe('AI Complete API Endpoint', () => {
       setSetting(db, 'ai_provider', 'anthropic');
       setSetting(db, 'anthropic_api_key', 'sk-test-key');
 
-      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNREFUSED')));
+      stubFetch(async () => { throw new Error('ECONNREFUSED'); });
 
       const res = await request(app)
         .post('/v1/ai/complete')
@@ -187,7 +181,7 @@ describe('AI Complete API Endpoint', () => {
       setSetting(db, 'ai_provider', 'gemini');
       setSetting(db, 'gemini_api_key', 'gem-test-key');
 
-      mockFetchOk({
+      const stub = mockFetchOk({
         candidates: [{ content: { parts: [{ text: 'completedCode()' }] } }],
       });
 
@@ -198,10 +192,10 @@ describe('AI Complete API Endpoint', () => {
       expect(res.status).toBe(200);
       expect(res.body.data.completion).toBe('completedCode()');
 
-      const fetchCall = (global.fetch as any).mock.calls[0];
-      expect(fetchCall[0]).toContain('generativelanguage.googleapis.com');
-      expect(fetchCall[0]).toContain('key=gem-test-key');
-      const body = JSON.parse(fetchCall[1].body);
+      const call = stub.calls[0];
+      expect(call.url).toContain('generativelanguage.googleapis.com');
+      expect(call.url).toContain('key=gem-test-key');
+      const body = call.body;
       expect(body.system_instruction.parts[0].text).toContain('code completion engine');
       expect(body.contents[0].parts[0].text).toBe('await <CURSOR>;');
     });
@@ -226,7 +220,7 @@ describe('AI Complete API Endpoint', () => {
     it('should call Ollama with default URL and model', async () => {
       setSetting(db, 'ai_provider', 'ollama');
 
-      mockFetchOk({ message: { content: 'ollamaCompletion()' } });
+      const stub = mockFetchOk({ message: { content: 'ollamaCompletion()' } });
 
       const res = await request(app)
         .post('/v1/ai/complete')
@@ -235,9 +229,9 @@ describe('AI Complete API Endpoint', () => {
       expect(res.status).toBe(200);
       expect(res.body.data.completion).toBe('ollamaCompletion()');
 
-      const fetchCall = (global.fetch as any).mock.calls[0];
-      expect(fetchCall[0]).toBe('http://localhost:11434/api/chat');
-      const body = JSON.parse(fetchCall[1].body);
+      const call = stub.calls[0];
+      expect(call.url).toBe('http://localhost:11434/api/chat');
+      const body = call.body;
       expect(body.model).toBe('qwen2.5-coder:1.5b');
       expect(body.stream).toBe(false);
       expect(body.messages).toHaveLength(2);
@@ -250,7 +244,7 @@ describe('AI Complete API Endpoint', () => {
       setSetting(db, 'ollama_base_url', 'http://myhost:9999');
       setSetting(db, 'ollama_model', 'deepseek-coder:6.7b');
 
-      mockFetchOk({ message: { content: 'custom()' } });
+      const stub = mockFetchOk({ message: { content: 'custom()' } });
 
       const res = await request(app)
         .post('/v1/ai/complete')
@@ -258,9 +252,9 @@ describe('AI Complete API Endpoint', () => {
 
       expect(res.status).toBe(200);
 
-      const fetchCall = (global.fetch as any).mock.calls[0];
-      expect(fetchCall[0]).toBe('http://myhost:9999/api/chat');
-      const body = JSON.parse(fetchCall[1].body);
+      const call = stub.calls[0];
+      expect(call.url).toBe('http://myhost:9999/api/chat');
+      const body = call.body;
       expect(body.model).toBe('deepseek-coder:6.7b');
     });
 
@@ -295,7 +289,7 @@ describe('AI Complete API Endpoint', () => {
       setSetting(db, 'ai_provider', 'openrouter');
       setSetting(db, 'openrouter_api_key', 'or-test-key');
 
-      mockFetchOk({
+      const stub = mockFetchOk({
         choices: [{ message: { content: 'routerCompletion()' } }],
       });
 
@@ -306,10 +300,10 @@ describe('AI Complete API Endpoint', () => {
       expect(res.status).toBe(200);
       expect(res.body.data.completion).toBe('routerCompletion()');
 
-      const fetchCall = (global.fetch as any).mock.calls[0];
-      expect(fetchCall[0]).toBe('https://openrouter.ai/api/v1/chat/completions');
-      expect(fetchCall[1].headers['Authorization']).toBe('Bearer or-test-key');
-      const body = JSON.parse(fetchCall[1].body);
+      const call = stub.calls[0];
+      expect(call.url).toBe('https://openrouter.ai/api/v1/chat/completions');
+      expect(callHeader(call, 'Authorization')).toBe('Bearer or-test-key');
+      const body = call.body;
       expect(body.model).toBe('google/gemini-2.0-flash-001');
       expect(body.messages).toHaveLength(2);
       expect(body.messages[1].content).toBe('let y = <CURSOR>;');
@@ -320,7 +314,7 @@ describe('AI Complete API Endpoint', () => {
       setSetting(db, 'openrouter_api_key', 'or-test-key');
       setSetting(db, 'openrouter_model', 'anthropic/claude-3-haiku');
 
-      mockFetchOk({
+      const stub = mockFetchOk({
         choices: [{ message: { content: 'custom()' } }],
       });
 
@@ -330,7 +324,7 @@ describe('AI Complete API Endpoint', () => {
 
       expect(res.status).toBe(200);
 
-      const body = JSON.parse((global.fetch as any).mock.calls[0][1].body);
+      const body = stub.calls[0].body;
       expect(body.model).toBe('anthropic/claude-3-haiku');
     });
   });
@@ -352,7 +346,7 @@ describe('AI Complete API Endpoint', () => {
       setSetting(db, 'ai_provider', 'codestral');
       setSetting(db, 'codestral_api_key', 'cs-test-key');
 
-      mockFetchOk({
+      const stub = mockFetchOk({
         choices: [{ message: { content: 'fimCompletion()' } }],
       });
 
@@ -363,10 +357,10 @@ describe('AI Complete API Endpoint', () => {
       expect(res.status).toBe(200);
       expect(res.body.data.completion).toBe('fimCompletion()');
 
-      const fetchCall = (global.fetch as any).mock.calls[0];
-      expect(fetchCall[0]).toBe('https://codestral.mistral.ai/v1/fim/completions');
-      expect(fetchCall[1].headers['Authorization']).toBe('Bearer cs-test-key');
-      const body = JSON.parse(fetchCall[1].body);
+      const call = stub.calls[0];
+      expect(call.url).toBe('https://codestral.mistral.ai/v1/fim/completions');
+      expect(callHeader(call, 'Authorization')).toBe('Bearer cs-test-key');
+      const body = call.body;
       expect(body.model).toBe('codestral-latest');
       expect(body.prompt).toBe('function hello() { ');
       expect(body.suffix).toBe(' }');
