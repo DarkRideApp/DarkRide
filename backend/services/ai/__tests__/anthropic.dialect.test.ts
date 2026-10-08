@@ -111,6 +111,19 @@ describe('parseStream content', () => {
     const events = await run([start(), toolStart('tu_1', 'get_apps'), toolDelta('{"q":'), toolDelta('"x"}'), blockStop(), msgDelta('tool_use', 3), stop()]);
     expect(events.filter((e) => e.type === 'tool_use')).toEqual([{ type: 'tool_use', id: 'tu_1', name: 'get_apps', input: { q: 'x' } }]);
   });
+  it.each([
+    ['a string', '"str"'],
+    ['an array', '[1,2]'],
+    ['a number', '5'],
+    ['null', 'null'],
+  ])('a tool input that parses to %s becomes an empty object', async (_label, json) => {
+    const events = await run([start(), toolStart('tu_1', 'get_apps'), toolDelta(json), blockStop(), msgDelta('tool_use', 3), stop()]);
+    expect(events.filter((e) => e.type === 'tool_use')).toEqual([{ type: 'tool_use', id: 'tu_1', name: 'get_apps', input: {} }]);
+  });
+  it('an object tool input is passed through untouched', async () => {
+    const events = await run([start(), toolStart('tu_1', 'get_apps'), toolDelta('{"q":{"r":[1]}}'), blockStop(), msgDelta('tool_use', 3), stop()]);
+    expect(events.filter((e) => e.type === 'tool_use')).toEqual([{ type: 'tool_use', id: 'tu_1', name: 'get_apps', input: { q: { r: [1] } } }]);
+  });
   it('ignores thinking, redacted_thinking, ping, and unknown events', async () => {
     const events = await run([
       start(), ev('ping'),

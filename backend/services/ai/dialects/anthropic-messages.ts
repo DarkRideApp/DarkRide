@@ -3,6 +3,7 @@ import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../sha
 import { parseSSEStream, safeText } from '../http';
 import { AiProviderError, OutputLimitError, OverloadedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
+import { toolInput } from '../tool-input';
 
 const SUPPORTS_EFFORT = /^claude-(fable|mythos|opus|sonnet|haiku)-5(?:-|$)/;
 const CYBER_NOTE = " If this is legitimate security work, see Anthropic's Cyber Verification Program.";
@@ -88,7 +89,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
       case 'content_block_stop':
         if (toolId && toolName) {
           let input: Record<string, any> = {};
-          try { input = JSON.parse(toolJson); } catch { /* keep {} */ }
+          try { input = toolInput(JSON.parse(toolJson)); } catch { /* keep {} */ }
           yield { type: 'tool_use', id: toolId, name: toolName, input };
           toolId = toolName = toolJson = '';
         }

@@ -4,6 +4,7 @@ import { createLoggers } from '../../../logs';
 import { OPENAI_QUOTA_CODES, OVERLOADED_CODES, OVERLOADED_STATUSES, RATE_LIMIT_CODES, parseSSEStream, safeText } from '../http';
 import { AiProviderError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiCompleteRequest, AiRequest, Dialect, DialectContext } from '../dialect';
+import { isPlainObject, toolInput } from '../tool-input';
 
 const { log } = createLoggers('ai-openai-chat');
 
@@ -73,9 +74,13 @@ function cutOff(finish: string | null): boolean {
   return finish === 'length' || finish === 'model_length';
 }
 
+/**
+ * True when a call's arguments are ready to emit: none at all, or a JSON object. A fragment that parses as something
+ * else (`1`, `[1]`) may still be the start of a longer value, so the call keeps waiting for more.
+ */
 function argsComplete(args: string): boolean {
   if (args.trim() === '') return true;
-  try { JSON.parse(args); return true; } catch { return false; }
+  try { return isPlainObject(JSON.parse(args)); } catch { return false; }
 }
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
@@ -95,7 +100,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
 
   /**
    * Emit finished tool calls in the order they started. A non-final flush (at finish_reason) stops at the first buffer
-   * whose arguments do not parse yet, because some servers send finish_reason before the last argument fragment, and a
+   * whose arguments are not yet a complete JSON object, because some servers send finish_reason before the last argument fragment, and a
    * later call must not overtake it. The final flush (end of stream, or a 'length' finish) emits everything: unparsable
    * arguments become `{}`, or an OutputLimitError after truncation. Returns early once the caller has aborted.
    */
@@ -108,7 +113,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
       if (!b.name) continue;
       let input: Record<string, any> = {};
       if (b.args.trim() !== '') {
-        try { input = JSON.parse(b.args); }
+        try { input = toolInput(JSON.parse(b.args)); }
         catch {
           if (cutOff(finish)) {
             throw new OutputLimitError(`${shortName} response reached its output token limit in the middle of a tool call`, { provider: ctx.descriptor.id });

@@ -3,6 +3,7 @@ import { createLoggers } from '../../../logs';
 import { parseSSEStream, safeText } from '../http';
 import { AiProviderError, AuthError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
+import { toolInput } from '../tool-input';
 
 const { log } = createLoggers('ai-gemini');
 /** Finish reasons that mean the model ended normally. Every other reason is shown to the user. */
@@ -184,7 +185,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
         const fc = part.functionCall;
         const id = typeof fc.id === 'string' && fc.id ? fc.id : generateId(ctx);
         produced = true;
-        yield { type: 'tool_use', id, name: fc.name, input: fc.args || {} };
+        yield { type: 'tool_use', id, name: fc.name, input: toolInput(fc.args) };
       }
     }
     const fr: unknown = cand?.finishReason;

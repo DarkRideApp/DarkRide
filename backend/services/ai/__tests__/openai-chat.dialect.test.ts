@@ -108,6 +108,33 @@ describe('parseStream', () => {
     expect(events).toEqual([{ type: 'text', text: 'Hel' }, { type: 'text', text: 'lo' }, { type: 'usage', inputTokens: 11, outputTokens: 4 }]);
   });
 
+  it.each([
+    ['an array', '[1,2]'],
+    ['a number', '5'],
+    ['a string', '"text"'],
+    ['null', 'null'],
+  ])('tool arguments that parse to %s become an empty object', async (_label, args) => {
+    const events = await run(sseResponse([delta(tc({ index: 0, id: 'a', name: 'f', args })), delta({}, 'tool_calls'), { data: '[DONE]' }]));
+    expect(events).toEqual([{ type: 'tool_use', id: 'a', name: 'f', input: {} }]);
+  });
+
+  it('object tool arguments are passed through untouched', async () => {
+    const events = await run(sseResponse([delta(tc({ index: 0, id: 'a', name: 'f', args: '{"a":[1,{"b":2}]}' })), delta({}, 'tool_calls'), { data: '[DONE]' }]));
+    expect(events).toEqual([{ type: 'tool_use', id: 'a', name: 'f', input: { a: [1, { b: 2 }] } }]);
+  });
+
+  it('arguments that parse only as a number are not complete at finish_reason: a late fragment still joins that call', async () => {
+    // The name arrives after finish_reason. If '1' counted as complete, the call would be flushed (and dropped, having
+    // no name) at finish_reason, and the late fragment would start a separate call under a made-up id.
+    const events = await run(sseResponse([
+      delta(tc({ index: 0, id: 'a', args: '1' })),
+      delta({}, 'tool_calls'),
+      delta(tc({ index: 0, name: 'f', args: '2' })),
+      { data: '[DONE]' },
+    ]));
+    expect(events).toEqual([{ type: 'tool_use', id: 'a', name: 'f', input: {} }]);
+  });
+
   it('parallel tool calls keyed by index: interleaved fragments are concatenated per call, emitted in the order the calls started', async () => {
     const events = await run(sseResponse([
       delta(tc({ index: 0, id: 'a', name: 'first', args: '{"x":' })),

@@ -100,6 +100,21 @@ describe('function call ids and thought signatures', () => {
     return (geminiDialect.buildChat(makeCtx('gemini', { model }), { ...req, messages }, { stream: true }).body as any).contents;
   };
 
+  it.each([
+    ['an array', [1]],
+    ['a string', 'text'],
+    ['a number', 5],
+    ['null', null],
+  ])('function call args that are %s become an empty object', async (_label, args) => {
+    const events = await run([parts([{ functionCall: { id: 'c1', name: 'f', args } }], { finishReason: 'STOP' })]);
+    expect(events).toEqual([{ type: 'tool_use', id: 'c1', name: 'f', input: {} }]);
+  });
+
+  it('object function call args are passed through untouched', async () => {
+    const events = await run([parts([{ functionCall: { id: 'c1', name: 'f', args: { a: { b: [1] } } } }], { finishReason: 'STOP' })]);
+    expect(events).toEqual([{ type: 'tool_use', id: 'c1', name: 'f', input: { a: { b: [1] } } }]);
+  });
+
   it('uses the id the model sends as the tool_use id, and a generated one only when there is none', async () => {
     const events = await run([parts([
       { functionCall: { id: '8f2b1a3c', name: 'f', args: {} } },

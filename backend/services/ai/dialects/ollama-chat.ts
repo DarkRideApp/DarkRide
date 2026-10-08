@@ -2,6 +2,7 @@
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { parseNDJSONStream, safeText } from '../http';
 import { AiProviderError } from '../errors';
+import { toolInput } from '../tool-input';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 
 function formatMessages(messages: AiMessage[], systemPrompt: string): any[] {
@@ -39,17 +40,13 @@ function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError
   return new AiProviderError(`${ctx.descriptor.shortName} stream error: ${safeText(msg, ctx)}`, { provider: ctx.descriptor.id });
 }
 
-function isPlainObject(v: unknown): v is Record<string, any> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
-
-/** Tool input is always a plain object: a string is parsed, anything that is not an object at the end becomes {}. */
-function toolInput(args: unknown): Record<string, any> {
+/** Ollama sends arguments as an object or as a JSON string: a string is parsed first, then shaped like any other. */
+function argumentsInput(args: unknown): Record<string, any> {
   let value = args;
   if (typeof value === 'string') {
     try { value = JSON.parse(value); } catch { return {}; }
   }
-  return isPlainObject(value) ? value : {};
+  return toolInput(value);
 }
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
@@ -66,7 +63,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     if (chunk.message?.content) yield { type: 'text', text: chunk.message.content };
     for (const tc of chunk.message?.tool_calls ?? []) {
       if (!tc.function) continue;
-      yield { type: 'tool_use', id: tc.id || ctx.newId(), name: tc.function.name, input: toolInput(tc.function.arguments) };
+      yield { type: 'tool_use', id: tc.id || ctx.newId(), name: tc.function.name, input: argumentsInput(tc.function.arguments) };
     }
     if (chunk.done && (chunk.prompt_eval_count || chunk.eval_count)) {
       yield { type: 'usage', inputTokens: chunk.prompt_eval_count ?? 0, outputTokens: chunk.eval_count ?? 0 };
