@@ -175,7 +175,7 @@ function scrubCause(holder: { cause?: unknown }, apiKey: string | undefined): vo
 }
 
 /** `err` made safe to attach as a `cause` (message and stack redacted in place), or undefined if that is not possible. */
-function redactedCause(err: unknown, apiKey: string | undefined): unknown {
+export function redactedCause(err: unknown, apiKey: string | undefined): unknown {
   const holder = { cause: err };
   try { scrubCause(holder, apiKey); return holder.cause; } catch { return undefined; }
 }
@@ -312,35 +312,75 @@ const ERROR_BODY_TIMEOUT_MS = 10_000;
  * known, the last `apiKey.length - 1` characters are dropped: the longest key prefix that could be dangling.
  */
 async function readBodyText(res: Response, apiKey?: string): Promise<string> {
-  const body = res.body;
-  if (!body) return '';
+  const { text, end } = await readCapped(res.body, MAX_ERROR_BODY_BYTES, ERROR_BODY_TIMEOUT_MS);
+  const stoppedEarly = end === 'timeout' || end === 'error';   // the size cap is a deliberate stop, not a cut-off
+  if (stoppedEarly && apiKey && apiKey.length >= 6) return text.slice(0, Math.max(0, text.length - (apiKey.length - 1)));
+  return text;
+}
+
+/**
+ * Read a body as text, at most `maxBytes` and (optionally) for at most `deadlineMs`, then cancel whatever is left.
+ * Never throws: `end` says why reading stopped, and `error` carries a read failure.
+ */
+async function readCapped(
+  body: ReadableStream<Uint8Array> | null, maxBytes: number, deadlineMs?: number,
+): Promise<{ text: string; end: 'done' | 'cap' | 'timeout' | 'error'; error?: unknown }> {
+  if (!body) return { text: '', end: 'done' };
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   const decoder = new TextDecoder();
   let text = '';
   let bytes = 0;
-  let stoppedEarly = true;
+  let end: 'done' | 'cap' | 'timeout' | 'error' = 'cap';
+  let error: unknown;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), ERROR_BODY_TIMEOUT_MS); });
+  const deadline = deadlineMs === undefined
+    ? new Promise<never>(() => { /* no deadline */ })
+    : new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), deadlineMs); });
   try {
     reader = body.getReader();
-    while (bytes < MAX_ERROR_BODY_BYTES) {
+    while (bytes < maxBytes) {
       const next = await Promise.race([reader.read(), deadline]);
-      if (next === 'timeout') break;
-      if (next.done) { stoppedEarly = false; break; }
-      const room = MAX_ERROR_BODY_BYTES - bytes;
+      if (next === 'timeout') { end = 'timeout'; break; }
+      if (next.done) { end = 'done'; break; }
+      const room = maxBytes - bytes;
       const chunk = next.value.length > room ? next.value.subarray(0, room) : next.value;
       bytes += chunk.length;
       text += decoder.decode(chunk, { stream: true });
     }
-    if (bytes >= MAX_ERROR_BODY_BYTES) stoppedEarly = false;   // the size cap is a deliberate stop, not a cut-off
     text += decoder.decode();
-  } catch { /* return what was read */ }
-  finally {
+  } catch (err) {
+    end = 'error';
+    error = err;
+  } finally {
     clearTimeout(timer);
     reader?.cancel().catch(() => { /* already closed or errored */ });
   }
-  if (stoppedEarly && apiKey && apiKey.length >= 6) text = text.slice(0, Math.max(0, text.length - (apiKey.length - 1)));
-  return text;
+  return { text, end, error };
+}
+
+/** Largest successful JSON body (a model list or a completion) read before giving up. Real model lists are about 1 MB. */
+export const MAX_JSON_BODY_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Read and parse a 2xx JSON body (a model list or a completion), bounded at MAX_JSON_BODY_BYTES.
+ * - After the caller aborted (or a timeout fired), a read failure propagates unchanged.
+ * - Any other read failure (the server dropped the connection mid-body) is a ConnectionError, so callers can fall back.
+ * - A body over the cap is "too large"; one that does not parse (a login page or captive portal) is "not JSON".
+ */
+export async function readJson(res: Response, ctx: DialectContext, signal?: AbortSignal): Promise<unknown> {
+  const d = ctx.descriptor;
+  // One byte past the cap tells "exactly at the cap" apart from "over it".
+  const { text, end, error } = await readCapped(res.body, MAX_JSON_BODY_BYTES + 1);
+  if (end === 'error') {
+    if (signal?.aborted) throw error;
+    throw new ConnectionError(`${d.shortName} closed the connection while sending the response`, { provider: d.id, cause: redactedCause(error, ctx.apiKey) });
+  }
+  if (end === 'cap') throw new AiProviderError(`${d.shortName} response is too large`, { provider: d.id, status: res.status });
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new AiProviderError(`${d.shortName} returned a response that is not JSON. Check the Base URL.`, { provider: d.id, status: res.status });
+  }
 }
 
 /**

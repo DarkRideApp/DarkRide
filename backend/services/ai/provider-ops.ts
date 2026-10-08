@@ -4,8 +4,8 @@ import {
 } from '../../../shared/lib/ai-provider-catalog';
 import { ClaudeCliProvider } from '../claude-cli-provider';
 import { AiProviderError, ConnectionError, RateLimitError } from './errors';
-import { sendChat, sendChecked } from './http';
-import { readJson, resolveContext } from './provider';
+import { readJson, redactedCause, sendChat, sendChecked } from './http';
+import { resolveContext } from './provider';
 import { getDialect } from './registry';
 import type { DialectContext } from './dialect';
 
@@ -38,14 +38,15 @@ function requireKey(d: AiProviderDescriptor, row: ProviderRow): void {
  * Run one request with a 15 s budget covering the response and its body. When the budget runs out, whatever the
  * request was doing (waiting for headers, reading the body) fails with "<name> did not respond within 15s".
  */
-async function withTimeout<T>(d: AiProviderDescriptor, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+async function withTimeout<T>(ctx: DialectContext, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const d = ctx.descriptor;
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(new DOMException('The operation timed out', 'TimeoutError')), REQUEST_TIMEOUT_MS);
   try {
     return await run(ac.signal);
   } catch (err) {
     if (ac.signal.aborted) {
-      throw new ConnectionError(`${d.shortName} did not respond within ${REQUEST_TIMEOUT_MS / 1000}s`, { provider: d.id, cause: err });
+      throw new ConnectionError(`${d.shortName} did not respond within ${REQUEST_TIMEOUT_MS / 1000}s`, { provider: d.id, cause: redactedCause(err, ctx.apiKey) });
     }
     throw err;
   } finally {
@@ -71,9 +72,9 @@ export async function listModels(row: ProviderRow): Promise<{ id: string; name: 
   const all: { id: string; name: string }[] = [];
   let page: string | undefined;
   for (let i = 0; i < MAX_PAGES; i++) {
-    const json = await withTimeout(d, async (signal) => {
+    const json = await withTimeout(ctx, async (signal) => {
       const { res } = await sendChecked(dialect, ctx, (c) => buildListModels.call(dialect, c, page), { signal, method: 'GET' });
-      return readJson(res, d);
+      return readJson(res, ctx, signal);
     });
     const parsed = parseModels.call(dialect, json);
     all.push(...parsed.models);
@@ -103,8 +104,9 @@ function cliVersionOk(token: string | undefined): Promise<boolean> {
 async function probe(row: ProviderRow, model: string): Promise<TestResult> {
   const d = httpDescriptor(row);
   try {
-    await withTimeout(d, async (signal) => {
-      const { res } = await sendChat(getDialect(d.dialect!), ctxFor(row, model), {
+    const ctx = ctxFor(row, model);
+    await withTimeout(ctx, async (signal) => {
+      const { res } = await sendChat(getDialect(d.dialect!), ctx, {
         messages: [{ role: 'user', content: 'hi' }], systemPrompt: '', tools: [], maxOutputTokens: 16, cache: false, signal,
       }, { stream: true });
       await res.body?.cancel().catch(() => undefined);

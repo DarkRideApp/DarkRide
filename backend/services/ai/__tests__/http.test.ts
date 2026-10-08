@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { classifyHttpError, redact, safeText, upstreamMessage, sendChat, sendChecked, parseSSEStream } from '../http';
+import { classifyHttpError, redact, safeText, upstreamMessage, sendChat, sendChecked, parseSSEStream, readJson, MAX_JSON_BODY_BYTES } from '../http';
 import { AuthError, QuotaExhaustedError, RateLimitError, OverloadedError, ConnectionError, AiProviderError } from '../errors';
 import { getProviderDescriptor } from '../../../../shared/lib/ai-provider-catalog';
 import type { Dialect, DialectContext } from '../dialect';
@@ -392,6 +392,45 @@ describe('sendChat', () => {
       const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
       expect(err.message).toBe('OpenAI API error (500): café au lait');
     });
+  });
+});
+
+describe('readJson', () => {
+  const enc = new TextEncoder();
+  const ok = (body: ReadableStream<Uint8Array> | string) => new Response(body, { status: 200 });
+  it('parses a body just under the size cap', async () => {
+    const pad = 'x'.repeat(MAX_JSON_BODY_BYTES - 12);
+    const json: any = await readJson(ok(`{"p":"${pad}"}`), ctxFor('openai'));
+    expect(json.p.length).toBe(MAX_JSON_BODY_BYTES - 12);
+  });
+  it('a body over the cap is "too large", and the stream is cancelled', async () => {
+    const chunk = enc.encode('x'.repeat(1024 * 1024));
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ pull(c) { c.enqueue(chunk); }, cancel() { cancelled = true; } });
+    const err = await readJson(ok(body), ctxFor('openai')).catch((e) => e);
+    expect(err).toBeInstanceOf(AiProviderError);
+    expect(err.message).toBe('OpenAI response is too large');
+    expect(cancelled).toBe(true);
+  });
+  it('a 200 that is not JSON is an AiProviderError', async () => {
+    await expect(readJson(ok('<html>'), ctxFor('openai'))).rejects.toThrow('OpenAI returned a response that is not JSON. Check the Base URL.');
+  });
+  it('a connection dropped mid-body is a ConnectionError with a redacted cause', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(enc.encode('{"da')); },
+      pull(c) { c.error(new TypeError('terminated near sk-test-placeholder')); },
+    });
+    const err = await readJson(ok(body), ctxFor('openai')).catch((e) => e);
+    expect(err).toBeInstanceOf(ConnectionError);
+    expect(err.message).toBe('OpenAI closed the connection while sending the response');
+    expect(err.provider).toBe('openai');
+    expect(err.cause.message).toBe('terminated near ***');
+  });
+  it('a read error after the caller aborted passes through untouched', async () => {
+    const ac = new AbortController();
+    const reason = new DOMException('stop', 'AbortError');
+    const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(enc.encode('{')); }, pull(c) { ac.abort(reason); c.error(reason); } });
+    await expect(readJson(ok(body), ctxFor('openai'), ac.signal)).rejects.toBe(reason);
   });
 });
 

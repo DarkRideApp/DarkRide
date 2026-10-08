@@ -3,7 +3,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createProvider, getDialect } from '../registry';
 import { AI_PROVIDER_CATALOG } from '../../../../shared/lib/ai-provider-catalog';
-import { UnknownProviderError, AiProviderError } from '../errors';
+import { UnknownProviderError, AiProviderError, ConnectionError, isFallbackEligible } from '../errors';
 import { stubFetch, sseResponse, jsonResponse, textResponse, collect, callHeader } from '../test-helpers';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -145,6 +145,16 @@ describe('DialectProvider', () => {
     const err = await p;
     expect(err).not.toBeInstanceOf(AiProviderError);
     expect(err.name).toBe('AbortError');
+  });
+  it('complete(): a connection dropped while the FIM body is read is a ConnectionError the router can fall back on', async () => {
+    stubFetch(() => new Response(new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode('{"choi')); },
+      pull(c) { c.error(new TypeError('terminated')); },
+    }), { status: 200 }));
+    const err: any = await createProvider('codestral', { apiKey: 'k' }).complete({ prefix: 'a', suffix: 'b' }).catch((e) => e);
+    expect(err).toBeInstanceOf(ConnectionError);
+    expect(err.message).toBe('Codestral closed the connection while sending the response');
+    expect(isFallbackEligible(err)).toBe(true);
   });
   it('complete(): Mistral uses FIM for a codestral model', async () => {
     const stub = stubFetch(() => jsonResponse({ choices: [{ message: { content: 'x' } }] }));

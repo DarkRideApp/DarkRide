@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../shared/types/ai-chat';
 import { normalizeBaseUrl, type AiProviderDescriptor } from '../../../shared/lib/ai-provider-catalog';
 import { AiProviderError, OutputLimitError } from './errors';
-import { sendChat, sendChecked } from './http';
+import { readJson, sendChat, sendChecked } from './http';
 import type {
   AiCompleteRequest, AiProvider, AiProviderConfig, AiRequest, AiStreamOptions, Dialect, DialectContext,
 } from './dialect';
@@ -32,19 +32,6 @@ export function resolveContext(
   const baseUrl = norm.url ?? d.defaultBaseUrl;
   if (!baseUrl) throw new AiProviderError(`${d.label}: Base URL is required`, { provider: d.id });
   return { descriptor: d, baseUrl, apiKey: config.apiKey?.trim() || undefined, model, newId, flags: {} };
-}
-
-/**
- * Parse a 2xx body as JSON. A login page or captive portal answers 200 with HTML, which is a configuration problem.
- * Only the parse is caught: an abort or timeout while the body is read propagates unchanged.
- */
-export async function readJson(res: Response, d: AiProviderDescriptor): Promise<unknown> {
-  const text = await res.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new AiProviderError(`${d.shortName} returned a response that is not JSON. Check the Base URL.`, { provider: d.id, status: res.status });
-  }
 }
 
 export class DialectProvider implements AiProvider {
@@ -97,7 +84,7 @@ export class DialectProvider implements AiProvider {
       const buildFim = d.buildFim.bind(d);
       const { res } = await sendChecked(d, ctx, (c) => buildFim(c, req), { signal: req.signal });
       this.lastResponseHeaders = res.headers;
-      return trimCompletion(d.parseFim(await readJson(res, this.descriptor)));
+      return trimCompletion(d.parseFim(await readJson(res, ctx, req.signal)));
     }
     let text = '';
     try {

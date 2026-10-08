@@ -4,6 +4,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { listModels, testProvider, testModel } from '../provider-ops';
 import { stubFetch, jsonResponse, textResponse, sseResponse, callHeader } from '../test-helpers';
 import { EventEmitter } from 'events';
+import { ConnectionError, isFallbackEligible } from '../errors';
 
 vi.mock('child_process', () => ({ spawn: vi.fn() }));
 vi.mock('../../claude-cli-provider', () => ({ ClaudeCliProvider: { getVersion: vi.fn(), testToolUse: vi.fn() } }));
@@ -31,6 +32,31 @@ describe('timeouts (15 s per request)', () => {
     await vi.advanceTimersByTimeAsync(15_000);
     const err = await p;
     expect(err).toMatchObject({ name: 'ConnectionError', message: 'OpenRouter did not respond within 15s' });
+  });
+  it('a timeout keeps the underlying error as a redacted cause', async () => {
+    vi.useFakeTimers();
+    // The body stalls and then fails when the timeout aborts it; that error never passes through the fetch wrapper.
+    stubFetch((call) => new Response(new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"data":['));
+        (call.init.signal as AbortSignal).addEventListener('abort', () => c.error(new Error('socket reset for sk-test-placeholder')), { once: true });
+      },
+    }), { status: 200 }));
+    const p = listModels(row('openrouter')).catch((e) => e);
+    await vi.advanceTimersByTimeAsync(15_000);
+    const err = await p;
+    expect(err.message).toBe('OpenRouter did not respond within 15s');
+    expect(err.cause.message).toBe('socket reset for ***');
+  });
+  it('a listing whose connection drops mid-body is a ConnectionError, not a raw TypeError', async () => {
+    stubFetch(() => new Response(new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode('{"data":[')); },
+      pull(c) { c.error(new TypeError('terminated')); },
+    }), { status: 200 }));
+    const err = await listModels(row('openrouter')).catch((e) => e);
+    expect(err).toBeInstanceOf(ConnectionError);
+    expect(err.message).toBe('OpenRouter closed the connection while sending the response');
+    expect(isFallbackEligible(err)).toBe(true);
   });
   it('a listing whose server never answers reads as a timeout', async () => {
     vi.useFakeTimers();

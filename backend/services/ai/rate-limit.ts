@@ -16,8 +16,9 @@ const num = (v: string | null): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
-// A lookup table, not an if-chain: the scheme name 'anthropic' equals a provider id, and the AST guard
-// (Task 19) flags comparisons against provider-id literals outside the catalog and the dialects.
+// A lookup table, not an if-chain: the scheme name 'anthropic' equals a provider id, and the provider-id guard
+// (backend/test-utils/provider-branch-scan.test.ts) flags comparisons against provider-id literals outside the
+// catalog and the dialects.
 const PARSERS: Record<'anthropic' | 'x-ratelimit' | 'none', (h: Headers) => ParsedRateLimitHeaders> = {
   anthropic: (headers) => {
     const rl = (k: string) => headers.get(`anthropic-ratelimit-${k}`);
