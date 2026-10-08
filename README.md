@@ -31,7 +31,7 @@ Self-hosted toolkit for Android device control, network traffic capture, APK ana
 ## Features
 
 - **Live device control** — H.264 stream via scrcpy with WebCodecs decoding in the browser; adaptive bitrate (500 kbps–8 Mbps); adb-screencap fallback; hardware buttons; per-device proxy/TLS profile.
-- **TypeScript automation engine** — Monaco editor with full `DeviceAPI` typings (click, scroll, getText, waitFor, DOM queries, HTTP); cron/HTTP triggers; rule system for popups; session history with logs, screenshots, and captured traffic; AI completion via Anthropic, Gemini, Ollama, OpenRouter, or Codestral.
+- **TypeScript automation engine** — Monaco editor with full `DeviceAPI` typings (click, scroll, getText, waitFor, DOM queries, HTTP); cron/HTTP triggers; rule system for popups; session history with logs, screenshots, and captured traffic; AI completion via Anthropic, Gemini, Ollama, OpenRouter, OpenAI, Mistral, Codestral, or any OpenAI-compatible server (see [docs/ai-providers.md](docs/ai-providers.md)).
 - **HTTPS traffic capture** — WireGuard transparent proxy + mitmproxy; auto SSL injection on rooted devices; filter by device/method/status/host/path; domain block/hide lists; WebSocket capture with pluggable protocol decoders; TLS fingerprint spoofing (Chrome 120 Android).
 - **Frida instrumentation** — In-browser IDE, script library, spawn/attach, live output; managed `frida-server` releases pushed to device; Frida Gadget injection for non-rooted devices; APK cache keyed on app/version/Frida version.
 - **Proxy pool** — Health-monitored proxy rotation; NordVPN SOCKS5 per-country routing; server-side `device.httpGet/Post` helpers.
@@ -112,7 +112,7 @@ DarkRide binds to `127.0.0.1` by default. Multi-user auth is built in (argon2id,
 | Device control | scrcpy-server (H.264/WebCodecs), minicap, minitouch, uiautomator2 |
 | Traffic capture | mitmproxy, WireGuard |
 | Frida | frida-tools, Frida Gadget injection |
-| AI completion | Anthropic, Gemini, Ollama, OpenRouter |
+| AI completion | Anthropic, Gemini, Ollama, OpenRouter, OpenAI, Mistral, Codestral, OpenAI-compatible |
 | Testing | Vitest, React Testing Library, supertest |
 
 ## Architecture

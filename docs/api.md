@@ -186,6 +186,8 @@ Classification comes from `shared/lib/traffic-classify.ts`, the same code the Tr
 
 Allowed keys: `nordvpn_username`, `nordvpn_password`, `anthropic_api_key`, `gemini_api_key`, `openrouter_api_key`, `codestral_api_key`, `ai_provider`, `ollama_base_url`, `ollama_model`, `openrouter_model`, `document_store_url`, `document_store_headers`, `frida_default_version`
 
+The AI keys in that list (`ai_provider`, `anthropic_api_key`, `gemini_api_key`, `openrouter_api_key`, `codestral_api_key`, `ollama_base_url`, `ollama_model`, `openrouter_model`) are deprecated in favour of provider entries and model rows; see [ai-providers.md](ai-providers.md).
+
 ## Credentials
 
 | Method | Path | Description |
@@ -222,7 +224,7 @@ Allowed keys: `nordvpn_username`, `nordvpn_password`, `anthropic_api_key`, `gemi
 |--------|------|-------------|
 | POST | /v1/ai/complete | Code completion for automation scripts |
 
-Providers: Anthropic, Gemini, Ollama, OpenRouter, Codestral. Configure via Settings API.
+Providers: Anthropic, Gemini, Ollama, OpenRouter, OpenAI, Mistral, Codestral, and any OpenAI-compatible server. Requests use models in the `Low` tier. Installs without one fall back to the deprecated AI settings keys. See [ai-providers.md](ai-providers.md).
 
 ## Plugin Endpoints
 

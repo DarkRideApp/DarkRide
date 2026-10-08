@@ -7,6 +7,20 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 ### Added
 
 - **Plugin SDK 1.5.0** — `ctx.documentStore` (`DocStoreApi`: `putDoc`/`getDoc`) is now available to plugins as a typed handle over the host Document Store. Accessible from `start()` — throws if accessed during `register()`. Includes an in-memory test fixture `createInMemoryDocStore` exported from `@darkrideapp/plugin-sdk/test-utils`. Non-breaking minor bump (1.4.0 → 1.5.0).
+- **AI providers** are now defined by a catalog and four wire dialects. New provider types: `openai`, `mistral`, and `openai-compatible` (any OpenAI-style server, for example LM Studio, vLLM, or a gateway). See `docs/ai-providers.md`.
+- **Fallback on exhausted credits.** When a model's API credits or spend limit run out, or its provider is overloaded or unreachable, the next model in the tier is tried instead of the request failing.
+- Anthropic requests use prompt caching, which cuts the cost of long agent sessions.
+
+### Changed
+
+- Anthropic: blank-model rows now default to `claude-sonnet-5-5`; `max_tokens` is 16000; a model refusal is shown as a message instead of an empty reply.
+- Gemini: the API key is sent in a header instead of the URL; default model is `gemini-2.5-flash` (2.0 Flash has been shut down). Tool results now carry the real function name.
+- OpenRouter and Gemini now honour the Base URL field. Existing stored values for these two types are cleared by a one-time migration because they were never used.
+- Codestral now uses `api.mistral.ai/v1` for chat, test, model listing, and FIM. If your key was issued for the Codestral host, set Base URL to `https://codestral.mistral.ai/v1`.
+- Editing a provider's Base URL or type clears its saved API key unless you enter a new one. Redirects are no longer followed when calling providers.
+- Inline code completion (`/v1/ai/complete`) now uses models in the `Low` tier. Installs without one keep working through the old settings keys, which are deprecated.
+- Reported input tokens now include cached tokens.
+- A model whose provider has no default (OpenAI, Mistral, OpenAI-compatible) must be chosen explicitly; blank-model OpenRouter rows now default to `openrouter/auto`.
 
 ## [1.0.0] — 2026-05-17
 

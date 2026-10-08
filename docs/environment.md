@@ -53,7 +53,7 @@ These are created automatically on startup:
 
 ## AI Provider Settings
 
-AI code completion is configured via the Settings API (`PUT /v1/settings/:key`), not environment variables:
+AI providers are configured in the app (Settings → Integrations), not through environment variables. The keys below are deprecated and only read as a fallback for installs with no model in the `Low` tier; see [ai-providers.md](ai-providers.md).
 
 | Setting Key | Description |
 |-------------|-------------|
