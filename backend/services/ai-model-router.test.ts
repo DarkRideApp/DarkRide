@@ -4,7 +4,6 @@ import { BetterSQLite3Database, drizzle } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
 import { RateLimitCache, AiModelRouter } from './ai-model-router';
 import { RateLimitError } from './ai-provider';
-import * as aiProviderModule from './ai-provider';
 import { createTestDb } from '../test-utils/create-test-db';
 
 const { aiModels, aiProviders } = schema;
@@ -367,16 +366,15 @@ describe('AiModelRouter', () => {
       // Put first model in cooldown
       cache.record429(models[0].id);
 
-      // Spy on createProvider to return a mock provider
-      vi.spyOn(aiProviderModule, 'createProvider').mockReturnValue({
+      // Inject a factory that returns a mock provider
+      const factory = vi.fn().mockReturnValue({
         name: 'gemini',
         lastResponseHeaders: undefined,
-        buildHeaders: () => ({}),
-        formatTools: () => [],
         createStreamingRequest: async function* () {
           yield { type: 'text' as const, text: 'from fallback' };
         },
       });
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
 
       const events = await collectAsyncIterator(
         router.createStreamingRequest(
@@ -388,9 +386,9 @@ describe('AiModelRouter', () => {
 
       expect(events).toHaveLength(1);
       expect(events[0]).toEqual({ type: 'text', text: 'from fallback' });
-      // createProvider should have been called only once (for the available model)
-      expect(aiProviderModule.createProvider).toHaveBeenCalledTimes(1);
-      expect(aiProviderModule.createProvider).toHaveBeenCalledWith('gemini', expect.any(Object));
+      // The factory should have been called only once (for the available model)
+      expect(factory).toHaveBeenCalledTimes(1);
+      expect(factory).toHaveBeenCalledWith('gemini', expect.any(Object));
     });
 
     it('should fall back on RateLimitError (429)', async () => {
@@ -399,15 +397,13 @@ describe('AiModelRouter', () => {
       insertModel(db, { name: 'Model B', priority: 1, provider: 'gemini', tierId: highTierId, _providerId: geminiProviderId });
 
       let callCount = 0;
-      vi.spyOn(aiProviderModule, 'createProvider').mockImplementation(() => {
+      const factory = vi.fn().mockImplementation(() => {
         callCount++;
         if (callCount === 1) {
           // First provider throws RateLimitError
           return {
             name: 'openrouter',
             lastResponseHeaders: undefined,
-            buildHeaders: () => ({}),
-            formatTools: () => [],
             createStreamingRequest: async function* () {
               throw new RateLimitError('rate limited', new Headers());
             },
@@ -417,13 +413,12 @@ describe('AiModelRouter', () => {
         return {
           name: 'gemini',
           lastResponseHeaders: new Headers(),
-          buildHeaders: () => ({}),
-          formatTools: () => [],
           createStreamingRequest: async function* () {
             yield { type: 'text' as const, text: 'fallback response' };
           },
         };
       });
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
 
       const events = await collectAsyncIterator(
         router.createStreamingRequest(
@@ -443,15 +438,14 @@ describe('AiModelRouter', () => {
       insertModel(db, { name: 'Model A', priority: 0, tierId: highTierId, _providerId: defaultProviderId });
       insertModel(db, { name: 'Model B', priority: 1, tierId: highTierId, _providerId: defaultProviderId });
 
-      vi.spyOn(aiProviderModule, 'createProvider').mockReturnValue({
+      const factory = vi.fn().mockReturnValue({
         name: 'openrouter',
         lastResponseHeaders: undefined,
-        buildHeaders: () => ({}),
-        formatTools: () => [],
         createStreamingRequest: async function* () {
           throw new Error('API key invalid');
         },
       });
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
 
       const gen = router.createStreamingRequest(
         [{ role: 'user', content: 'hi' }],
@@ -460,8 +454,8 @@ describe('AiModelRouter', () => {
       );
 
       await expect(collectAsyncIterator(gen)).rejects.toThrow('API key invalid');
-      // Should only have called createProvider once (no fallback for non-429 errors)
-      expect(aiProviderModule.createProvider).toHaveBeenCalledTimes(1);
+      // Should only have called the factory once (no fallback for non-429 errors)
+      expect(factory).toHaveBeenCalledTimes(1);
     });
 
     it('should throw when all models are rate-limited or in cooldown', async () => {
@@ -491,15 +485,14 @@ describe('AiModelRouter', () => {
         'x-ratelimit-remaining-requests': '0',
       });
 
-      vi.spyOn(aiProviderModule, 'createProvider').mockReturnValue({
+      const factory = vi.fn().mockReturnValue({
         name: 'openrouter',
         lastResponseHeaders: undefined,
-        buildHeaders: () => ({}),
-        formatTools: () => [],
         createStreamingRequest: async function* () {
           throw new RateLimitError('rate limited', responseHeaders);
         },
       });
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
 
       const gen = router.createStreamingRequest(
         [{ role: 'user', content: 'hi' }],
@@ -521,15 +514,14 @@ describe('AiModelRouter', () => {
         'x-ratelimit-remaining-requests': '999',
       });
 
-      vi.spyOn(aiProviderModule, 'createProvider').mockReturnValue({
+      const factory = vi.fn().mockReturnValue({
         name: 'openrouter',
         lastResponseHeaders: responseHeaders,
-        buildHeaders: () => ({}),
-        formatTools: () => [],
         createStreamingRequest: async function* () {
           yield { type: 'text' as const, text: 'ok' };
         },
       });
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
 
       await collectAsyncIterator(
         router.createStreamingRequest(
@@ -542,6 +534,21 @@ describe('AiModelRouter', () => {
       const entry = cache.get(models[0].id);
       expect(entry).toBeDefined();
       expect(entry!.headers!.requestsRemaining).toBe(999);
+    });
+
+    it('uses an injected providerFactory instead of the module createProvider', async () => {
+      // The suite seeds a provider and the two hardcoded tiers but no model: add one.
+      insertModel(db, { name: 'Injected', tierId: highTierId, _providerId: defaultProviderId });
+      const seen: Array<[string, any]> = [];
+      const factory = vi.fn((typeId: string, cfg: any) => {
+        seen.push([typeId, cfg]);
+        return { name: typeId, createStreamingRequest: async function* () { yield { type: 'text' as const, text: 'hi' }; } } as any;
+      });
+      const injected = new AiModelRouter(db as any, cache, { providerFactory: factory });
+      const out: any[] = [];
+      for await (const e of injected.createStreamingRequest([{ role: 'user', content: 'x' }], 's', [])) out.push(e);
+      expect(out).toEqual([{ type: 'text', text: 'hi' }]);
+      expect(factory).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -602,17 +609,16 @@ describe('AiModelRouter', () => {
       insertModel(db, { name: 'Valid Model', provider: 'openrouter', _providerId: defaultProviderId });
       const models = router.getModels();
 
-      vi.spyOn(aiProviderModule, 'createProvider').mockReturnValue({
+      const factory = vi.fn().mockReturnValue({
         name: 'openrouter',
-        buildHeaders: () => ({}),
-        formatTools: () => [],
         createStreamingRequest: async function* () { yield { type: 'text' as const, text: 'ok' }; },
       });
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
 
       const provider = router.createProviderForModelId(models[0].id);
       expect(provider).toBeDefined();
       expect(provider.name).toBe('openrouter');
-      expect(aiProviderModule.createProvider).toHaveBeenCalledWith('openrouter', expect.any(Object));
+      expect(factory).toHaveBeenCalledWith('openrouter', expect.any(Object));
     });
 
     it('should throw for a non-existent model ID', () => {
@@ -649,12 +655,11 @@ describe('AiModelRouter', () => {
       const models = router.getModels();
       cache.record429(models[0].id);
 
-      vi.spyOn(aiProviderModule, 'createProvider').mockReturnValue({
+      const factory = vi.fn().mockReturnValue({
         name: 'openrouter',
-        buildHeaders: () => ({}),
-        formatTools: () => [],
         createStreamingRequest: async function* () { yield { type: 'text' as const, text: 'ok' }; },
       });
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
 
       // Should succeed even though model is in cooldown
       const provider = router.createProviderForModelId(models[0].id);
@@ -665,12 +670,11 @@ describe('AiModelRouter', () => {
       insertModel(db, { name: 'Disabled Model', provider: 'openrouter', enabled: false, _providerId: defaultProviderId });
       const models = router.getModels();
 
-      vi.spyOn(aiProviderModule, 'createProvider').mockReturnValue({
+      const factory = vi.fn().mockReturnValue({
         name: 'openrouter',
-        buildHeaders: () => ({}),
-        formatTools: () => [],
         createStreamingRequest: async function* () { yield { type: 'text' as const, text: 'ok' }; },
       });
+      router = new AiModelRouter(db as any, cache, { providerFactory: factory });
 
       const provider = router.createProviderForModelId(models[0].id);
       expect(provider).toBeDefined();

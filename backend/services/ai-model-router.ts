@@ -76,11 +76,20 @@ export class RateLimitCache {
 
 // ── AiModelRouter ────────────────────────────────────────────────────
 
+export interface AiModelRouterOptions {
+  providerFactory?: (typeId: string, config: AiProviderConfig) => AiProvider;
+}
+
 export class AiModelRouter {
+  private makeProvider: (typeId: string, config: AiProviderConfig) => AiProvider;
+
   constructor(
     private db: AppDatabase,
     private rateLimitCache: RateLimitCache,
-  ) {}
+    opts: AiModelRouterOptions = {},
+  ) {
+    this.makeProvider = opts.providerFactory ?? createProvider;
+  }
 
   getModels() {
     return this.db
@@ -277,6 +286,6 @@ export class AiModelRouter {
       model: model.model ?? undefined,
     };
 
-    return createProvider(model.provider, config);
+    return this.makeProvider(model.provider, config);
   }
 }
