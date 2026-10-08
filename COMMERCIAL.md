@@ -1,16 +1,22 @@
-# Commercial DarkRide
+# Supporting DarkRide
 
-DarkRide is free and open source under [AGPL-3.0](LICENSE). For people and organizations that need more, the options are: a Pro subscription, a commercial license, or bespoke work.
+DarkRide is free and open source under [AGPL-3.0](LICENSE). Every feature is in the public build and there is no paid tier. It is built and maintained by one developer. If it saves you time, these are the ways to keep it going.
 
 ---
 
-## Pro
+## Sponsor
 
-A paid tier for solo practitioners — security researchers, mobile app developers, reverse engineers, freelancers — who use DarkRide regularly and want premium features alongside the open-source build.
+[**Sponsor on GitHub →**](https://github.com/sponsors/cubehouse)
 
-Pro is the same DarkRide as Free; Pro features are gated behind a license check in the app, not behind a separate distribution. You always get the AGPL source.
+Sponsorship pays for development time. It does not unlock anything: sponsors and non-sponsors run the same software.
 
-[**See current Pro features and subscribe →**](https://darkride.app/pro)
+---
+
+## Bespoke Work
+
+Custom plugin development, integration with your existing tooling, on-premises deployment help, performance tuning, custom AI provider integrations: anything where you need DarkRide adapted to a specific use case beyond what the public tree covers.
+
+Work is scoped per project. [Reach out](#contact) with the problem you want solved and we'll talk through scope and cost.
 
 ---
 
@@ -18,7 +24,7 @@ Pro is the same DarkRide as Free; Pro features are gated behind a license check 
 
 DarkRide's AGPL-3.0 license requires that any modified version made available to users over a network must publish its complete source code under the same license. That works for some organizations; for others it doesn't fit the business model.
 
-A commercial license grants the same use of DarkRide without the AGPL copyleft requirements — useful if you need to:
+A commercial license grants the same use of DarkRide without the AGPL copyleft requirements. It is useful if you need to:
 
 - Distribute DarkRide as part of a closed-source product
 - Run a modified DarkRide as a hosted service without publishing modifications
@@ -28,17 +34,9 @@ A commercial license grants the same use of DarkRide without the AGPL copyleft r
 
 ### What you do *not* need a commercial license for
 
-- **Unmodified internal use.** Running stock DarkRide inside your company — even on a server multiple employees access — is unrestricted. The AGPL kicks in only if you *modify* DarkRide; §13 then obligates you to offer source to anyone who interacts with the modified version over a network, including internal users. If you've forked or patched DarkRide for in-house use, [reach out](#contact) and we'll discuss.
+- **Unmodified internal use.** Running stock DarkRide inside your company, even on a server multiple employees access, is unrestricted. The AGPL kicks in only if you *modify* DarkRide; §13 then obligates you to offer source to anyone who interacts with the modified version over a network, including internal users. If you've forked or patched DarkRide for in-house use, [reach out](#contact) and we'll discuss.
 - **Building proprietary plugins.** Plugins are separate works that interact through the public plugin API. You can ship closed-source plugins under any license.
 - **Contributing to DarkRide.** The [Contributor License Agreement](CLA.md) lets the project distribute contributions under both AGPL and commercial licenses.
-
----
-
-## Bespoke Work
-
-Custom plugin development, integration work, on-premises deployment help, performance tuning, custom AI provider integrations — anything where you need DarkRide adapted to a specific use case beyond what the public tree covers.
-
-If you have a problem you'd like solved on top of DarkRide, [reach out](#contact) and we'll talk through scope and shape.
 
 ---
 
@@ -46,6 +44,4 @@ If you have a problem you'd like solved on top of DarkRide, [reach out](#contact
 
 **Jamie Holding** — `hello@darkride.app`
 
-For Pro subscriptions: use the link above (or the in-app upgrade flow once live).
-
-For everything else — commercial licensing, custom plugins, embedded engineering, or anything that doesn't fit the standard options — email is the right path. Expect a response within a few business days.
+Email is the right path for bespoke work, commercial licensing, or anything that doesn't fit the options above. Expect a response within a few business days.

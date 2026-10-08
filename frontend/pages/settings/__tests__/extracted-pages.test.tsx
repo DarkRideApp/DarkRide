@@ -12,7 +12,6 @@ import { CloudStoragePage } from '../CloudStoragePage';
 import { CertificatesPage } from '../CertificatesPage';
 import { TrafficSettingsPage } from '../TrafficSettingsPage';
 import { ChangelogPage } from '../ChangelogPage';
-import { LicensePage } from '../LicensePage';
 
 function makeWs() {
   return {
@@ -50,7 +49,6 @@ describe('Extracted Settings pages — smoke render', () => {
     ['CertificatesPage', <CertificatesPage />],
     ['TrafficSettingsPage', <TrafficSettingsPage />],
     ['ChangelogPage', <ChangelogPage />],
-    ['LicensePage', <LicensePage />],
   ])('%s renders', (_name, node) => {
     expect(() => renderInRouter(node)).not.toThrow();
   });

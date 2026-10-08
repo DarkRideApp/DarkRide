@@ -154,7 +154,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full breakdown, and [do
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Legal Notice](LEGAL.md)
-- [Commercial / Pro / Consulting](COMMERCIAL.md)
+- [Sponsoring, commercial licensing and consulting](COMMERCIAL.md)
 
 ## Screenshots
 
@@ -170,7 +170,7 @@ Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development se
 
 ## Funding
 
-DarkRide is built and maintained by one developer. [DarkRide Pro](COMMERCIAL.md) supports continued development; commercial licensing and consulting are also available.
+DarkRide is free, with no paid tier, and is built and maintained by one developer. You can [sponsor development on GitHub](https://github.com/sponsors/cubehouse); bespoke work and commercial licensing are also available, see [COMMERCIAL.md](COMMERCIAL.md).
 
 ## License
 

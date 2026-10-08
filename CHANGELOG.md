@@ -35,6 +35,10 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 
 - The `ai_provider` setting and the per-provider settings `anthropic_api_key`, `gemini_api_key`, `openrouter_api_key`, `codestral_api_key`, `ollama_base_url`, `ollama_model`, and `openrouter_model`. `/v1/ai/complete` still honours them, but only when the `Low` tier has no usable model, and a startup migration copies them into providers and models. Configure providers and models in Settings → AI instead.
 
+### Removed
+
+- **DarkRide Pro.** DarkRide is free and has no paid tier. The Settings → License page, the `GET`/`PUT`/`DELETE /v1/license` endpoints and the license-key verifier are gone; no feature was ever gated behind them. A license key saved in an earlier build is ignored and can be left in place. Roadmap items that were tagged Pro are ordinary roadmap items. See `COMMERCIAL.md` for sponsorship, bespoke work and commercial licensing.
+
 ## [1.0.0] — 2026-05-17
 
 Initial public release.

@@ -101,8 +101,6 @@ import { registerIosSyslogHandlers } from './websocket/ios-syslog-handlers';
 import { IosDeviceManager } from './services/ios-device-manager';
 import { NotificationService } from './services/notification-service';
 import { registerNotificationEndpoints } from './api/notifications';
-import { LicenseService } from './services/license';
-import { registerLicenseEndpoints } from './api/license';
 import { JobRegistry } from './services/job-registry';
 import { registerJobEndpoints } from './api/jobs';
 import { PluginManager } from './plugins/plugin-manager';
@@ -289,12 +287,6 @@ registerOAuthRoutes(app, db);
 
 // Initialize notification service (early, so other services can use it)
 const notificationService = new NotificationService(db);
-
-// Initialize license service — verifies/stores DarkRide Pro license JWS.
-// init() is awaited inside the async startup IIFE below to rehydrate any
-// stored license from the DB before plugins / services start.
-const licenseService = new LicenseService(db);
-registerLicenseEndpoints(licenseService);
 
 // Initialize services
 const deviceManager = DeviceManager.getInstance(db);
@@ -943,10 +935,6 @@ httpServer.listen(PORT, HOST, () => {
 
 // Async startup: non-blocking operations that broadcast progress to connected clients
 (async () => {
-  // Rehydrate any stored Pro license from the DB. Cheap (one row + one
-  // JWS verify) so it can run before the slower phases below.
-  await licenseService.init();
-
   // docker-android — only register if the Docker daemon is reachable. The
   // provider's isAvailable() check is async, so we do it here at boot time
   // once rather than on every wizard load. Result is cached implicitly by

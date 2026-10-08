@@ -137,6 +137,26 @@ test.describe('Settings', () => {
     expect(toastErrors).toHaveLength(0);
   });
 
+  test('there is no License page or /v1/license endpoint: DarkRide has no paid tier', async ({ page }) => {
+    await loginAsAdmin(page);
+    await page.goto('/ui/settings');
+    await page.waitForLoadState('networkidle');
+
+    // Sidebar is up (Changelog sits in the same group the License link used to).
+    await expect(page.getByRole('link', { name: 'Changelog' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('link', { name: 'License' })).toHaveCount(0);
+
+    // The old deep link must not render a licence form.
+    await page.goto('/ui/settings/license');
+    await page.waitForLoadState('networkidle');
+    await expect(page.getByText('DarkRide Pro')).toHaveCount(0);
+    await expect(page.getByPlaceholder(/eyJ|license|jws/i)).toHaveCount(0);
+
+    // And the REST surface is gone.
+    const res = await page.request.get('/v1/license');
+    expect(res.status()).toBe(404);
+  });
+
   test('jobs page renders job list', async ({ page }) => {
     await loginAsAdmin(page);
     await page.goto('/ui/settings/jobs');

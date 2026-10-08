@@ -13,7 +13,6 @@ import { CloudStoragePage } from '../pages/settings/CloudStoragePage';
 import { CertificatesPage } from '../pages/settings/CertificatesPage';
 import { TrafficSettingsPage } from '../pages/settings/TrafficSettingsPage';
 import { ChangelogPage } from '../pages/settings/ChangelogPage';
-import { LicensePage } from '../pages/settings/LicensePage';
 import { Proxies } from '../pages/Proxies';
 import { Credentials } from '../pages/Credentials';
 import { Jobs } from '../pages/Jobs';
@@ -155,7 +154,6 @@ describe('Settings tour — every page renders without an error toast', () => {
     { name: 'Utilities', Component: Utils },
     { name: 'SDK Catalog', Component: SdkCatalog },
     { name: 'Changelog', Component: ChangelogPage },
-    { name: 'License', Component: LicensePage },
   ];
 
   for (const { name, Component } of pages) {
