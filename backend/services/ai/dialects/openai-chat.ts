@@ -1,7 +1,7 @@
 // backend/services/ai/dialects/openai-chat.ts
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
-import { parseSSEStream, safeText } from '../http';
+import { OPENAI_QUOTA_CODES, OVERLOADED_CODES, OVERLOADED_STATUSES, RATE_LIMIT_CODES, parseSSEStream, safeText } from '../http';
 import { AiProviderError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiCompleteRequest, AiRequest, Dialect, DialectContext } from '../dialect';
 
@@ -54,16 +54,24 @@ function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError
   const e = payload?.error ?? payload ?? {};
   const msg = typeof e === 'string' ? e : String(e.message ?? e.type ?? 'Unknown stream error');
   const code = Number(typeof e === 'object' ? (e.code ?? e.status) : NaN);
+  // OpenRouter sends a numeric code; OpenAI-style servers send string `code` and `type` values instead.
+  const names = typeof e === 'object' ? [e.code, e.type].filter((v): v is string => typeof v === 'string') : [];
+  const named = (codes: Set<string>) => names.some((n) => codes.has(n));
   const text = `${ctx.descriptor.shortName} stream error: ${safeText(msg, ctx)}`;
   const opts = { provider: ctx.descriptor.id, status: Number.isFinite(code) ? code : undefined };
-  if (code === 402) return new QuotaExhaustedError(text, opts);
-  if (code === 429) return new RateLimitError(text, new Headers(), opts);
-  if ([502, 503, 529, 408].includes(code)) return new OverloadedError(text, opts);
+  if (code === 402 || named(OPENAI_QUOTA_CODES)) return new QuotaExhaustedError(text, opts);
+  if (code === 429 || named(RATE_LIMIT_CODES)) return new RateLimitError(text, new Headers(), opts);
+  if (OVERLOADED_STATUSES.includes(code) || named(OVERLOADED_CODES)) return new OverloadedError(text, opts);
   return new AiProviderError(text, opts);
 }
 
 /** One tool call being assembled. `synthetic` marks an id we made up because the server had not sent one yet. */
 interface Buf { id: string; synthetic: boolean; name: string; args: string }
+
+/** The response was cut off: `length` is the output token limit, Mistral's `model_length` the model's context length. */
+function cutOff(finish: string | null): boolean {
+  return finish === 'length' || finish === 'model_length';
+}
 
 function argsComplete(args: string): boolean {
   if (args.trim() === '') return true;
@@ -102,7 +110,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
       if (b.args.trim() !== '') {
         try { input = JSON.parse(b.args); }
         catch {
-          if (finish === 'length') {
+          if (cutOff(finish)) {
             throw new OutputLimitError(`${shortName} response reached its output token limit in the middle of a tool call`, { provider: ctx.descriptor.id });
           }
         }
@@ -159,9 +167,15 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
 
     if (choice.finish_reason) {
       finish = choice.finish_reason;
-      yield* flush(finish === 'length'); // keep reading afterwards: the usage chunk (and any late argument fragment) follows
+      yield* flush(cutOff(finish)); // keep reading afterwards: the usage chunk (and any late argument fragment) follows
       if (signal?.aborted) return;
-      if (finish === 'length') log(`${shortName} response was cut off by the output token limit`);
+      if (cutOff(finish)) log(`${shortName} response was cut off by the output token limit`);
+      // A filtered response would otherwise just stop, which reads like a finished (or empty) answer.
+      if (finish === 'content_filter') {
+        sawContent = true;
+        yield { type: 'text', text: `${shortName} stopped this response (reason: ${safeText(finish, ctx)}).` };
+        if (signal?.aborted) return;
+      }
     }
   }
 

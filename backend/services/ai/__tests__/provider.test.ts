@@ -1,8 +1,13 @@
 // fixtures: hand-written from https://docs.anthropic.com/en/api/messages-streaming,
 // https://platform.openai.com/docs/api-reference/chat-streaming and https://docs.mistral.ai/api/#tag/fim
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createProvider, getDialect } from '../registry';
-import { AI_PROVIDER_CATALOG } from '../../../../shared/lib/ai-provider-catalog';
+import { AI_PROVIDER_CATALOG, getProviderDescriptor } from '../../../../shared/lib/ai-provider-catalog';
+import { DialectProvider } from '../provider';
+import { parseSSEStream } from '../http';
+import type { Dialect } from '../dialect';
 import { UnknownProviderError, AiProviderError, ConnectionError, isFallbackEligible } from '../errors';
 import { stubFetch, sseResponse, jsonResponse, textResponse, collect, callHeader } from '../test-helpers';
 
@@ -163,7 +168,7 @@ describe('DialectProvider', () => {
     expect(stub.calls[0].body.model).toBe('codestral-latest');
   });
   it('a model of only whitespace counts as no model', async () => {
-    const stub = stubFetch(() => sseResponse([{ data: JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }) }]));
+    const stub = stubFetch(() => sseResponse([{ data: JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] }) }]));
     await expect(collect(createProvider('openai', { apiKey: 'k', model: '  ' }).createStreamingRequest(msgs, '', []))).rejects.toThrow(/No model selected for OpenAI/);
     expect(stub.calls).toHaveLength(0);
     await collect(createProvider('gemini', { apiKey: 'k', model: ' \n' }).createStreamingRequest(msgs, '', []));
@@ -196,5 +201,197 @@ describe('DialectProvider', () => {
     expect(err).toMatchObject({ name: 'AuthError', status: 401, provider: 'codestral' });
     expect(err.message).toContain('Codestral API error (401): bad key');
     expect(err.message).not.toContain('sk-test-placeholder');
+  });
+});
+
+// ── A connection that drops after the 200 headers ─────────────────────
+
+const sse = (o: unknown, event?: string) => (event ? `event: ${event}\n` : '') + `data: ${JSON.stringify(o)}\n\n`;
+const nd = (o: unknown) => `${JSON.stringify(o)}\n`;
+
+/** Per provider: the stream fragments that make up "usage only" and "text" before the drop. */
+const DROP_CASES: Record<string, { usage: string; text: string; config: Record<string, string> }> = {
+  anthropic: {
+    usage: sse({ type: 'message_start', message: { usage: { input_tokens: 3 } } }, 'message_start'),
+    text: sse({ type: 'message_start', message: { usage: { input_tokens: 3 } } }, 'message_start')
+      + sse({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'half' } }, 'content_block_delta'),
+    config: { apiKey: 'sk-test-placeholder' },
+  },
+  openrouter: {
+    usage: sse({ choices: [], usage: { prompt_tokens: 3, completion_tokens: 0 } }),
+    text: sse({ choices: [{ delta: { content: 'half' }, finish_reason: null }] }),
+    config: { apiKey: 'sk-test-placeholder' },
+  },
+  gemini: {
+    usage: sse({ usageMetadata: { promptTokenCount: 3 } }),
+    text: sse({ candidates: [{ content: { parts: [{ text: 'half' }] } }] }),
+    config: { apiKey: 'sk-test-placeholder' },
+  },
+  ollama: {
+    usage: nd({ message: { content: '' }, prompt_eval_count: 3 }),
+    text: nd({ message: { content: 'half' } }),
+    config: { baseUrl: 'http://localhost:11434' },
+  },
+};
+
+/** A 200 body that sends `chunks` and then fails the way undici does when the socket is reset. */
+function droppedBody(chunks: string[], message = 'terminated'): ReadableStream<Uint8Array> {
+  let i = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(c) {
+      if (i < chunks.length) c.enqueue(new TextEncoder().encode(chunks[i++]));
+      else c.error(new TypeError(message));
+    },
+  });
+}
+
+describe('DialectProvider: a connection dropped mid-stream is a ConnectionError', () => {
+  const msgs = [{ role: 'user' as const, content: 'hi' }];
+  for (const [id, c] of Object.entries(DROP_CASES)) {
+    for (const [label, chunks] of [['before any content', []], ['after only usage', [c.usage]], ['after some text', [c.text]]] as const) {
+      it(`${id}: ${label}`, async () => {
+        stubFetch(() => new Response(droppedBody([...chunks]), { status: 200 }));
+        const p = createProvider(id, c.config);
+        const seen: any[] = [];
+        const err: any = await (async () => { for await (const e of p.createStreamingRequest(msgs, '', [])) seen.push(e); })().catch((e) => e);
+        expect(err).toBeInstanceOf(ConnectionError);
+        expect(err.message).toBe(`${(p as any).descriptor.shortName} closed the connection while streaming`);
+        expect(err.provider).toBe(id);
+        expect(isFallbackEligible(err)).toBe(true);
+        expect(err.cause).toBeInstanceOf(TypeError);
+        const content = seen.filter((e) => e.type !== 'usage');
+        expect(content).toEqual(label === 'after some text' ? [{ type: 'text', text: 'half' }] : []);
+      });
+    }
+  }
+
+  it('the key is redacted from the cause', async () => {
+    stubFetch(() => new Response(droppedBody([], 'socket closed for sk-test-placeholder'), { status: 200 }));
+    const err: any = await collect(createProvider('openrouter', { apiKey: 'sk-test-placeholder' }).createStreamingRequest(msgs, '', [])).catch((e) => e);
+    expect(err).toBeInstanceOf(ConnectionError);
+    expect(String(err.cause.message)).not.toContain('sk-test-placeholder');
+    expect(String(err.cause.stack)).not.toContain('sk-test-placeholder');
+  });
+
+  it('complete(): a drop while the chat stream is read is a ConnectionError too', async () => {
+    stubFetch(() => new Response(droppedBody([DROP_CASES.openrouter.text]), { status: 200 }));
+    const err: any = await createProvider('openrouter', { apiKey: 'k' }).complete({ prefix: 'a', suffix: 'b' }).catch((e) => e);
+    expect(err).toBeInstanceOf(ConnectionError);
+  });
+
+  it('a caller abort while the stream is read passes through unchanged', async () => {
+    const ac = new AbortController();
+    stubFetch((call) => new Response(stalledBody(call.init.signal, sse({ choices: [{ delta: { content: 'a' } }] })), { status: 200 }));
+    const seen: any[] = [];
+    const err: any = await (async () => {
+      for await (const e of createProvider('openrouter', { apiKey: 'k' }).createStreamingRequest(msgs, '', [], { signal: ac.signal })) {
+        seen.push(e);
+        setTimeout(() => ac.abort(new DOMException('stop', 'AbortError')), 5);
+      }
+    })().then(() => undefined, (e) => e);
+    // Either the dialect noticed the abort and stopped quietly, or the read rejected with the abort reason. Never a ConnectionError.
+    if (err !== undefined) {
+      expect(err).not.toBeInstanceOf(ConnectionError);
+      expect(err.name).toBe('AbortError');
+    }
+    expect(seen).toEqual([{ type: 'text', text: 'a' }]);
+  });
+
+  it('an abort while a body read is pending surfaces the abort reason itself', async () => {
+    const ac = new AbortController();
+    const reason = new DOMException('caller stopped', 'AbortError');
+    stubFetch((call) => new Response(stalledBody(call.init.signal, ''), { status: 200 }));
+    setTimeout(() => ac.abort(reason), 10);
+    const err: any = await collect(createProvider('openrouter', { apiKey: 'k' }).createStreamingRequest(msgs, '', [], { signal: ac.signal })).catch((e) => e);
+    expect(err).toBe(reason);
+  });
+
+  it('a bug in a parser is rethrown as itself, not as a dropped connection', async () => {
+    const bug = new TypeError("Cannot read properties of null (reading 'choices')");
+    const buggy: Dialect = {
+      ...getDialect('openai-chat'),
+      async *parseStream(res, ctx, signal) {
+        for await (const _sse of parseSSEStream(res.body!, signal)) throw bug;
+      },
+    };
+    stubFetch(() => sseResponse([{ data: '{}' }]));
+    const p = new DialectProvider(getProviderDescriptor('openrouter')!, buggy, { apiKey: 'k' });
+    const err: any = await collect(p.createStreamingRequest(msgs, '', [])).catch((e) => e);
+    expect(err).toBe(bug);
+    expect(err).not.toBeInstanceOf(ConnectionError);
+    expect(isFallbackEligible(err)).toBe(false);
+  });
+
+  it('a provider error raised by the dialect passes through unchanged', async () => {
+    stubFetch(() => new Response(droppedBody([sse({ error: { code: 429, message: 'slow' } })]), { status: 200 }));
+    const err: any = await collect(createProvider('openrouter', { apiKey: 'k' }).createStreamingRequest(msgs, '', [])).catch((e) => e);
+    expect(err.name).toBe('RateLimitError');
+  });
+});
+
+describe('DialectProvider: an over-long stream line', () => {
+  it('fails with the provider named, and is not fallback-eligible', async () => {
+    const chunk = new TextEncoder().encode('a'.repeat(64 * 1024));
+    let sent = 0;
+    stubFetch(() => new Response(new ReadableStream<Uint8Array>({
+      pull(c) { if (sent++ < 140) c.enqueue(chunk); else c.close(); },
+    }), { status: 200 }));
+    const err: any = await collect(createProvider('openrouter', { apiKey: 'k' }).createStreamingRequest([{ role: 'user', content: 'hi' }], '', [])).catch((e) => e);
+    expect(err).toBeInstanceOf(AiProviderError);
+    expect(err.message).toBe('OpenRouter sent a line longer than 8 MB');
+    expect(err.provider).toBe('openrouter');
+    expect(isFallbackEligible(err)).toBe(false);
+  });
+});
+
+describe('DialectProvider against a real local server', () => {
+  let server: http.Server | undefined;
+  afterEach(async () => {
+    if (!server) return;
+    server.closeAllConnections();
+    await new Promise<void>((r) => server!.close(() => r()));
+    server = undefined;
+  });
+  async function listen(handler: http.RequestListener): Promise<string> {
+    server = http.createServer(handler);
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
+    return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  }
+  const msgs = [{ role: 'user' as const, content: 'hi' }];
+
+  it('a socket reset after the 200 headers is a ConnectionError', async () => {
+    const url = await listen((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(': keep-alive\n\n');
+        setTimeout(() => res.socket?.destroy(), 20);
+      });
+    });
+    const err: any = await collect(createProvider('openai-compatible', { baseUrl: `${url}/v1`, model: 'm' }).createStreamingRequest(msgs, '', [])).catch((e) => e);
+    expect(err).toBeInstanceOf(ConnectionError);
+    expect(err.message).toBe('OpenAI-compatible closed the connection while streaming');
+    expect(isFallbackEligible(err)).toBe(true);
+  });
+
+  it('a consumer that stops iterating closes the upstream connection', async () => {
+    let closed = false;
+    const url = await listen((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.on('close', () => { closed = true; });
+        const t = setInterval(() => {
+          if (res.destroyed) { clearInterval(t); return; }
+          res.write(sse({ choices: [{ delta: { content: 'x' } }] }));
+        }, 10);
+      });
+    });
+    let n = 0;
+    for await (const _e of createProvider('openai-compatible', { baseUrl: `${url}/v1`, model: 'm' }).createStreamingRequest(msgs, '', [])) {
+      if (++n >= 3) break;
+    }
+    for (let i = 0; i < 100 && !closed; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(closed).toBe(true);
   });
 });

@@ -174,11 +174,18 @@ describe('ollama', () => {
       ]);
     });
 
-    it('drops a final line that has no trailing newline', async () => {
+    it('reads a final line that has no trailing newline', async () => {
       stubFetch(() => chunkedResponse(['{"message":{"content":"a"}}\n', '{"done":true,"prompt_eval_count":2,"eval_count":2}']));
-      // Unchanged: the NDJSON reader only emits complete lines, so an unterminated last line (here the usage
-      // line) is lost. Ollama always ends its lines with a newline; flushing the tail would be a deliberate change.
-      expect(await run()).toEqual([{ type: 'text', text: 'a' }]);
+      // Was: the NDJSON reader only emitted complete lines, so an unterminated last line (here the usage line) was lost.
+      // Now: a stream that ends without a done line is an error, so the reader parses an unterminated last line
+      // instead of turning a complete answer into a failure.
+      expect(await run()).toEqual([{ type: 'text', text: 'a' }, { type: 'usage', inputTokens: 2, outputTokens: 2 }]);
+    });
+
+    it('a stream cut off before the done line is an error', async () => {
+      stubFetch(() => chunkedResponse(['{"message":{"content":"half a sent"}}\n']));
+      // Was: treated as a complete reply. Now: the router sees a failure instead of a silently truncated answer.
+      await expect(run()).rejects.toMatchObject({ name: 'AiProviderError', message: 'Ollama stream ended before done' });
     });
 
     it('throws a RateLimitError on 429', async () => {

@@ -1,6 +1,9 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { classifyHttpError, redact, safeText, upstreamMessage, sendChat, sendChecked, parseSSEStream, readJson, MAX_JSON_BODY_BYTES } from '../http';
-import { AuthError, QuotaExhaustedError, RateLimitError, OverloadedError, ConnectionError, AiProviderError } from '../errors';
+import {
+  classifyHttpError, redact, safeText, upstreamMessage, sendChat, sendChecked, parseSSEStream, parseNDJSONStream, readJson,
+  MAX_JSON_BODY_BYTES, MAX_STREAM_LINE_CHARS, LineTooLongError,
+} from '../http';
+import { AuthError, QuotaExhaustedError, RateLimitError, OverloadedError, ConnectionError, AiProviderError, isFallbackEligible } from '../errors';
 import { getProviderDescriptor } from '../../../../shared/lib/ai-provider-catalog';
 import type { Dialect, DialectContext } from '../dialect';
 import { stubFetch, jsonResponse, textResponse, sseResponse, chunkedResponse } from '../test-helpers';
@@ -22,12 +25,25 @@ describe('classifyHttpError', () => {
   const cls = (status: number, body: string, headers: Record<string, string> = {}, id = 'openai') =>
     classifyHttpError(nullDialect, ctxFor(id), status, new Headers(headers), body);
 
-  it('401/403 -> AuthError with the descriptor hint appended', () => {
+  it('401 -> AuthError with the descriptor hint appended', () => {
     const e = cls(401, '{"error":{"message":"bad key"}}', {}, 'codestral');
     expect(e).toBeInstanceOf(AuthError);
     expect(e.message).toMatch(/^Codestral API error \(401\): bad key/);
     expect(e.message).toContain('Hint:');
     expect(e.message).toContain('codestral.mistral.ai');
+  });
+  it('403 -> plain AiProviderError: a refusal for one request or resource, not a bad key', () => {
+    // Was: a 403 was an AuthError like a 401, which put the whole provider on cooldown.
+    // Now: only a 401 is a credential failure. A 403 (a moderation or guardrail block, a key without access to one
+    // model, a region or organisation restriction) fails this request only, with no fallback and no cooldown.
+    for (const id of ['openrouter', 'anthropic', 'openai', 'codestral']) {
+      const e = cls(403, '{"error":{"message":"flagged by moderation"}}', {}, id);
+      expect(e.constructor).toBe(AiProviderError);
+      expect(e.status).toBe(403);
+      expect(e.provider).toBe(id);
+      expect(e.message).toBe(`${getProviderDescriptor(id)!.shortName} API error (403): flagged by moderation`);
+      expect(isFallbackEligible(e)).toBe(false);
+    }
   });
   it('402 -> Quota, but 402 with Retry-After -> RateLimit', () => {
     expect(cls(402, 'insufficient credits')).toBeInstanceOf(QuotaExhaustedError);
@@ -40,6 +56,9 @@ describe('classifyHttpError', () => {
   it('openai-style quota codes at 429 -> Quota; plain 429 -> RateLimit', () => {
     expect(cls(429, '{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}')).toBeInstanceOf(QuotaExhaustedError);
     expect(cls(429, '{"error":{"code":"project_spend_limit_exceeded","message":"x"}}')).toBeInstanceOf(QuotaExhaustedError);
+    expect(cls(429, '{"error":{"code":"organization_spend_limit_exceeded","message":"x"}}')).toBeInstanceOf(QuotaExhaustedError);
+    expect(cls(429, '{"error":{"code":"organization_usage_limit_exceeded","message":"x"}}')).toBeInstanceOf(QuotaExhaustedError);
+    expect(cls(429, '{"error":{"code":"credit_balance_exhausted","message":"x"}}')).toBeInstanceOf(QuotaExhaustedError);
     const e = cls(429, 'slow down', { 'x-ratelimit-remaining-requests': '0' });
     expect(e).toBeInstanceOf(RateLimitError);
     expect((e as RateLimitError).headers.get('x-ratelimit-remaining-requests')).toBe('0');
@@ -161,14 +180,52 @@ describe('sendChat', () => {
     expect(stub.calls[0].url).toBe('https://x.test/chat');
   });
   it('maps a thrown network error to ConnectionError without leaking the key', async () => {
-    stubFetch(() => { throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:11434'), { code: 'ECONNREFUSED' }) }); });
-    await expect(sendChat(nullDialect, ctxFor('ollama', { baseUrl: 'http://127.0.0.1:11434' }), { messages: [], systemPrompt: '', tools: [] }, { stream: true }))
-      .rejects.toBeInstanceOf(ConnectionError);
+    const leaky = 'connect ECONNREFUSED for sk-test-placeholder via http://user:secret@127.0.0.1:11434';
+    stubFetch(() => { throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(leaky), { code: 'ECONNREFUSED' }) }); });
+    const err: any = await sendChat(nullDialect, ctxFor('ollama', { baseUrl: 'http://127.0.0.1:11434' }), { messages: [], systemPrompt: '', tools: [] }, { stream: true })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(ConnectionError);
+    expect(err.message).toBe('Ollama request failed: connect ECONNREFUSED for *** via http://***@127.0.0.1:11434');
+    for (const text of [err.message, err.cause.message, err.cause.stack ?? '', err.cause.cause.message, err.cause.cause.stack ?? '']) {
+      expect(text).not.toContain('sk-test-placeholder');
+      expect(text).not.toContain('user:secret@');
+    }
   });
   it('explains a redirect refusal', async () => {
     stubFetch(() => { throw Object.assign(new TypeError('fetch failed'), { cause: new Error('unexpected redirect') }); });
-    await expect(sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }))
-      .rejects.toThrow(/redirect/i);
+    const err: any = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+    expect(err).toBeInstanceOf(ConnectionError);
+    expect(err.message).toBe(
+      'OpenAI answered with a redirect. Redirects are not followed because they could forward the API key. Use the final URL as Base URL.',
+    );
+  });
+  it('an abort while the request is pending surfaces the abort reason, not a ConnectionError', async () => {
+    const ac = new AbortController();
+    const reason = new DOMException('caller stopped', 'AbortError');
+    // Like fetch: the pending request rejects with the abort reason of the signal it was given.
+    stubFetch((call) => new Promise<Response>((_resolve, reject) => {
+      const s = call.init.signal as AbortSignal;
+      s.addEventListener('abort', () => reject(s.reason), { once: true });
+    }));
+    const p = sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [], signal: ac.signal }, { stream: true }).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 5));
+    ac.abort(reason);
+    const err = await p;
+    expect(err).toBe(reason);
+    expect(err).not.toBeInstanceOf(ConnectionError);
+  });
+  it('waits 60 s for headers by default', async () => {
+    vi.useFakeTimers();
+    stubFetch((_c) => new Promise<Response>(() => {}));
+    const ctx = ctxFor('openai', { descriptor: { ...getProviderDescriptor('openai')!, headersTimeoutMs: undefined } as any });
+    let settled: unknown;
+    const p = sendChat(nullDialect, ctx, { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => { settled = e; });
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(settled).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1_001);
+    await p;
+    expect(settled).toBeInstanceOf(ConnectionError);
+    expect((settled as Error).message).toBe('OpenAI did not respond within 60s');
   });
   it('the raw fetch error attached as cause carries no key or URL userinfo in its message or stack', async () => {
     const leaky = `bad ${'sk-test-placeholder'} at https://u:p@host.test/x`;
@@ -407,7 +464,7 @@ describe('readJson', () => {
     const chunk = enc.encode('x'.repeat(1024 * 1024));
     let cancelled = false;
     const body = new ReadableStream<Uint8Array>({ pull(c) { c.enqueue(chunk); }, cancel() { cancelled = true; } });
-    const err = await readJson(ok(body), ctxFor('openai')).catch((e) => e);
+    const err: any = await readJson(ok(body), ctxFor('openai')).catch((e) => e);
     expect(err).toBeInstanceOf(AiProviderError);
     expect(err.message).toBe('OpenAI response is too large');
     expect(cancelled).toBe(true);
@@ -420,7 +477,7 @@ describe('readJson', () => {
       start(c) { c.enqueue(enc.encode('{"da')); },
       pull(c) { c.error(new TypeError('terminated near sk-test-placeholder')); },
     });
-    const err = await readJson(ok(body), ctxFor('openai')).catch((e) => e);
+    const err: any = await readJson(ok(body), ctxFor('openai')).catch((e) => e);
     expect(err).toBeInstanceOf(ConnectionError);
     expect(err.message).toBe('OpenAI closed the connection while sending the response');
     expect(err.provider).toBe('openai');
@@ -570,7 +627,7 @@ describe('classifyHttpError precedence', () => {
   const cls = (status: number, body: string, headers: Record<string, string> = {}, id = 'openai') =>
     classifyHttpError(nullDialect, ctxFor(id), status, new Headers(headers), body);
 
-  it('a 401 whose body says "credit balance is too low" is an AuthError (status rules beat body markers for 401/403)', () => {
+  it('a 401 whose body says "credit balance is too low" is an AuthError (the 401 status rule beats body markers)', () => {
     const e = cls(401, '{"error":{"message":"Your credit balance is too low to access the Anthropic API."}}', {}, 'anthropic');
     expect(e).toBeInstanceOf(AuthError);
     expect(e).not.toBeInstanceOf(QuotaExhaustedError);
@@ -586,10 +643,108 @@ describe('classifyHttpError precedence', () => {
 });
 
 describe('parseSSEStream', () => {
-  it('handles CRLF split across chunks, comments, and multi-line data', async () => {
-    const res = chunkedResponse([': hi\r', '\nevent: a\r\ndata: 1\r\ndata: 2\r\n\r\n', 'data: [DONE]\n\n']);
+  it('handles comments, CRLF, and multi-line data', async () => {
+    const res = chunkedResponse([': hi\r\nevent: a\r\ndata: 1\r\ndata: 2\r\n\r\n', 'data: [DONE]\n\n']);
     const out: any[] = [];
     for await (const e of parseSSEStream(res.body!)) out.push(e);
     expect(out).toEqual([{ event: 'a', data: '1\n2' }, { data: '[DONE]' }]);
+  });
+  it('a CRLF split across chunks inside an event is one line ending, not an empty line that ends the event', async () => {
+    const res = chunkedResponse(['data: a\r', '\ndata: b\r\n\r\n']);
+    const out: any[] = [];
+    for await (const e of parseSSEStream(res.body!)) out.push(e);
+    expect(out).toEqual([{ data: 'a\nb' }]);
+  });
+  it('a CR at the end of one chunk followed by LF in the next, repeatedly, including the blank line', async () => {
+    const res = chunkedResponse(['data: 1\r', '\ndata: 2\r', '\n\r', '\n']);
+    const out: any[] = [];
+    for await (const e of parseSSEStream(res.body!)) out.push(e);
+    expect(out).toEqual([{ data: '1\n2' }]);
+  });
+});
+
+describe('parseNDJSONStream', () => {
+  it('parses a final line that has no trailing newline', async () => {
+    const out: any[] = [];
+    for await (const e of parseNDJSONStream(chunkedResponse(['{"a":1}\n{"b"', ':2}']).body!)) out.push(e);
+    expect(out).toEqual([{ a: 1 }, { b: 2 }]);
+  });
+});
+
+/** A body that sends `head`, `count` copies of `chunk`, then `tail`, then closes. Encodes `chunk` once. */
+function repeatedBody(chunk: string, count: number, tail = '', head = ''): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(chunk);
+  let i = 0;
+  let sentHead = !head;
+  return new ReadableStream<Uint8Array>({
+    pull(c) {
+      if (!sentHead) { sentHead = true; c.enqueue(new TextEncoder().encode(head)); return; }
+      if (i < count) { i++; c.enqueue(bytes); return; }
+      if (tail) c.enqueue(new TextEncoder().encode(tail));
+      c.close();
+    },
+  });
+}
+
+/** An endless body that records whether it was cancelled. */
+function endlessBody(line: string): { body: ReadableStream<Uint8Array>; cancelled: () => boolean } {
+  let cancelled = false;
+  const bytes = new TextEncoder().encode(line);
+  return {
+    body: new ReadableStream<Uint8Array>({ pull(c) { c.enqueue(bytes); }, cancel() { cancelled = true; } }),
+    cancelled: () => cancelled,
+  };
+}
+
+describe.each([
+  ['parseSSEStream', (b: ReadableStream<Uint8Array>) => parseSSEStream(b), 'data: {"x":1}\n\n', 'data: '],
+  ['parseNDJSONStream', (b: ReadableStream<Uint8Array>) => parseNDJSONStream(b), '{"x":1}\n', '{"x":"'],
+] as const)('%s: stopping and long lines', (_name, parse, oneEvent, linePrefix) => {
+  it('cancels the body when the consumer stops iterating without aborting', async () => {
+    const { body, cancelled } = endlessBody(oneEvent);
+    let n = 0;
+    for await (const _e of parse(body)) if (++n >= 3) break;
+    expect(n).toBe(3);
+    expect(cancelled()).toBe(true);
+  });
+
+  it('a 100 KB line passes', async () => {
+    const big = 'a'.repeat(100 * 1024);
+    const out: any[] = [];
+    const tail = linePrefix.startsWith('data') ? '\n\n' : '"}\n';
+    for await (const e of parse(repeatedBody(linePrefix + big, 1, tail))) out.push(e);
+    expect(out).toHaveLength(1);
+    expect(JSON.stringify(out[0]).length).toBeGreaterThan(100 * 1024);
+  });
+
+  it('a line just over the cap throws a LineTooLongError quickly', async () => {
+    const chunk = 'a'.repeat(64 * 1024);
+    const count = Math.floor(MAX_STREAM_LINE_CHARS / chunk.length) + 1;
+    const started = Date.now();
+    const err: any = await (async () => { for await (const _e of parse(repeatedBody(chunk, count))) { /* drain */ } })().catch((e) => e);
+    expect(err).toBeInstanceOf(LineTooLongError);
+    expect(err).toBeInstanceOf(AiProviderError);
+    expect(isFallbackEligible(err)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('a line exactly at the cap is still accepted', async () => {
+    const chunk = 'a'.repeat(64 * 1024);
+    const count = MAX_STREAM_LINE_CHARS / chunk.length;   // the cap is a whole number of 64 KB chunks
+    expect(Number.isInteger(count)).toBe(true);
+    let n = 0;
+    for await (const _e of parse(repeatedBody(chunk, count, '\n\n'))) n++;
+    // The line is not valid JSON/SSE content worth an event; reaching here without a throw is the point.
+    expect(n).toBeLessThanOrEqual(1);
+  });
+
+  it('a 3 MB line delivered in 64 KB chunks is scanned in linear time', async () => {
+    const chunk = 'a'.repeat(64 * 1024);
+    const started = Date.now();
+    const out: any[] = [];
+    const tail = linePrefix.startsWith('data') ? '\n\n' : '"}\n';
+    for await (const e of parse(repeatedBody(chunk, 48, tail, linePrefix))) out.push(e);
+    expect(out).toHaveLength(1);
+    expect(Date.now() - started).toBeLessThan(1000);
   });
 });

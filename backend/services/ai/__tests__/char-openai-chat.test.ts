@@ -413,10 +413,11 @@ describe('Error responses across providers', () => {
     stubFetch(() => textResponse('{"error":"forbidden"}', 403));
     const p = runWith('gemini', { apiKey: 'bad' });
     await expect(p).rejects.toThrow(/403/);
-    // Was a plain Error carrying the raw JSON body. Now the provider's message is extracted from the JSON,
-    // and a 403 is an AuthError.
+    // Was a plain Error carrying the raw JSON body. Now the provider's message is extracted from the JSON.
+    // Was: a 403 was an AuthError. Now: a 403 without a credential marker is a plain AiProviderError, because it
+    // refuses one request or resource rather than proving the key is bad, so it must not cool the provider down.
     await expect(p).rejects.toThrow('Gemini API error (403): forbidden');
-    await expect(p).rejects.toMatchObject({ name: 'AuthError' });
+    await expect(p).rejects.toMatchObject({ name: 'AiProviderError', status: 403 });
   });
 
   it('Ollama should throw on 500 with error body', async () => {

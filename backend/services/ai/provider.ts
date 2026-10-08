@@ -1,8 +1,8 @@
 import { randomUUID } from 'crypto';
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../shared/types/ai-chat';
 import { normalizeBaseUrl, type AiProviderDescriptor } from '../../../shared/lib/ai-provider-catalog';
-import { AiProviderError, OutputLimitError } from './errors';
-import { readJson, sendChat, sendChecked } from './http';
+import { AiProviderError, ConnectionError, OutputLimitError } from './errors';
+import { LineTooLongError, StreamReadError, readJson, redactedCause, sendChat, sendChecked } from './http';
 import type {
   AiCompleteRequest, AiProvider, AiProviderConfig, AiRequest, AiStreamOptions, Dialect, DialectContext,
 } from './dialect';
@@ -66,8 +66,22 @@ export class DialectProvider implements AiProvider {
   private async *stream(ctx: DialectContext, req: AiRequest): AsyncIterable<AiStreamEvent> {
     const { res, ctx: used } = await sendChat(this.dialect, ctx, req, { stream: true });
     this.lastResponseHeaders = res.headers;
-    if (!res.body) throw new AiProviderError(`${this.descriptor.shortName} response has no body`, { provider: this.descriptor.id });
-    yield* this.dialect.parseStream(res, used, req.signal);
+    const d = this.descriptor;
+    if (!res.body) throw new AiProviderError(`${d.shortName} response has no body`, { provider: d.id });
+    try {
+      yield* this.dialect.parseStream(res, used, req.signal);
+    } catch (err) {
+      if (err instanceof LineTooLongError) throw new AiProviderError(`${d.shortName} sent a line longer than 8 MB`, { provider: d.id });
+      if (err instanceof StreamReadError) {
+        // The caller aborted (or its timeout fired): surface the abort reason itself.
+        if (req.signal?.aborted) throw err.cause;
+        // The body read failed after the 200 headers (undici reports a reset as "TypeError: terminated").
+        // A ConnectionError lets the router fall back, as it does for a failed connect.
+        throw new ConnectionError(`${d.shortName} closed the connection while streaming`, { provider: d.id, cause: redactedCause(err.cause, used.apiKey) });
+      }
+      // Anything else (a classified provider error, or a bug in a parser) passes through as it is.
+      throw err;
+    }
   }
 
   /**

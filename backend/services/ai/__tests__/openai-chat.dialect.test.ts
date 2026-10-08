@@ -4,7 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { openAiChatDialect, __resetOpenAiChatMemo } from '../dialects/openai-chat';
 import { makeCtx } from '../test-ctx';
 import { sseResponse, sseBody, chunkedResponse, collect } from '../test-helpers';
-import { OutputLimitError, AiProviderError, QuotaExhaustedError, RateLimitError } from '../errors';
+import { OutputLimitError, AiProviderError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiToolDefinition } from '../../../../shared/types/ai-chat';
 
 const { logSpy } = vi.hoisted(() => ({ logSpy: vi.fn() }));
@@ -86,6 +86,11 @@ describe('retryWith', () => {
     expect(next?.flags.noStreamUsage).toBe(true);
     const later: any = openAiChatDialect.buildChat(makeCtx('openai-compatible'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).body;
     expect(later.stream_options).toBeUndefined();
+  });
+  it('a 422 that names stream_options also triggers the retry without it', () => {
+    const next = openAiChatDialect.retryWith!(422, '{"detail":[{"loc":["body","stream_options"],"msg":"Extra inputs are not permitted"}]}', makeCtx('mistral'));
+    expect(next?.flags.noStreamUsage).toBe(true);
+    expect(openAiChatDialect.retryWith!(422, 'something else', makeCtx('mistral'))).toBeUndefined();
   });
   it('ignores other failures and providers that always send it', () => {
     expect(openAiChatDialect.retryWith!(400, 'something else', makeCtx('openai-compatible'))).toBeUndefined();
@@ -398,6 +403,55 @@ describe('parseStream', () => {
     await expect(run(sseResponse([chunk({ error: { code: 429, message: 'slow' } })]), 'openrouter')).rejects.toBeInstanceOf(RateLimitError);
     await expect(run(sseResponse([chunk({ error: { message: 'boom' } })]), 'openrouter')).rejects.toThrow(/OpenRouter stream error: boom/);
     await expect(run(sseResponse([delta({}, 'error')]), 'openrouter')).rejects.toBeInstanceOf(AiProviderError);
+  });
+
+  describe('in-stream error codes, numeric and string', () => {
+    const cases: Array<[string, Record<string, unknown>, Function]> = [
+      ['numeric 402', { code: 402 }, QuotaExhaustedError],
+      ['numeric 429', { code: 429 }, RateLimitError],
+      ['numeric 502', { code: 502 }, OverloadedError],
+      ['numeric 503', { code: 503 }, OverloadedError],
+      ['numeric 529', { code: 529 }, OverloadedError],
+      ['numeric 408', { code: 408 }, OverloadedError],
+      ['numeric status 429', { status: 429 }, RateLimitError],
+      ['string code rate_limit_exceeded', { type: 'requests', code: 'rate_limit_exceeded' }, RateLimitError],
+      ['string type rate_limit_exceeded', { type: 'rate_limit_exceeded' }, RateLimitError],
+      ['string type rate_limit_error', { type: 'rate_limit_error' }, RateLimitError],
+      ['string code insufficient_quota', { code: 'insufficient_quota' }, QuotaExhaustedError],
+      ['string type insufficient_quota', { type: 'insufficient_quota' }, QuotaExhaustedError],
+      ['string code project_spend_limit_exceeded', { code: 'project_spend_limit_exceeded' }, QuotaExhaustedError],
+      ['string type overloaded_error', { type: 'overloaded_error' }, OverloadedError],
+      ['string code overloaded', { code: 'overloaded' }, OverloadedError],
+      ['string code engine_overloaded', { code: 'engine_overloaded' }, OverloadedError],
+      ['string code service_unavailable', { code: 'service_unavailable' }, OverloadedError],
+      ['string type server_error', { type: 'server_error' }, AiProviderError],
+      ['an unknown string code', { code: 'something_else' }, AiProviderError],
+      ['a numeric 500', { code: 500 }, AiProviderError],
+      ['no code at all', {}, AiProviderError],
+    ];
+    it.each(cases)('%s', async (_label, fields, cls) => {
+      const err: any = await run(sseResponse([chunk({ error: { ...fields, message: 'upstream said no' } })]), 'openai').catch((e) => e);
+      expect(err.constructor).toBe(cls);
+      expect(err.message).toBe('OpenAI stream error: upstream said no');
+      expect(err.provider).toBe('openai');
+      if (cls === RateLimitError) expect(err.headers).toBeInstanceOf(Headers);
+    });
+  });
+
+  it('finish_reason content_filter yields a visible message instead of ending silently', async () => {
+    const events = await run(sseResponse([delta({ content: 'Sure, ' }), delta({}, 'content_filter'), { data: '[DONE]' }]), 'openai');
+    expect(events).toEqual([
+      { type: 'text', text: 'Sure, ' },
+      { type: 'text', text: 'OpenAI stopped this response (reason: content_filter).' },
+    ]);
+  });
+
+  it('Mistral finish_reason model_length is treated like length', async () => {
+    await expect(run(sseResponse([delta(tc({ index: 0, id: 'a', name: 'f', args: '{"q":"abc' })), delta({}, 'model_length')]), 'mistral'))
+      .rejects.toBeInstanceOf(OutputLimitError);
+    const ok = await run(sseResponse([delta({ content: 'cut off' }, 'model_length')]), 'mistral');
+    expect(ok).toEqual([{ type: 'text', text: 'cut off' }]);
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Mistral response was cut off by the output token limit'));
   });
 
   it('survives SSE comments, CRLF, and chunk splits mid-line', async () => {

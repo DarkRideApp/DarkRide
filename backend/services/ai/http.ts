@@ -6,31 +6,106 @@ import type { BuiltRequest, Dialect, DialectContext, AiRequest } from './dialect
 
 // ── SSE / NDJSON readers ──────────────────────────────────────────────
 
+/**
+ * Longest line (in characters) a stream reader buffers while waiting for its line ending. Real events are a few KB;
+ * a server that never sends a newline would otherwise grow the buffer without bound.
+ */
+export const MAX_STREAM_LINE_CHARS = 8 * 1024 * 1024;
+
+/**
+ * A stream line passed MAX_STREAM_LINE_CHARS. The readers do not know which provider they read, so the message is
+ * generic; DialectProvider rethrows it with the provider's name.
+ */
+export class LineTooLongError extends AiProviderError {
+  constructor() { super('The server sent a line longer than 8 MB'); }
+}
+
+/**
+ * The unfinished last line of a stream, kept as the pieces that arrived so each piece is copied once (when the line
+ * completes) rather than once per chunk. Throws LineTooLongError when it passes MAX_STREAM_LINE_CHARS.
+ */
+class PendingLine {
+  private parts: string[] = [];
+  private length = 0;
+
+  hold(text: string): void {
+    if (!text) return;
+    this.parts.push(text);
+    this.length += text.length;
+    if (this.length > MAX_STREAM_LINE_CHARS) throw new LineTooLongError();
+  }
+
+  /** The held text followed by `rest`, as one line. Empties the buffer. */
+  take(rest: string): string {
+    if (this.length === 0) return rest;
+    this.parts.push(rest);
+    const line = this.parts.join('');
+    this.parts = [];
+    this.length = 0;
+    return line;
+  }
+}
+
+/**
+ * Reading the response body failed (the connection was reset or closed early, or the request was aborted). The
+ * original error is the `cause`. Not an AiProviderError: DialectProvider decides what it means, using the caller's
+ * signal, so a bug in a parser is never mistaken for a dropped connection.
+ */
+export class StreamReadError extends Error {
+  constructor(cause: unknown) {
+    super('Reading the response stream failed', { cause });
+    this.name = 'StreamReadError';
+  }
+}
+
+/** `reader.read()`, with a rejection wrapped as a StreamReadError. Only the read is wrapped. */
+async function readChunk(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  try {
+    return await reader.read();
+  } catch (err) {
+    throw new StreamReadError(err);
+  }
+}
+
+/** Stop reading the body (so a consumer that stops iterating also closes the connection), then release it. */
+function closeReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  reader.cancel().catch(() => { /* already closed or errored */ });
+  reader.releaseLock();
+}
+
 export async function* parseSSEStream(
   body: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
 ): AsyncGenerator<{ event?: string; data: string }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
+  const pending = new PendingLine();
+  // The previous chunk ended in CR: an LF at the start of this one completes that CRLF, it is not an empty line.
+  let skipLF = false;
   let currentEvent: string | undefined;
   let currentData: string[] = [];
+  const lineEnding = /\r\n|\r|\n/g;
 
   try {
     while (true) {
       if (signal?.aborted) return;
-      const { done, value } = await reader.read();
+      const { done, value } = await readChunk(reader);
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      let text = decoder.decode(value, { stream: true });
+      if (skipLF && text) {
+        if (text.charCodeAt(0) === 10) text = text.slice(1);
+        skipLF = false;
+      }
 
-      // SSE permits CRLF, LF, or CR endings. Keep a trailing CR buffered so
-      // a CRLF split across network chunks remains one line ending.
-      let lineEnd: number;
-      while ((lineEnd = buffer.search(/\r\n|\r|\n/)) !== -1) {
-        const match = buffer.match(/\r\n|\r|\n/)!;
-        if (match[0] === '\r' && lineEnd === buffer.length - 1) break;
-        const line = buffer.slice(0, lineEnd);
-        buffer = buffer.slice(lineEnd + match[0].length);
+      // SSE permits CRLF, LF, or CR endings. Only the new chunk is searched; an unfinished line waits in `pending`.
+      let start = 0;
+      lineEnding.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = lineEnding.exec(text)) !== null) {
+        const line = pending.take(text.slice(start, match.index));
+        start = match.index + match[0].length;
+        lineEnding.lastIndex = start;
+        if (match[0] === '\r' && start === text.length) skipLF = true;
 
         if (line === '') {
           if (currentData.length > 0) {
@@ -49,13 +124,14 @@ export async function* parseSSEStream(
         if (field === 'event') currentEvent = fieldValue;
         else if (field === 'data') currentData.push(fieldValue);
       }
+      pending.hold(text.slice(start));
     }
 
     if (currentData.length > 0) {
       yield { event: currentEvent, data: currentData.join('\n') };
     }
   } finally {
-    reader.releaseLock();
+    closeReader(reader);
   }
 }
 
@@ -65,30 +141,37 @@ export async function* parseNDJSONStream(
 ): AsyncGenerator<any> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
+  const pending = new PendingLine();
+
+  function parse(line: string): { ok: true; value: any } | { ok: false } {
+    const trimmed = line.trim();
+    if (!trimmed) return { ok: false };
+    try { return { ok: true, value: JSON.parse(trimmed) }; } catch { return { ok: false }; }   // skip malformed lines
+  }
 
   try {
     while (true) {
       if (signal?.aborted) return;
-      const { done, value } = await reader.read();
+      const { done, value } = await readChunk(reader);
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      const text = decoder.decode(value, { stream: true });
 
-      const lines = buffer.split('\n');
-      buffer = lines.pop()!;
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          yield JSON.parse(trimmed);
-        } catch {
-          // skip malformed lines
-        }
+      // Only the new chunk is searched; an unfinished line waits in `pending`.
+      let start = 0;
+      let end: number;
+      while ((end = text.indexOf('\n', start)) !== -1) {
+        const parsed = parse(pending.take(text.slice(start, end)));
+        start = end + 1;
+        if (parsed.ok) yield parsed.value;
       }
+      pending.hold(text.slice(start));
     }
+
+    // A last line without a trailing newline is still a line.
+    const parsed = parse(pending.take(decoder.decode()));
+    if (parsed.ok) yield parsed.value;
   } finally {
-    reader.releaseLock();
+    closeReader(reader);
   }
 }
 
@@ -144,10 +227,21 @@ function errorInfo(bodyText: string): { type?: string; code?: string; message?: 
   return {};
 }
 
-const OPENAI_QUOTA_CODES = new Set([
+/** Error `code` values (OpenAI style) that mean the account is out of credit or over a spend limit. */
+export const OPENAI_QUOTA_CODES = new Set([
   'insufficient_quota', 'credit_balance_exhausted', 'organization_spend_limit_exceeded',
   'project_spend_limit_exceeded', 'organization_usage_limit_exceeded',
 ]);
+
+/**
+ * Error `code` or `type` strings for a rate limit or an overloaded server. An HTTP error is classified by its status;
+ * these are for errors sent inside a 200 stream, where the string is all there is.
+ */
+export const RATE_LIMIT_CODES = new Set(['rate_limit_exceeded', 'rate_limit_error']);
+export const OVERLOADED_CODES = new Set(['overloaded', 'overloaded_error', 'engine_overloaded', 'service_unavailable']);
+
+/** HTTP statuses (and numeric in-stream codes) for a busy or briefly unreachable server. */
+export const OVERLOADED_STATUSES: readonly number[] = [502, 503, 529, 408];
 
 /**
  * Redact (and cap) an error's message and stack in place. Throws if a property it has to change is not writable.
@@ -174,10 +268,28 @@ function scrubCause(holder: { cause?: unknown }, apiKey: string | undefined): vo
   }
 }
 
-/** `err` made safe to attach as a `cause` (message and stack redacted in place), or undefined if that is not possible. */
+/** How deep redactedCause follows a `cause` chain. fetch puts the detail one level down (TypeError -> socket error). */
+const MAX_CAUSE_DEPTH = 5;
+
+/**
+ * `err` made safe to attach as a `cause`: its message and stack, and those of the errors in its own `cause` chain,
+ * are redacted in place. Returns undefined if that is not possible.
+ */
 export function redactedCause(err: unknown, apiKey: string | undefined): unknown {
   const holder = { cause: err };
-  try { scrubCause(holder, apiKey); return holder.cause; } catch { return undefined; }
+  try {
+    scrubCause(holder, apiKey);
+    const seen = new Set<unknown>([holder.cause]);
+    let current: unknown = holder.cause;
+    for (let depth = 1; depth < MAX_CAUSE_DEPTH && current instanceof Error; depth++) {
+      const next = (current as { cause?: unknown }).cause;
+      if (next === undefined || seen.has(next)) break;
+      scrubCause(current as { cause?: unknown }, apiKey);
+      seen.add(next);
+      current = (current as { cause?: unknown }).cause;
+    }
+    return holder.cause;
+  } catch { return undefined; }
 }
 
 /**
@@ -218,7 +330,10 @@ export function classifyHttpError(
   const base = `${d.shortName} API error (${status}): ${msg}`;
   const retryAfter = headers.get('retry-after');
 
-  if (status === 401 || status === 403) {
+  // Only a 401 proves the credentials are wrong. A 403 refuses one request or resource (a moderation or guardrail
+  // block, a key without access to one model, a region or organisation restriction): it falls through to the
+  // rules below and usually ends as a plain error, so it does not put the whole provider on cooldown.
+  if (status === 401) {
     return new AuthError(d.authHint ? `${base} Hint: ${d.authHint}` : base, opts);
   }
   if (/credit balance is too low/i.test(bodyText)) return new QuotaExhaustedError(base, opts);
@@ -235,7 +350,7 @@ export function classifyHttpError(
     return retryAfter ? new RateLimitError(base, headers, opts) : new QuotaExhaustedError(base, opts);
   }
   if (status === 429) return new RateLimitError(base, headers, opts);
-  if ([502, 503, 529, 408].includes(status)) return new OverloadedError(base, opts);
+  if (OVERLOADED_STATUSES.includes(status)) return new OverloadedError(base, opts);
   return new AiProviderError(base, opts);
 }
 

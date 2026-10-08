@@ -53,10 +53,15 @@ function toolInput(args: unknown): Record<string, any> {
 }
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
-  if (!res.body) throw new AiProviderError(`${ctx.descriptor.shortName} response has no body`);
+  const shortName = ctx.descriptor.shortName;
+  if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
+  let sawLine = false;
+  let finished = false;
   for await (const chunk of parseNDJSONStream(res.body, signal)) {
     // A line can be valid JSON without being an object (null, 7, "text"); there is nothing to read from it.
     if (!chunk || typeof chunk !== 'object') continue;
+    sawLine = true;
+    if (chunk.done === true) finished = true;
     if (chunk.error) throw classifyStreamError(chunk, ctx);
     if (chunk.message?.content) yield { type: 'text', text: chunk.message.content };
     for (const tc of chunk.message?.tool_calls ?? []) {
@@ -67,6 +72,10 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
       yield { type: 'usage', inputTokens: chunk.prompt_eval_count ?? 0, outputTokens: chunk.eval_count ?? 0 };
     }
   }
+  // Ollama always ends a reply with a `done: true` line. Without it the reply was cut off, unless the caller cancelled.
+  if (signal?.aborted || finished) return;
+  if (!sawLine) throw new AiProviderError(`${shortName} returned an empty response`, { provider: ctx.descriptor.id });
+  throw new AiProviderError(`${shortName} stream ended before done`, { provider: ctx.descriptor.id });
 }
 
 export const ollamaDialect: Dialect = {

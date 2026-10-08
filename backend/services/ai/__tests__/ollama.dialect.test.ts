@@ -3,7 +3,7 @@
 import { describe, it, expect } from 'vitest';
 import { ollamaDialect } from '../dialects/ollama-chat';
 import { makeCtx } from '../test-ctx';
-import { ndjsonResponse, collect } from '../test-helpers';
+import { ndjsonResponse, chunkedResponse, collect } from '../test-helpers';
 import { AiProviderError } from '../errors';
 
 const run = (lines: unknown[]) => collect(ollamaDialect.parseStream(ndjsonResponse(lines), makeCtx('ollama')));
@@ -63,7 +63,7 @@ describe('parseStream', () => {
     ]);
   });
   it('a valid JSON-object string for arguments still parses', async () => {
-    const events = await run([{ message: { tool_calls: [{ function: { name: 'f', arguments: '{"a":1,"b":{"c":2}}' } }] } }]);
+    const events = await run([{ message: { tool_calls: [{ function: { name: 'f', arguments: '{"a":1,"b":{"c":2}}' } }] } }, { done: true }]);
     expect(events).toEqual([{ type: 'tool_use', id: 'id-1', name: 'f', input: { a: 1, b: { c: 2 } } }]);
   });
   it.each([
@@ -77,7 +77,7 @@ describe('parseStream', () => {
     ['null', null],
     ['a boolean', true],
   ])('never yields a non-object input: arguments as %s gives {}', async (_label, args) => {
-    const events = await run([{ message: { tool_calls: [{ function: { name: 'f', arguments: args } }] } }]);
+    const events = await run([{ message: { tool_calls: [{ function: { name: 'f', arguments: args } }] } }, { done: true }]);
     expect(events).toEqual([{ type: 'tool_use', id: 'id-1', name: 'f', input: {} }]);
   });
   it('skips lines that are valid JSON but not an object (null, a number, a string) and keeps the real chunks', async () => {
@@ -98,6 +98,35 @@ describe('parseStream', () => {
   it('a {"error": "..."} line throws', async () => {
     await expect(run([{ error: 'model "x" not found' }])).rejects.toThrow(/Ollama stream error: model "x" not found/);
     await expect(run([{ error: 'x' }])).rejects.toBeInstanceOf(AiProviderError);
+  });
+  it('a stream that ends without a done line is an error, not a short success', async () => {
+    const err: any = await run([{ message: { content: 'half a sent' } }]).catch((e) => e);
+    expect(err.constructor).toBe(AiProviderError);
+    expect(err.message).toBe('Ollama stream ended before done');
+    expect(err.provider).toBe('ollama');
+  });
+  it('an empty body is an error', async () => {
+    const err: any = await run([]).catch((e) => e);
+    expect(err.constructor).toBe(AiProviderError);
+    expect(err.message).toBe('Ollama returned an empty response');
+    expect(err.provider).toBe('ollama');
+  });
+  it('a body of only blank or junk lines counts as empty', async () => {
+    const res = new Response('\n\n  \nnot json\n', { status: 200 });
+    await expect(collect(ollamaDialect.parseStream(res, makeCtx('ollama')))).rejects.toThrow('Ollama returned an empty response');
+  });
+  it('done: false on the last line is not a finished stream', async () => {
+    await expect(run([{ message: { content: 'a' }, done: false }])).rejects.toThrow('Ollama stream ended before done');
+  });
+  it('a caller abort before the end does not report a truncated stream', async () => {
+    const ac = new AbortController();
+    const seen: any[] = [];
+    const res = chunkedResponse(['{"message":{"content":"a"}}\n', '{"message":{"content":"b"}}\n']);
+    for await (const e of ollamaDialect.parseStream(res, makeCtx('ollama'), ac.signal)) {
+      seen.push(e);
+      ac.abort();
+    }
+    expect(seen).toEqual([{ type: 'text', text: 'a' }]);
   });
   it('redacts the api key in a stream error message', async () => {
     const err: any = await run([{ error: 'bad key sk-test-placeholder' }]).catch((e) => e);
