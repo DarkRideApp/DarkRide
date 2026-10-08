@@ -96,9 +96,10 @@ function classifyError(status: number, _headers: Headers, bodyText: string): AiP
   if (!quota && !(status === 400 && isBadKeyBody(bodyText))) return undefined;
   const { error } = parseErrorBody(bodyText);
   const msg = typeof error?.message === 'string' && error.message ? error.message : bodyText.trim();
-  // The hook has no DialectContext. classifyHttpError applies key redaction and provider tagging centrally;
-  // safeText here only caps the upstream text at 500 characters.
-  const text = `Gemini API error (${status}): ${safeText(msg, {})}`;
+  // Deliberately the raw upstream text: the hook has no DialectContext (no key to redact with). classifyHttpError
+  // redacts the key first and only then caps the length, so a key straddling a cap can never leave a prefix behind.
+  // Capping here would run before that redaction and cut a key in half.
+  const text = `Gemini API error (${status}): ${msg}`;
   return quota ? new QuotaExhaustedError(text, { status }) : new AuthError(text, { status });
 }
 

@@ -258,9 +258,12 @@ describe('classifyError', () => {
     const body = JSON.stringify({ error: { code: 400, message: 'API key not valid. Please pass a valid API key.' } });
     expect(geminiDialect.classifyError!(400, new Headers(), body)).toBeInstanceOf(AuthError);
   });
-  it('caps an oversized upstream message', () => {
-    const e = geminiDialect.classifyError!(400, new Headers(), `API key not valid ${'x'.repeat(5000)}`) as any;
-    expect(e.message.length).toBeLessThanOrEqual('Gemini API error (400): '.length + 500);
+  it('the hook leaves capping to classifyHttpError, which caps the final message at 1000 characters', () => {
+    const body = `API key not valid ${'x'.repeat(5000)}`;
+    expect((geminiDialect.classifyError!(400, new Headers(), body) as any).message.length).toBeGreaterThan(1000);
+    const e = classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), body);
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.message.length).toBeLessThanOrEqual(1000);
   });
   it('an unrelated 400 and other statuses return undefined', () => {
     expect(geminiDialect.classifyError!(400, new Headers(), '{"error":{"code":400,"message":"Invalid JSON payload","status":"INVALID_ARGUMENT"}}')).toBeUndefined();
@@ -286,5 +289,111 @@ describe('models', () => {
       ], nextPageToken: 'n2',
     });
     expect(r).toEqual({ models: [{ id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' }], next: 'n2' });
+  });
+});
+
+// A key an upstream echoes back must be redacted BEFORE any length cap, or a key straddling the cut leaves a prefix behind.
+describe('key echoed by the upstream never survives, even straddling a cap (real dialect through classifyHttpError)', () => {
+  const KEY = 'AIzaSyPLACEHOLDERKEY1234567890abcd';
+  const bodies: Record<string, (message: string) => { status: number; body: string; cls: Function }> = {
+    'bad-key 400': (message) => ({
+      status: 400, cls: AuthError,
+      body: JSON.stringify({ error: { code: 400, message, status: 'INVALID_ARGUMENT', details: [{ reason: 'API_KEY_INVALID' }] } }),
+    }),
+    'quota 429': (message) => ({
+      status: 429, cls: QuotaExhaustedError,
+      body: JSON.stringify({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: `${message} billing details` } }),
+    }),
+  };
+  const rows = Object.keys(bodies).flatMap((path) => [0, 480, 490, 495, 499].map((offset) => [path, offset] as const));
+  it.each(rows)('%s, key echoed at offset %i', (path, offset) => {
+    const { status, body, cls } = bodies[path](`${'x'.repeat(offset)}${KEY} tail`);
+    const e = classifyHttpError(geminiDialect, makeCtx('gemini', { apiKey: KEY }), status, new Headers(), body);
+    expect(e).toBeInstanceOf(cls);
+    expect(e.message).toContain('***');
+    expect(e.message.length).toBeLessThanOrEqual(1000);
+    for (const text of [e.message, String(e.stack)]) {
+      expect(text).not.toContain(KEY);
+      // any 4+ character prefix of the key contains the first four characters
+      expect(text).not.toContain(KEY.slice(0, 4));
+    }
+  });
+});
+
+describe('malformed error shapes never throw and land on the safe side', () => {
+  const BILLING = 'check your plan and billing details';
+  const exhausted = (fields: object) => ({ code: 429, status: 'RESOURCE_EXHAUSTED', ...fields });
+  const viol = (v: unknown) => [{ violations: v }];
+
+  // [label, error object, expected class for the stream path]
+  const STREAM_ROWS: Array<[string, any, Function]> = [
+    ['details is an object', exhausted({ message: 'm', details: { violations: [{ quotaId: 'PerDay' }] } }), RateLimitError],
+    ['details is a string', exhausted({ message: 'm', details: 'PerDay' }), RateLimitError],
+    ['details is null', exhausted({ message: 'm', details: null }), RateLimitError],
+    ['details is null with billing wording', exhausted({ message: BILLING, details: null }), QuotaExhaustedError],
+    ['violations is missing', exhausted({ message: 'm', details: [{}] }), RateLimitError],
+    ['violations is an object', exhausted({ message: 'm', details: viol({ quotaId: 'PerDay' }) }), RateLimitError],
+    ['violations is a string', exhausted({ message: 'm', details: viol('PerDay') }), RateLimitError],
+    ['details entries are null, a number and an array', exhausted({ message: 'm', details: [null, 5, [], 'x'] }), RateLimitError],
+    ['violations entries are null, a number, a string and an array', exhausted({ message: 'm', details: viol([null, 3, 'PerDay', []]) }), RateLimitError],
+    ['quotaId is a number', exhausted({ message: 'm', details: viol([{ quotaId: 5 }]) }), RateLimitError],
+    ['quotaId is null and quotaMetric an object', exhausted({ message: 'm', details: viol([{ quotaId: null, quotaMetric: {} }]) }), RateLimitError],
+    ['message is missing', exhausted({}), RateLimitError],
+    ['message is numeric', exhausted({ message: 12345 }), RateLimitError],
+    ['message is an object', exhausted({ message: { billing: true } }), RateLimitError],
+    ['code is the string "429"', { code: '429', message: 'm' }, RateLimitError],
+    ['code is the string "429" with billing wording and status', { code: '429', status: 'RESOURCE_EXHAUSTED', message: BILLING }, QuotaExhaustedError],
+    ['error is true', true, AiProviderError],
+    ['error is a number', 42, AiProviderError],
+    ['error is an empty array', [], AiProviderError],
+    ['error is an empty object', {}, AiProviderError],
+  ];
+  it.each(STREAM_ROWS)('stream: %s', async (_label, error, cls) => {
+    const e = await thrown([chunk({ error })]);
+    expect(e.constructor).toBe(cls);
+  });
+
+  it.each([[null], ['str'], [429], [undefined]])('classifyStreamError called with a %s payload returns a plain AiProviderError', (payload) => {
+    const e = geminiDialect.classifyStreamError!(payload, makeCtx('gemini')) as any;
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.status).toBeUndefined();
+  });
+
+  // [label, raw body]: the hook must answer undefined, and the generic path must still classify without throwing.
+  const BODY_ROWS: Array<[string, string]> = [
+    ['a JSON string', '"str"'],
+    ['a JSON array', '[1]'],
+    ['JSON null', 'null'],
+    ['a JSON number', '429'],
+    ['error: null', '{"error":null}'],
+    ['error: true', '{"error":true}'],
+    ['error: a string', '{"error":"API key not valid"}'],
+    ['error: an array', '{"error":[{"message":"billing"}]}'],
+    ['an empty body', ''],
+    ['an HTML page', '<html><body><h1>502 Bad Gateway</h1></body></html>'],
+  ];
+  it.each(BODY_ROWS)('HTTP 429 with %s: hook defers, generic path gives RateLimitError', (_label, body) => {
+    expect(geminiDialect.classifyError!(429, new Headers(), body)).toBeUndefined();
+    const headers = new Headers({ 'retry-after': '3' });
+    const e: any = classifyHttpError(geminiDialect, makeCtx('gemini'), 429, headers, body);
+    expect(e).toBeInstanceOf(RateLimitError);
+    expect(e.headers.get('retry-after')).toBe('3');
+  });
+  it.each(BODY_ROWS)('HTTP 400 with %s: hook defers, generic path gives a plain AiProviderError', (_label, body) => {
+    expect(geminiDialect.classifyError!(400, new Headers(), body)).toBeUndefined();
+    expect(classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), body).constructor).toBe(AiProviderError);
+  });
+
+  it.each([
+    ['details is an object', { message: 'm', details: { violations: [{ quotaId: 'PerDay' }] } }],
+    ['details is null', { message: 'm', details: null }],
+    ['details entries are null, a number and an array', { message: 'm', details: [null, 5, []] }],
+    ['violations is an object', { message: 'm', details: viol({ quotaId: 'PerDay' }) }],
+    ['violations entries are null, a number and an array', { message: 'm', details: viol([null, 3, []]) }],
+    ['quotaId is a number', { message: 'm', details: viol([{ quotaId: 5 }]) }],
+    ['message is missing', {}],
+    ['message is numeric', { message: 429 }],
+  ])('HTTP 429 body whose error has %s: hook defers', (_label, error) => {
+    expect(geminiDialect.classifyError!(429, new Headers(), JSON.stringify({ error }))).toBeUndefined();
   });
 });
