@@ -1,7 +1,7 @@
 /**
  * AI Tiers E2E Tests
  *
- * Tests the AI tier management UI in the Integrations settings section:
+ * Tests the AI tier management UI in the AI settings section:
  * - Seeded hardcoded tiers (High, Low) are visible
  * - User-added tiers can be created, renamed, and deleted
  * - Hardcoded tiers do not expose Rename or Delete controls
@@ -20,7 +20,7 @@ test.describe('AI Tiers', () => {
     await ctx.close();
   });
 
-  test('seeded High and Low tiers are visible in Integrations', async ({ page }) => {
+  test('seeded High and Low tiers are visible in the AI settings', async ({ page }) => {
     await loginAsAdmin(page);
     await page.goto('/ui/settings/ai');
     await page.waitForLoadState('networkidle');
