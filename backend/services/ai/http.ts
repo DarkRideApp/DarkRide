@@ -96,10 +96,15 @@ export async function* parseNDJSONStream(
 
 const MAX_UPSTREAM_CHARS = 500;
 
+/**
+ * Mask the API key and any URL userinfo (`scheme://user:pass@` and the token-only `scheme://token@`).
+ * Keys shorter than 6 characters are deliberately NOT masked: a string that short would mangle ordinary text.
+ */
 export function redact(text: string, apiKey?: string): string {
   let out = text;
   if (apiKey && apiKey.length >= 6) out = out.split(apiKey).join('***');
-  out = out.replace(/(https?:\/\/)[^\s/@]+:[^\s/@]*@/g, '$1***@');
+  // Anchored on the literal "://" (no leading scheme pattern) so the scan stays linear on a 64 KB body of letters.
+  out = out.replace(/(:\/\/)[^\s/@?#]+@/g, '$1***@');
   return out;
 }
 
@@ -181,6 +186,13 @@ export function classifyHttpError(
 
 const DEFAULT_HEADERS_TIMEOUT_MS = 60_000;
 
+/** 50 -> "50ms", 2000 -> "2s", 1500 -> "1.5s". Never rounds a sub-second timeout down to "0s". */
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  return `${Number.isInteger(s) ? s : s.toFixed(1)}s`;
+}
+
 function abortError(signal?: AbortSignal): unknown {
   return signal?.reason ?? new DOMException('This operation was aborted', 'AbortError');
 }
@@ -212,7 +224,7 @@ export async function sendBuilt(
     });
   } catch (err: any) {
     if (timedOut) {
-      throw new ConnectionError(`${d.shortName} did not respond within ${Math.round(timeoutMs / 1000)}s`, { provider: d.id, cause: err });
+      throw new ConnectionError(`${d.shortName} did not respond within ${formatDuration(timeoutMs)}`, { provider: d.id, cause: err });
     }
     if (signal?.aborted) throw err;
     const causeMsg = String(err?.cause?.message ?? err?.message ?? err);
@@ -228,8 +240,40 @@ export async function sendBuilt(
   }
 }
 
+// An error body only feeds a 500-char message and a few classifier regexes, so it is read in bounded form:
+// at most 64 KB, and at most 10 s (the header timer is already cleared, and a caller may pass no signal).
+const MAX_ERROR_BODY_BYTES = 64 * 1024;
+const ERROR_BODY_TIMEOUT_MS = 10_000;
+
+/**
+ * Read up to MAX_ERROR_BODY_BYTES of an error body, then cancel the rest. Never throws: a read error, a stall
+ * past ERROR_BODY_TIMEOUT_MS, or a caller abort all return whatever was read so far.
+ */
 async function readBodyText(res: Response): Promise<string> {
-  try { return await res.text(); } catch { return ''; }
+  const body = res.body;
+  if (!body) return '';
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let bytes = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), ERROR_BODY_TIMEOUT_MS); });
+  try {
+    while (bytes < MAX_ERROR_BODY_BYTES) {
+      const next = await Promise.race([reader.read(), deadline]);
+      if (next === 'timeout' || next.done) break;
+      const room = MAX_ERROR_BODY_BYTES - bytes;
+      const chunk = next.value.length > room ? next.value.subarray(0, room) : next.value;
+      bytes += chunk.length;
+      text += decoder.decode(chunk, { stream: true });
+    }
+    text += decoder.decode();
+  } catch { /* return what was read */ }
+  finally {
+    clearTimeout(timer);
+    reader.cancel().catch(() => { /* already closed or errored */ });
+  }
+  return text;
 }
 
 export async function sendChat(

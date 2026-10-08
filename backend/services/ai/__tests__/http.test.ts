@@ -5,7 +5,8 @@ import { getProviderDescriptor } from '../../../../shared/lib/ai-provider-catalo
 import type { Dialect, DialectContext } from '../dialect';
 import { stubFetch, jsonResponse, textResponse, sseResponse, chunkedResponse } from '../test-helpers';
 
-afterEach(() => vi.unstubAllGlobals());
+// useRealTimers lives here so a failed assertion in a fake-timer test cannot leak fake timers into later tests.
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 const ctxFor = (id: string, extra: Partial<DialectContext> = {}): DialectContext => ({
   descriptor: getProviderDescriptor(id)!, baseUrl: 'https://x.test', apiKey: 'sk-test-placeholder',
@@ -85,6 +86,29 @@ describe('redact', () => {
   it('does nothing harmful without a key', () => {
     expect(redact('plain')).toBe('plain');
   });
+  it('redacts the token-only userinfo form (no colon) as well as user:pass', () => {
+    expect(redact('GET https://sk-abc123@host.test/x failed')).toBe('GET https://***@host.test/x failed');
+    expect(redact('GET https://u:p@host.test/x failed')).toBe('GET https://***@host.test/x failed');
+    expect(redact('http://tok@127.0.0.1:11434/api')).toBe('http://***@127.0.0.1:11434/api');
+    expect(redact('wss://tok@host.test/socket')).toBe('wss://***@host.test/socket');
+    expect(redact('HTTPS://tok@host.test/x')).toBe('HTTPS://***@host.test/x');
+  });
+  it('stays linear on a large body with no URL in it (a scheme-prefix pattern would be quadratic here)', () => {
+    const started = Date.now();
+    redact('e'.repeat(64 * 1024), 'sk-test-placeholder');
+    redact('://' + 'e'.repeat(64 * 1024), 'sk-test-placeholder');
+    redact('a:/'.repeat(20_000), 'sk-test-placeholder');
+    expect(Date.now() - started).toBeLessThan(250);
+  });
+  it('leaves URLs without userinfo alone, including an @ in the path or query', () => {
+    expect(redact('see https://host.test/users/@me and https://host.test/p?mail=a@b.test'))
+      .toBe('see https://host.test/users/@me and https://host.test/p?mail=a@b.test');
+    expect(redact('mail me at a@b.test')).toBe('mail me at a@b.test');
+  });
+  it('does not redact keys shorter than 6 characters (documented: they would mangle ordinary text), but does at exactly 6', () => {
+    expect(redact('pw abc12 here', 'abc12')).toBe('pw abc12 here');
+    expect(redact('pw abc123 here', 'abc123')).toBe('pw *** here');
+  });
 });
 
 describe('upstreamMessage', () => {
@@ -152,7 +176,32 @@ describe('sendChat', () => {
     await vi.advanceTimersByTimeAsync(60);
     await assertion;
     await expect(p).rejects.toBeInstanceOf(ConnectionError);
-    vi.useRealTimers();
+  });
+  it('names a sub-second header timeout in ms and a fractional one with a decimal, never "0s"', async () => {
+    for (const [timeoutMs, expected] of [[50, /within 50ms$/], [1500, /within 1\.5s$/], [2000, /within 2s$/]] as const) {
+      vi.useFakeTimers();
+      stubFetch((_c) => new Promise<Response>(() => {}));
+      const ctx = ctxFor('openai', { descriptor: { ...getProviderDescriptor('openai')!, headersTimeoutMs: timeoutMs } as any });
+      const p = sendChat(nullDialect, ctx, { messages: [], systemPrompt: '', tools: [] }, { stream: true });
+      const assertion = expect(p).rejects.toThrow(expected);
+      await vi.advanceTimersByTimeAsync(timeoutMs + 10);
+      await assertion;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+  it('the header timeout only covers the wait for headers: nothing is aborted once the response arrives', async () => {
+    vi.useFakeTimers();
+    let body!: ReadableStreamDefaultController<Uint8Array>;
+    const stub = stubFetch(() => new Response(new ReadableStream<Uint8Array>({ start(c) { body = c; } }), { status: 200 }));
+    const ctx = ctxFor('openai', { descriptor: { ...getProviderDescriptor('openai')!, headersTimeoutMs: 50 } as any });
+    const { res } = await sendChat(nullDialect, ctx, { messages: [], systemPrompt: '', tools: [] }, { stream: true });
+    expect(vi.getTimerCount()).toBe(0);                       // the header timer was cleared
+    await vi.advanceTimersByTimeAsync(10_000);                // far past headersTimeoutMs, body still open
+    expect((stub.calls[0].init.signal as AbortSignal).aborted).toBe(false);
+    body.enqueue(new TextEncoder().encode('late chunk'));     // the stream is still readable after the timeout window
+    body.close();
+    expect(await res.text()).toBe('late chunk');
   });
   it('retries once with an adjusted context when retryWith returns one', async () => {
     const dialect: Dialect = { ...nullDialect, retryWith: (status, body, ctx) => status === 400 && /stream_options/.test(body) ? { ...ctx, flags: { noStreamUsage: true } } : undefined };
@@ -163,6 +212,93 @@ describe('sendChat', () => {
     expect(stub.calls).toHaveLength(2);
     expect(stub.calls[0].body.flag).toBe(false);
     expect(stub.calls[1].body.flag).toBe(true);
+  });
+  it('retry then fail: exactly 2 fetches, the adjusted context is used, and the error comes from the SECOND response', async () => {
+    const seenFlags: Array<boolean | undefined> = [];
+    const retryWith = vi.fn((status: number, body: string, ctx: DialectContext) =>
+      status === 400 && /stream_options/.test(body) ? { ...ctx, flags: { noStreamUsage: true } } : undefined);
+    const dialect: Dialect = {
+      ...nullDialect,
+      buildChat: (ctx, req, opts) => { seenFlags.push(ctx.flags.noStreamUsage); return nullDialect.buildChat(ctx, req, opts); },
+      retryWith,
+    };
+    const stub = stubFetch((_c, n) => n === 0 ? textResponse('unknown field stream_options', 400) : textResponse('upstream is busy', 503));
+    const err = await sendChat(dialect, ctxFor('openai-compatible'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+    expect(stub.calls).toHaveLength(2);
+    expect(seenFlags).toEqual([undefined, true]);
+    expect(retryWith).toHaveBeenCalledTimes(1);                // a second failure is not retried again
+    expect(err).toBeInstanceOf(OverloadedError);               // 503 from the second response, not the 400 from the first
+    expect(err.message).toBe('OpenAI-compatible API error (503): upstream is busy');
+  });
+
+  describe('error body reading', () => {
+    const KB = 1024;
+    it('a 5 MB error body is read only up to 64 KB, the rest is cancelled, and the message is capped', async () => {
+      let pulls = 0;
+      let cancelled = false;
+      const chunk = new TextEncoder().encode('e'.repeat(16 * KB));
+      const total = (5 * 1024 * KB) / (16 * KB);                // 320 chunks of 16 KB
+      const body = new ReadableStream<Uint8Array>({
+        pull(c) { if (pulls++ < total) c.enqueue(chunk); else c.close(); },
+        cancel() { cancelled = true; },
+      });
+      stubFetch(() => new Response(body, { status: 500 }));
+      const started = Date.now();
+      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(err).toBeInstanceOf(AiProviderError);
+      expect(err.message.length).toBeLessThan(600);
+      expect(cancelled).toBe(true);
+      expect(pulls).toBeLessThan(10);                           // stopped near 4 chunks, never drained 320
+    });
+    it('a body that errors mid-read does not throw out of sendChat and keeps what was read', async () => {
+      let n = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(c) { if (n++ === 0) c.enqueue(new TextEncoder().encode('partial text')); else c.error(new Error('socket reset')); },
+      });
+      stubFetch(() => new Response(body, { status: 500 }));
+      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      expect(err).toBeInstanceOf(AiProviderError);
+      expect(err.message).toBe('OpenAI API error (500): partial text');
+    });
+    it('a stalled partial body does not hang sendChat when no signal is passed', async () => {
+      vi.useFakeTimers();
+      const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode('half a body')); } });   // never closes
+      stubFetch(() => new Response(body, { status: 500 }));
+      const p = sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true });
+      const assertion = expect(p).rejects.toThrow('OpenAI API error (500): half a body');
+      await vi.advanceTimersByTimeAsync(60_000);
+      await assertion;
+    });
+    it('a UTF-8 character split across chunks is decoded intact', async () => {
+      const bytes = new TextEncoder().encode('café au lait');   // 'e-acute' is 2 bytes
+      const split = 4;                                             // cuts between the two bytes of e-acute
+      const body = new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(bytes.slice(0, split)); c.enqueue(bytes.slice(split)); c.close(); },
+      });
+      stubFetch(() => new Response(body, { status: 500 }));
+      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      expect(err.message).toBe('OpenAI API error (500): café au lait');
+    });
+  });
+});
+
+describe('classifyHttpError precedence', () => {
+  const cls = (status: number, body: string, headers: Record<string, string> = {}, id = 'openai') =>
+    classifyHttpError(nullDialect, ctxFor(id), status, new Headers(headers), body);
+
+  it('a 401 whose body says "credit balance is too low" is an AuthError (status rules beat body markers for 401/403)', () => {
+    const e = cls(401, '{"error":{"message":"Your credit balance is too low to access the Anthropic API."}}', {}, 'anthropic');
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e).not.toBeInstanceOf(QuotaExhaustedError);
+  });
+  it('a 402 with Retry-After and a plain body is a RateLimitError', () => {
+    expect(cls(402, 'payment required, try again later', { 'retry-after': '7' })).toBeInstanceOf(RateLimitError);
+  });
+  it('a 402 with Retry-After AND an insufficient_quota body is still QuotaExhausted (body rules run before the 402 status rule)', () => {
+    const e = cls(402, '{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}', { 'retry-after': '7' });
+    expect(e).toBeInstanceOf(QuotaExhaustedError);
+    expect(e).not.toBeInstanceOf(RateLimitError);
   });
 });
 
