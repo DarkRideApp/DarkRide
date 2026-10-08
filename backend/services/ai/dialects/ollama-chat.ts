@@ -16,7 +16,7 @@ function formatMessages(messages: AiMessage[], systemPrompt: string): any[] {
       const toolCalls: any[] = [];
       for (const b of msg.content) {
         if (b.type === 'text') text += b.text;
-        // docs: Ollama native API takes an object; the old code sent a string (BC-24)
+        // Ollama's native API documents tool-call arguments as an object; they used to be sent as a JSON string
         else toolCalls.push({ id: b.id, type: 'function', function: { name: b.name, arguments: b.input } });
       }
       const entry: any = { role: 'assistant', content: text };

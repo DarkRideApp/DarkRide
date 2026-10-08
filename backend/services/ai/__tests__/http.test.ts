@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { classifyHttpError, redact, safeText, upstreamMessage, sendChat, parseSSEStream } from '../http';
+import { classifyHttpError, redact, safeText, upstreamMessage, sendChat, sendChecked, parseSSEStream } from '../http';
 import { AuthError, QuotaExhaustedError, RateLimitError, OverloadedError, ConnectionError, AiProviderError } from '../errors';
 import { getProviderDescriptor } from '../../../../shared/lib/ai-provider-catalog';
 import type { Dialect, DialectContext } from '../dialect';
@@ -392,6 +392,41 @@ describe('sendChat', () => {
       const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
       expect(err.message).toBe('OpenAI API error (500): café au lait');
     });
+  });
+});
+
+describe('sendChecked', () => {
+  const list = (ctx: DialectContext) => ({ url: `${ctx.baseUrl}/models`, headers: { authorization: `Bearer ${ctx.apiKey}` } });
+  it('sends a GET with no body and returns a 2xx response', async () => {
+    const stub = stubFetch(() => jsonResponse({ data: [] }));
+    const { res } = await sendChecked(nullDialect, ctxFor('openai'), list, { method: 'GET' });
+    expect(res.ok).toBe(true);
+    expect(stub.calls[0].init.method).toBe('GET');
+    expect(stub.calls[0].init.body).toBeUndefined();
+    expect(stub.calls[0].init.redirect).toBe('error');
+  });
+  it('classifies a non-2xx with the provider message, redacted', async () => {
+    stubFetch(() => textResponse('{"error":{"message":"bad key sk-test-placeholder"}}', 401));
+    const err = await sendChecked(nullDialect, ctxFor('openai'), list, { method: 'GET' }).catch((e) => e);
+    expect(err).toBeInstanceOf(AuthError);
+    expect(err.message).toBe('OpenAI API error (401): bad key ***');
+  });
+  it('reads a stalled error body bounded by the deadline instead of hanging', async () => {
+    vi.useFakeTimers();
+    const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode('half a body')); } });   // never closes
+    stubFetch(() => new Response(body, { status: 500 }));
+    const p = sendChecked(nullDialect, ctxFor('openai', { apiKey: undefined }), list, { method: 'GET' });
+    const assertion = expect(p).rejects.toThrow('OpenAI API error (500): half a body');
+    await vi.advanceTimersByTimeAsync(10_000);
+    await assertion;
+  });
+  it('never calls retryWith unless retry is asked for', async () => {
+    const retryWith = vi.fn(() => ({ ...ctxFor('openai'), flags: { noStreamUsage: true } }));
+    const stub = stubFetch(() => textResponse('unknown field stream_options', 400));
+    const err = await sendChecked({ ...nullDialect, retryWith }, ctxFor('openai'), list).catch((e) => e);
+    expect(err).toBeInstanceOf(AiProviderError);
+    expect(retryWith).not.toHaveBeenCalled();
+    expect(stub.calls).toHaveLength(1);
   });
 });
 

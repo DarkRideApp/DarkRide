@@ -43,10 +43,10 @@ const fullHistoryWire = [
   { role: 'tool', content: 'out', tool_call_id: 'tc1' },
 ];
 
-// ── OpenRouterProvider ──────────────────────────────────────────────
+// ── openrouter ──────────────────────────────────────────────────────
 
-describe('OpenRouterProvider', () => {
-  describe('buildHeaders', () => {
+describe('openrouter', () => {
+  describe('request headers', () => {
     it('uses Bearer authorization', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('openrouter', { apiKey: 'or-key-123' });
@@ -55,7 +55,7 @@ describe('OpenRouterProvider', () => {
     });
   });
 
-  describe('formatTools', () => {
+  describe('tool definitions', () => {
     it('uses OpenAI function format', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('openrouter', { apiKey: 'test' }, msgs, 'sys', [
@@ -118,10 +118,10 @@ describe('OpenRouterProvider', () => {
   });
 });
 
-// ── CodestralProvider ───────────────────────────────────────────────
+// ── codestral ───────────────────────────────────────────────────────
 
-describe('CodestralProvider', () => {
-  describe('buildHeaders', () => {
+describe('codestral', () => {
+  describe('request headers', () => {
     it('uses Bearer authorization', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('codestral', { apiKey: 'cs-key-456' });
@@ -130,7 +130,7 @@ describe('CodestralProvider', () => {
     });
   });
 
-  describe('formatTools', () => {
+  describe('tool definitions', () => {
     it('uses OpenAI function format', async () => {
       const stub = stubFetch(() => okStream('openai-chat'));
       await runWith('codestral', { apiKey: 'test' }, msgs, 'sys', [
@@ -186,9 +186,9 @@ describe('CodestralProvider', () => {
   });
 });
 
-// ── Tool call buffering (OpenAI-compatible: OpenRouter & Codestral) ─
+// ── Tool call buffering (openai-chat: OpenRouter and Codestral) ─────
 
-describe('OpenAI-compatible tool call buffering', () => {
+describe('openai-chat tool call buffering', () => {
   it('should buffer incremental tool call arguments correctly', async () => {
     // Three chunks building up the arguments JSON incrementally
     stubFetch(() => sseResponse([

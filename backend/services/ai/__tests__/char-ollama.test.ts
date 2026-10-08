@@ -16,8 +16,8 @@ const ollama = (cfg: Record<string, any> = { baseUrl: 'http://localhost:11434' }
 const run = (messages: AiMessage[] = msgs, system = 'system', tools: AiToolDefinition[] = noTools, cfg?: Record<string, any>) =>
   collect(ollama(cfg).createStreamingRequest(messages, system, tools));
 
-describe('OllamaProvider', () => {
-  describe('buildHeaders', () => {
+describe('ollama', () => {
+  describe('request headers', () => {
     it('includes Content-Type', async () => {
       const stub = stubFetch(() => okStream('ollama'));
       await run(msgs, 's', noTools, {});
@@ -53,7 +53,7 @@ describe('OllamaProvider', () => {
     });
   });
 
-  describe('formatTools', () => {
+  describe('tool definitions', () => {
     it('uses OpenAI function format', async () => {
       const stub = stubFetch(() => okStream('ollama'));
       await run(msgs, 's', [
@@ -77,7 +77,7 @@ describe('OllamaProvider', () => {
     });
   });
 
-  describe('formatMessages (empty assistant content)', () => {
+  describe('message history (empty assistant content)', () => {
     it('should handle assistant message with empty text array', async () => {
       // NDJSON stream for Ollama
       const stub = stubFetch(() => ndjsonResponse([

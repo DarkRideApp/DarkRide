@@ -7,6 +7,16 @@ import { UnknownProviderError, AiProviderError } from '../errors';
 import { stubFetch, sseResponse, jsonResponse, textResponse, collect, callHeader } from '../test-helpers';
 
 afterEach(() => vi.unstubAllGlobals());
+
+/** A 200 body that sends a first fragment and then stalls; it errors the way fetch does when the request is aborted. */
+function stalledBody(signal: AbortSignal | null | undefined, first = '{"choi'): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(new TextEncoder().encode(first));
+      signal?.addEventListener('abort', () => c.error(signal.reason), { once: true });
+    },
+  });
+}
 const oneOk = () => sseResponse([{ data: JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] }) }, { data: '[DONE]' }]);
 
 describe('createProvider', () => {
@@ -125,6 +135,34 @@ describe('DialectProvider', () => {
     const err: any = await createProvider('codestral', { apiKey: 'k' }).complete({ prefix: 'a', suffix: 'b' }).catch((e) => e);
     expect(err).toBeInstanceOf(AiProviderError);
     expect(err.message).toMatch(/not JSON/);
+  });
+  it('complete(): an abort while the FIM body is being read passes through as the AbortError, not "not JSON"', async () => {
+    const ac = new AbortController();
+    stubFetch((call) => new Response(stalledBody(call.init.signal), { status: 200 }));
+    const p = createProvider('codestral', { apiKey: 'k' }).complete({ prefix: 'a', suffix: 'b', signal: ac.signal }).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 10));
+    ac.abort();
+    const err = await p;
+    expect(err).not.toBeInstanceOf(AiProviderError);
+    expect(err.name).toBe('AbortError');
+  });
+  it('complete(): Mistral uses FIM for a codestral model', async () => {
+    const stub = stubFetch(() => jsonResponse({ choices: [{ message: { content: 'x' } }] }));
+    expect(await createProvider('mistral', { apiKey: 'k', model: 'codestral-latest' }).complete({ prefix: 'a', suffix: 'b' })).toBe('x');
+    expect(stub.calls[0].url).toBe('https://api.mistral.ai/v1/fim/completions');
+    expect(stub.calls[0].body.model).toBe('codestral-latest');
+  });
+  it('a model of only whitespace counts as no model', async () => {
+    const stub = stubFetch(() => sseResponse([{ data: JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }) }]));
+    await expect(collect(createProvider('openai', { apiKey: 'k', model: '  ' }).createStreamingRequest(msgs, '', []))).rejects.toThrow(/No model selected for OpenAI/);
+    expect(stub.calls).toHaveLength(0);
+    await collect(createProvider('gemini', { apiKey: 'k', model: ' \n' }).createStreamingRequest(msgs, '', []));
+    expect(stub.calls[0].url).toContain('/models/gemini-2.5-flash:streamGenerateContent');
+  });
+  it('a configured model is trimmed before it is sent', async () => {
+    const stub = stubFetch(oneOk);
+    await collect(createProvider('openrouter', { apiKey: 'k', model: ' vendor/model\n' }).createStreamingRequest(msgs, '', []));
+    expect(stub.calls[0].body.model).toBe('vendor/model');
   });
   it('complete(): FIM does not send when the signal is already aborted', async () => {
     const stub = stubFetch(() => jsonResponse({}));

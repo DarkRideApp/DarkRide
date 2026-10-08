@@ -2,9 +2,9 @@ import { randomUUID } from 'crypto';
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../shared/types/ai-chat';
 import { normalizeBaseUrl, type AiProviderDescriptor } from '../../../shared/lib/ai-provider-catalog';
 import { AiProviderError, OutputLimitError } from './errors';
-import { sendChat } from './http';
+import { sendChat, sendChecked } from './http';
 import type {
-  AiCompleteRequest, AiProvider, AiProviderConfig, AiRequest, AiStreamOptions, BuiltRequest, Dialect, DialectContext,
+  AiCompleteRequest, AiProvider, AiProviderConfig, AiRequest, AiStreamOptions, Dialect, DialectContext,
 } from './dialect';
 
 const TRIPLE_NEWLINE = /\n\n\n[\s\S]*$/;
@@ -25,7 +25,7 @@ export function resolveContext(
   config: { apiKey?: string | null; baseUrl?: string | null; model?: string | null },
   newId: () => string,
 ): DialectContext {
-  const model = config.model || d.defaultModel;
+  const model = config.model?.trim() || d.defaultModel;
   if (!model) throw new AiProviderError(`No model selected for ${d.label}. Choose a model in the model settings.`, { provider: d.id });
   const norm = normalizeBaseUrl(d, config.baseUrl);
   if (!norm.ok) throw new AiProviderError(`${d.label}: invalid Base URL. ${norm.error}`, { provider: d.id });
@@ -35,22 +35,13 @@ export function resolveContext(
 }
 
 /**
- * Send a prebuilt POST through the same transport as chat requests (headers timeout, redirect: 'error',
- * bounded error-body read, classification with redaction). The wrapper dialect only swaps the request
- * builder; the real dialect's error hooks still apply, and there is no retry hook.
+ * Parse a 2xx body as JSON. A login page or captive portal answers 200 with HTML, which is a configuration problem.
+ * Only the parse is caught: an abort or timeout while the body is read propagates unchanged.
  */
-export async function sendPrebuilt(
-  dialect: Dialect, ctx: DialectContext, built: BuiltRequest, signal?: AbortSignal,
-): Promise<Response> {
-  const once: Dialect = { ...dialect, buildChat: () => built, retryWith: undefined };
-  const { res } = await sendChat(once, ctx, { messages: [], systemPrompt: '', tools: [], signal }, { stream: false });
-  return res;
-}
-
-/** Parse a 2xx body as JSON. A login page or captive portal answers 200 with HTML, which is a configuration problem. */
 export async function readJson(res: Response, d: AiProviderDescriptor): Promise<unknown> {
+  const text = await res.text();
   try {
-    return await res.json();
+    return JSON.parse(text);
   } catch {
     throw new AiProviderError(`${d.shortName} returned a response that is not JSON. Check the Base URL.`, { provider: d.id, status: res.status });
   }
@@ -78,16 +69,18 @@ export class DialectProvider implements AiProvider {
   async *createStreamingRequest(
     messages: AiMessage[], systemPrompt: string, tools: AiToolDefinition[], options?: AiStreamOptions,
   ): AsyncIterable<AiStreamEvent> {
-    const ctx = this.ctx();
-    const req: AiRequest = {
+    yield* this.stream(this.ctx(), {
       messages, systemPrompt, tools, signal: options?.signal,
       maxOutputTokens: options?.maxOutputTokens, stopSequences: options?.stopSequences,
       temperature: options?.temperature, effort: options?.effort, cache: options?.cache,
-    };
+    });
+  }
+
+  private async *stream(ctx: DialectContext, req: AiRequest): AsyncIterable<AiStreamEvent> {
     const { res, ctx: used } = await sendChat(this.dialect, ctx, req, { stream: true });
     this.lastResponseHeaders = res.headers;
     if (!res.body) throw new AiProviderError(`${this.descriptor.shortName} response has no body`, { provider: this.descriptor.id });
-    yield* this.dialect.parseStream(res, used, options?.signal);
+    yield* this.dialect.parseStream(res, used, req.signal);
   }
 
   /**
@@ -99,20 +92,20 @@ export class DialectProvider implements AiProvider {
   async complete(req: AiCompleteRequest): Promise<string> {
     const ctx = this.ctx();
     const fim = this.descriptor.capabilities.fim;
-    if (fim && this.dialect.buildFim && this.dialect.parseFim && new RegExp(fim.modelPattern, 'i').test(ctx.model)) {
-      const res = await sendPrebuilt(this.dialect, ctx, this.dialect.buildFim(ctx, req), req.signal);
+    const d = this.dialect;
+    if (fim && d.buildFim && d.parseFim && new RegExp(fim.modelPattern, 'i').test(ctx.model)) {
+      const buildFim = d.buildFim.bind(d);
+      const { res } = await sendChecked(d, ctx, (c) => buildFim(c, req), { signal: req.signal });
       this.lastResponseHeaders = res.headers;
-      return trimCompletion(this.dialect.parseFim(await readJson(res, this.descriptor)));
+      return trimCompletion(d.parseFim(await readJson(res, this.descriptor)));
     }
     let text = '';
     try {
-      for await (const e of this.createStreamingRequest(
-        [{ role: 'user', content: `${req.prefix}<CURSOR>${req.suffix}` }], req.systemPrompt ?? '', [],
-        {
-          signal: req.signal, maxOutputTokens: req.maxOutputTokens, stopSequences: req.stopSequences,
-          temperature: req.temperature, effort: 'low', cache: false,
-        },
-      )) {
+      for await (const e of this.stream(ctx, {
+        messages: [{ role: 'user', content: `${req.prefix}<CURSOR>${req.suffix}` }], systemPrompt: req.systemPrompt ?? '', tools: [],
+        signal: req.signal, maxOutputTokens: req.maxOutputTokens, stopSequences: req.stopSequences,
+        temperature: req.temperature, effort: 'low', cache: false,
+      })) {
         if (e.type === 'text') text += e.text;
       }
     } catch (err) {

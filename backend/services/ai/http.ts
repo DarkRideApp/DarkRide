@@ -343,23 +343,33 @@ async function readBodyText(res: Response, apiKey?: string): Promise<string> {
   return text;
 }
 
-export async function sendChat(
+/**
+ * Send one request built from the context and return the 2xx response; a non-2xx has its body read bounded and is
+ * thrown classified. With `retry`, the dialect's retryWith hook may adjust the context once and the request is
+ * rebuilt from it. Chat, completion, listing, and connection tests all go through here.
+ */
+export async function sendChecked(
+  dialect: Dialect,
+  ctx: DialectContext,
+  build: (ctx: DialectContext) => { url: string; headers: Record<string, string>; body?: unknown },
+  opts: { signal?: AbortSignal; method?: 'POST' | 'GET'; retry?: boolean } = {},
+): Promise<{ res: Response; ctx: DialectContext }> {
+  let current = ctx;
+  for (let attempt = 0; ; attempt++) {
+    const res = await sendBuilt({ body: undefined, ...build(current) }, current, opts.signal, opts.method);
+    if (res.ok) return { res, ctx: current };
+    const bodyText = await readBodyText(res, current.apiKey);
+    const retry = opts.retry && attempt === 0 ? dialect.retryWith?.(res.status, bodyText, current) : undefined;
+    if (!retry) throw classifyHttpError(dialect, current, res.status, res.headers, bodyText);
+    current = retry;
+  }
+}
+
+export function sendChat(
   dialect: Dialect,
   ctx: DialectContext,
   req: AiRequest,
   opts: { stream: boolean },
 ): Promise<{ res: Response; ctx: DialectContext }> {
-  let current = ctx;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const built = dialect.buildChat(current, req, opts);
-    const res = await sendBuilt(built, current, req.signal);
-    if (res.ok) return { res, ctx: current };
-    const bodyText = await readBodyText(res, current.apiKey);
-    if (attempt === 0) {
-      const retry = dialect.retryWith?.(res.status, bodyText, current);
-      if (retry) { current = retry; continue; }
-    }
-    throw classifyHttpError(dialect, current, res.status, res.headers, bodyText);
-  }
-  throw new AiProviderError('unreachable');
+  return sendChecked(dialect, ctx, (c) => dialect.buildChat(c, req, opts), { signal: req.signal, retry: true });
 }

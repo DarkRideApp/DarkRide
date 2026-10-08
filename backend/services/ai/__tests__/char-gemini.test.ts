@@ -17,8 +17,8 @@ const gemini = (cfg: Record<string, any> = { apiKey: 'test-key' }, newId?: () =>
 const run = (messages: AiMessage[] = msgs, system = 'system', tools: AiToolDefinition[] = noTools, cfg?: Record<string, any>) =>
   collect(gemini(cfg).createStreamingRequest(messages, system, tools));
 
-describe('GeminiProvider', () => {
-  describe('buildHeaders', () => {
+describe('gemini', () => {
+  describe('request headers', () => {
     it('includes Content-Type', async () => {
       const stub = stubFetch(() => okStream('gemini'));
       await run(msgs, 's', noTools, { apiKey: 'test' });
@@ -59,7 +59,7 @@ describe('GeminiProvider', () => {
     });
   });
 
-  describe('formatTools', () => {
+  describe('tool definitions', () => {
     it('uses parameters field (Gemini format)', async () => {
       const stub = stubFetch(() => okStream('gemini'));
       await run(msgs, 's', [
@@ -84,7 +84,7 @@ describe('GeminiProvider', () => {
     });
   });
 
-  describe('formatMessages (tool results)', () => {
+  describe('message history (tool results)', () => {
     it('should format tool results as functionResponse parts', async () => {
       const stub = stubFetch(() => sseResponse([
         chunk({ candidates: [{ content: { parts: [{ text: 'response' }] } }] }),

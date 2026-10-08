@@ -20,7 +20,7 @@ const anthropic = (cfg: Record<string, any> = { apiKey: 'test-key' }) => createP
 const run = (messages: AiMessage[] = msgs, system = 'system', tools: AiToolDefinition[] = noTools, cfg?: Record<string, any>) =>
   collect(anthropic(cfg).createStreamingRequest(messages, system, tools));
 
-describe('AnthropicProvider', () => {
+describe('anthropic', () => {
   describe('request', () => {
     it('uses x-api-key authorization', async () => {
       const stub = stubFetch(() => okStream('anthropic'));
@@ -55,12 +55,11 @@ describe('AnthropicProvider', () => {
       expect(stub.calls[0].body.model).toBe('m1');
     });
 
-    it('sends an empty x-api-key when no key is configured', async () => {
-      // Unchanged on purpose: the key is required for Anthropic, so the connection test refuses a keyless
-      // provider before any request, and a chat request without one gets a 401 that is now an AuthError.
+    it('sends no x-api-key header when no key is configured', async () => {
+      // Was an empty `x-api-key: ''` header. Now the header is left out, like every other provider without a key.
       const stub = stubFetch(() => okStream('anthropic'));
       await run(msgs, 's', noTools, {});
-      expect(callHeader(stub.calls[0], 'x-api-key')).toBe('');
+      expect(callHeader(stub.calls[0], 'x-api-key')).toBeUndefined();
     });
 
     it('omits tools when none are given', async () => {
@@ -70,7 +69,7 @@ describe('AnthropicProvider', () => {
     });
   });
 
-  describe('formatTools', () => {
+  describe('tool definitions', () => {
     it('uses Anthropic input_schema format', async () => {
       const stub = stubFetch(() => okStream('anthropic'));
       await run(msgs, 's', [

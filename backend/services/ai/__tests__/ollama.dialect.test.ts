@@ -31,7 +31,7 @@ describe('buildChat', () => {
         { role: 'tool_result', toolUseId: 'c1', content: 'done' },
       ],
     }, { stream: true });
-    // docs: Ollama native API takes an object; the old code sent a string (BC-24)
+    // Ollama's native API documents tool-call arguments as an object; they used to be sent as a JSON string
     expect(b.body.messages[2]).toEqual({ role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: { a: 1 } } }] });
     expect(b.body.messages[3]).toEqual({ role: 'tool', content: 'done', tool_call_id: 'c1', tool_name: 'f' });
   });

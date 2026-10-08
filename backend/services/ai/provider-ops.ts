@@ -3,8 +3,8 @@ import {
   getProviderDescriptor, isCliProvider, type AiProviderDescriptor,
 } from '../../../shared/lib/ai-provider-catalog';
 import { ClaudeCliProvider } from '../claude-cli-provider';
-import { AiProviderError, RateLimitError } from './errors';
-import { classifyHttpError, sendBuilt, sendChat } from './http';
+import { AiProviderError, ConnectionError, RateLimitError } from './errors';
+import { sendChat, sendChecked } from './http';
 import { readJson, resolveContext } from './provider';
 import { getDialect } from './registry';
 import type { DialectContext } from './dialect';
@@ -16,6 +16,8 @@ const MAX_PAGES = 10;
 const REQUEST_TIMEOUT_MS = 15_000;
 const CLI_MISSING = 'Claude CLI not found or not working';
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+/** A stored value with surrounding whitespace removed; only whitespace counts as not set. */
+const clean = (v: string | null | undefined): string | undefined => v?.trim() || undefined;
 
 function httpDescriptor(row: ProviderRow): AiProviderDescriptor {
   const d = getProviderDescriptor(row.type);
@@ -29,42 +31,26 @@ function ctxFor(row: ProviderRow, model: string): DialectContext {
 }
 
 function requireKey(d: AiProviderDescriptor, row: ProviderRow): void {
-  if (d.auth.required && !row.apiKey?.trim()) throw new AiProviderError(`No ${d.shortName} API key configured`, { provider: d.id });
+  if (d.auth.required && !clean(row.apiKey)) throw new AiProviderError(`No ${d.shortName} API key configured`, { provider: d.id });
 }
 
-// A failed listing's body only feeds a 500-character message and a few classifier patterns, so it is read
-// bounded: at most 64 KB and 10 s. Mirrors the transport's own reader for chat requests, including dropping a
-// possibly cut-off key from the tail when the read stops early.
-const MAX_ERROR_BODY_BYTES = 64 * 1024;
-const ERROR_BODY_TIMEOUT_MS = 10_000;
-
-async function readErrorBody(res: Response, apiKey?: string): Promise<string> {
-  if (!res.body) return '';
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let text = '';
-  let bytes = 0;
-  let complete = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), ERROR_BODY_TIMEOUT_MS); });
+/**
+ * Run one request with a 15 s budget covering the response and its body. When the budget runs out, whatever the
+ * request was doing (waiting for headers, reading the body) fails with "<name> did not respond within 15s".
+ */
+async function withTimeout<T>(d: AiProviderDescriptor, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new DOMException('The operation timed out', 'TimeoutError')), REQUEST_TIMEOUT_MS);
   try {
-    while (bytes < MAX_ERROR_BODY_BYTES) {
-      const next = await Promise.race([reader.read(), deadline]);
-      if (next === 'timeout') break;
-      if (next.done) { complete = true; break; }
-      const chunk = next.value.subarray(0, MAX_ERROR_BODY_BYTES - bytes);
-      bytes += chunk.length;
-      text += decoder.decode(chunk, { stream: true });
+    return await run(ac.signal);
+  } catch (err) {
+    if (ac.signal.aborted) {
+      throw new ConnectionError(`${d.shortName} did not respond within ${REQUEST_TIMEOUT_MS / 1000}s`, { provider: d.id, cause: err });
     }
-    if (bytes >= MAX_ERROR_BODY_BYTES) complete = true;   // the size cap is a deliberate stop, not a cut-off
-    text += decoder.decode();
-  } catch { /* keep what was read */ }
-  finally {
+    throw err;
+  } finally {
     clearTimeout(timer);
-    reader.cancel().catch(() => { /* already closed */ });
   }
-  if (!complete && apiKey && apiKey.length >= 6) text = text.slice(0, Math.max(0, text.length - (apiKey.length - 1)));
-  return text;
 }
 
 /**
@@ -79,15 +65,17 @@ export async function listModels(row: ProviderRow): Promise<{ id: string; name: 
   if (d.kind !== 'http' || !d.dialect) return [];
   requireKey(d, row);
   const dialect = getDialect(d.dialect);
-  if (!dialect.buildListModels || !dialect.parseModels) return [];
+  const { buildListModels, parseModels } = dialect;
+  if (!buildListModels || !parseModels) return [];
   const ctx = ctxFor(row, d.defaultModel ?? 'unused');
   const all: { id: string; name: string }[] = [];
   let page: string | undefined;
   for (let i = 0; i < MAX_PAGES; i++) {
-    const built = dialect.buildListModels(ctx, page);
-    const res = await sendBuilt({ ...built, body: undefined }, ctx, AbortSignal.timeout(REQUEST_TIMEOUT_MS), 'GET');
-    if (!res.ok) throw classifyHttpError(dialect, ctx, res.status, res.headers, await readErrorBody(res, ctx.apiKey));
-    const parsed = dialect.parseModels(await readJson(res, d));
+    const json = await withTimeout(d, async (signal) => {
+      const { res } = await sendChecked(dialect, ctx, (c) => buildListModels.call(dialect, c, page), { signal, method: 'GET' });
+      return readJson(res, d);
+    });
+    const parsed = parseModels.call(dialect, json);
     all.push(...parsed.models);
     if (!parsed.next) break;
     page = parsed.next;
@@ -95,9 +83,9 @@ export async function listModels(row: ProviderRow): Promise<{ id: string; name: 
   return all;
 }
 
-function cliVersionOk(apiKey: string | null): Promise<boolean> {
+function cliVersionOk(token: string | undefined): Promise<boolean> {
   return new Promise((resolve) => {
-    const env = apiKey ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: apiKey } : undefined;
+    const env = token ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token } : undefined;
     let child: ReturnType<typeof spawn>;
     try { child = spawn('claude', ['--version'], { env }); }
     catch { resolve(false); return; }
@@ -109,21 +97,18 @@ function cliVersionOk(apiKey: string | null): Promise<boolean> {
 
 /**
  * One tiny streaming request. Only the HTTP outcome is judged: the body is cancelled unread, so a truncated,
- * odd, or empty stream cannot fail the test, and no parser runs.
+ * odd, or empty stream cannot fail the test, and no parser runs. A 2xx or a rate limit (the key works, the
+ * account is just busy) is success.
  */
-async function probe(row: ProviderRow, model: string): Promise<void> {
+async function probe(row: ProviderRow, model: string): Promise<TestResult> {
   const d = httpDescriptor(row);
-  const { res } = await sendChat(getDialect(d.dialect!), ctxFor(row, model), {
-    messages: [{ role: 'user', content: 'hi' }], systemPrompt: '', tools: [], maxOutputTokens: 16, cache: false,
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  }, { stream: true });
-  await res.body?.cancel().catch(() => undefined);
-}
-
-/** Generation result: a 2xx or a rate limit (the key works, the account is just busy) is success. */
-async function probeResult(row: ProviderRow, model: string): Promise<TestResult> {
   try {
-    await probe(row, model);
+    await withTimeout(d, async (signal) => {
+      const { res } = await sendChat(getDialect(d.dialect!), ctxFor(row, model), {
+        messages: [{ role: 'user', content: 'hi' }], systemPrompt: '', tools: [], maxOutputTokens: 16, cache: false, signal,
+      }, { stream: true });
+      await res.body?.cancel().catch(() => undefined);
+    });
     return { success: true, model };
   } catch (err) {
     if (err instanceof RateLimitError) return { success: true, model };
@@ -140,11 +125,11 @@ export async function testProvider(row: ProviderRow): Promise<TestResult> {
   const d = getProviderDescriptor(row.type);
   if (!d) return { success: false, error: `Unknown provider type: ${row.type}` };
   if (isCliProvider(row.type)) {
-    return (await cliVersionOk(row.apiKey)) ? { success: true, model: 'claude-cli' } : { success: false, error: CLI_MISSING };
+    return (await cliVersionOk(clean(row.apiKey))) ? { success: true, model: 'claude-cli' } : { success: false, error: CLI_MISSING };
   }
   try { requireKey(d, row); } catch (e) { return { success: false, error: message(e) }; }
 
-  if (d.defaultModel && d.auth.scheme !== 'none') return probeResult(row, d.defaultModel);
+  if (d.defaultModel && d.auth.scheme !== 'none') return probe(row, d.defaultModel);
   try {
     const models = await listModels(row);
     return { success: true, model: `${models.length} models` };
@@ -157,16 +142,17 @@ export async function testProvider(row: ProviderRow): Promise<TestResult> {
 export async function testModel(row: ProviderRow, modelRow: { model: string | null }): Promise<TestResult> {
   const d = getProviderDescriptor(row.type);
   if (!d) return { success: false, error: `Unknown provider: ${row.type}` };
+  const chosen = clean(modelRow.model);
   if (isCliProvider(row.type)) {
-    const token = row.apiKey ?? undefined;
+    const token = clean(row.apiKey);
     const version = await ClaudeCliProvider.getVersion(token);
     if (!version) return { success: false, error: CLI_MISSING };
-    const tool = await ClaudeCliProvider.testToolUse(token, modelRow.model || d.defaultModel || 'sonnet');
+    const tool = await ClaudeCliProvider.testToolUse(token, chosen || d.defaultModel || 'sonnet');
     if (!tool.ok) return { success: false, error: tool.reason || 'Claude CLI cannot use tools' };
-    return { success: true, model: modelRow.model || 'claude-cli' };
+    return { success: true, model: chosen || 'claude-cli' };
   }
   try { requireKey(d, row); } catch (e) { return { success: false, error: message(e) }; }
-  const model = modelRow.model || d.defaultModel;
+  const model = chosen || d.defaultModel;
   if (!model) return { success: false, error: `No model selected for ${d.label}. Choose a model in the model settings.` };
-  return probeResult(row, model);
+  return probe(row, model);
 }

@@ -27,6 +27,11 @@ describe('buildChat', () => {
     expect(b.headers['anthropic-version']).toBe('2023-06-01');
     expect(b.body).toMatchObject({ model: 'claude-sonnet-5-5', max_tokens: 16000, system: 'sys', stream: true, cache_control: { type: 'ephemeral' } });
   });
+  it('omits x-api-key when no key is configured', () => {
+    const b = anthropicDialect.buildChat(makeCtx('anthropic', { apiKey: undefined }), req, { stream: true });
+    expect(Object.keys(b.headers).map((k) => k.toLowerCase())).not.toContain('x-api-key');
+    expect(b.headers['anthropic-version']).toBe('2023-06-01');
+  });
   it('formats tools with input_schema', () => {
     const body: any = anthropicDialect.buildChat(makeCtx('anthropic'), req, { stream: true }).body;
     expect(body.tools).toEqual([{ name: 'get_apps', description: 'List', input_schema: { type: 'object', properties: { q: { type: 'string' } } } }]);

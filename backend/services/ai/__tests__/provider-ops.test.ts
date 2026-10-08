@@ -10,7 +10,98 @@ vi.mock('../../claude-cli-provider', () => ({ ClaudeCliProvider: { getVersion: v
 import { spawn } from 'child_process';
 import { ClaudeCliProvider } from '../../claude-cli-provider';
 
-afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
+
+/** A body that sends a first fragment and then stalls; it errors the way fetch does when the request is aborted. */
+function stalledBody(signal: AbortSignal | null | undefined, first: string): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(new TextEncoder().encode(first));
+      signal?.addEventListener('abort', () => c.error(signal.reason), { once: true });
+    },
+  });
+}
+const never = () => new Promise<Response>(() => { /* the server never answers */ });
+
+describe('timeouts (15 s per request)', () => {
+  it('a listing whose 200 body stalls reads as a timeout, not "not JSON"', async () => {
+    vi.useFakeTimers();
+    stubFetch((call) => new Response(stalledBody(call.init.signal, '{"data":['), { status: 200 }));
+    const p = listModels(row('openrouter')).catch((e) => e);
+    await vi.advanceTimersByTimeAsync(15_000);
+    const err = await p;
+    expect(err).toMatchObject({ name: 'ConnectionError', message: 'OpenRouter did not respond within 15s' });
+  });
+  it('a listing whose server never answers reads as a timeout', async () => {
+    vi.useFakeTimers();
+    stubFetch(never);
+    const p = listModels(row('openai-compatible', { baseUrl: 'http://127.0.0.1:1234' })).catch((e) => e);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect((await p).message).toBe('OpenAI-compatible did not respond within 15s');
+  });
+  it('a failed listing with a stalled error body is classified after the bounded read, before the timeout', async () => {
+    vi.useFakeTimers();
+    stubFetch((call) => new Response(stalledBody(call.init.signal, 'half a body'), { status: 500 }));
+    const p = listModels(row('ollama', { apiKey: null })).catch((e) => e);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await p).toMatchObject({ name: 'AiProviderError', message: 'Ollama API error (500): half a body' });
+  });
+  it('the connection test reports a timeout in words', async () => {
+    vi.useFakeTimers();
+    stubFetch(never);
+    const p = testProvider(row('openrouter'));
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(await p).toEqual({ success: false, error: 'OpenRouter did not respond within 15s' });
+  });
+  it('the model test reports a timeout in words', async () => {
+    vi.useFakeTimers();
+    stubFetch(never);
+    const p = testModel(row('anthropic'), { model: 'claude-haiku-5-5' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(await p).toEqual({ success: false, error: 'Anthropic did not respond within 15s' });
+  });
+  it('the CLI version check gives up after 15 s and kills the process', async () => {
+    vi.useFakeTimers();
+    const child: any = new EventEmitter();
+    child.kill = vi.fn();
+    (spawn as any).mockImplementationOnce(() => child);
+    const p = testProvider(row('claude-cli', { apiKey: null }));
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(await p).toEqual({ success: false, error: 'Claude CLI not found or not working' });
+    expect(child.kill).toHaveBeenCalled();
+  });
+});
+
+describe('whitespace-only values', () => {
+  it('a model of only whitespace falls back to the default, or fails clearly without one', async () => {
+    const stub = stubFetch(() => sseResponse([{ data: '[DONE]' }]));
+    expect(await testModel(row('openrouter'), { model: '  ' })).toEqual({ success: true, model: 'openrouter/auto' });
+    expect(stub.calls[0].body.model).toBe('openrouter/auto');
+    expect(await testModel(row('openai'), { model: ' \n' })).toMatchObject({ success: false, error: expect.stringMatching(/No model selected/) });
+    expect(stub.calls).toHaveLength(1);
+  });
+  it('a configured model is trimmed before it is sent and reported', async () => {
+    const stub = stubFetch(() => sseResponse([{ data: '[DONE]' }]));
+    expect(await testModel(row('openrouter'), { model: ' vendor/m ' })).toEqual({ success: true, model: 'vendor/m' });
+    expect(stub.calls[0].body.model).toBe('vendor/m');
+  });
+  it('a key of only whitespace is missing for the connection and model tests', async () => {
+    const stub = stubFetch(() => jsonResponse({}));
+    expect(await testProvider(row('openrouter', { apiKey: '  ' }))).toEqual({ success: false, error: 'No OpenRouter API key configured' });
+    expect(await testModel(row('openrouter', { apiKey: '\n' }), { model: 'm' })).toEqual({ success: false, error: 'No OpenRouter API key configured' });
+    expect(stub.calls).toHaveLength(0);
+  });
+  it('a CLI token of only whitespace is not passed to the CLI', async () => {
+    (spawn as any).mockImplementationOnce(() => fakeChild({ code: 0 }));
+    await testProvider(row('claude-cli', { apiKey: '  ' }));
+    expect((spawn as any).mock.calls[0][2]?.env?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    (ClaudeCliProvider.getVersion as any).mockResolvedValueOnce('1.0.0');
+    (ClaudeCliProvider.testToolUse as any).mockResolvedValueOnce({ ok: true });
+    await testModel(row('claude-cli', { apiKey: ' ' }), { model: ' ' });
+    expect((ClaudeCliProvider.getVersion as any).mock.calls[0][0]).toBeUndefined();
+    expect((ClaudeCliProvider.testToolUse as any).mock.calls[0]).toEqual([undefined, 'sonnet']);
+  });
+});
 
 function fakeChild(outcome: { code: number } | { error: true }) {
   const child: any = new EventEmitter();

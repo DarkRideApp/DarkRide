@@ -34,7 +34,7 @@ function formatMessages(messages: AiMessage[]): any[] {
 }
 
 function headers(ctx: DialectContext): Record<string, string> {
-  return { 'Content-Type': 'application/json', 'x-api-key': ctx.apiKey || '', ...(ctx.descriptor.extraHeaders ?? {}) };
+  return { 'Content-Type': 'application/json', ...(ctx.apiKey ? { 'x-api-key': ctx.apiKey } : {}), ...(ctx.descriptor.extraHeaders ?? {}) };
 }
 
 function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError {
