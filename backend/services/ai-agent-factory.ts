@@ -13,6 +13,9 @@ import {
 } from './ai-agent';
 import { CORE_SERVICE_IDENTITIES, type CoreServiceKey } from './core-service-identities';
 import { scopeIntersect } from '../auth/scope-matcher';
+import { createLoggers } from '../logs';
+
+const { error: logError } = createLoggers('ai-agent-factory');
 
 // Some callers (bootstrap, claim-manager, system-user, api-key-manager,
 // admin-users) pre-stringify scopes before Drizzle's mode:'json' stringifies
@@ -161,16 +164,33 @@ export class AiAgentFactory {
       async handleMessage(params: HandleMessageParams): Promise<HandleMessageResult> {
         const provider = deps.providerFactory(options);
         if (!provider) throw new Error('No AI provider configured');
-        const logId = deps.logger.startCall(identity, params);
+        // Call logging is bookkeeping: a logger failure is reported and never changes the run's outcome.
+        let logId = -1;
+        try {
+          logId = deps.logger.startCall(identity, params);
+        } catch (logErr) {
+          logError(`AI call log start failed: ${String(logErr)}`);
+        }
+        const endCall = (...args: Parameters<AiCallLoggerLike['endCall']>) => {
+          if (logId === -1) return;
+          try {
+            deps.logger.endCall(...args);
+          } catch (logErr) {
+            logError(`AI call log end failed for run ${logId}: ${String(logErr)}`);
+          }
+        };
+
         let result: HandleMessageResult;
         try {
           result = await provider.handleMessageWithIdentity(identity, params);
         } catch (err) {
-          // A run that throws still paid for the requests it made before failing.
+          // A run that throws still paid for the requests it made before failing. A user cancel mid-stream
+          // surfaces here as the signal's AbortError; a turn timeout aborts a different signal and stays an error.
+          const cancelled = params.signal?.aborted === true;
           const partial = getRunUsageFromError(err);
-          deps.logger.endCall(
+          endCall(
             logId,
-            'error',
+            cancelled ? 'aborted' : 'error',
             partial
               ? {
                 inputTokens: sum(partial.requests, 'inputTokens'),
@@ -180,25 +200,27 @@ export class AiAgentFactory {
                 toolCalls: partial.toolCalls,
               }
               : undefined,
-            String(err),
+            cancelled ? 'Request was cancelled' : String(err),
           );
           throw err;
         }
-        deps.logger.endCall(
+        const { run, ...rest } = result;
+        endCall(
           logId,
           result.aborted ? 'aborted' : result.error ? 'error' : 'success',
-          result.usage || result.run
+          result.usage || run
             ? {
               inputTokens: result.usage?.inputTokens,
               outputTokens: result.usage?.outputTokens,
-              requests: result.run?.requests,
-              turns: result.run?.turns,
-              toolCalls: result.run?.toolCalls,
+              requests: run?.requests,
+              turns: run?.turns,
+              toolCalls: run?.toolCalls,
             }
             : undefined,
           result.error,
         );
-        return result;
+        // The per-request detail is for the call log only; callers (including plugin code) never see it.
+        return rest;
       },
     };
   }

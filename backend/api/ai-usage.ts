@@ -7,7 +7,9 @@ const LIMIT = { name: 'limit', min: 1, max: 200, fallback: 50 };
 
 /**
  * Reads an optional whole-number query parameter. Absent means the default; anything else that is not a
- * plain integer inside the range (including an empty value or a repeated parameter) is an error.
+ * plain integer inside the range (including an empty value) is an error. A repeated parameter is an error
+ * over HTTP, where Express parses it into an array; the WebSocket REST adapter keeps only the last value,
+ * so there it is validated like a single value.
  */
 function intParam(
   raw: unknown,
