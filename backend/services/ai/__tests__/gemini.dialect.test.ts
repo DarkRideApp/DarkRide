@@ -3,11 +3,16 @@ import { describe, it, expect } from 'vitest';
 import { geminiDialect } from '../dialects/gemini-generate';
 import { makeCtx } from '../test-ctx';
 import { sseResponse, collect } from '../test-helpers';
-import { AiProviderError } from '../errors';
+import { classifyHttpError } from '../http';
+import { AiProviderError, AuthError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 
 const chunk = (o: unknown) => ({ data: JSON.stringify(o) });
 const parts = (p: unknown[], extra: object = {}) => chunk({ candidates: [{ content: { role: 'model', parts: p }, ...extra }] });
 const run = (events: any[]) => collect(geminiDialect.parseStream(sseResponse(events), makeCtx('gemini')));
+const thrown = async (events: any[]): Promise<any> => {
+  try { await collect(geminiDialect.parseStream(sseResponse(events), makeCtx('gemini'))); } catch (e) { return e; }
+  throw new Error('expected parseStream to throw');
+};
 const req = { messages: [{ role: 'user' as const, content: 'hi' }], systemPrompt: 'sys', tools: [] };
 
 describe('buildChat', () => {
@@ -51,6 +56,22 @@ describe('buildChat', () => {
     }, { stream: true }).body;
     expect(body.contents).toEqual([{ role: 'user', parts: [{ functionResponse: { name: 'tool_result', response: { result: 'r' } } }] }]);
   });
+  it('a plain user text turn after tool results is never merged into the functionResponse turn', () => {
+    const body: any = geminiDialect.buildChat(makeCtx('gemini'), {
+      ...req,
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'first', input: {} }] },
+        { role: 'tool_result', toolUseId: 'a', content: 'ra' },
+        { role: 'user', content: 'thanks' },
+        { role: 'tool_result', toolUseId: 'a', content: 'again' },
+      ],
+    }, { stream: true }).body;
+    expect(body.contents).toHaveLength(5);
+    expect(body.contents[2]).toEqual({ role: 'user', parts: [{ functionResponse: { name: 'first', response: { result: 'ra' } } }] });
+    expect(body.contents[3]).toEqual({ role: 'user', parts: [{ text: 'thanks' }] });
+    expect(body.contents[4]).toEqual({ role: 'user', parts: [{ functionResponse: { name: 'first', response: { result: 'again' } } }] });
+  });
 });
 
 describe('parseStream', () => {
@@ -78,12 +99,115 @@ describe('parseStream', () => {
     const blocked = await run([chunk({ promptFeedback: { blockReason: 'OTHER' } })]);
     expect((blocked.find((e) => e.type === 'text') as any).text).toContain('OTHER');
   });
-  it('MAX_TOKENS does not throw', async () => {
-    const events = await run([parts([{ text: 'cut' }], { finishReason: 'MAX_TOKENS' })]);
-    expect(events).toEqual([{ type: 'text', text: 'cut' }]);
+  it('MAX_TOKENS does not throw and still yields the text it produced', async () => {
+    await expect(run([parts([{ text: 'cut' }], { finishReason: 'MAX_TOKENS' })])).resolves.toEqual([{ type: 'text', text: 'cut' }]);
   });
-  it('classifies an in-stream error object', async () => {
-    await expect(run([chunk({ error: { code: 503, message: 'overloaded' } })])).rejects.toBeInstanceOf(AiProviderError);
+  it('skips thought parts so reasoning never reaches the chat', async () => {
+    const events = await run([parts([{ text: 'secret reasoning', thought: true }, { text: 'answer' }])]);
+    expect(events).toEqual([{ type: 'text', text: 'answer' }]);
+  });
+  it('skips chunks that are not JSON objects instead of throwing', async () => {
+    const events = await run([
+      { data: 'null' }, { data: '7' }, { data: '"str"' }, { data: 'not json at all' }, { data: '[]' },
+      parts([{ text: 'ok' }]),
+    ]);
+    expect(events).toEqual([{ type: 'text', text: 'ok' }]);
+  });
+  it('redacts the key out of a hostile blockReason', async () => {
+    const events = await run([chunk({ promptFeedback: { blockReason: 'bad sk-test-placeholder bad' } })]);
+    const text = (events.find((e) => e.type === 'text') as any).text as string;
+    expect(text).toContain('***');
+    expect(text).not.toContain('sk-test-placeholder');
+  });
+});
+
+describe('in-stream error classification', () => {
+  it.each([503, 502])('code %i is OverloadedError', async (code) => {
+    const e = await thrown([chunk({ error: { code, message: 'overloaded' } })]);
+    expect(e).toBeInstanceOf(OverloadedError);
+    expect(e.status).toBe(code);
+    expect(e.message).toBe('Gemini stream error: overloaded');
+  });
+  it('a plain 429 is RateLimitError with an empty Headers, not quota', async () => {
+    const e = await thrown([chunk({ error: { code: 429, message: 'slow down' } })]);
+    expect(e).toBeInstanceOf(RateLimitError);
+    expect(e).not.toBeInstanceOf(QuotaExhaustedError);
+    expect(e.headers).toBeInstanceOf(Headers);
+    expect(e.status).toBe(429);
+  });
+  it('the real 429 RESOURCE_EXHAUSTED billing payload is QuotaExhaustedError', async () => {
+    const e = await thrown([chunk({ error: {
+      code: 429, status: 'RESOURCE_EXHAUSTED',
+      message: 'You exceeded your current quota, please check your plan and billing details.',
+    } })]);
+    expect(e).toBeInstanceOf(QuotaExhaustedError);
+    expect(e).not.toBeInstanceOf(RateLimitError);
+    expect(e.status).toBe(429);
+  });
+  it('RESOURCE_EXHAUSTED without billing or quota wording stays RateLimitError', async () => {
+    const e = await thrown([chunk({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Try again shortly' } })]);
+    expect(e).toBeInstanceOf(RateLimitError);
+    expect(e).not.toBeInstanceOf(QuotaExhaustedError);
+  });
+  it('a 500 is a plain AiProviderError, not overloaded, rate-limited or quota', async () => {
+    const e = await thrown([chunk({ error: { code: 500, message: 'internal' } })]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e).not.toBeInstanceOf(OverloadedError);
+    expect(e).not.toBeInstanceOf(RateLimitError);
+    expect(e).not.toBeInstanceOf(QuotaExhaustedError);
+    expect(e.status).toBe(500);
+  });
+  it('a string code is coerced, so "503" is OverloadedError', async () => {
+    const e = await thrown([chunk({ error: { code: '503', message: 'overloaded' } })]);
+    expect(e).toBeInstanceOf(OverloadedError);
+    expect(e.status).toBe(503);
+  });
+  it('status UNAVAILABLE without a code is OverloadedError', async () => {
+    const e = await thrown([chunk({ error: { status: 'UNAVAILABLE', message: 'try later' } })]);
+    expect(e).toBeInstanceOf(OverloadedError);
+  });
+  it('a string error body keeps its message', async () => {
+    const e = await thrown([chunk({ error: 'boom' })]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.message).toBe('Gemini stream error: boom');
+  });
+  it('redacts the key from the thrown message', async () => {
+    const e = await thrown([chunk({ error: { code: 500, message: 'bad key sk-test-placeholder rejected' } })]);
+    expect(e.message).toContain('***');
+    expect(e.message).not.toContain('sk-test-placeholder');
+  });
+});
+
+describe('classifyError', () => {
+  const badKeyBody = JSON.stringify({ error: {
+    code: 400, message: 'API key not valid. Please pass a valid API key.', status: 'INVALID_ARGUMENT',
+    details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID', domain: 'googleapis.com' }],
+  } });
+  it('a 400 for a bad key is AuthError (Gemini does not answer 401)', () => {
+    const e = geminiDialect.classifyError!(400, new Headers(), badKeyBody) as any;
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.status).toBe(400);
+    expect(e.message).toBe('Gemini API error (400): API key not valid. Please pass a valid API key.');
+  });
+  it('matches on the reason code alone, and on a non-JSON body', () => {
+    expect(geminiDialect.classifyError!(400, new Headers(), '{"error":{"message":"x","details":[{"reason":"API_KEY_INVALID"}]}}')).toBeInstanceOf(AuthError);
+    const e = geminiDialect.classifyError!(400, new Headers(), '<html>API key not valid</html>') as any;
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.message).toContain('API key not valid');
+  });
+  it('caps an oversized upstream message', () => {
+    const e = geminiDialect.classifyError!(400, new Headers(), `API key not valid ${'x'.repeat(5000)}`) as any;
+    expect(e.message.length).toBeLessThanOrEqual('Gemini API error (400): '.length + 500);
+  });
+  it('an unrelated 400 and other statuses return undefined', () => {
+    expect(geminiDialect.classifyError!(400, new Headers(), '{"error":{"code":400,"message":"Invalid JSON payload","status":"INVALID_ARGUMENT"}}')).toBeUndefined();
+    expect(geminiDialect.classifyError!(500, new Headers(), badKeyBody)).toBeUndefined();
+    expect(geminiDialect.classifyError!(429, new Headers(), '{}')).toBeUndefined();
+  });
+  it('classifyHttpError uses the hook for a bad-key 400 and falls through for others', () => {
+    const ctx = makeCtx('gemini');
+    expect(classifyHttpError(geminiDialect, ctx, 400, new Headers(), badKeyBody)).toBeInstanceOf(AuthError);
+    expect(classifyHttpError(geminiDialect, ctx, 400, new Headers(), '{"error":{"message":"Invalid JSON payload"}}').constructor).toBe(AiProviderError);
   });
 });
 

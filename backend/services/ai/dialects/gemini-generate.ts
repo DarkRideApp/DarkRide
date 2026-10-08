@@ -1,7 +1,7 @@
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
 import { parseSSEStream, safeText } from '../http';
-import { AiProviderError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
+import { AiProviderError, AuthError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 
 const { log } = createLoggers('ai-gemini');
@@ -42,12 +42,29 @@ function formatTools(tools: AiToolDefinition[]): any[] {
 
 function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError {
   const e = payload?.error ?? payload ?? {};
-  const text = `${ctx.descriptor.shortName} stream error: ${safeText(e.message ?? 'Unknown error', ctx)}`;
-  const opts = { provider: ctx.descriptor.id, status: typeof e.code === 'number' ? e.code : undefined };
-  if (e.code === 429) return new RateLimitError(text, new Headers(), opts);
-  if (e.code === 503 || e.code === 502) return new OverloadedError(text, opts);
-  if (e.status === 'RESOURCE_EXHAUSTED' && /billing|quota/i.test(String(e.message))) return new QuotaExhaustedError(text, opts);
+  const isObj = typeof e === 'object';
+  const message = String((isObj ? e.message : e) || 'Unknown error');
+  const text = `${ctx.descriptor.shortName} stream error: ${safeText(message, ctx)}`;
+  const code = Number(isObj ? e.code : NaN);
+  const grpcStatus: unknown = isObj ? e.status : undefined;
+  const opts = { provider: ctx.descriptor.id, status: Number.isFinite(code) && code > 0 ? code : undefined };
+  // Quota wording is checked before the status code: Google sends its billing/quota exhaustion as a 429.
+  if (grpcStatus === 'RESOURCE_EXHAUSTED' && /billing|quota/i.test(message)) return new QuotaExhaustedError(text, opts);
+  if (code === 429) return new RateLimitError(text, new Headers(), opts);
+  if (code === 502 || code === 503 || grpcStatus === 'UNAVAILABLE') return new OverloadedError(text, opts);
   return new AiProviderError(text, opts);
+}
+
+/** Gemini answers a bad API key with HTTP 400 INVALID_ARGUMENT (reason API_KEY_INVALID), not 401. */
+function classifyError(status: number, _headers: Headers, bodyText: string): AiProviderError | undefined {
+  if (status !== 400 || !/API_KEY_INVALID|API key not valid/i.test(bodyText)) return undefined;
+  let msg = bodyText.trim();
+  try {
+    const m = JSON.parse(bodyText)?.error?.message;
+    if (typeof m === 'string' && m) msg = m;
+  } catch { /* not JSON: use the raw text */ }
+  // No DialectContext on this hook, so there is no key to redact; safeText still caps the length.
+  return new AuthError(`Gemini API error (400): ${safeText(msg, {})}`, { status });
 }
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
@@ -59,13 +76,15 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     if (sse.data === '[DONE]') break;
     let p: any;
     try { p = JSON.parse(sse.data); } catch { continue; }
-    if (p?.error) throw classifyStreamError(p, ctx);
+    if (!p || typeof p !== 'object') continue;
+    if (p.error) throw classifyStreamError(p, ctx);
 
     if (p.promptFeedback?.blockReason && !p.candidates?.length) {
-      yield { type: 'text', text: `${shortName} blocked this request (reason: ${p.promptFeedback.blockReason}).` };
+      yield { type: 'text', text: `${shortName} blocked this request (reason: ${safeText(p.promptFeedback.blockReason, ctx)}).` };
     }
     const cand = p.candidates?.[0];
     for (const part of cand?.content?.parts ?? []) {
+      if (!part || part.thought) continue;
       if (part.text) yield { type: 'text', text: part.text };
       else if (part.functionCall) yield { type: 'tool_use', id: ctx.newId(), name: part.functionCall.name, input: part.functionCall.args || {} };
     }
@@ -101,6 +120,7 @@ export const geminiDialect: Dialect = {
 
   parseStream,
   classifyStreamError,
+  classifyError,
 
   buildListModels(ctx: DialectContext, page?: string) {
     return { url: `${ctx.baseUrl}/v1beta/models?pageSize=1000${page ? `&pageToken=${encodeURIComponent(page)}` : ''}`, headers: headers(ctx) };
