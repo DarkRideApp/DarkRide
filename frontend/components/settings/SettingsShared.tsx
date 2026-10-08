@@ -3,15 +3,10 @@ import type { BlockedDomain, HiddenDomain } from '../../../shared/types/api';
 import type { AiModelConfig } from '../../../shared/types/ai-models';
 import type { AiProviderConfig, AiProviderType } from '../../../shared/types/ai-providers';
 import { ConfirmDialog } from '@darkrideapp/plugin-sdk/react';
+import { isCliProvider } from '../../../shared/lib/ai-provider-catalog';
+import { providerNeedsKeyBadge, providerTypeOptions } from '../../../shared/lib/ai-provider-form';
 
-export const PROVIDER_TYPE_OPTIONS: { value: AiProviderType; label: string }[] = [
-  { value: 'anthropic', label: 'Anthropic' },
-  { value: 'gemini', label: 'Google Gemini' },
-  { value: 'ollama', label: 'Ollama' },
-  { value: 'openrouter', label: 'OpenRouter' },
-  { value: 'codestral', label: 'Codestral' },
-  { value: 'claude-cli', label: 'Claude CLI' },
-];
+export const PROVIDER_TYPE_OPTIONS: { value: AiProviderType; label: string }[] = providerTypeOptions();
 
 export type CloudProvider = '' | 's3' | 'b2' | 'r2' | 'custom';
 
@@ -113,10 +108,10 @@ export function ProviderTypeBadge({ type }: { type: string }) {
 }
 
 export function ProviderStatusBadge({ provider }: { provider: AiProviderConfig }) {
-  if (!provider.hasApiKey && provider.type !== 'ollama' && provider.type !== 'claude-cli') {
+  if (providerNeedsKeyBadge(provider.type, provider.hasApiKey)) {
     return <StatusBadge color="var(--status-error, #ef4444)" bg="rgba(239,68,68,0.1)" text="No Key" />;
   }
-  if (provider.type === 'claude-cli' && provider.hasApiKey) {
+  if (isCliProvider(provider.type) && provider.hasApiKey) {
     return <StatusBadge color="var(--status-online, #22c55e)" bg="rgba(34,197,94,0.12)" text="Token Set" />;
   }
   return <StatusBadge color="var(--status-online, #22c55e)" bg="rgba(34,197,94,0.12)" text="Ready" />;
