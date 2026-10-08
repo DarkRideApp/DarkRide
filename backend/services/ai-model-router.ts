@@ -84,6 +84,11 @@ export class RateLimitCache {
     return endsAt > Date.now() ? endsAt : null;
   }
 
+  /** Forget the cooldown and parsed headers of these models, e.g. after their provider's key was corrected. */
+  clear(modelIds: number[]): void {
+    for (const id of modelIds) this.cache.delete(id);
+  }
+
   getAll(): Map<number, RateLimitEntry> {
     return this.cache;
   }
@@ -145,11 +150,18 @@ export class AiModelRouter {
   }
 
   /**
-   * Returns the enabled models for the requested tier name, falling down
-   * (to higher sort_order = cheaper) then up (to lower sort_order = more
-   * capable) when the requested tier is empty. Throws when every tier is
-   * empty. An unknown tier name is treated as "empty" and follows the
-   * same fallback path.
+   * Returns the enabled models for the requested tier name, in priority order.
+   *
+   * By default, when the requested tier is empty it falls down (to higher
+   * sort_order = cheaper) then up (to lower sort_order = more capable); an
+   * unknown tier name is treated as empty and follows the same path.
+   *
+   * With `strict`, only the named tier is considered and it never falls to
+   * another; an unknown name counts as empty. claude-cli models (resolved by
+   * the provider row's type) are dropped, since the CLI has no HTTP
+   * completion, so a tier holding only CLI models counts as empty.
+   *
+   * Throws NoModelsConfiguredError when nothing usable is found.
    */
   getModelsForTier(tierName: string, opts: { strict?: boolean } = {}): ModelRow[] {
     const allTiers = this.db.select().from(aiTiers).orderBy(asc(aiTiers.sortOrder)).all();
@@ -264,7 +276,8 @@ export class AiModelRouter {
    * tool call went out, a fallback would duplicate output, so the error is rethrown. Usage events are
    * held until the first content event (or the normal end of the stream) and discarded if the stream
    * fails first, so a fallback never double counts. A caller abort is never treated as a provider
-   * failure: it is rethrown with no fallback, no cooldown, and no held usage released.
+   * failure: it surfaces as the signal's reason with no fallback, no cooldown, and no held usage
+   * released.
    */
   async *createStreamingRequest(
     messages: AiMessage[],
@@ -273,6 +286,7 @@ export class AiModelRouter {
     options?: AiStreamOptions & { tier?: string },
   ): AsyncIterable<AiStreamEvent> {
     const signal = options?.signal;
+    signal?.throwIfAborted();
     const models = this.getModelsForTier(options?.tier ?? 'High');
     const attempts: Attempt[] = [];
     let lastError: unknown;
@@ -292,7 +306,10 @@ export class AiModelRouter {
           yield event;
         }
       } catch (err) {
-        if (yielded || callerAborted(signal) || !isFallbackEligible(err)) throw err;
+        // A cancelled request surfaces as the signal's reason (AbortError, or TimeoutError for a turn
+        // timeout), never as the provider error that raced the abort.
+        signal?.throwIfAborted();
+        if (yielded || !isFallbackEligible(err)) throw err;
         log(`Model "${model.name}" (${row.type}) failed with ${(err as Error).name}, trying next...`);
         this.recordFailure(model, row, err);
         attempts.push({ model: model.name, error: this.describeAttempt(err) });
@@ -318,19 +335,29 @@ export class AiModelRouter {
    */
   async completeText(req: AiCompleteRequest, opts: { tier: string; strict?: boolean }): Promise<string> {
     const signal = req.signal;
+    signal?.throwIfAborted();
     const models = this.getModelsForTier(opts.tier, { strict: opts.strict });
     const attempts: Attempt[] = [];
     let lastError: unknown;
 
     for (const { model, row, provider } of this.candidates(models, attempts)) {
       signal?.throwIfAborted();
+      // The factory seam allows streaming-only providers; those cannot complete, so try the next model.
+      const complete = (provider as Partial<AiProvider>).complete;
+      if (typeof complete !== 'function') {
+        attempts.push({ model: model.name, error: 'does not support completion' });
+        continue;
+      }
       try {
-        const text = await provider.complete(req);
+        const text = await complete.call(provider, req);
+        // A drained stream returns its partial text when the caller aborts; that is not a success.
+        signal?.throwIfAborted();
         this.rateLimitCache.recordSuccess(model.id, provider.lastResponseHeaders, row.type);
         log(`Completion served by model "${model.name}" (${row.type})`);
         return text;
       } catch (err) {
-        if (callerAborted(signal) || !isFallbackEligible(err)) throw err;
+        signal?.throwIfAborted();
+        if (!isFallbackEligible(err)) throw err;
         log(`Model "${model.name}" (${row.type}) failed with ${(err as Error).name}, trying next...`);
         this.recordFailure(model, row, err);
         attempts.push({ model: model.name, error: this.describeAttempt(err) });
