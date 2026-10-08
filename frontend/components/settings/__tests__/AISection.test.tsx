@@ -5,6 +5,19 @@ import { MemoryRouter } from 'react-router-dom';
 import { WebSocketContext, ToastProvider } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
 import { AISection } from '../AISection';
+import type { AiUsageResponse } from '../../../../shared/types/ai-usage';
+
+const EMPTY_USAGE: AiUsageResponse = {
+  days: 30,
+  generatedAt: '2026-10-08T09:00:00.000Z',
+  totals: {
+    runs: 0, failedRuns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    cacheHitRate: null, costUsd: null, unpricedRuns: 0,
+  },
+  byPurpose: [],
+  byDay: [],
+  recentRuns: [],
+};
 
 function makeWs(overrides?: Partial<WebSocketContextValue>): WebSocketContextValue {
   return {
@@ -39,6 +52,10 @@ function makeWs(overrides?: Partial<WebSocketContextValue>): WebSocketContextVal
             { id: 1, name: 'Gemini', type: 'gemini', baseUrl: null, hasApiKey: true, createdAt: 0, updatedAt: 0 },
           ] },
         });
+      }
+      if (method === 'GET' && path.startsWith('/v1/ai/usage')) {
+        // A valid response with no runs, so the usage card shows its empty state (not an error).
+        return Promise.resolve({ type: 'restapi', id: 'u', status: 200, body: EMPTY_USAGE });
       }
       return Promise.resolve({ type: 'restapi', id: 'x', status: 200, body: { success: true } });
     }),
