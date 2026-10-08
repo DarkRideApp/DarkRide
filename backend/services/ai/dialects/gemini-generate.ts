@@ -40,6 +40,23 @@ function formatTools(tools: AiToolDefinition[]): any[] {
   return [{ functionDeclarations: tools.map((t) => ({ name: t.name, description: t.description, parameters: t.inputSchema })) }];
 }
 
+/**
+ * Is a RESOURCE_EXHAUSTED / 429 error a genuinely exhausted quota rather than a transient limit?
+ * Calling a transient limit "quota" benches every model on the credential for the whole cooldown, while calling
+ * a spent daily quota a rate limit only benches one model row, so every doubtful case answers false.
+ */
+function isQuotaExhausted(err: any): boolean {
+  const ids: string[] = [];
+  for (const detail of Array.isArray(err?.details) ? err.details : []) {
+    for (const v of Array.isArray(detail?.violations) ? detail.violations : []) {
+      for (const k of [v?.quotaId, v?.quotaMetric]) if (typeof k === 'string') ids.push(k);
+    }
+  }
+  // Structured QuotaFailure info is authoritative: only a per-day / per-month limit counts, whatever the wording says.
+  if (ids.length > 0) return ids.some((id) => /PerDay|PerMonth|Daily/i.test(id));
+  return /billing/i.test(String(err?.message ?? ''));
+}
+
 function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError {
   const e = payload?.error ?? payload ?? {};
   const isObj = typeof e === 'object';
@@ -48,23 +65,41 @@ function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError
   const code = Number(isObj ? e.code : NaN);
   const grpcStatus: unknown = isObj ? e.status : undefined;
   const opts = { provider: ctx.descriptor.id, status: Number.isFinite(code) && code > 0 ? code : undefined };
-  // Quota wording is checked before the status code: Google sends its billing/quota exhaustion as a 429.
-  if (grpcStatus === 'RESOURCE_EXHAUSTED' && /billing|quota/i.test(message)) return new QuotaExhaustedError(text, opts);
-  if (code === 429) return new RateLimitError(text, new Headers(), opts);
+  // RESOURCE_EXHAUSTED is gRPC's name for HTTP 429, and Google sends both transient limits and spent quota as one.
+  if (code === 429 || grpcStatus === 'RESOURCE_EXHAUSTED') {
+    return isQuotaExhausted(e) ? new QuotaExhaustedError(text, opts) : new RateLimitError(text, new Headers(), opts);
+  }
   if (code === 502 || code === 503 || grpcStatus === 'UNAVAILABLE') return new OverloadedError(text, opts);
   return new AiProviderError(text, opts);
 }
 
+function parseErrorBody(bodyText: string): { json: boolean; error?: any } {
+  try { return { json: true, error: JSON.parse(bodyText)?.error }; } catch { return { json: false }; }
+}
+
 /** Gemini answers a bad API key with HTTP 400 INVALID_ARGUMENT (reason API_KEY_INVALID), not 401. */
+function isBadKeyBody(bodyText: string): boolean {
+  const { json, error } = parseErrorBody(bodyText);
+  if (!json) return /API_KEY_INVALID|API key not valid/i.test(bodyText);
+  // Structured body: trust the reason code or a message that STARTS with the phrase, not a proxy message that echoes it.
+  if (Array.isArray(error?.details) && error.details.some((d: any) => d?.reason === 'API_KEY_INVALID')) return true;
+  return typeof error?.message === 'string' && /^API key not valid/i.test(error.message);
+}
+
+/**
+ * HTTP-level hook. Handles the two cases the generic classifier gets wrong for Google:
+ * a bad key answered with 400 (not 401), and a spent quota answered with 429 (generic would make it a RateLimitError).
+ * Everything else returns undefined and takes the generic path, which keeps Retry-After for a plain 429.
+ */
 function classifyError(status: number, _headers: Headers, bodyText: string): AiProviderError | undefined {
-  if (status !== 400 || !/API_KEY_INVALID|API key not valid/i.test(bodyText)) return undefined;
-  let msg = bodyText.trim();
-  try {
-    const m = JSON.parse(bodyText)?.error?.message;
-    if (typeof m === 'string' && m) msg = m;
-  } catch { /* not JSON: use the raw text */ }
-  // No DialectContext on this hook, so there is no key to redact; safeText still caps the length.
-  return new AuthError(`Gemini API error (400): ${safeText(msg, {})}`, { status });
+  const quota = status === 429 && isQuotaExhausted(parseErrorBody(bodyText).error);
+  if (!quota && !(status === 400 && isBadKeyBody(bodyText))) return undefined;
+  const { error } = parseErrorBody(bodyText);
+  const msg = typeof error?.message === 'string' && error.message ? error.message : bodyText.trim();
+  // The hook has no DialectContext. classifyHttpError applies key redaction and provider tagging centrally;
+  // safeText here only caps the upstream text at 500 characters.
+  const text = `Gemini API error (${status}): ${safeText(msg, {})}`;
+  return quota ? new QuotaExhaustedError(text, { status }) : new AuthError(text, { status });
 }
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {

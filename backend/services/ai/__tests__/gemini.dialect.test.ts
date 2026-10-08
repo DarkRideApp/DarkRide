@@ -171,10 +171,62 @@ describe('in-stream error classification', () => {
     expect(e.constructor).toBe(AiProviderError);
     expect(e.message).toBe('Gemini stream error: boom');
   });
+  it.each([
+    ['empty string', ''], ['null', null], ['undefined', undefined], ['an object', {}], ['zero', 0], ['negative', -1], ['NaN (serialises to null)', NaN],
+  ])('a %s code is a plain AiProviderError with no status', async (_label, code) => {
+    const e = await thrown([chunk({ error: { code, message: 'boom' } })]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.status).toBeUndefined();
+    expect(e.message).toBe('Gemini stream error: boom');
+  });
+  it('RESOURCE_EXHAUSTED with no code and no billing wording is RateLimitError, not a plain error', async () => {
+    const e = await thrown([chunk({ error: { status: 'RESOURCE_EXHAUSTED', message: 'Resource has been exhausted (e.g. check quota).' } })]);
+    expect(e).toBeInstanceOf(RateLimitError);
+    expect(e).not.toBeInstanceOf(QuotaExhaustedError);
+  });
   it('redacts the key from the thrown message', async () => {
     const e = await thrown([chunk({ error: { code: 500, message: 'bad key sk-test-placeholder rejected' } })]);
     expect(e.message).toContain('***');
     expect(e.message).not.toContain('sk-test-placeholder');
+  });
+});
+
+const BILLING_MSG = 'You exceeded your current quota, please check your plan and billing details.';
+const quotaDetails = (...quotaIds: string[]) => [
+  { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: quotaIds.map((quotaId) => ({
+    quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_requests', quotaId, quotaDimensions: { location: 'global', model: 'gemini-2.5-flash' }, quotaValue: '20',
+  })) },
+  { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '30s' },
+];
+// [label, error fields, is the credential's quota really exhausted]. When unsure the answer is "no" (RateLimit):
+// calling a transient limit Quota would bench every model on the credential for the full cooldown.
+const QUOTA_CASES: Array<[string, object, boolean]> = [
+  ['PerMinute quotaId beats billing wording', { message: BILLING_MSG, details: quotaDetails('GenerateRequestsPerMinutePerProjectPerModel-FreeTier') }, false],
+  ['PerDay quotaId', { message: 'Quota exceeded for metric', details: quotaDetails('GenerateRequestsPerDayPerProjectPerModel-FreeTier') }, true],
+  ['PerMinute and PerDay violated together', { message: 'Quota exceeded', details: quotaDetails('GenerateRequestsPerMinutePerProjectPerModel-FreeTier', 'GenerateRequestsPerDayPerProjectPerModel-FreeTier') }, true],
+  ['unrecognised quotaId plus billing wording', { message: BILLING_MSG, details: quotaDetails('SomeNewQuotaName-FreeTier') }, false],
+  ['transient text that mentions quota but not billing', { message: 'Resource has been exhausted (e.g. check quota).' }, false],
+  ['unstructured billing wording', { message: BILLING_MSG }, true],
+];
+
+describe.each(QUOTA_CASES)('quota or rate limit: %s', (_label, fields, isQuota) => {
+  const error = { code: 429, status: 'RESOURCE_EXHAUSTED', ...fields };
+  const expectKind = (e: any) => {
+    if (isQuota) { expect(e).toBeInstanceOf(QuotaExhaustedError); expect(e).not.toBeInstanceOf(RateLimitError); }
+    else { expect(e).toBeInstanceOf(RateLimitError); expect(e).not.toBeInstanceOf(QuotaExhaustedError); }
+    expect(e.status).toBe(429);
+  };
+  it('in-stream', async () => { expectKind(await thrown([chunk({ error })])); });
+  it('HTTP 429 through classifyHttpError', () => {
+    const headers = new Headers({ 'retry-after': '7' });
+    const e: any = classifyHttpError(geminiDialect, makeCtx('gemini'), 429, headers, JSON.stringify({ error }));
+    expectKind(e);
+    if (isQuota) expect(e.message).toBe(`Gemini API error (429): ${(fields as any).message}`);
+    else expect(e.headers.get('retry-after')).toBe('7');   // the generic path keeps the headers for the cooldown
+  });
+  it('classifyError returns a QuotaExhaustedError for a quota 429 and defers otherwise', () => {
+    const r = geminiDialect.classifyError!(429, new Headers(), JSON.stringify({ error }));
+    if (isQuota) expect(r).toBeInstanceOf(QuotaExhaustedError); else expect(r).toBeUndefined();
   });
 });
 
@@ -194,6 +246,17 @@ describe('classifyError', () => {
     const e = geminiDialect.classifyError!(400, new Headers(), '<html>API key not valid</html>') as any;
     expect(e).toBeInstanceOf(AuthError);
     expect(e.message).toContain('API key not valid');
+  });
+  it('a JSON 400 that merely echoes the phrase mid-sentence is not treated as a bad key', () => {
+    const proxy = JSON.stringify({ error: { code: 400, message: 'upstream said: API key not valid', status: 'INVALID_ARGUMENT' } });
+    expect(geminiDialect.classifyError!(400, new Headers(), proxy)).toBeUndefined();
+    const reasonText = JSON.stringify({ error: { code: 400, message: 'bad field, see API_KEY_INVALID in the docs' } });
+    expect(geminiDialect.classifyError!(400, new Headers(), reasonText)).toBeUndefined();
+    expect(classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), proxy).constructor).toBe(AiProviderError);
+  });
+  it('a JSON 400 whose message starts with the phrase matches, with no details', () => {
+    const body = JSON.stringify({ error: { code: 400, message: 'API key not valid. Please pass a valid API key.' } });
+    expect(geminiDialect.classifyError!(400, new Headers(), body)).toBeInstanceOf(AuthError);
   });
   it('caps an oversized upstream message', () => {
     const e = geminiDialect.classifyError!(400, new Headers(), `API key not valid ${'x'.repeat(5000)}`) as any;
