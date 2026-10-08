@@ -24,5 +24,5 @@
     "baseUrl": "."
   },
   "include": ["backend/**/*.ts", "shared/**/*.ts", "plugins/**/*.ts", "bin/**/*.ts"],
-  "exclude": ["node_modules", "dist", "frontend", "**/*.test.ts", "plugins/*/frontend/**", "plugins/*/__tests__/**", "bin/**/__tests__/**", "bin/templates/**"]
+  "exclude": ["node_modules", "dist", "frontend", "**/*.test.ts", "plugins/*/frontend/**", "plugins/*/__tests__/**", "bin/**/__tests__/**", "bin/templates/**", "backend/services/ai/test-helpers.ts", "backend/services/ai/test-ctx.ts"]
 }
