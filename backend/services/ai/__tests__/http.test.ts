@@ -98,12 +98,22 @@ describe('redact', () => {
     redact('e'.repeat(64 * 1024), 'sk-test-placeholder');
     redact('://' + 'e'.repeat(64 * 1024), 'sk-test-placeholder');
     redact('a:/'.repeat(20_000), 'sk-test-placeholder');
+    redact('://' + 'a@'.repeat(32 * 1024), 'sk-test-placeholder');
+    redact('://' + '@'.repeat(64 * 1024), 'sk-test-placeholder');
+    redact('a@'.repeat(32 * 1024), 'sk-test-placeholder');
+    redact('://a'.repeat(16 * 1024), 'sk-test-placeholder');
     expect(Date.now() - started).toBeLessThan(250);
+  });
+  it('redacts userinfo whose password contains a literal @ up to the LAST @ of the authority', () => {
+    expect(redact('GET https://u:p@ss@host.test/x failed')).toBe('GET https://***@host.test/x failed');
+    expect(redact('https://u:p@@ss@host.test/x')).toBe('https://***@host.test/x');
   });
   it('leaves URLs without userinfo alone, including an @ in the path or query', () => {
     expect(redact('see https://host.test/users/@me and https://host.test/p?mail=a@b.test'))
       .toBe('see https://host.test/users/@me and https://host.test/p?mail=a@b.test');
     expect(redact('mail me at a@b.test')).toBe('mail me at a@b.test');
+    expect(redact('file:///home/u/@x and file:///etc/hosts')).toBe('file:///home/u/@x and file:///etc/hosts');
+    expect(redact('https://host.test?mail=a@b.test#frag@x')).toBe('https://host.test?mail=a@b.test#frag@x');
   });
   it('does not redact keys shorter than 6 characters (documented: they would mangle ordinary text), but does at exactly 6', () => {
     expect(redact('pw abc12 here', 'abc12')).toBe('pw abc12 here');
@@ -257,7 +267,7 @@ describe('sendChat', () => {
         pull(c) { if (n++ === 0) c.enqueue(new TextEncoder().encode('partial text')); else c.error(new Error('socket reset')); },
       });
       stubFetch(() => new Response(body, { status: 500 }));
-      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      const err = await sendChat(nullDialect, ctxFor('openai', { apiKey: undefined }), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
       expect(err).toBeInstanceOf(AiProviderError);
       expect(err.message).toBe('OpenAI API error (500): partial text');
     });
@@ -265,10 +275,93 @@ describe('sendChat', () => {
       vi.useFakeTimers();
       const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode('half a body')); } });   // never closes
       stubFetch(() => new Response(body, { status: 500 }));
-      const p = sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true });
+      const p = sendChat(nullDialect, ctxFor('openai', { apiKey: undefined }), { messages: [], systemPrompt: '', tools: [] }, { stream: true });
       const assertion = expect(p).rejects.toThrow('OpenAI API error (500): half a body');
       await vi.advanceTimersByTimeAsync(60_000);
       await assertion;
+    });
+    it('a partial read that ends mid-key never leaks a key prefix (stream error)', async () => {
+      const key = 'sk-test-placeholder';
+      let n = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(c) { if (n++ === 0) c.enqueue(new TextEncoder().encode('invalid key sk-test-pla')); else c.error(new Error('socket reset')); },
+      });
+      stubFetch(() => new Response(body, { status: 500 }));
+      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      expect(err).toBeInstanceOf(AiProviderError);
+      expect(err.message).not.toContain('sk-test-pla');
+      expect(err.message).not.toContain('sk-');
+      expect(err.message).not.toContain(key);
+    });
+    it('a partial read that ends mid-key never leaks a key prefix (10 s stall)', async () => {
+      vi.useFakeTimers();
+      const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode('bad key sk-test-pla')); } });   // never closes
+      stubFetch(() => new Response(body, { status: 500 }));
+      const p = sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true });
+      const assertion = expect(p).rejects.not.toThrow(/sk-/);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await assertion;
+      await expect(p).rejects.toBeInstanceOf(AiProviderError);
+    });
+    it('a partial read that ends mid-key never leaks a key prefix (caller abort)', async () => {
+      const ac = new AbortController();
+      const stub = stubFetch((call) => {
+        const signal = call.init.signal as AbortSignal;
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode('invalid key sk-test-pla'));
+            signal.addEventListener('abort', () => c.error(new DOMException('This operation was aborted', 'AbortError')), { once: true });
+          },
+        });
+        return new Response(body, { status: 500 });
+      });
+      const p = sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [], signal: ac.signal }, { stream: true }).catch((e) => e);
+      await vi.waitFor(() => expect(stub.calls).toHaveLength(1));
+      await new Promise((r) => setTimeout(r, 20));              // let the first chunk be read before aborting
+      ac.abort();
+      const err = await p;
+      expect(err).toBeInstanceOf(AiProviderError);
+      expect(err.message).not.toContain('sk-');
+    });
+    it('a complete short body is not clipped: the key is redacted in place and the rest kept', async () => {
+      stubFetch(() => new Response('invalid key sk-test-placeholder-1234', { status: 500 }));
+      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      expect(err.message).toBe('OpenAI API error (500): invalid key ***-1234');
+    });
+    it('without a key (or with a key under 6 chars) a partial body is kept whole', async () => {
+      for (const apiKey of [undefined, 'abc12']) {
+        let n = 0;
+        const body = new ReadableStream<Uint8Array>({
+          pull(c) { if (n++ === 0) c.enqueue(new TextEncoder().encode('partial text')); else c.error(new Error('socket reset')); },
+        });
+        stubFetch(() => new Response(body, { status: 500 }));
+        const err = await sendChat(nullDialect, ctxFor('openai', { apiKey }), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+        expect(err.message).toBe('OpenAI API error (500): partial text');
+        vi.unstubAllGlobals();
+      }
+    });
+    it('the 10 s deadline timer is cleared after a normal read', async () => {
+      vi.useFakeTimers();
+      stubFetch(() => new Response('plain failure', { status: 500 }));
+      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      expect(err.message).toBe('OpenAI API error (500): plain failure');
+      expect(vi.getTimerCount()).toBe(0);
+    });
+    it('a response with a null body gives an empty upstream message instead of throwing', async () => {
+      stubFetch(() => new Response(null, { status: 500 }));
+      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      expect(err).toBeInstanceOf(AiProviderError);
+      expect(err.message).toBe('OpenAI API error (500): ');
+    });
+    it('never throws, even when the body stream is already locked (getReader fails)', async () => {
+      stubFetch(() => {
+        const res = new Response('locked body', { status: 502 });
+        res.body!.getReader();                                  // lock it so a second getReader() throws TypeError
+        return res;
+      });
+      const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
+      expect(err).toBeInstanceOf(OverloadedError);
+      expect(err.message).toBe('OpenAI API error (502): ');
     });
     it('a UTF-8 character split across chunks is decoded intact', async () => {
       const bytes = new TextEncoder().encode('café au lait');   // 'e-acute' is 2 bytes
@@ -280,6 +373,65 @@ describe('sendChat', () => {
       const err = await sendChat(nullDialect, ctxFor('openai'), { messages: [], systemPrompt: '', tools: [] }, { stream: true }).catch((e) => e);
       expect(err.message).toBe('OpenAI API error (500): café au lait');
     });
+  });
+});
+
+describe('classifyHttpError: dialect classifyError hook results are normalised centrally', () => {
+  const KEY = 'sk-test-placeholder';
+  const withHook = (hook: Dialect['classifyError']): Dialect => ({ ...nullDialect, classifyError: hook });
+  const run = (dialect: Dialect, status = 401, body = 'oops', id = 'openai') =>
+    classifyHttpError(dialect, ctxFor(id), status, new Headers(), body);
+
+  it('redacts the key and URL userinfo, tags provider and status, and keeps class and identity', () => {
+    const fromHook = new AuthError(`bad key ${KEY} at https://u:p@host.test/x`);
+    const e = run(withHook(() => fromHook), 401);
+    expect(e).toBe(fromHook);                                  // same object, not wrapped
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.message).toBe('bad key *** at https://***@host.test/x');
+    expect(e.message).not.toContain(KEY);
+    expect(e.message).not.toContain('u:p@');
+    expect(e.provider).toBe('openai');
+    expect(e.status).toBe(401);
+    expect(e.stack ?? '').not.toContain(KEY);                  // the stack header embeds the original message
+    expect(e.stack ?? '').not.toContain('u:p@');
+  });
+  it('fills status from the HTTP status when the hook set none, but keeps a status the hook set', () => {
+    expect(run(withHook(() => new QuotaExhaustedError('q')), 429).status).toBe(429);
+    expect(run(withHook(() => new QuotaExhaustedError('q', { status: 418 })), 429).status).toBe(418);
+  });
+  it('keeps a provider the hook already set', () => {
+    const e = run(withHook(() => new AuthError('x', { provider: 'custom-id' })), 401);
+    expect(e.provider).toBe('custom-id');
+  });
+  it('preserves every error class the hook can return (RateLimitError keeps its headers)', () => {
+    const headers = new Headers({ 'retry-after': '3' });
+    const e = run(withHook(() => new RateLimitError(`slow ${KEY}`, headers, { status: 429 })), 429);
+    expect(e).toBeInstanceOf(RateLimitError);
+    expect((e as RateLimitError).headers.get('retry-after')).toBe('3');
+    expect(e.message).toBe('slow ***');
+  });
+  it('redacts BEFORE capping: a key straddling the message cap leaves no fragment', () => {
+    for (const pad of [990, 995, 999, 1000]) {
+      const e = run(withHook(() => new OverloadedError('x'.repeat(pad) + KEY + ' tail')), 503);
+      expect(e.message, `pad ${pad}`).not.toContain('sk-');
+    }
+  });
+  it('caps a huge hook message', () => {
+    const e = run(withHook(() => new AiProviderError('z'.repeat(50_000))), 500);
+    expect(e.message.length).toBeLessThanOrEqual(1000);
+  });
+  it('does not clip a normal hook message (prefix plus up to 500 chars of upstream text)', () => {
+    const msg = `Gemini API error (400): ${'u'.repeat(500)}`;
+    expect(run(withHook(() => new AuthError(msg)), 400).message).toBe(msg);
+  });
+  it('a hook returning undefined falls through to the generic path unchanged', () => {
+    const hook = vi.fn(() => undefined);
+    const e = run(withHook(hook), 500, 'oops');
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(e).toBeInstanceOf(AiProviderError);
+    expect(e.message).toBe('OpenAI API error (500): oops');
+    expect(e.provider).toBe('openai');
+    expect(e.status).toBe(500);
   });
 });
 

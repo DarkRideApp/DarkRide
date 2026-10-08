@@ -95,6 +95,9 @@ export async function* parseNDJSONStream(
 // ── Redaction and messages ───────────────────────────────────────────
 
 const MAX_UPSTREAM_CHARS = 500;
+// Backstop for a message a dialect hook built itself: its prefix ("Gemini API error (400): ") plus up to
+// MAX_UPSTREAM_CHARS of upstream text and possibly a hint. Only stops runaway text; not a tighter limit.
+const MAX_ERROR_MESSAGE_CHARS = 1000;
 
 /**
  * Mask the API key and any URL userinfo (`scheme://user:pass@` and the token-only `scheme://token@`).
@@ -104,7 +107,9 @@ export function redact(text: string, apiKey?: string): string {
   let out = text;
   if (apiKey && apiKey.length >= 6) out = out.split(apiKey).join('***');
   // Anchored on the literal "://" (no leading scheme pattern) so the scan stays linear on a 64 KB body of letters.
-  out = out.replace(/(:\/\/)[^\s/@?#]+@/g, '$1***@');
+  // '@' is allowed inside the match so a password containing '@' is masked up to the LAST '@' of the authority;
+  // '/', '?' and '#' end the authority, so '@' in a path, query or fragment is left alone.
+  out = out.replace(/(:\/\/)[^\s/?#]+@/g, '$1***@');
   return out;
 }
 
@@ -144,6 +149,25 @@ const OPENAI_QUOTA_CODES = new Set([
   'project_spend_limit_exceeded', 'organization_usage_limit_exceeded',
 ]);
 
+/**
+ * A dialect's classifyError hook has no DialectContext, so it cannot redact or tag its own errors. Do it here, once,
+ * for every dialect: mask the key and URL userinfo (BEFORE the cap), cap the message, fill in provider and status
+ * if the hook left them unset. The error object is mutated in place, so its class (and e.g. a RateLimitError's
+ * headers) and identity are preserved.
+ */
+function normaliseHookError(err: AiProviderError, ctx: DialectContext, status: number): AiProviderError {
+  const original = err.message;
+  const message = redact(original, ctx.apiKey).slice(0, MAX_ERROR_MESSAGE_CHARS);
+  if (message !== original) {
+    err.message = message;
+    // V8 bakes the construction-time message into the stack header; keep the raw text out of logged stacks too.
+    if (typeof err.stack === 'string') err.stack = err.stack.split(original).join(message);
+  }
+  err.provider ??= ctx.descriptor.id;
+  err.status ??= status;
+  return err;
+}
+
 export function classifyHttpError(
   dialect: Dialect,
   ctx: DialectContext,
@@ -152,7 +176,7 @@ export function classifyHttpError(
   bodyText: string,
 ): AiProviderError {
   const fromDialect = dialect.classifyError?.(status, headers, bodyText);
-  if (fromDialect) return fromDialect;
+  if (fromDialect) return normaliseHookError(fromDialect, ctx, status);
 
   const d: AiProviderDescriptor = ctx.descriptor;
   const opts = { status, provider: d.id };
@@ -247,32 +271,41 @@ const ERROR_BODY_TIMEOUT_MS = 10_000;
 
 /**
  * Read up to MAX_ERROR_BODY_BYTES of an error body, then cancel the rest. Never throws: a read error, a stall
- * past ERROR_BODY_TIMEOUT_MS, or a caller abort all return whatever was read so far.
+ * past ERROR_BODY_TIMEOUT_MS, a caller abort, or a body that cannot be read at all all return whatever was read.
+ *
+ * If the read stops early (anything other than a clean end of body or the 64 KB cap) the body may end in the
+ * middle of an echoed API key, which no later redaction can recognise. So when an `apiKey` of 6+ characters is
+ * known, the last `apiKey.length - 1` characters are dropped: the longest key prefix that could be dangling.
  */
-async function readBodyText(res: Response): Promise<string> {
+async function readBodyText(res: Response, apiKey?: string): Promise<string> {
   const body = res.body;
   if (!body) return '';
-  const reader = body.getReader();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   const decoder = new TextDecoder();
   let text = '';
   let bytes = 0;
+  let stoppedEarly = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), ERROR_BODY_TIMEOUT_MS); });
   try {
+    reader = body.getReader();
     while (bytes < MAX_ERROR_BODY_BYTES) {
       const next = await Promise.race([reader.read(), deadline]);
-      if (next === 'timeout' || next.done) break;
+      if (next === 'timeout') break;
+      if (next.done) { stoppedEarly = false; break; }
       const room = MAX_ERROR_BODY_BYTES - bytes;
       const chunk = next.value.length > room ? next.value.subarray(0, room) : next.value;
       bytes += chunk.length;
       text += decoder.decode(chunk, { stream: true });
     }
+    if (bytes >= MAX_ERROR_BODY_BYTES) stoppedEarly = false;   // the size cap is a deliberate stop, not a cut-off
     text += decoder.decode();
   } catch { /* return what was read */ }
   finally {
     clearTimeout(timer);
-    reader.cancel().catch(() => { /* already closed or errored */ });
+    reader?.cancel().catch(() => { /* already closed or errored */ });
   }
+  if (stoppedEarly && apiKey && apiKey.length >= 6) text = text.slice(0, Math.max(0, text.length - (apiKey.length - 1)));
   return text;
 }
 
@@ -287,7 +320,7 @@ export async function sendChat(
     const built = dialect.buildChat(current, req, opts);
     const res = await sendBuilt(built, current, req.signal);
     if (res.ok) return { res, ctx: current };
-    const bodyText = await readBodyText(res);
+    const bodyText = await readBodyText(res, current.apiKey);
     if (attempt === 0) {
       const retry = dialect.retryWith?.(res.status, bodyText, current);
       if (retry) { current = retry; continue; }
