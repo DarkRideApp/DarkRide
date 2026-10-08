@@ -1,0 +1,166 @@
+import { spawn } from 'child_process';
+import {
+  getProviderDescriptor, isCliProvider, type AiProviderDescriptor,
+} from '../../../shared/lib/ai-provider-catalog';
+import { ClaudeCliProvider } from '../claude-cli-provider';
+import { AiProviderError, ConnectionError, RateLimitError } from './errors';
+import { readJson, redactedCause, sendChat, sendChecked } from './http';
+import { resolveContext } from './provider';
+import { getDialect } from './registry';
+import type { DialectContext } from './dialect';
+
+export type TestResult = { success: true; model: string } | { success: false; error: string };
+export interface ProviderRow { type: string; apiKey: string | null; baseUrl: string | null }
+
+const MAX_PAGES = 10;
+/** More models than any real catalogue offers; a longer list is treated as a broken or hostile endpoint. */
+const MAX_MODELS = 50_000;
+const REQUEST_TIMEOUT_MS = 15_000;
+const CLI_MISSING = 'Claude CLI not found or not working';
+const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+/** A stored value with surrounding whitespace removed; only whitespace counts as not set. */
+const clean = (v: string | null | undefined): string | undefined => v?.trim() || undefined;
+
+function httpDescriptor(row: ProviderRow): AiProviderDescriptor {
+  const d = getProviderDescriptor(row.type);
+  if (!d || d.kind !== 'http' || !d.dialect) throw new AiProviderError(`Unknown provider type: ${row.type}`);
+  return d;
+}
+
+function ctxFor(row: ProviderRow, model: string): DialectContext {
+  // Ids are never synthesised here: listing and the probe do not parse tool calls.
+  return resolveContext(httpDescriptor(row), { apiKey: row.apiKey, baseUrl: row.baseUrl, model }, () => 'unused');
+}
+
+function requireKey(d: AiProviderDescriptor, row: ProviderRow): void {
+  if (d.auth.required && !clean(row.apiKey)) throw new AiProviderError(`No ${d.shortName} API key configured`, { provider: d.id });
+}
+
+/**
+ * Run one request with a 15 s budget covering the response and its body. When the budget runs out, whatever the
+ * request was doing (waiting for headers, reading the body) fails with "<name> did not respond within 15s".
+ */
+async function withTimeout<T>(ctx: DialectContext, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const d = ctx.descriptor;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new DOMException('The operation timed out', 'TimeoutError')), REQUEST_TIMEOUT_MS);
+  try {
+    return await run(ac.signal);
+  } catch (err) {
+    if (ac.signal.aborted) {
+      throw new ConnectionError(`${d.shortName} did not respond within ${REQUEST_TIMEOUT_MS / 1000}s`, { provider: d.id, cause: redactedCause(err, ctx.apiKey) });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * List a provider's models: the descriptor's static list, or the listing endpoint, following pagination for at
+ * most 10 pages and 50,000 models. A failed listing is classified like any other request, so a bad key reads as a typed AuthError
+ * with the provider's hint, and a 200 that is not JSON is an AiProviderError rather than a SyntaxError.
+ */
+export async function listModels(row: ProviderRow): Promise<{ id: string; name: string }[]> {
+  const d = getProviderDescriptor(row.type);
+  if (!d?.listModels) return [];
+  if ('static' in d.listModels) return d.listModels.static.map((m) => ({ id: m.id, name: m.name }));
+  if (d.kind !== 'http' || !d.dialect) return [];
+  requireKey(d, row);
+  const dialect = getDialect(d.dialect);
+  const { buildListModels, parseModels } = dialect;
+  if (!buildListModels || !parseModels) return [];
+  const ctx = ctxFor(row, d.defaultModel ?? 'unused');
+  const all: { id: string; name: string }[] = [];
+  let page: string | undefined;
+  for (let i = 0; i < MAX_PAGES; i++) {
+    const json = await withTimeout(ctx, async (signal) => {
+      const { res } = await sendChecked(dialect, ctx, (c) => buildListModels.call(dialect, c, page), { signal, method: 'GET' });
+      return readJson(res, ctx, signal);
+    });
+    const parsed = parseModels.call(dialect, json);
+    // A loop rather than a spread: spreading a very long array overflows the call stack.
+    if (all.length + parsed.models.length > MAX_MODELS) {
+      throw new AiProviderError(`${d.shortName} model list is too large`, { provider: d.id });
+    }
+    for (const m of parsed.models) all.push(m);
+    if (!parsed.next) break;
+    page = parsed.next;
+  }
+  return all;
+}
+
+function cliVersionOk(token: string | undefined): Promise<boolean> {
+  return new Promise((resolve) => {
+    const env = token ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token } : undefined;
+    let child: ReturnType<typeof spawn>;
+    try { child = spawn('claude', ['--version'], { env }); }
+    catch { resolve(false); return; }
+    const timer = setTimeout(() => { child.kill(); resolve(false); }, REQUEST_TIMEOUT_MS);
+    child.on('close', (code) => { clearTimeout(timer); resolve(code === 0); });
+    child.on('error', () => { clearTimeout(timer); resolve(false); });
+  });
+}
+
+/**
+ * One tiny streaming request. Only the HTTP outcome is judged: the body is cancelled unread, so a truncated,
+ * odd, or empty stream cannot fail the test, and no parser runs. A 2xx or a rate limit (the key works, the
+ * account is just busy) is success.
+ */
+async function probe(row: ProviderRow, model: string): Promise<TestResult> {
+  const d = httpDescriptor(row);
+  try {
+    const ctx = ctxFor(row, model);
+    await withTimeout(ctx, async (signal) => {
+      const { res } = await sendChat(getDialect(d.dialect!), ctx, {
+        messages: [{ role: 'user', content: 'hi' }], systemPrompt: '', tools: [], maxOutputTokens: 16, cache: false, signal,
+      }, { stream: true });
+      await res.body?.cancel().catch(() => undefined);
+    });
+    return { success: true, model };
+  } catch (err) {
+    if (err instanceof RateLimitError) return { success: true, model };
+    return { success: false, error: message(err) };
+  }
+}
+
+/**
+ * Test a provider's connection. With a default model and a credential, a one-turn generation, because some
+ * APIs list models even with a bad key or no credit. Otherwise (no default model, or no auth at all, such as a
+ * local Ollama whose default model may not be pulled) a listing, reporting the model count.
+ */
+export async function testProvider(row: ProviderRow): Promise<TestResult> {
+  const d = getProviderDescriptor(row.type);
+  if (!d) return { success: false, error: `Unknown provider type: ${row.type}` };
+  if (isCliProvider(row.type)) {
+    return (await cliVersionOk(clean(row.apiKey))) ? { success: true, model: 'claude-cli' } : { success: false, error: CLI_MISSING };
+  }
+  try { requireKey(d, row); } catch (e) { return { success: false, error: message(e) }; }
+
+  if (d.defaultModel && d.auth.scheme !== 'none') return probe(row, d.defaultModel);
+  try {
+    const models = await listModels(row);
+    return { success: true, model: `${models.length} models` };
+  } catch (err) {
+    return { success: false, error: message(err) };
+  }
+}
+
+/** Test one model row: a one-turn generation capped at 16 output tokens, or the CLI's version and tool self-test. */
+export async function testModel(row: ProviderRow, modelRow: { model: string | null }): Promise<TestResult> {
+  const d = getProviderDescriptor(row.type);
+  if (!d) return { success: false, error: `Unknown provider: ${row.type}` };
+  const chosen = clean(modelRow.model);
+  if (isCliProvider(row.type)) {
+    const token = clean(row.apiKey);
+    const version = await ClaudeCliProvider.getVersion(token);
+    if (!version) return { success: false, error: CLI_MISSING };
+    const tool = await ClaudeCliProvider.testToolUse(token, chosen || d.defaultModel || 'sonnet');
+    if (!tool.ok) return { success: false, error: tool.reason || 'Claude CLI cannot use tools' };
+    return { success: true, model: chosen || 'claude-cli' };
+  }
+  try { requireKey(d, row); } catch (e) { return { success: false, error: message(e) }; }
+  const model = chosen || d.defaultModel;
+  if (!model) return { success: false, error: `No model selected for ${d.label}. Choose a model in the model settings.` };
+  return probe(row, model);
+}

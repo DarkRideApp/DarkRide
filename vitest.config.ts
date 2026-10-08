@@ -40,6 +40,9 @@ export default defineConfig({
       // config (tests/e2e/vitest.config.ts). They must not run in the
       // default gate suite, where they fail fast with no server.
       'tests/e2e/**',
+      // Paid provider checks. They run only through `npm run test:ai-live`
+      // (vitest.live.config.ts), never in the default suite or in CI.
+      'tests/live/**',
     ],
     // Use process forks (not threads) — each fork is an isolated process whose
     // memory is fully reclaimed on exit. With 24 CPU cores and 130+ test files

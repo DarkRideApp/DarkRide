@@ -66,8 +66,8 @@ import { ClaudeCliProvider, writeMcpConfig } from './services/claude-cli-provide
 import { registerAllTools } from './services/ai-tool-definitions';
 import { AiAgent, type AiAgentInterface, type TierConfig } from './services/ai-agent';
 import { ClaudeCliAgent } from './services/claude-cli-agent';
-import { createProvider } from './services/ai-provider';
-import type { AiProvider } from './services/ai-provider';
+import type { AiStreamingProvider } from './services/ai/dialect';
+import { getProviderDescriptor } from '../shared/lib/ai-provider-catalog';
 import { registerAiChatEndpoints } from './websocket/ai-chat-handlers';
 import { AiModelRouter, RateLimitCache } from './services/ai-model-router';
 import { migrateAiSettingsToModels } from './db/migrate-ai-models';
@@ -435,8 +435,8 @@ registerCaptureEndpoints(captureManager);
 registerBlocklistEndpoints(db);
 registerHiddenlistEndpoints(db);
 registerCredentialsEndpoints(db);
-// Settings registration is deferred until after diff engine is set up (needs DEFAULT_DIFF_PROMPT)
-registerAiCompleteEndpoints(db);
+// Settings registration is deferred until after diff engine is set up (needs DEFAULT_DIFF_PROMPT).
+// Inline completion registers after the AI model router is created, below.
 registerAiChatApiEndpoints(db, getClaudeCliProvider);
 registerUtilsEndpoints(DATABASE_PATH, db);
 registerSavedTrafficEndpoints(savedTrafficStore, db);
@@ -516,29 +516,29 @@ function getClaudeCliProvider(): ClaudeCliProvider | null {
 migrateAiSettingsToModels(db);
 migrateAiProviders(db);
 
-// AI Provider endpoints
-registerAiProviderEndpoints(db);
+// AI Provider endpoints (share the router's cache so saving a provider lifts its models' cooldowns)
+const rateLimitCache = new RateLimitCache();
+registerAiProviderEndpoints(db, rateLimitCache);
 
 // AI Tier endpoints
 const aiTierStore = new AiTierStore(db);
 registerAiTiersRoutes({ tierStore: aiTierStore, db });
 
 // AI Model Router (multi-model with rate limit fallback)
-const rateLimitCache = new RateLimitCache();
 const aiModelRouter = new AiModelRouter(db, rateLimitCache);
 registerAiModelEndpoints(db, aiModelRouter, rateLimitCache);
+// Completion registers after the router exists so its cooldowns are shared.
+registerAiCompleteEndpoints(db, aiModelRouter);
 
 // Router-based provider facade: delegates createStreamingRequest to the router.
 // When `tier` is provided, the facade injects it into every createStreamingRequest
 // call so the router picks models from the correct tier (not the default 'High').
-function getAiProvider(tier?: string): AiProvider | null {
+function getAiProvider(tier?: string): AiStreamingProvider | null {
   const models = aiModelRouter.getEnabledModels();
   if (models.length === 0) return null;
 
   return {
     name: 'router',
-    buildHeaders: () => ({}),
-    formatTools: (tools) => tools,
     createStreamingRequest: (messages, systemPrompt, tools, options) =>
       aiModelRouter.createStreamingRequest(messages, systemPrompt, tools, { ...options, tier: tier ?? options?.tier }),
   };
@@ -550,7 +550,7 @@ function getAiAgent(options?: { tier?: string }): AiAgentInterface | null {
     if (models.length === 0) return null;
 
     const topModel = models[0];
-    if (topModel.provider === 'claude-cli') {
+    if (aiModelRouter.isCliModel(topModel)) {
       const cli = claudeCliProvider;
       if (!cli) { log('claude-cli model configured but CLI not available'); return null; }
       if (topModel.providerId) {
@@ -559,7 +559,7 @@ function getAiAgent(options?: { tier?: string }): AiAgentInterface | null {
       } else {
         cli.setOauthToken(undefined);
       }
-      return new ClaudeCliAgent(db, cli, topModel.model || 'sonnet');
+      return new ClaudeCliAgent(db, cli, topModel.model || getProviderDescriptor('claude-cli')!.defaultModel!);
     }
 
     const provider = getAiProvider(options?.tier);
@@ -585,7 +585,7 @@ function getTierConfig(writeToolNames: string[]): TierConfig | null {
     const writeModel = writeModels[0];
 
     // TierConfig is not supported for claude-cli models (inherits prior behaviour).
-    if (researchModel.provider === 'claude-cli' || writeModel.provider === 'claude-cli') return null;
+    if (aiModelRouter.isCliModel(researchModel) || aiModelRouter.isCliModel(writeModel)) return null;
 
     return {
       researchProvider: aiModelRouter.createProviderForModelId(researchModel.id),

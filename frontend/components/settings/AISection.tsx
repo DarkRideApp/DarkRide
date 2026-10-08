@@ -12,6 +12,8 @@ import {
 import type { AiModelConfig } from '../../../shared/types/ai-models';
 import type { AiProviderConfig, AiProviderType } from '../../../shared/types/ai-providers';
 import type { AiTier } from '@darkrideapp/plugin-sdk/react';
+import { AI_PROVIDER_CATALOG, getProviderDescriptor, isKnownProviderType, sameEffectiveBaseUrl } from '../../../shared/lib/ai-provider-catalog';
+import { providerFormShape, validateProviderForm } from '../../../shared/lib/ai-provider-form';
 
 export function AISection() {
   const ws = useWebSocket();
@@ -22,7 +24,7 @@ export function AISection() {
   const [showProviderModal, setShowProviderModal] = useState(false);
   const [editingProvider, setEditingProvider] = useState<AiProviderConfig | null>(null);
   const [providerForm, setProviderForm] = useState({
-    name: '', type: 'gemini' as AiProviderType, apiKey: '', baseUrl: '', clearApiKey: false,
+    name: '', type: AI_PROVIDER_CATALOG[0].id as AiProviderType, apiKey: '', baseUrl: '', clearApiKey: false,
   });
   const [providerSaving, setProviderSaving] = useState(false);
   const [providerTestResult, setProviderTestResult] = useState<{ success: boolean; message: string } | null>(null);
@@ -103,7 +105,7 @@ export function AISection() {
   // AI Provider handlers
   const handleOpenAddProvider = () => {
     setEditingProvider(null);
-    setProviderForm({ name: '', type: 'gemini', apiKey: '', baseUrl: '', clearApiKey: false });
+    setProviderForm({ name: '', type: AI_PROVIDER_CATALOG[0].id, apiKey: '', baseUrl: '', clearApiKey: false });
     setProviderTestResult(null);
     setShowProviderModal(true);
   };
@@ -131,11 +133,12 @@ export function AISection() {
       if (providerForm.clearApiKey) payload.apiKey = '';
       else if (providerForm.apiKey) payload.apiKey = providerForm.apiKey;
 
-      if (editingProvider) {
-        await ws.sendRestApi('PUT', `/v1/ai/providers/${editingProvider.id}`, payload);
-      } else {
-        await ws.sendRestApi('POST', '/v1/ai/providers', payload);
-      }
+      const res = editingProvider
+        ? await ws.sendRestApi('PUT', `/v1/ai/providers/${editingProvider.id}`, payload)
+        : await ws.sendRestApi('POST', '/v1/ai/providers', payload);
+      // sendRestApi resolves on a 400. The global API error handler already
+      // shows the server's message, so keep the modal open and do not toast.
+      if (res.body?.success === false) return;
 
       setShowProviderModal(false);
       fetchAiProviders();
@@ -246,11 +249,11 @@ export function AISection() {
         tierId: modelForm.tierId,
       };
 
-      if (editingModel) {
-        await ws.sendRestApi('PUT', `/v1/ai/models/${editingModel.id}`, payload);
-      } else {
-        await ws.sendRestApi('POST', '/v1/ai/models', payload);
-      }
+      const res = editingModel
+        ? await ws.sendRestApi('PUT', `/v1/ai/models/${editingModel.id}`, payload)
+        : await ws.sendRestApi('POST', '/v1/ai/models', payload);
+      // Same as handleSaveProvider: a rejected save keeps the modal open.
+      if (res.body?.success === false) return;
 
       setShowModelModal(false);
       fetchAiModels();
@@ -422,6 +425,33 @@ export function AISection() {
       toast.error('Failed to move model to tier');
     }
   };
+
+  // ── Provider form, derived from the catalog ──
+  const shape = providerFormShape(providerForm.type);
+  const savedBaseUrl = editingProvider?.baseUrl ?? '';
+  // An unchanged legacy Base URL must not block a rename (the server also
+  // validates only on change). A type change re-validates, because the new
+  // type may require a Base URL the old one did not.
+  const baseUrlUnchanged = !!editingProvider
+    && providerForm.type === editingProvider.type
+    && providerForm.baseUrl === savedBaseUrl;
+  const baseUrlCheck = baseUrlUnchanged
+    ? { ok: true as const }
+    : validateProviderForm(providerForm.type, providerForm.baseUrl);
+  const baseUrlError = baseUrlCheck.ok ? null : baseUrlCheck.error;
+  // Mirrors the server: PUT clears the stored key when the type or the
+  // effective Base URL changes and no new key is supplied.
+  const editDescriptor = getProviderDescriptor(providerForm.type);
+  const keyWillBeCleared = !!editingProvider && editingProvider.hasApiKey && (
+    providerForm.type !== editingProvider.type
+    || (editDescriptor
+      ? !sameEffectiveBaseUrl(editDescriptor, providerForm.baseUrl, editingProvider.baseUrl)
+      : providerForm.baseUrl.trim() !== savedBaseUrl.trim())
+  );
+
+  // ── Model form: a provider without a default model needs one chosen ──
+  const modelShape = providerFormShape(aiProvidersList.find(p => p.id === modelForm.providerId)?.type ?? '');
+  const modelMissing = modelShape.modelRequired && !modelForm.model.trim();
 
   return (
     <div id="section-ai">
@@ -780,7 +810,7 @@ export function AISection() {
               <button
                 className="btn btn-primary"
                 onClick={handleSaveProvider}
-                disabled={providerSaving || !providerForm.name || !providerForm.type}
+                disabled={providerSaving || !providerForm.name || !providerForm.type || !!baseUrlError}
                 data-testid="save-provider-btn"
               >
                 {providerSaving ? 'Saving...' : editingProvider ? 'Update' : 'Add'}
@@ -807,16 +837,25 @@ export function AISection() {
                 id="settings-llm-type"
                 className="form-input"
                 value={providerForm.type}
-                onChange={e => setProviderForm(f => ({ ...f, type: e.target.value as AiProviderType }))}
+                onChange={e => {
+                  const type = e.target.value as AiProviderType;
+                  // Back on the saved type, the saved Base URL returns; otherwise saving would store none.
+                  const baseUrl = editingProvider && type === editingProvider.type ? savedBaseUrl : '';
+                  setProviderForm(f => ({ ...f, type, baseUrl }));
+                }}
                 data-testid="provider-type-select"
               >
+                {/* A stored type that is no longer offered still needs an option, or the select shows the first one. */}
+                {!isKnownProviderType(providerForm.type) && (
+                  <option value={providerForm.type} disabled>Unknown type: {providerForm.type}</option>
+                )}
                 {PROVIDER_TYPE_OPTIONS.map(o => (
                   <option key={o.value} value={o.value}>{o.label}</option>
                 ))}
               </select>
             </div>
 
-            {providerForm.type === 'claude-cli' && (
+            {shape.isCli && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <div style={{ fontSize: 13, color: 'var(--text-muted)', padding: '4px 0' }}>
                   Uses the server's Claude CLI login. To (re)authenticate without SSH, open the
@@ -828,7 +867,8 @@ export function AISection() {
                 </div>
                 <div className="form-group">
                   <label htmlFor="settings-llm-oauth-token">
-                    OAuth Token <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>(optional)</span>
+                    {shape.keyLabel}{' '}
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{shape.keyRequired ? '(required)' : '(optional)'}</span>
                   </label>
                   <input
                     id="settings-llm-oauth-token"
@@ -836,7 +876,7 @@ export function AISection() {
                     type="password"
                     value={providerForm.apiKey}
                     onChange={e => setProviderForm(f => ({ ...f, apiKey: e.target.value, clearApiKey: false }))}
-                    placeholder={editingProvider?.hasApiKey ? 'Enter new token to replace' : 'CLAUDE_CODE_OAUTH_TOKEN from setup-token'}
+                    placeholder={editingProvider?.hasApiKey ? 'Enter new token to replace' : (shape.keyPlaceholder ?? '')}
                     data-testid="provider-oauth-token-input"
                   />
                   {renderSavedKeyNotice()}
@@ -844,33 +884,59 @@ export function AISection() {
               </div>
             )}
 
-            {['anthropic', 'gemini', 'openrouter', 'codestral'].includes(providerForm.type) && (
+            {shape.showKey && !shape.isCli && (
               <div className="form-group">
-                <label htmlFor="settings-llm-api-key">API Key</label>
+                <label htmlFor="settings-llm-api-key">
+                  {shape.keyLabel}
+                  {!shape.keyRequired && <> <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>(optional)</span></>}
+                </label>
                 <input
                   id="settings-llm-api-key"
                   className="form-input"
                   type="password"
                   value={providerForm.apiKey}
                   onChange={e => setProviderForm(f => ({ ...f, apiKey: e.target.value, clearApiKey: false }))}
-                  placeholder={editingProvider?.hasApiKey ? 'Enter new key to replace' : 'Enter API key'}
+                  placeholder={editingProvider?.hasApiKey ? 'Enter new key to replace' : (shape.keyPlaceholder ?? 'Enter API key')}
                   data-testid="provider-api-key-input"
                 />
                 {renderSavedKeyNotice()}
               </div>
             )}
 
-            {providerForm.type === 'ollama' && (
+            {shape.showBaseUrl && (
               <div className="form-group">
-                <label htmlFor="settings-llm-base-url">Base URL</label>
+                <label htmlFor="settings-llm-base-url">
+                  Base URL{' '}
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    {shape.baseUrlRequired ? '(required)' : '(optional, leave empty for the default)'}
+                  </span>
+                </label>
                 <input
                   id="settings-llm-base-url"
                   className="form-input"
                   value={providerForm.baseUrl}
                   onChange={e => setProviderForm(f => ({ ...f, baseUrl: e.target.value }))}
-                  placeholder="http://localhost:11434"
+                  placeholder={shape.baseUrlPlaceholder || 'http://localhost:1234/v1'}
+                  aria-invalid={baseUrlError ? true : undefined}
+                  aria-describedby={baseUrlError ? 'settings-llm-base-url-error' : undefined}
                   data-testid="provider-base-url-input"
                 />
+                {baseUrlError && (
+                  <div
+                    id="settings-llm-base-url-error"
+                    aria-live="polite"
+                    style={{ fontSize: 12, color: 'var(--status-error, #ef4444)', marginTop: 4 }}
+                    data-testid="provider-base-url-error"
+                  >
+                    {baseUrlError}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {keyWillBeCleared && (
+              <div role="alert" style={{ fontSize: 12, color: 'var(--warning, #f59e0b)' }} data-testid="provider-key-clear-notice">
+                Changing the type or Base URL clears the saved key unless you enter a new one.
               </div>
             )}
 
@@ -910,7 +976,7 @@ export function AISection() {
               <button
                 className="btn btn-primary"
                 onClick={handleSaveModel}
-                disabled={modelSaving || !modelForm.name || !modelForm.providerId}
+                disabled={modelSaving || !modelForm.name || !modelForm.providerId || modelMissing}
                 data-testid="save-model-btn"
               >
                 {modelSaving ? 'Saving...' : editingModel ? 'Update' : 'Add'}
@@ -951,7 +1017,10 @@ export function AISection() {
 
             <div className="form-group">
               <label>
-                Model <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>(optional, uses provider default)</span>
+                Model{' '}
+                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                  {modelShape.modelRequired ? '(required)' : '(optional, uses provider default)'}
+                </span>
                 {providerModelsLoading && <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 8 }}>Loading models...</span>}
               </label>
               {providerModels.length > 0 ? (
@@ -967,7 +1036,7 @@ export function AISection() {
                     style={{ flex: 1 }}
                     data-testid="model-model-select"
                   >
-                    <option value="">— Provider default —</option>
+                    <option value="">{modelShape.modelRequired ? '— Select a model —' : '— Provider default —'}</option>
                     {providerModels.map(m => (
                       <option key={m.id} value={m.id}>{m.name !== m.id ? `${m.name} (${m.id})` : m.id}</option>
                     ))}
@@ -989,7 +1058,7 @@ export function AISection() {
                   className="form-input"
                   value={modelForm.model}
                   onChange={e => setModelForm(f => ({ ...f, model: e.target.value }))}
-                  placeholder="e.g. claude-sonnet-4-20250514"
+                  placeholder="e.g. a model id from the provider's list"
                   data-testid="model-model-input"
                 />
               )}

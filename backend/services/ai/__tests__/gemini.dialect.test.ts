@@ -1,0 +1,609 @@
+// fixtures: hand-written from https://ai.google.dev/api/generate-content (wire shape only)
+import { describe, it, expect } from 'vitest';
+import { geminiDialect } from '../dialects/gemini-generate';
+import { makeCtx } from '../test-ctx';
+import { sseResponse, collect } from '../test-helpers';
+import { classifyHttpError } from '../http';
+import { AiProviderError, AuthError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
+
+const chunk = (o: unknown) => ({ data: JSON.stringify(o) });
+const parts = (p: unknown[], extra: object = {}) => chunk({ candidates: [{ content: { role: 'model', parts: p }, ...extra }] });
+const run = (events: any[]) => collect(geminiDialect.parseStream(sseResponse(events), makeCtx('gemini')));
+const thrown = async (events: any[]): Promise<any> => {
+  try { await collect(geminiDialect.parseStream(sseResponse(events), makeCtx('gemini'))); } catch (e) { return e; }
+  throw new Error('expected parseStream to throw');
+};
+const req = { messages: [{ role: 'user' as const, content: 'hi' }], systemPrompt: 'sys', tools: [] };
+
+describe('buildChat', () => {
+  it('uses the header for the key, never the URL, and the streaming endpoint', () => {
+    const b = geminiDialect.buildChat(makeCtx('gemini', { model: 'gemini-2.5-flash' }), req, { stream: true });
+    expect(b.url).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse');
+    expect(b.url).not.toContain('key=');
+    expect(b.headers['x-goog-api-key']).toBe('sk-test-placeholder');
+  });
+  it('system instruction, tools as functionDeclarations, generationConfig only when needed', () => {
+    const body: any = geminiDialect.buildChat(makeCtx('gemini'), {
+      ...req, tools: [{ name: 'f', description: 'd', inputSchema: { type: 'object', properties: {} }, context: [] }],
+      maxOutputTokens: 256, stopSequences: ['x'], temperature: 0,
+    }, { stream: true }).body;
+    expect(body.systemInstruction).toEqual({ parts: [{ text: 'sys' }] });
+    expect(body.tools).toEqual([{ functionDeclarations: [{ name: 'f', description: 'd', parameters: { type: 'object', properties: {} } }] }]);
+    expect(body.generationConfig).toEqual({ maxOutputTokens: 256, stopSequences: ['x'], temperature: 0 });
+    const plain: any = geminiDialect.buildChat(makeCtx('gemini'), req, { stream: true }).body;
+    expect(plain.generationConfig).toBeUndefined();
+    expect(plain.tools).toBeUndefined();
+  });
+  it('an empty system prompt sends no systemInstruction at all', () => {
+    const body: any = geminiDialect.buildChat(makeCtx('gemini'), { ...req, systemPrompt: '' }, { stream: true }).body;
+    expect('systemInstruction' in body).toBe(false);
+  });
+  it('percent-encodes the model id so it cannot change the request path or add a query', () => {
+    const ctx = makeCtx('gemini', { model: 'tunedModels/my model?alt=json#x' });
+    const stream = geminiDialect.buildChat(ctx, req, { stream: true });
+    expect(stream.url).toBe('https://generativelanguage.googleapis.com/v1beta/models/tunedModels%2Fmy%20model%3Falt%3Djson%23x:streamGenerateContent?alt=sse');
+    const once = geminiDialect.buildChat(ctx, req, { stream: false });
+    expect(once.url).toBe('https://generativelanguage.googleapis.com/v1beta/models/tunedModels%2Fmy%20model%3Falt%3Djson%23x:generateContent');
+  });
+  it('tool results carry the real function name and id, and parallel results merge into one user turn', () => {
+    const body: any = geminiDialect.buildChat(makeCtx('gemini'), {
+      ...req,
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'first', input: { x: 1 } }, { type: 'tool_use', id: 'b', name: 'second', input: {} }] },
+        { role: 'tool_result', toolUseId: 'a', content: 'ra' },
+        { role: 'tool_result', toolUseId: 'b', content: 'rb' },
+      ],
+    }, { stream: true }).body;
+    expect(body.contents).toHaveLength(3);
+    expect(body.contents[2]).toEqual({ role: 'user', parts: [
+      { functionResponse: { id: 'a', name: 'first', response: { result: 'ra' } } },
+      { functionResponse: { id: 'b', name: 'second', response: { result: 'rb' } } },
+    ] });
+  });
+  it('an orphan tool result keeps the literal name tool_result; empty assistant turns are dropped', () => {
+    const body: any = geminiDialect.buildChat(makeCtx('gemini'), {
+      ...req, messages: [{ role: 'assistant', content: [] }, { role: 'tool_result', toolUseId: 'zzz', content: 'r' }],
+    }, { stream: true }).body;
+    expect(body.contents).toEqual([{ role: 'user', parts: [{ functionResponse: { id: 'zzz', name: 'tool_result', response: { result: 'r' } } }] }]);
+  });
+  it('a plain user text turn after tool results is never merged into the functionResponse turn', () => {
+    const body: any = geminiDialect.buildChat(makeCtx('gemini'), {
+      ...req,
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'first', input: {} }] },
+        { role: 'tool_result', toolUseId: 'a', content: 'ra' },
+        { role: 'user', content: 'thanks' },
+        { role: 'tool_result', toolUseId: 'a', content: 'again' },
+      ],
+    }, { stream: true }).body;
+    expect(body.contents).toHaveLength(5);
+    expect(body.contents[2]).toEqual({ role: 'user', parts: [{ functionResponse: { id: 'a', name: 'first', response: { result: 'ra' } } }] });
+    expect(body.contents[3]).toEqual({ role: 'user', parts: [{ text: 'thanks' }] });
+    expect(body.contents[4]).toEqual({ role: 'user', parts: [{ functionResponse: { id: 'a', name: 'first', response: { result: 'again' } } }] });
+  });
+});
+
+// https://ai.google.dev/gemini-api/docs/generate-content/function-calling (Gemini 3 returns an id with every
+// functionCall; the matching functionResponse must carry it) and .../thought-signatures (the first functionCall
+// part of each step needs a signature on Gemini 3; "skip_thought_signature_validator" is the documented stand-in).
+describe('function call ids and thought signatures', () => {
+  const SKIP = 'skip_thought_signature_validator';
+  const tool = (id: string, name = 'f', input: object = {}) => ({ type: 'tool_use' as const, id, name, input });
+  const loop = (model: string, turns: Array<Array<ReturnType<typeof tool> | { type: 'text'; text: string }>>) => {
+    const messages: any[] = [{ role: 'user', content: 'go' }];
+    for (const content of turns) {
+      messages.push({ role: 'assistant', content });
+      for (const b of content) if (b.type === 'tool_use') messages.push({ role: 'tool_result', toolUseId: b.id, content: `r-${b.id}` });
+    }
+    return (geminiDialect.buildChat(makeCtx('gemini', { model }), { ...req, messages }, { stream: true }).body as any).contents;
+  };
+
+  it.each([
+    ['an array', [1]],
+    ['a string', 'text'],
+    ['a number', 5],
+    ['null', null],
+  ])('function call args that are %s become an empty object', async (_label, args) => {
+    const events = await run([parts([{ functionCall: { id: 'c1', name: 'f', args } }], { finishReason: 'STOP' })]);
+    expect(events).toEqual([{ type: 'tool_use', id: 'c1', name: 'f', input: {} }]);
+  });
+
+  it('object function call args are passed through untouched', async () => {
+    const events = await run([parts([{ functionCall: { id: 'c1', name: 'f', args: { a: { b: [1] } } } }], { finishReason: 'STOP' })]);
+    expect(events).toEqual([{ type: 'tool_use', id: 'c1', name: 'f', input: { a: { b: [1] } } }]);
+  });
+
+  it('uses the id the model sends as the tool_use id, and a generated one only when there is none', async () => {
+    const events = await run([parts([
+      { functionCall: { id: '8f2b1a3c', name: 'f', args: {} } },
+      { functionCall: { name: 'g', args: {} } },
+    ], { finishReason: 'STOP' })]);
+    expect(events).toEqual([
+      { type: 'tool_use', id: '8f2b1a3c', name: 'f', input: {} },
+      { type: 'tool_use', id: 'id-1', name: 'g', input: {} },
+    ]);
+  });
+
+  it('echoes a model-supplied id on the replayed functionCall and on its functionResponse', () => {
+    const contents = loop('gemini-2.5-flash', [[tool('8f2b1a3c', 'first', { x: 1 })]]);
+    expect(contents[1]).toEqual({ role: 'model', parts: [{ functionCall: { id: '8f2b1a3c', name: 'first', args: { x: 1 } } }] });
+    expect(contents[2]).toEqual({ role: 'user', parts: [{ functionResponse: { id: '8f2b1a3c', name: 'first', response: { result: 'r-8f2b1a3c' } } }] });
+  });
+
+  it('never sends an id this process generated, nor one in the shape the default generator produces', async () => {
+    const minted = `minted-${Math.random().toString(36).slice(2)}`;
+    const [ev] = await collect(geminiDialect.parseStream(
+      sseResponse([parts([{ functionCall: { name: 'f', args: {} } }], { finishReason: 'STOP' })]),
+      makeCtx('gemini', { newId: () => minted }),
+    ));
+    expect(ev).toMatchObject({ type: 'tool_use', id: minted });
+    const stored = 'call_0123456789abcdef01234567';   // made up by an earlier process, read back from history
+    const contents = loop('gemini-2.5-flash', [[tool(minted, 'a'), tool(stored, 'b')]]);
+    expect(contents[1].parts).toEqual([{ functionCall: { name: 'a', args: {} } }, { functionCall: { name: 'b', args: {} } }]);
+    expect(contents[2].parts).toEqual([
+      { functionResponse: { name: 'a', response: { result: `r-${minted}` } } },
+      { functionResponse: { name: 'b', response: { result: `r-${stored}` } } },
+    ]);
+  });
+
+  it('on Gemini 3 the first functionCall of each replayed model turn carries the stand-in signature, parallel calls do not', () => {
+    const contents = loop('gemini-3-pro-preview', [
+      [{ type: 'text', text: 'checking' }, tool('s1', 'a'), tool('s2', 'b')],
+      [tool('s3', 'c')],
+    ]);
+    expect(contents[1].parts).toEqual([
+      { text: 'checking' },
+      { functionCall: { id: 's1', name: 'a', args: {} }, thoughtSignature: SKIP },
+      { functionCall: { id: 's2', name: 'b', args: {} } },
+    ]);
+    expect(contents[2].parts.map((p: any) => p.functionResponse.id)).toEqual(['s1', 's2']);
+    expect(contents[3].parts).toEqual([{ functionCall: { id: 's3', name: 'c', args: {} }, thoughtSignature: SKIP }]);
+  });
+
+  it('sends no signature to models before Gemini 3, and none on a text-only model turn', () => {
+    const older = loop('gemini-2.5-pro', [[tool('s1', 'a'), tool('s2', 'b')]]);
+    expect(JSON.stringify(older)).not.toContain('thoughtSignature');
+    const textOnly = (geminiDialect.buildChat(makeCtx('gemini', { model: 'gemini-3-flash-preview' }), {
+      ...req, messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: [{ type: 'text', text: 'hello' }] }],
+    }, { stream: true }).body as any).contents;
+    expect(textOnly[1]).toEqual({ role: 'model', parts: [{ text: 'hello' }] });
+  });
+});
+
+// https://ai.google.dev/gemini-api/docs/generate-content/thinking: 2.5 Flash and Flash-Lite turn thinking off with a
+// budget of 0, 2.5 Pro cannot turn it off (minimum 128), Gemini 3 takes a thinkingLevel.
+describe('low effort limits thinking so it cannot eat a small output budget', () => {
+  const gen = (model: string, effort?: 'low') =>
+    (geminiDialect.buildChat(makeCtx('gemini', { model }), { ...req, maxOutputTokens: 256, effort }, { stream: true }).body as any).generationConfig;
+  it.each([
+    ['gemini-2.5-flash', { thinkingBudget: 0 }],
+    ['gemini-2.5-flash-lite', { thinkingBudget: 0 }],
+    ['gemini-2.5-flash-preview-09-2025', { thinkingBudget: 0 }],
+    ['gemini-2.5-pro', { thinkingBudget: 128 }],
+    ['gemini-3-pro-preview', { thinkingLevel: 'low' }],
+    ['gemini-3-flash-preview', { thinkingLevel: 'low' }],
+  ])('%s gets %o', (model, thinkingConfig) => {
+    expect(gen(model, 'low')).toEqual({ maxOutputTokens: 256, thinkingConfig });
+  });
+  it.each(['gemma-3-27b-it', 'gemini-2.0-flash', 'learnlm-2.0-flash'])('%s gets no thinkingConfig', (model) => {
+    expect(gen(model, 'low')).toEqual({ maxOutputTokens: 256 });
+  });
+  it('no effort means no thinkingConfig, whatever the model', () => {
+    expect(gen('gemini-2.5-flash')).toEqual({ maxOutputTokens: 256 });
+    expect(gen('gemini-3-pro-preview')).toEqual({ maxOutputTokens: 256 });
+  });
+  it('an output limit hit before any text or tool call is an OutputLimitError, not a silent empty reply', async () => {
+    const e = await thrown([parts([{ text: 'thinking hard', thought: true }], { finishReason: 'MAX_TOKENS' })]);
+    expect(e).toBeInstanceOf(OutputLimitError);
+    expect(e.message).toBe('Gemini response was cut off by the output token limit before any text.');
+    expect(e.provider).toBe('gemini');
+  });
+  it('an output limit after a tool call keeps the call and does not throw', async () => {
+    const events = await run([parts([{ functionCall: { name: 'f', args: {} } }], { finishReason: 'MAX_TOKENS' })]);
+    expect(events).toEqual([{ type: 'tool_use', id: 'id-1', name: 'f', input: {} }]);
+  });
+});
+
+describe('a stream that ends without saying it finished', () => {
+  it('a clean close with no finishReason is an error, not a truncated success', async () => {
+    const e = await thrown([parts([{ text: 'half a sent' }])]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.message).toBe('Gemini stream ended before finishReason');
+    expect(e.provider).toBe('gemini');
+  });
+  it('a body with no chunks at all is an empty response error', async () => {
+    const e = await thrown([]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.message).toBe('Gemini returned an empty response');
+    expect(e.provider).toBe('gemini');
+    const junk = await thrown([{ data: 'not json' }, { data: 'null' }]);
+    expect(junk.message).toBe('Gemini returned an empty response');
+  });
+  it('a finishReason on an earlier chunk counts, and so does a prompt block', async () => {
+    await expect(run([parts([{ text: 'a' }], { finishReason: 'STOP' }), chunk({ usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } })]))
+      .resolves.toEqual([{ type: 'text', text: 'a' }, { type: 'usage', inputTokens: 1, outputTokens: 1 }]);
+    await expect(run([chunk({ promptFeedback: { blockReason: 'SAFETY' } })])).resolves.toHaveLength(1);
+  });
+  it('an aborted call ends quietly however far it got', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    await expect(collect(geminiDialect.parseStream(sseResponse([parts([{ text: 'x' }])]), makeCtx('gemini'), ac.signal))).resolves.toEqual([]);
+  });
+});
+
+// https://ai.google.dev/api/generate-content#FinishReason
+describe('every stop other than STOP and MAX_TOKENS is visible', () => {
+  it.each([
+    'SAFETY', 'RECITATION', 'LANGUAGE', 'OTHER', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'MALFORMED_FUNCTION_CALL',
+    'IMAGE_SAFETY', 'IMAGE_PROHIBITED_CONTENT', 'IMAGE_OTHER', 'NO_IMAGE', 'IMAGE_RECITATION',
+    'UNEXPECTED_TOOL_CALL', 'TOO_MANY_TOOL_CALLS', 'MISSING_THOUGHT_SIGNATURE', 'MALFORMED_RESPONSE',
+    'FINISH_REASON_UNSPECIFIED', 'SOMETHING_NEW',
+  ])('%s', async (reason) => {
+    const events = await run([parts([{ text: 'partial ' }], { finishReason: reason })]);
+    expect(events).toEqual([{ type: 'text', text: 'partial ' }, { type: 'text', text: `Gemini stopped this response (reason: ${reason}).` }]);
+  });
+  it('STOP adds nothing', async () => {
+    expect(await run([parts([{ text: 'done' }], { finishReason: 'STOP' })])).toEqual([{ type: 'text', text: 'done' }]);
+  });
+  it('a hostile finishReason goes through redaction and the cap', async () => {
+    const events = await run([chunk({ candidates: [{ finishReason: `x sk-test-placeholder ${'y'.repeat(5000)}` }] })]);
+    const text = (events[0] as any).text as string;
+    expect(text).not.toContain('sk-test-placeholder');
+    expect(text).toContain('***');
+    expect(text.length).toBeLessThan(1000);
+  });
+});
+
+describe('parseStream', () => {
+  it('yields text and function calls with generated ids, and usage once from the last chunk', async () => {
+    const events = await run([
+      parts([{ text: 'Hel' }], {}), chunk({ candidates: [{ content: { parts: [{ text: 'lo' }, { functionCall: { name: 'f', args: { a: 1 } } }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, thoughtsTokenCount: 3 } }),
+    ]);
+    expect(events).toEqual([
+      { type: 'text', text: 'Hel' }, { type: 'text', text: 'lo' },
+      { type: 'tool_use', id: 'id-1', name: 'f', input: { a: 1 } },
+      { type: 'usage', inputTokens: 5, outputTokens: 5 },
+    ]);
+  });
+  it('usage reported on every chunk is emitted once', async () => {
+    const um = (p: number, c: number) => ({ usageMetadata: { promptTokenCount: p, candidatesTokenCount: c } });
+    const events = await run([chunk({ candidates: [{ content: { parts: [{ text: 'a' }] } }], ...um(5, 1) }), chunk({ candidates: [{ content: { parts: [{ text: 'b' }] }, finishReason: 'STOP' }], ...um(5, 4) })]);
+    expect(events.filter((e) => e.type === 'usage')).toEqual([{ type: 'usage', inputTokens: 5, outputTokens: 4 }]);
+  });
+  it('safety and blocked stops become a visible message', async () => {
+    for (const reason of ['SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII', 'MALFORMED_FUNCTION_CALL']) {
+      const events = await run([chunk({ candidates: [{ finishReason: reason }] })]);
+      const t = events.find((e) => e.type === 'text') as any;
+      expect(t.text).toContain(reason);
+    }
+    const blocked = await run([chunk({ promptFeedback: { blockReason: 'OTHER' } })]);
+    expect((blocked.find((e) => e.type === 'text') as any).text).toContain('OTHER');
+  });
+  it('MAX_TOKENS does not throw and still yields the text it produced', async () => {
+    await expect(run([parts([{ text: 'cut' }], { finishReason: 'MAX_TOKENS' })])).resolves.toEqual([{ type: 'text', text: 'cut' }]);
+  });
+  it('skips thought parts so reasoning never reaches the chat', async () => {
+    const events = await run([parts([{ text: 'secret reasoning', thought: true }, { text: 'answer' }], { finishReason: 'STOP' })]);
+    expect(events).toEqual([{ type: 'text', text: 'answer' }]);
+  });
+  it('skips chunks that are not JSON objects instead of throwing', async () => {
+    const events = await run([
+      { data: 'null' }, { data: '7' }, { data: '"str"' }, { data: 'not json at all' }, { data: '[]' },
+      parts([{ text: 'ok' }], { finishReason: 'STOP' }),
+    ]);
+    expect(events).toEqual([{ type: 'text', text: 'ok' }]);
+  });
+  it('redacts the key out of a hostile blockReason', async () => {
+    const events = await run([chunk({ promptFeedback: { blockReason: 'bad sk-test-placeholder bad' } })]);
+    const text = (events.find((e) => e.type === 'text') as any).text as string;
+    expect(text).toContain('***');
+    expect(text).not.toContain('sk-test-placeholder');
+  });
+});
+
+describe('in-stream error classification', () => {
+  it.each([503, 502])('code %i is OverloadedError', async (code) => {
+    const e = await thrown([chunk({ error: { code, message: 'overloaded' } })]);
+    expect(e).toBeInstanceOf(OverloadedError);
+    expect(e.status).toBe(code);
+    expect(e.message).toBe('Gemini stream error: overloaded');
+  });
+  it('a plain 429 is RateLimitError with an empty Headers, not quota', async () => {
+    const e = await thrown([chunk({ error: { code: 429, message: 'slow down' } })]);
+    expect(e).toBeInstanceOf(RateLimitError);
+    expect(e).not.toBeInstanceOf(QuotaExhaustedError);
+    expect(e.headers).toBeInstanceOf(Headers);
+    expect(e.status).toBe(429);
+  });
+  it('the real 429 RESOURCE_EXHAUSTED billing payload is QuotaExhaustedError', async () => {
+    const e = await thrown([chunk({ error: {
+      code: 429, status: 'RESOURCE_EXHAUSTED',
+      message: 'You exceeded your current quota, please check your plan and billing details.',
+    } })]);
+    expect(e).toBeInstanceOf(QuotaExhaustedError);
+    expect(e).not.toBeInstanceOf(RateLimitError);
+    expect(e.status).toBe(429);
+  });
+  it('RESOURCE_EXHAUSTED without billing or quota wording stays RateLimitError', async () => {
+    const e = await thrown([chunk({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Try again shortly' } })]);
+    expect(e).toBeInstanceOf(RateLimitError);
+    expect(e).not.toBeInstanceOf(QuotaExhaustedError);
+  });
+  it('a 500 is a plain AiProviderError, not overloaded, rate-limited or quota', async () => {
+    const e = await thrown([chunk({ error: { code: 500, message: 'internal' } })]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e).not.toBeInstanceOf(OverloadedError);
+    expect(e).not.toBeInstanceOf(RateLimitError);
+    expect(e).not.toBeInstanceOf(QuotaExhaustedError);
+    expect(e.status).toBe(500);
+  });
+  it('a string code is coerced, so "503" is OverloadedError', async () => {
+    const e = await thrown([chunk({ error: { code: '503', message: 'overloaded' } })]);
+    expect(e).toBeInstanceOf(OverloadedError);
+    expect(e.status).toBe(503);
+  });
+  it('status UNAVAILABLE without a code is OverloadedError', async () => {
+    const e = await thrown([chunk({ error: { status: 'UNAVAILABLE', message: 'try later' } })]);
+    expect(e).toBeInstanceOf(OverloadedError);
+  });
+  it('a string error body keeps its message', async () => {
+    const e = await thrown([chunk({ error: 'boom' })]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.message).toBe('Gemini stream error: boom');
+  });
+  it.each([
+    ['empty string', ''], ['null', null], ['undefined', undefined], ['an object', {}], ['zero', 0], ['negative', -1], ['NaN (serialises to null)', NaN],
+  ])('a %s code is a plain AiProviderError with no status', async (_label, code) => {
+    const e = await thrown([chunk({ error: { code, message: 'boom' } })]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.status).toBeUndefined();
+    expect(e.message).toBe('Gemini stream error: boom');
+  });
+  it('RESOURCE_EXHAUSTED with no code and no billing wording is RateLimitError, not a plain error', async () => {
+    const e = await thrown([chunk({ error: { status: 'RESOURCE_EXHAUSTED', message: 'Resource has been exhausted (e.g. check quota).' } })]);
+    expect(e).toBeInstanceOf(RateLimitError);
+    expect(e).not.toBeInstanceOf(QuotaExhaustedError);
+  });
+  it('redacts the key from the thrown message', async () => {
+    const e = await thrown([chunk({ error: { code: 500, message: 'bad key sk-test-placeholder rejected' } })]);
+    expect(e.message).toContain('***');
+    expect(e.message).not.toContain('sk-test-placeholder');
+  });
+});
+
+const BILLING_MSG = 'You exceeded your current quota, please check your plan and billing details.';
+const quotaDetails = (...quotaIds: string[]) => [
+  { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: quotaIds.map((quotaId) => ({
+    quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_requests', quotaId, quotaDimensions: { location: 'global', model: 'gemini-2.5-flash' }, quotaValue: '20',
+  })) },
+  { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '30s' },
+];
+// [label, error fields, is the credential's quota really exhausted]. When unsure the answer is "no" (RateLimit):
+// calling a transient limit Quota would bench every model on the credential for the full cooldown.
+const QUOTA_CASES: Array<[string, object, boolean]> = [
+  ['PerMinute quotaId beats billing wording', { message: BILLING_MSG, details: quotaDetails('GenerateRequestsPerMinutePerProjectPerModel-FreeTier') }, false],
+  ['PerDay quotaId', { message: 'Quota exceeded for metric', details: quotaDetails('GenerateRequestsPerDayPerProjectPerModel-FreeTier') }, true],
+  ['PerMonth quotaId', { message: 'Quota exceeded for metric', details: quotaDetails('GenerateRequestsPerMonthPerProject-FreeTier') }, true],
+  ['Daily quotaId', { message: 'Quota exceeded for metric', details: quotaDetails('DailyRequestLimitPerProject-FreeTier') }, true],
+  ['PerMinute and PerDay violated together', { message: 'Quota exceeded', details: quotaDetails('GenerateRequestsPerMinutePerProjectPerModel-FreeTier', 'GenerateRequestsPerDayPerProjectPerModel-FreeTier') }, true],
+  ['unrecognised quotaId plus billing wording', { message: BILLING_MSG, details: quotaDetails('SomeNewQuotaName-FreeTier') }, false],
+  ['transient text that mentions quota but not billing', { message: 'Resource has been exhausted (e.g. check quota).' }, false],
+  ['unstructured billing wording', { message: BILLING_MSG }, true],
+];
+
+describe.each(QUOTA_CASES)('quota or rate limit: %s', (_label, fields, isQuota) => {
+  const error = { code: 429, status: 'RESOURCE_EXHAUSTED', ...fields };
+  const expectKind = (e: any) => {
+    if (isQuota) { expect(e).toBeInstanceOf(QuotaExhaustedError); expect(e).not.toBeInstanceOf(RateLimitError); }
+    else { expect(e).toBeInstanceOf(RateLimitError); expect(e).not.toBeInstanceOf(QuotaExhaustedError); }
+    expect(e.status).toBe(429);
+  };
+  it('in-stream', async () => { expectKind(await thrown([chunk({ error })])); });
+  it('HTTP 429 through classifyHttpError', () => {
+    const headers = new Headers({ 'retry-after': '7' });
+    const e: any = classifyHttpError(geminiDialect, makeCtx('gemini'), 429, headers, JSON.stringify({ error }));
+    expectKind(e);
+    if (isQuota) expect(e.message).toBe(`Gemini API error (429): ${(fields as any).message}`);
+    else expect(e.headers.get('retry-after')).toBe('7');   // the generic path keeps the headers for the cooldown
+  });
+  it('classifyError returns a QuotaExhaustedError for a quota 429 and defers otherwise', () => {
+    const r = geminiDialect.classifyError!(429, new Headers(), JSON.stringify({ error }));
+    if (isQuota) expect(r).toBeInstanceOf(QuotaExhaustedError); else expect(r).toBeUndefined();
+  });
+});
+
+describe('classifyError', () => {
+  const badKeyBody = JSON.stringify({ error: {
+    code: 400, message: 'API key not valid. Please pass a valid API key.', status: 'INVALID_ARGUMENT',
+    details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID', domain: 'googleapis.com' }],
+  } });
+  it('a 400 for a bad key is AuthError (Gemini does not answer 401)', () => {
+    const e = geminiDialect.classifyError!(400, new Headers(), badKeyBody) as any;
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.status).toBe(400);
+    expect(e.message).toBe('Gemini API error (400): API key not valid. Please pass a valid API key.');
+  });
+  it('matches on the reason code alone, and on a non-JSON body', () => {
+    expect(geminiDialect.classifyError!(400, new Headers(), '{"error":{"message":"x","details":[{"reason":"API_KEY_INVALID"}]}}')).toBeInstanceOf(AuthError);
+    const e = geminiDialect.classifyError!(400, new Headers(), '<html>API key not valid</html>') as any;
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.message).toContain('API key not valid');
+  });
+  it('a JSON 400 that merely echoes the phrase mid-sentence is not treated as a bad key', () => {
+    const proxy = JSON.stringify({ error: { code: 400, message: 'upstream said: API key not valid', status: 'INVALID_ARGUMENT' } });
+    expect(geminiDialect.classifyError!(400, new Headers(), proxy)).toBeUndefined();
+    const reasonText = JSON.stringify({ error: { code: 400, message: 'bad field, see API_KEY_INVALID in the docs' } });
+    expect(geminiDialect.classifyError!(400, new Headers(), reasonText)).toBeUndefined();
+    expect(classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), proxy).constructor).toBe(AiProviderError);
+  });
+  it('a JSON 400 whose message starts with the phrase matches, with no details', () => {
+    const body = JSON.stringify({ error: { code: 400, message: 'API key not valid. Please pass a valid API key.' } });
+    expect(geminiDialect.classifyError!(400, new Headers(), body)).toBeInstanceOf(AuthError);
+  });
+  it('the hook leaves capping to classifyHttpError, which caps the final message at 1000 characters', () => {
+    const body = `API key not valid ${'x'.repeat(5000)}`;
+    expect((geminiDialect.classifyError!(400, new Headers(), body) as any).message.length).toBeGreaterThan(1000);
+    const e = classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), body);
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.message.length).toBeLessThanOrEqual(1000);
+  });
+  it('an unrelated 400 and other statuses return undefined', () => {
+    expect(geminiDialect.classifyError!(400, new Headers(), '{"error":{"code":400,"message":"Invalid JSON payload","status":"INVALID_ARGUMENT"}}')).toBeUndefined();
+    expect(geminiDialect.classifyError!(500, new Headers(), badKeyBody)).toBeUndefined();
+    expect(geminiDialect.classifyError!(429, new Headers(), '{}')).toBeUndefined();
+  });
+  it('classifyHttpError uses the hook for a bad-key 400 and falls through for others', () => {
+    const ctx = makeCtx('gemini');
+    expect(classifyHttpError(geminiDialect, ctx, 400, new Headers(), badKeyBody)).toBeInstanceOf(AuthError);
+    expect(classifyHttpError(geminiDialect, ctx, 400, new Headers(), '{"error":{"message":"Invalid JSON payload"}}').constructor).toBe(AiProviderError);
+  });
+});
+
+describe('403 split: a key-level PERMISSION_DENIED is a credential failure, any other 403 is not', () => {
+  const denied = JSON.stringify({ error: { code: 403, message: 'Method doesn\'t allow unregistered callers.', status: 'PERMISSION_DENIED' } });
+  it('PERMISSION_DENIED stays an AuthError in the usual message shape', () => {
+    const e = geminiDialect.classifyError!(403, new Headers(), denied) as any;
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.status).toBe(403);
+    expect(e.message).toBe('Gemini API error (403): Method doesn\'t allow unregistered callers.');
+    const viaHttp = classifyHttpError(geminiDialect, makeCtx('gemini'), 403, new Headers(), denied);
+    expect(viaHttp).toBeInstanceOf(AuthError);
+    expect(viaHttp.status).toBe(403);
+    expect(viaHttp.provider).toBe('gemini');
+    expect(viaHttp.message).toBe('Gemini API error (403): Method doesn\'t allow unregistered callers.');
+  });
+  it.each([
+    ['a different status', JSON.stringify({ error: { code: 403, message: 'nope', status: 'FORBIDDEN' } })],
+    ['no status', JSON.stringify({ error: { code: 403, message: 'PERMISSION_DENIED in the text only' } })],
+    ['a non-JSON body', '<html>403 PERMISSION_DENIED</html>'],
+    ['an empty body', ''],
+  ])('a 403 with %s falls through to the generic path', (_label, body) => {
+    expect(geminiDialect.classifyError!(403, new Headers(), body)).toBeUndefined();
+  });
+  it('PERMISSION_DENIED on another status is left alone', () => {
+    expect(geminiDialect.classifyError!(400, new Headers(), denied)).toBeUndefined();
+  });
+});
+
+describe('models', () => {
+  it('lists with pageSize 1000, paginates, strips models/ and keeps generateContent models', () => {
+    const ctx = makeCtx('gemini');
+    expect(geminiDialect.buildListModels!(ctx).url).toBe('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000');
+    expect(geminiDialect.buildListModels!(ctx, 'tok').url).toBe('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&pageToken=tok');
+    const r = geminiDialect.parseModels!({
+      models: [
+        { name: 'models/gemini-2.5-flash', displayName: 'Gemini 2.5 Flash', supportedGenerationMethods: ['generateContent'] },
+        { name: 'models/embedding-001', supportedGenerationMethods: ['embedContent'] },
+      ], nextPageToken: 'n2',
+    });
+    expect(r).toEqual({ models: [{ id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' }], next: 'n2' });
+  });
+});
+
+// A key an upstream echoes back must be redacted BEFORE any length cap, or a key straddling the cut leaves a prefix behind.
+describe('key echoed by the upstream never survives, even straddling a cap (real dialect through classifyHttpError)', () => {
+  const KEY = 'zq7-placeholder-key-1234567890abcd';
+  const bodies: Record<string, (message: string) => { status: number; body: string; cls: Function }> = {
+    'bad-key 400': (message) => ({
+      status: 400, cls: AuthError,
+      body: JSON.stringify({ error: { code: 400, message, status: 'INVALID_ARGUMENT', details: [{ reason: 'API_KEY_INVALID' }] } }),
+    }),
+    'quota 429': (message) => ({
+      status: 429, cls: QuotaExhaustedError,
+      body: JSON.stringify({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: `${message} billing details` } }),
+    }),
+  };
+  const rows = Object.keys(bodies).flatMap((path) => [0, 480, 490, 495, 499].map((offset) => [path, offset] as const));
+  it.each(rows)('%s, key echoed at offset %i', (path, offset) => {
+    const { status, body, cls } = bodies[path](`${'x'.repeat(offset)}${KEY} tail`);
+    const e = classifyHttpError(geminiDialect, makeCtx('gemini', { apiKey: KEY }), status, new Headers(), body);
+    expect(e).toBeInstanceOf(cls);
+    expect(e.message).toContain('***');
+    expect(e.message.length).toBeLessThanOrEqual(1000);
+    for (const text of [e.message, String(e.stack)]) {
+      expect(text).not.toContain(KEY);
+      // any 4+ character prefix of the key contains the first four characters
+      expect(text).not.toContain(KEY.slice(0, 4));
+    }
+  });
+});
+
+describe('malformed error shapes never throw and land on the safe side', () => {
+  const BILLING = 'check your plan and billing details';
+  const exhausted = (fields: object) => ({ code: 429, status: 'RESOURCE_EXHAUSTED', ...fields });
+  const viol = (v: unknown) => [{ violations: v }];
+
+  // [label, error object, expected class for the stream path]
+  const STREAM_ROWS: Array<[string, any, Function]> = [
+    ['details is an object', exhausted({ message: 'm', details: { violations: [{ quotaId: 'PerDay' }] } }), RateLimitError],
+    ['details is a string', exhausted({ message: 'm', details: 'PerDay' }), RateLimitError],
+    ['details is null', exhausted({ message: 'm', details: null }), RateLimitError],
+    ['details is null with billing wording', exhausted({ message: BILLING, details: null }), QuotaExhaustedError],
+    ['violations is missing', exhausted({ message: 'm', details: [{}] }), RateLimitError],
+    ['violations is an object', exhausted({ message: 'm', details: viol({ quotaId: 'PerDay' }) }), RateLimitError],
+    ['violations is a string', exhausted({ message: 'm', details: viol('PerDay') }), RateLimitError],
+    ['details entries are null, a number and an array', exhausted({ message: 'm', details: [null, 5, [], 'x'] }), RateLimitError],
+    ['violations entries are null, a number, a string and an array', exhausted({ message: 'm', details: viol([null, 3, 'PerDay', []]) }), RateLimitError],
+    ['quotaId is a number', exhausted({ message: 'm', details: viol([{ quotaId: 5 }]) }), RateLimitError],
+    ['quotaId is null and quotaMetric an object', exhausted({ message: 'm', details: viol([{ quotaId: null, quotaMetric: {} }]) }), RateLimitError],
+    ['message is missing', exhausted({}), RateLimitError],
+    ['message is numeric', exhausted({ message: 12345 }), RateLimitError],
+    ['message is an object', exhausted({ message: { billing: true } }), RateLimitError],
+    ['code is the string "429"', { code: '429', message: 'm' }, RateLimitError],
+    ['code is the string "429" with billing wording and status', { code: '429', status: 'RESOURCE_EXHAUSTED', message: BILLING }, QuotaExhaustedError],
+    ['error is true', true, AiProviderError],
+    ['error is a number', 42, AiProviderError],
+    ['error is an empty array', [], AiProviderError],
+    ['error is an empty object', {}, AiProviderError],
+  ];
+  it.each(STREAM_ROWS)('stream: %s', async (_label, error, cls) => {
+    const e = await thrown([chunk({ error })]);
+    expect(e.constructor).toBe(cls);
+  });
+
+  it.each([[null], ['str'], [429], [undefined]])('classifyStreamError called with a %s payload returns a plain AiProviderError', (payload) => {
+    const e = geminiDialect.classifyStreamError!(payload, makeCtx('gemini')) as any;
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.status).toBeUndefined();
+  });
+
+  // [label, raw body]: the hook must answer undefined, and the generic path must still classify without throwing.
+  const BODY_ROWS: Array<[string, string]> = [
+    ['a JSON string', '"str"'],
+    ['a JSON array', '[1]'],
+    ['JSON null', 'null'],
+    ['a JSON number', '429'],
+    ['error: null', '{"error":null}'],
+    ['error: true', '{"error":true}'],
+    ['error: a string', '{"error":"API key not valid"}'],
+    ['error: an array', '{"error":[{"message":"billing"}]}'],
+    ['an empty body', ''],
+    ['an HTML page', '<html><body><h1>502 Bad Gateway</h1></body></html>'],
+  ];
+  it.each(BODY_ROWS)('HTTP 429 with %s: hook defers, generic path gives RateLimitError', (_label, body) => {
+    expect(geminiDialect.classifyError!(429, new Headers(), body)).toBeUndefined();
+    const headers = new Headers({ 'retry-after': '3' });
+    const e: any = classifyHttpError(geminiDialect, makeCtx('gemini'), 429, headers, body);
+    expect(e).toBeInstanceOf(RateLimitError);
+    expect(e.headers.get('retry-after')).toBe('3');
+  });
+  it.each(BODY_ROWS)('HTTP 400 with %s: hook defers, generic path gives a plain AiProviderError', (_label, body) => {
+    expect(geminiDialect.classifyError!(400, new Headers(), body)).toBeUndefined();
+    expect(classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), body).constructor).toBe(AiProviderError);
+  });
+
+  it.each([
+    ['details is an object', { message: 'm', details: { violations: [{ quotaId: 'PerDay' }] } }],
+    ['details is null', { message: 'm', details: null }],
+    ['details entries are null, a number and an array', { message: 'm', details: [null, 5, []] }],
+    ['violations is an object', { message: 'm', details: viol({ quotaId: 'PerDay' }) }],
+    ['violations entries are null, a number and an array', { message: 'm', details: viol([null, 3, []]) }],
+    ['quotaId is a number', { message: 'm', details: viol([{ quotaId: 5 }]) }],
+    ['message is missing', {}],
+    ['message is numeric', { message: 429 }],
+  ])('HTTP 429 body whose error has %s: hook defers', (_label, error) => {
+    expect(geminiDialect.classifyError!(429, new Headers(), JSON.stringify({ error }))).toBeUndefined();
+  });
+});

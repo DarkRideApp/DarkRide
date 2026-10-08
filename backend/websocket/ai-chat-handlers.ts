@@ -117,7 +117,7 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
         type: 'ai:error',
         conversationId: conversationId ?? null,
         ...(requestId ? { requestId } : {}),
-        error: 'No AI provider configured. Add a provider in Settings > Integrations.',
+        error: 'No AI provider configured. Add a provider in Settings > AI.',
       });
       return;
     }

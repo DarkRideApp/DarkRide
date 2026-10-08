@@ -10,21 +10,18 @@ import {
   type AgentIdentity,
 } from './ai-agent';
 import { AiToolRegistry, type AiToolRegistration } from './ai-tools';
-import type { AiProvider } from './ai-provider';
+import type { AiStreamingProvider } from './ai/dialect';
 import { createTestDb } from '../test-utils/create-test-db';
 import type {
   AiStreamEvent,
   AiMessage,
-  AiToolDefinition,
 } from '../../shared/types/ai-chat';
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function makeMockProvider(streamFn: () => AsyncIterable<AiStreamEvent>): AiProvider {
+function makeMockProvider(streamFn: () => AsyncIterable<AiStreamEvent>): AiStreamingProvider {
   return {
     name: 'mock',
-    buildHeaders: () => ({}),
-    formatTools: (tools: AiToolDefinition[]) => tools,
     createStreamingRequest: streamFn,
   };
 }
@@ -843,6 +840,38 @@ describe('AiAgent', () => {
 
     expect(result.error).toBe('Request was cancelled');
     expect(onToken).not.toHaveBeenCalled();
+  });
+
+  it('counts total prompt tokens, including cache reads, as the turn size and sums usage deltas', async () => {
+    // Providers report inputTokens as the whole prompt (cache reads and writes included) and cachedInputTokens
+    // as the cache-read share. The agent must use the total for the context-window percentage and the records.
+    const provider = makeMockProvider(async function* () {
+      yield { type: 'usage' as const, inputTokens: 100_000, outputTokens: 0, cachedInputTokens: 90_000 };
+      yield { type: 'text' as const, text: 'done' };
+      yield { type: 'usage' as const, inputTokens: 0, outputTokens: 20 };
+    });
+    const percents: number[] = [];
+    const agent = new AiAgent(db, makeRegistry(), provider);
+    const result = await agent.handleMessageWithIdentity({
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: [],
+      onBehalfOfService: 'test',
+    }, {
+      conversationId: null,
+      message: 'hi',
+      pageContext: 'devices',
+      contextId: '',
+      onToken: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolResult: vi.fn(),
+      onContextUsage: (p: number) => percents.push(p),
+      mode: 'streaming',
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.usage).toEqual({ inputTokens: 100_000, outputTokens: 20 });
+    expect(percents.at(-1)).toBe(50);          // 100000 of the agent's 200000-token window
   });
 
   it.skip('should handle tool that returns null', async () => {

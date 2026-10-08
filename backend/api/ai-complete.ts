@@ -3,6 +3,15 @@ import { registerEndpoint } from './api-service';
 import { settings } from '../db/schema';
 import { buildAiReferencePrompt } from '../../shared/api-reference';
 import type { AppDatabase } from '../db/index';
+import type { AiModelRouter } from '../services/ai-model-router';
+import { createProvider } from '../services/ai/registry';
+import { AiProviderError, NoModelsConfiguredError } from '../services/ai/errors';
+import { redact } from '../services/ai/http';
+import type { AiCompleteRequest, AiProvider } from '../services/ai/dialect';
+import { getProviderDescriptor } from '../../shared/lib/ai-provider-catalog';
+import { createLoggers } from '../logs';
+
+const { log, error } = createLoggers('ai-complete');
 
 let _cachedSystemPrompt: string | undefined;
 
@@ -28,212 +37,113 @@ function getSetting(db: AppDatabase, key: string): string | undefined {
   return row?.value || undefined;
 }
 
-async function callAnthropic(apiKey: string, prefix: string, suffix: string): Promise<string> {
-  const userMessage = `${prefix}<CURSOR>${suffix}`;
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 256,
-      temperature: 0,
-      stop_sequences: ['\n\n\n'],
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userMessage }],
-    }),
-  });
+// ── Legacy settings (deprecated) ─────────────────────────────────────
+// Installs that predate AI models configured completion through the `ai_provider` setting and one key
+// setting per provider. That path stays, read-only, for installs with no Low tier model, and is built
+// through the same registry as everything else.
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Anthropic API error (${response.status}): ${errorBody}`);
-  }
+interface LegacyConfig { keySetting?: string; urlSetting?: string; modelSetting?: string; model?: string; baseUrl?: string }
 
-  const data: any = await response.json();
-  return data.content?.[0]?.text || '';
+const LEGACY: Record<string, LegacyConfig> = {
+  anthropic: { keySetting: 'anthropic_api_key', model: 'claude-haiku-4-5-20251001' },
+  gemini: { keySetting: 'gemini_api_key' },                                                  // catalog default model
+  ollama: { urlSetting: 'ollama_base_url', modelSetting: 'ollama_model', model: 'qwen2.5-coder:1.5b' },
+  openrouter: { keySetting: 'openrouter_api_key', modelSetting: 'openrouter_model' },        // catalog default model
+  // Legacy settings have no Base URL field, and these keys were issued for the Codestral host.
+  codestral: { keySetting: 'codestral_api_key', model: 'codestral-latest', baseUrl: 'https://codestral.mistral.ai/v1' },
+};
+
+let warnedLegacy = false;
+
+type Legacy = { provider: AiProvider } | { status: number; error: string } | null;
+
+function legacyProvider(db: AppDatabase): Legacy {
+  const type = getSetting(db, 'ai_provider');
+  if (!type) return null;
+  const cfg = Object.prototype.hasOwnProperty.call(LEGACY, type) ? LEGACY[type] : undefined;
+  const d = getProviderDescriptor(type);
+  if (!cfg || !d) return { status: 400, error: `Unknown AI provider: ${type}` };
+  const apiKey = cfg.keySetting ? getSetting(db, cfg.keySetting) : undefined;
+  if (cfg.keySetting && !apiKey) return { status: 400, error: `${d.shortName} API key not configured` };
+  const baseUrl = (cfg.urlSetting ? getSetting(db, cfg.urlSetting) : undefined) ?? cfg.baseUrl;
+  const model = (cfg.modelSetting ? getSetting(db, cfg.modelSetting) : undefined) ?? cfg.model;
+  return { provider: createProvider(type, { apiKey, baseUrl, model }) };
 }
 
-async function callGemini(apiKey: string, prefix: string, suffix: string): Promise<string> {
-  const userMessage = `${prefix}<CURSOR>${suffix}`;
-  const model = 'gemini-2.0-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-      generationConfig: { maxOutputTokens: 256, temperature: 0 },
-    }),
-  });
+// ── Handler ──────────────────────────────────────────────────────────
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Gemini API error (${response.status}): ${errorBody}`);
-  }
-
-  const data: any = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-}
-
-async function callOllama(baseUrl: string, model: string, prefix: string, suffix: string): Promise<string> {
-  const userMessage = `${prefix}<CURSOR>${suffix}`;
-  const url = `${baseUrl}/api/chat`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userMessage },
-      ],
-      stream: false,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Ollama API error (${response.status}): ${errorBody}`);
-  }
-
-  const data: any = await response.json();
-  return data.message?.content || '';
-}
-
-async function callOpenRouter(apiKey: string, model: string, prefix: string, suffix: string): Promise<string> {
-  const userMessage = `${prefix}<CURSOR>${suffix}`;
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userMessage },
-      ],
-      max_tokens: 256,
-      temperature: 0,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`OpenRouter API error (${response.status}): ${errorBody}`);
-  }
-
-  const data: any = await response.json();
-  return data.choices?.[0]?.message?.content || '';
-}
-
-async function callCodestral(apiKey: string, prefix: string, suffix: string): Promise<string> {
-  const response = await fetch('https://codestral.mistral.ai/v1/fim/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: 'codestral-latest',
-      prompt: prefix,
-      suffix,
-      max_tokens: 256,
-      temperature: 0,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Codestral API error (${response.status}): ${errorBody}`);
-  }
-
-  const data: any = await response.json();
-  return data.choices?.[0]?.message?.content || '';
-}
-
-export function registerAiCompleteEndpoints(db: AppDatabase): void {
-  registerEndpoint('POST', '/v1/ai/complete', async (req, res) => {
-    const { prefix, suffix, language } = req.body || {};
-
+/**
+ * POST /v1/ai/complete. Completes from the Low tier only (never a slower, more expensive tier), falling
+ * back to the deprecated settings when no Low tier model exists. Status by error class: 400 for missing
+ * configuration, 502 for any provider error (its message is already redacted by the transport), 500 with a
+ * generic message for anything else. When the client goes away (the editor cancels on every keystroke) the
+ * upstream call is aborted and nothing is written or logged as an error.
+ *
+ * Exported so it can be called with the minimal `res` the WebSocket REST adapter builds.
+ */
+export function completeHandler(db: AppDatabase, router: AiModelRouter) {
+  return async (req: any, res: any): Promise<void> => {
+    const { prefix, suffix } = req.body || {};
     if (!prefix && !suffix) {
       res.status(400).json({ success: false, error: 'prefix or suffix is required' });
       return;
     }
 
-    const provider = getSetting(db, 'ai_provider') || '';
-    if (!provider) {
-      res.status(400).json({ success: false, error: 'No AI provider configured' });
-      return;
-    }
+    const ac = new AbortController();
+    // The WebSocket REST adapter's res has no event emitter. A close after the response finished is normal.
+    if (typeof res.on === 'function') res.on('close', () => { if (!res.writableEnded) ac.abort(); });
+    const gone = () => ac.signal.aborted;
+
+    const request: AiCompleteRequest = {
+      prefix: prefix || '',
+      suffix: suffix || '',
+      systemPrompt: SYSTEM_PROMPT,
+      maxOutputTokens: 256,
+      stopSequences: ['\n\n\n'],
+      temperature: 0,
+      signal: ac.signal,
+    };
 
     try {
       let completion: string;
-      const p = prefix || '';
-      const s = suffix || '';
-
-      switch (provider) {
-        case 'anthropic': {
-          const apiKey = getSetting(db, 'anthropic_api_key');
-          if (!apiKey) {
-            res.status(400).json({ success: false, error: 'Anthropic API key not configured' });
-            return;
-          }
-          completion = await callAnthropic(apiKey, p, s);
-          break;
-        }
-        case 'gemini': {
-          const apiKey = getSetting(db, 'gemini_api_key');
-          if (!apiKey) {
-            res.status(400).json({ success: false, error: 'Gemini API key not configured' });
-            return;
-          }
-          completion = await callGemini(apiKey, p, s);
-          break;
-        }
-        case 'ollama': {
-          const baseUrl = getSetting(db, 'ollama_base_url') || 'http://localhost:11434';
-          const model = getSetting(db, 'ollama_model') || 'qwen2.5-coder:1.5b';
-          completion = await callOllama(baseUrl, model, p, s);
-          break;
-        }
-        case 'openrouter': {
-          const apiKey = getSetting(db, 'openrouter_api_key');
-          if (!apiKey) {
-            res.status(400).json({ success: false, error: 'OpenRouter API key not configured' });
-            return;
-          }
-          const model = getSetting(db, 'openrouter_model') || 'google/gemini-2.0-flash-001';
-          completion = await callOpenRouter(apiKey, model, p, s);
-          break;
-        }
-        case 'codestral': {
-          const apiKey = getSetting(db, 'codestral_api_key');
-          if (!apiKey) {
-            res.status(400).json({ success: false, error: 'Codestral API key not configured' });
-            return;
-          }
-          completion = await callCodestral(apiKey, p, s);
-          break;
-        }
-        default:
-          res.status(400).json({ success: false, error: `Unknown AI provider: ${provider}` });
+      try {
+        completion = await router.completeText(request, { tier: 'Low', strict: true });
+      } catch (err) {
+        if (!(err instanceof NoModelsConfiguredError)) throw err;
+        const legacy = legacyProvider(db);
+        if (!legacy) {
+          res.status(400).json({ success: false, error: 'No AI provider configured' });
           return;
+        }
+        if ('error' in legacy) {
+          res.status(legacy.status).json({ success: false, error: legacy.error });
+          return;
+        }
+        // The editor asks for a completion every few hundred milliseconds while typing: say it once per process.
+        if (!warnedLegacy) {
+          warnedLegacy = true;
+          log('Using deprecated ai_provider settings for /v1/ai/complete; add a model to the Low tier instead');
+        }
+        completion = await legacy.provider.complete(request);
       }
-
+      // A provider that drains a stream returns partial text on abort; the client is gone either way.
+      if (gone()) return;
       res.json({ success: true, data: { completion } });
     } catch (err: any) {
-      const message = err.message || String(err);
-      if (message.includes('API error')) {
-        res.status(502).json({ success: false, error: message });
-      } else {
-        res.status(500).json({ success: false, error: `Failed to reach AI provider: ${message}` });
+      if (gone()) return;
+      if (err instanceof AiProviderError) {
+        log(`Completion failed: ${err.name}`);
+        res.status(502).json({ success: false, error: err.message || err.name });
+        return;
       }
+      // Not a classified provider failure, so the message may hold anything: keep it in the server log only.
+      // Masked and capped anyway, since log lines are streamed to live log viewers.
+      error(`Completion failed unexpectedly: ${err?.name ?? 'Error'}: ${redact(String(err?.message ?? err)).slice(0, 500)}`);
+      res.status(500).json({ success: false, error: 'Inline completion failed' });
     }
-  });
+  };
+}
+
+export function registerAiCompleteEndpoints(db: AppDatabase, router: AiModelRouter): void {
+  registerEndpoint('POST', '/v1/ai/complete', completeHandler(db, router));
 }

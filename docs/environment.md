@@ -53,11 +53,13 @@ These are created automatically on startup:
 
 ## AI Provider Settings
 
-AI code completion is configured via the Settings API (`PUT /v1/settings/:key`), not environment variables:
+AI providers and models are configured in the app (Settings → AI), not through environment variables. The setting keys below are deprecated. They are still read in two places: `/v1/ai/complete`, as a fallback when the `Low` tier has no usable model, and a startup migration that copies them into providers and models. See [ai-providers.md](ai-providers.md#deprecated-settings).
 
 | Setting Key | Description |
 |-------------|-------------|
-| ai_provider | Active provider: anthropic, gemini, ollama, openrouter, codestral |
+| ai_provider | Provider for the `/v1/ai/complete` fallback and the startup migration: anthropic, gemini, ollama, openrouter, codestral |
+| ai_chat_provider | Read by the startup migration only |
+| ai_chat_model | Read by the startup migration only |
 | anthropic_api_key | Anthropic API key |
 | gemini_api_key | Google Gemini API key |
 | openrouter_api_key | OpenRouter API key |
@@ -65,6 +67,8 @@ AI code completion is configured via the Settings API (`PUT /v1/settings/:key`),
 | ollama_base_url | Ollama server URL (e.g., http://localhost:11434) |
 | ollama_model | Ollama model name |
 | openrouter_model | OpenRouter model identifier |
+
+The opt-in live test lane (`npm run test:ai-live`) is the one place AI keys come from the environment (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`, `CODESTRAL_API_KEY`, `OLLAMA_BASE_URL`, and `AI_LIVE_<PROVIDER>_MODEL` to pin a model). The server never reads them. See [ai-providers.md](ai-providers.md#live-checks).
 
 ## NordVPN Settings
 

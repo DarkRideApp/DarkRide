@@ -1,8 +1,11 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { drizzle, BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import * as schema from './schema';
 import { migrateAiProviders } from './migrate-ai-providers';
+import { applyMigrations } from '../test-utils/create-test-db';
+import { AiModelRouter, RateLimitCache } from '../services/ai-model-router';
+import { stubFetch, textResponse } from '../services/ai/test-helpers';
 
 vi.mock('../logs', () => ({
   createLoggers: () => ({ log: vi.fn(), error: vi.fn() }),
@@ -188,6 +191,31 @@ describe('migrateAiProviders', () => {
     expect(providers).toHaveLength(1);
   });
 
+  it('drops a stale Base URL on OpenRouter and Gemini rows, keeping one provider per credential', () => {
+    const now = Date.now();
+    const insert = sqlite.prepare(`
+      INSERT INTO ai_models (name, provider, model, api_key, base_url, priority, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    // The old form posted whatever was in the Base URL field, and these types ignored it.
+    insert.run('Router A', 'openrouter', null, 'or-legacy-000000', 'http://localhost:11434', 0, now, now);
+    insert.run('Router B', 'openrouter', null, 'or-legacy-000000', null, 1, now, now);
+    insert.run('Gem', 'gemini', null, 'gem-legacy-000000', 'http://localhost:11434', 2, now, now);
+    insert.run('Local', 'ollama', null, null, 'http://192.168.1.5:11434', 3, now, now);
+
+    migrateAiProviders(db as any);
+    migrateAiProviders(db as any);
+
+    const providers = sqlite.prepare('SELECT type, base_url FROM ai_providers ORDER BY id').all();
+    expect(providers).toEqual([
+      { type: 'openrouter', base_url: null },
+      { type: 'gemini', base_url: null },
+      { type: 'ollama', base_url: 'http://192.168.1.5:11434' },   // a type that always used the field keeps it
+    ]);
+    const links = sqlite.prepare('SELECT provider_id FROM ai_models ORDER BY id').all() as any[];
+    expect(links[0].provider_id).toBe(links[1].provider_id);
+  });
+
   it('should migrate OAuth model without carrying OAuth fields (removed)', () => {
     const now = Date.now();
     sqlite.prepare(`
@@ -204,5 +232,30 @@ describe('migrateAiProviders', () => {
     expect(providers[0].oauth_access_token).toBeUndefined();
     expect(providers[0].oauth_refresh_token).toBeUndefined();
     expect(providers[0].oauth_expires_at).toBeUndefined();
+  });
+});
+
+describe('upgrading a database with an OpenRouter model from before providers existed', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('stores no Base URL, so requests go to the OpenRouter default', async () => {
+    const sqlite = new Database(':memory:');
+    applyMigrations(sqlite);
+    const now = Date.now();
+    // Credentials on the model, no provider_id, and a stale Ollama URL left by the old form.
+    sqlite.prepare(`INSERT INTO ai_models (name, provider, provider_id, model, api_key, base_url, enabled, priority, tier_id, created_at, updated_at)
+      VALUES ('OpenRouter (Chat)', 'openrouter', NULL, NULL, 'or-legacy-000000', 'http://localhost:11434', 1, 0, 1, ?, ?)`).run(now, now);
+    const db = drizzle(sqlite, { schema });
+
+    migrateAiProviders(db as any);
+    migrateAiProviders(db as any);
+
+    expect(sqlite.prepare('SELECT type, base_url FROM ai_providers').all()).toEqual([{ type: 'openrouter', base_url: null }]);
+    const stub = stubFetch(() => textResponse('{}', 418));
+    const router = new AiModelRouter(db as any, new RateLimitCache());
+    await (async () => {
+      for await (const _ of router.createStreamingRequest([{ role: 'user', content: 'hi' }], '', [], { tier: 'High' })) { /* drain */ }
+    })().catch(() => undefined);
+    expect(stub.calls.map((c) => c.url)).toEqual(['https://openrouter.ai/api/v1/chat/completions']);
   });
 });

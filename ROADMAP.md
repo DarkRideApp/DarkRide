@@ -12,8 +12,8 @@
 - **HTTPS traffic capture** — mitmproxy + WireGuard transparent proxy, TLS fingerprint spoofing (Chrome 120 Android), NordVPN SOCKS5 proxy integration, per-device profiles
 - **Frida integration** — gadget injection, re-signing, script library (26+ built-in scripts across 6 categories: cert pinning, root detection, integrity, anti-debugging, emulator detection, analytics bypass), controlled spawn mode
 - **APK analysis** — multi-source acquisition (ADB pull, Play Store, manual upload), jadx decompilation, security findings scanner, React Native/Hermes bundle analysis, Flutter class/method extraction, version diffing with AI summaries
-- **AI agent** — multi-provider (Anthropic, Gemini, OpenRouter, Ollama, Codestral), 40+ context-aware tools, tiered model routing, context compaction
-- **AI model tiers** — declarative tier definitions, per-conversation routing, rate-limit-aware fallbacks, configurable per-user defaults
+- **AI agent** — multi-provider (Anthropic, Gemini, OpenRouter, Ollama, OpenAI, Mistral, Codestral, OpenAI-compatible, Claude CLI), 40+ context-aware tools, tiered model routing, context compaction
+- **AI model tiers** — declarative tier definitions, per-conversation routing, fallback to the next model on rate limits, exhausted credits, overload, rejected keys, and connection errors, configurable per-user defaults
 - **MCP server** — expose every DarkRide tool to AI agents (Claude Code, etc.) via Model Context Protocol with OAuth-based auth flow
 - **Authentication & authorisation** — multi-user with 23 area-level scopes, cookie sessions, API keys with scope intersection, built-in password provider (Argon2id), progressive lockout, claim-URL user onboarding, admin user management
 - **CLI** — `darkride plugin list/create/dev`, `darkride admin create`
@@ -329,7 +329,7 @@ Traffic capture and device discovery work TODAY on iOS — connect an iPhone via
 | Frontend | React 19, Vite, Monaco Editor, xterm.js |
 | Device Bridges | Python JSON-RPC (Android: bridge.py, iOS: ios_bridge.py) |
 | Traffic Proxy | mitmproxy (Python) + WireGuard |
-| AI | Multi-provider (Anthropic, Gemini, OpenRouter, Ollama) |
+| AI | Multi-provider (Anthropic, Gemini, OpenRouter, Ollama, OpenAI, Mistral, Codestral, OpenAI-compatible, Claude CLI) |
 | Auth | Cookie sessions, Argon2id, scoped API keys, OAuth/MCP |
 | Plugins | `@darkrideapp/plugin-sdk` (Ed25519-signed, marketplace-distributed), 15 extension points, npm-compatible registry workflow |
 | Storage | Local SQLite + optional cloud sync (S3/B2/R2) |

@@ -2,7 +2,7 @@ import { eq } from 'drizzle-orm';
 import type { AppDatabase } from '../db/index';
 import { aiConversations } from '../db/schema';
 import type { AiToolRegistry } from './ai-tools';
-import type { AiProvider } from './ai-provider';
+import type { AiStreamingProvider } from './ai/dialect';
 import { createLoggers } from '../logs';
 
 const { log, error: logError } = createLoggers('ai-agent');
@@ -18,8 +18,8 @@ import type {
 // ── Types ────────────────────────────────────────────────────────────
 
 export interface TierConfig {
-  researchProvider: AiProvider;  // cheap model for tool calls
-  writeProvider: AiProvider;     // expensive model for write tools
+  researchProvider: AiStreamingProvider;  // cheap model for tool calls
+  writeProvider: AiStreamingProvider;     // expensive model for write tools
   writeToolNames: string[];      // tool names that trigger escalation
 }
 
@@ -298,7 +298,7 @@ export class AiAgent implements AiAgentInterface {
   constructor(
     private db: AppDatabase,
     private toolRegistry: AiToolRegistry,
-    private provider: AiProvider,
+    private provider: AiStreamingProvider,
   ) {}
 
   public async handleMessage(_params: HandleMessageParams): Promise<HandleMessageResult> {
@@ -800,7 +800,7 @@ export class AiAgent implements AiAgentInterface {
     systemPrompt: string,
     tools: AiToolDefinition[],
     totalUsage: { inputTokens: number; outputTokens: number },
-    provider?: AiProvider,
+    provider?: AiStreamingProvider,
   ): Promise<AiMessage[]> {
     const compactionPrompt: AiMessage[] = [
       ...messages,
