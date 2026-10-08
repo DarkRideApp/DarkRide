@@ -96,7 +96,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   let finish: string | null = null;
   let done = false;
   let sawContent = false;
-  let usage: { input: number; output: number } | undefined;
+  let usage: { input: number; output: number; cached: number } | undefined;
 
   /**
    * Emit finished tool calls in the order they started. A non-final flush (at finish_reason) stops at the first buffer
@@ -133,7 +133,8 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     let p: any;
     try { p = JSON.parse(sse.data); } catch { continue; }
     if (p?.error) throw classifyStreamError(p, ctx);
-    if (p?.usage) usage = { input: p.usage.prompt_tokens ?? 0, output: p.usage.completion_tokens ?? 0 };
+    // prompt_tokens already includes the cached part; cached_tokens is the share of it read from cache.
+    if (p?.usage) usage = { input: p.usage.prompt_tokens ?? 0, output: p.usage.completion_tokens ?? 0, cached: p.usage.prompt_tokens_details?.cached_tokens ?? 0 };
     const choice = p?.choices?.[0];
     if (!choice) continue;
     if (choice.finish_reason === 'error') throw classifyStreamError({ error: choice.error ?? p.error ?? { message: 'upstream error' } }, ctx);
@@ -194,7 +195,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   }
   yield* flush(true);
   if (signal?.aborted) return;
-  if (usage) yield { type: 'usage', inputTokens: usage.input, outputTokens: usage.output };
+  if (usage) yield { type: 'usage', inputTokens: usage.input, outputTokens: usage.output, ...(usage.cached > 0 ? { cachedInputTokens: usage.cached } : {}) };
 }
 
 export const openAiChatDialect: Dialect = {

@@ -180,7 +180,7 @@ describe('gemini', () => {
         { type: 'text', text: 'Hel' },
         { type: 'text', text: 'lo' },
         { type: 'tool_use', id: 'call-1', name: 'get_apps', input: { q: 'x' } },
-        { type: 'usage', inputTokens: 9, outputTokens: 4 },
+        { type: 'usage', inputTokens: 9, outputTokens: 4, model: 'gemini-2.5-flash', providerType: 'gemini' },
       ]);
     });
 

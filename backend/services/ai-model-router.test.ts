@@ -917,6 +917,66 @@ describe('AiModelRouter', () => {
       expect(await run()).toEqual([{ type: 'usage', inputTokens: 5, outputTokens: 1 }]);
     });
 
+    describe('fallback chain on usage', () => {
+      it('usage from the model that served after a rate limit lists the failed model', async () => {
+        two([{ type: 'usage', value: [100, 0] }, { type: 'throw', value: new RLE('429', new Headers()) }],
+          [{ type: 'usage', value: [7, 0] }, { type: 'text', value: 'B' }, { type: 'usage', value: [0, 3] }]);
+        expect(await run()).toEqual([
+          { type: 'usage', inputTokens: 7, outputTokens: 0, fallbacks: [{ model: 'A', error: 'rate limited' }] },
+          { type: 'text', text: 'B' },
+          { type: 'usage', inputTokens: 0, outputTokens: 3, fallbacks: [{ model: 'A', error: 'rate limited' }] },
+        ]);
+      });
+
+      it('uses the same short description as the all-failed message for other errors', async () => {
+        two([{ type: 'throw', value: new QuotaExhaustedError('OpenRouter API error (402): no credits') }], [{ type: 'usage', value: [2, 1] }]);
+        expect(await run()).toEqual([
+          { type: 'usage', inputTokens: 2, outputTokens: 1, fallbacks: [{ model: 'A', error: 'OpenRouter API error (402): no credits' }] },
+        ]);
+      });
+
+      it('no fallbacks key when the first candidate served', async () => {
+        two([{ type: 'usage', value: [5, 0] }, { type: 'text', value: 'hi' }, { type: 'usage', value: [0, 2] }], []);
+        const usage = (await run()).filter((e: any) => e.type === 'usage');
+        expect(usage).toEqual([{ type: 'usage', inputTokens: 5, outputTokens: 0 }, { type: 'usage', inputTokens: 0, outputTokens: 2 }]);
+        expect(usage.every((e: any) => !('fallbacks' in e))).toBe(true);
+      });
+
+      it('a model skipped for cooldown appears in the chain', async () => {
+        two([{ type: 'text', value: 'A' }], [{ type: 'usage', value: [4, 0] }, { type: 'text', value: 'B' }]);
+        const byName = Object.fromEntries(r.getModels().map((m) => [m.name, m.id]));
+        cache.record429(byName.A);
+        const events = await run();
+        expect(events[0]).toEqual({ type: 'usage', inputTokens: 4, outputTokens: 0, fallbacks: [{ model: 'A', error: 'in cooldown (10m left)' }] });
+      });
+
+      it('a model skipped for its configuration appears in the chain, in order with failures', async () => {
+        insertModel(db, { name: 'Unlinked', model: 'U', priority: -1, tierId: highTierId });
+        two([{ type: 'throw', value: new ConnectionError('refused') }], [{ type: 'usage', value: [1, 1] }]);
+        expect(await run()).toEqual([{
+          type: 'usage', inputTokens: 1, outputTokens: 1,
+          fallbacks: [{ model: 'Unlinked', error: 'no provider linked' }, { model: 'A', error: 'refused' }],
+        }]);
+      });
+
+      it('does not mutate the event objects the provider yielded', async () => {
+        const original = { type: 'usage' as const, inputTokens: 1, outputTokens: 1 };
+        r = new AiModelRouter(db as any, cache, {
+          providerFactory: vi.fn((_t: string, cfg: any) => ({
+            name: 'x',
+            createStreamingRequest: async function* () {
+              if (cfg.model === 'A') throw new ConnectionError('refused');
+              yield original;
+            },
+          }) as any),
+        });
+        cache.getAll().clear();
+        const events = await run();
+        expect(events[0]).toMatchObject({ fallbacks: [{ model: 'A', error: 'refused' }] });
+        expect(original).toEqual({ type: 'usage', inputTokens: 1, outputTokens: 1 });
+      });
+    });
+
     it('throws AllModelsFailedError carrying each reason, starting with the legacy text', async () => {
       two([{ type: 'throw', value: new RLE('x', new Headers()) }], [{ type: 'throw', value: new AuthError('Anthropic API error (401): bad key') }]);
       const err: any = await run().catch((e) => e);
