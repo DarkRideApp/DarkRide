@@ -4,7 +4,7 @@ import { geminiDialect } from '../dialects/gemini-generate';
 import { makeCtx } from '../test-ctx';
 import { sseResponse, collect } from '../test-helpers';
 import { classifyHttpError } from '../http';
-import { AiProviderError, AuthError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
+import { AiProviderError, AuthError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 
 const chunk = (o: unknown) => ({ data: JSON.stringify(o) });
 const parts = (p: unknown[], extra: object = {}) => chunk({ candidates: [{ content: { role: 'model', parts: p }, ...extra }] });
@@ -34,7 +34,7 @@ describe('buildChat', () => {
     expect(plain.generationConfig).toBeUndefined();
     expect(plain.tools).toBeUndefined();
   });
-  it('tool results carry the real function name and parallel results merge into one user turn', () => {
+  it('tool results carry the real function name and id, and parallel results merge into one user turn', () => {
     const body: any = geminiDialect.buildChat(makeCtx('gemini'), {
       ...req,
       messages: [
@@ -46,15 +46,15 @@ describe('buildChat', () => {
     }, { stream: true }).body;
     expect(body.contents).toHaveLength(3);
     expect(body.contents[2]).toEqual({ role: 'user', parts: [
-      { functionResponse: { name: 'first', response: { result: 'ra' } } },
-      { functionResponse: { name: 'second', response: { result: 'rb' } } },
+      { functionResponse: { id: 'a', name: 'first', response: { result: 'ra' } } },
+      { functionResponse: { id: 'b', name: 'second', response: { result: 'rb' } } },
     ] });
   });
   it('an orphan tool result keeps the literal name tool_result; empty assistant turns are dropped', () => {
     const body: any = geminiDialect.buildChat(makeCtx('gemini'), {
       ...req, messages: [{ role: 'assistant', content: [] }, { role: 'tool_result', toolUseId: 'zzz', content: 'r' }],
     }, { stream: true }).body;
-    expect(body.contents).toEqual([{ role: 'user', parts: [{ functionResponse: { name: 'tool_result', response: { result: 'r' } } }] }]);
+    expect(body.contents).toEqual([{ role: 'user', parts: [{ functionResponse: { id: 'zzz', name: 'tool_result', response: { result: 'r' } } }] }]);
   });
   it('a plain user text turn after tool results is never merged into the functionResponse turn', () => {
     const body: any = geminiDialect.buildChat(makeCtx('gemini'), {
@@ -68,9 +68,165 @@ describe('buildChat', () => {
       ],
     }, { stream: true }).body;
     expect(body.contents).toHaveLength(5);
-    expect(body.contents[2]).toEqual({ role: 'user', parts: [{ functionResponse: { name: 'first', response: { result: 'ra' } } }] });
+    expect(body.contents[2]).toEqual({ role: 'user', parts: [{ functionResponse: { id: 'a', name: 'first', response: { result: 'ra' } } }] });
     expect(body.contents[3]).toEqual({ role: 'user', parts: [{ text: 'thanks' }] });
-    expect(body.contents[4]).toEqual({ role: 'user', parts: [{ functionResponse: { name: 'first', response: { result: 'again' } } }] });
+    expect(body.contents[4]).toEqual({ role: 'user', parts: [{ functionResponse: { id: 'a', name: 'first', response: { result: 'again' } } }] });
+  });
+});
+
+// https://ai.google.dev/gemini-api/docs/generate-content/function-calling (Gemini 3 returns an id with every
+// functionCall; the matching functionResponse must carry it) and .../thought-signatures (the first functionCall
+// part of each step needs a signature on Gemini 3; "skip_thought_signature_validator" is the documented stand-in).
+describe('function call ids and thought signatures', () => {
+  const SKIP = 'skip_thought_signature_validator';
+  const tool = (id: string, name = 'f', input: object = {}) => ({ type: 'tool_use' as const, id, name, input });
+  const loop = (model: string, turns: Array<Array<ReturnType<typeof tool> | { type: 'text'; text: string }>>) => {
+    const messages: any[] = [{ role: 'user', content: 'go' }];
+    for (const content of turns) {
+      messages.push({ role: 'assistant', content });
+      for (const b of content) if (b.type === 'tool_use') messages.push({ role: 'tool_result', toolUseId: b.id, content: `r-${b.id}` });
+    }
+    return (geminiDialect.buildChat(makeCtx('gemini', { model }), { ...req, messages }, { stream: true }).body as any).contents;
+  };
+
+  it('uses the id the model sends as the tool_use id, and a generated one only when there is none', async () => {
+    const events = await run([parts([
+      { functionCall: { id: '8f2b1a3c', name: 'f', args: {} } },
+      { functionCall: { name: 'g', args: {} } },
+    ], { finishReason: 'STOP' })]);
+    expect(events).toEqual([
+      { type: 'tool_use', id: '8f2b1a3c', name: 'f', input: {} },
+      { type: 'tool_use', id: 'id-1', name: 'g', input: {} },
+    ]);
+  });
+
+  it('echoes a model-supplied id on the replayed functionCall and on its functionResponse', () => {
+    const contents = loop('gemini-2.5-flash', [[tool('8f2b1a3c', 'first', { x: 1 })]]);
+    expect(contents[1]).toEqual({ role: 'model', parts: [{ functionCall: { id: '8f2b1a3c', name: 'first', args: { x: 1 } } }] });
+    expect(contents[2]).toEqual({ role: 'user', parts: [{ functionResponse: { id: '8f2b1a3c', name: 'first', response: { result: 'r-8f2b1a3c' } } }] });
+  });
+
+  it('never sends an id this process generated, nor one in the shape the default generator produces', async () => {
+    const minted = `minted-${Math.random().toString(36).slice(2)}`;
+    const [ev] = await collect(geminiDialect.parseStream(
+      sseResponse([parts([{ functionCall: { name: 'f', args: {} } }], { finishReason: 'STOP' })]),
+      makeCtx('gemini', { newId: () => minted }),
+    ));
+    expect(ev).toMatchObject({ type: 'tool_use', id: minted });
+    const stored = 'call_0123456789abcdef01234567';   // made up by an earlier process, read back from history
+    const contents = loop('gemini-2.5-flash', [[tool(minted, 'a'), tool(stored, 'b')]]);
+    expect(contents[1].parts).toEqual([{ functionCall: { name: 'a', args: {} } }, { functionCall: { name: 'b', args: {} } }]);
+    expect(contents[2].parts).toEqual([
+      { functionResponse: { name: 'a', response: { result: `r-${minted}` } } },
+      { functionResponse: { name: 'b', response: { result: `r-${stored}` } } },
+    ]);
+  });
+
+  it('on Gemini 3 the first functionCall of each replayed model turn carries the stand-in signature, parallel calls do not', () => {
+    const contents = loop('gemini-3-pro-preview', [
+      [{ type: 'text', text: 'checking' }, tool('s1', 'a'), tool('s2', 'b')],
+      [tool('s3', 'c')],
+    ]);
+    expect(contents[1].parts).toEqual([
+      { text: 'checking' },
+      { functionCall: { id: 's1', name: 'a', args: {} }, thoughtSignature: SKIP },
+      { functionCall: { id: 's2', name: 'b', args: {} } },
+    ]);
+    expect(contents[2].parts.map((p: any) => p.functionResponse.id)).toEqual(['s1', 's2']);
+    expect(contents[3].parts).toEqual([{ functionCall: { id: 's3', name: 'c', args: {} }, thoughtSignature: SKIP }]);
+  });
+
+  it('sends no signature to models before Gemini 3, and none on a text-only model turn', () => {
+    const older = loop('gemini-2.5-pro', [[tool('s1', 'a'), tool('s2', 'b')]]);
+    expect(JSON.stringify(older)).not.toContain('thoughtSignature');
+    const textOnly = (geminiDialect.buildChat(makeCtx('gemini', { model: 'gemini-3-flash-preview' }), {
+      ...req, messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: [{ type: 'text', text: 'hello' }] }],
+    }, { stream: true }).body as any).contents;
+    expect(textOnly[1]).toEqual({ role: 'model', parts: [{ text: 'hello' }] });
+  });
+});
+
+// https://ai.google.dev/gemini-api/docs/generate-content/thinking: 2.5 Flash and Flash-Lite turn thinking off with a
+// budget of 0, 2.5 Pro cannot turn it off (minimum 128), Gemini 3 takes a thinkingLevel.
+describe('low effort limits thinking so it cannot eat a small output budget', () => {
+  const gen = (model: string, effort?: 'low') =>
+    (geminiDialect.buildChat(makeCtx('gemini', { model }), { ...req, maxOutputTokens: 256, effort }, { stream: true }).body as any).generationConfig;
+  it.each([
+    ['gemini-2.5-flash', { thinkingBudget: 0 }],
+    ['gemini-2.5-flash-lite', { thinkingBudget: 0 }],
+    ['gemini-2.5-flash-preview-09-2025', { thinkingBudget: 0 }],
+    ['gemini-2.5-pro', { thinkingBudget: 128 }],
+    ['gemini-3-pro-preview', { thinkingLevel: 'low' }],
+    ['gemini-3-flash-preview', { thinkingLevel: 'low' }],
+  ])('%s gets %o', (model, thinkingConfig) => {
+    expect(gen(model, 'low')).toEqual({ maxOutputTokens: 256, thinkingConfig });
+  });
+  it.each(['gemma-3-27b-it', 'gemini-2.0-flash', 'learnlm-2.0-flash'])('%s gets no thinkingConfig', (model) => {
+    expect(gen(model, 'low')).toEqual({ maxOutputTokens: 256 });
+  });
+  it('no effort means no thinkingConfig, whatever the model', () => {
+    expect(gen('gemini-2.5-flash')).toEqual({ maxOutputTokens: 256 });
+    expect(gen('gemini-3-pro-preview')).toEqual({ maxOutputTokens: 256 });
+  });
+  it('an output limit hit before any text or tool call is an OutputLimitError, not a silent empty reply', async () => {
+    const e = await thrown([parts([{ text: 'thinking hard', thought: true }], { finishReason: 'MAX_TOKENS' })]);
+    expect(e).toBeInstanceOf(OutputLimitError);
+    expect(e.message).toBe('Gemini response was cut off by the output token limit before any text.');
+    expect(e.provider).toBe('gemini');
+  });
+  it('an output limit after a tool call keeps the call and does not throw', async () => {
+    const events = await run([parts([{ functionCall: { name: 'f', args: {} } }], { finishReason: 'MAX_TOKENS' })]);
+    expect(events).toEqual([{ type: 'tool_use', id: 'id-1', name: 'f', input: {} }]);
+  });
+});
+
+describe('a stream that ends without saying it finished', () => {
+  it('a clean close with no finishReason is an error, not a truncated success', async () => {
+    const e = await thrown([parts([{ text: 'half a sent' }])]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.message).toBe('Gemini stream ended before finishReason');
+    expect(e.provider).toBe('gemini');
+  });
+  it('a body with no chunks at all is an empty response error', async () => {
+    const e = await thrown([]);
+    expect(e.constructor).toBe(AiProviderError);
+    expect(e.message).toBe('Gemini returned an empty response');
+    expect(e.provider).toBe('gemini');
+    const junk = await thrown([{ data: 'not json' }, { data: 'null' }]);
+    expect(junk.message).toBe('Gemini returned an empty response');
+  });
+  it('a finishReason on an earlier chunk counts, and so does a prompt block', async () => {
+    await expect(run([parts([{ text: 'a' }], { finishReason: 'STOP' }), chunk({ usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } })]))
+      .resolves.toEqual([{ type: 'text', text: 'a' }, { type: 'usage', inputTokens: 1, outputTokens: 1 }]);
+    await expect(run([chunk({ promptFeedback: { blockReason: 'SAFETY' } })])).resolves.toHaveLength(1);
+  });
+  it('an aborted call ends quietly however far it got', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    await expect(collect(geminiDialect.parseStream(sseResponse([parts([{ text: 'x' }])]), makeCtx('gemini'), ac.signal))).resolves.toEqual([]);
+  });
+});
+
+// https://ai.google.dev/api/generate-content#FinishReason
+describe('every stop other than STOP and MAX_TOKENS is visible', () => {
+  it.each([
+    'SAFETY', 'RECITATION', 'LANGUAGE', 'OTHER', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'MALFORMED_FUNCTION_CALL',
+    'IMAGE_SAFETY', 'IMAGE_PROHIBITED_CONTENT', 'IMAGE_OTHER', 'NO_IMAGE', 'IMAGE_RECITATION',
+    'UNEXPECTED_TOOL_CALL', 'TOO_MANY_TOOL_CALLS', 'MISSING_THOUGHT_SIGNATURE', 'MALFORMED_RESPONSE',
+    'FINISH_REASON_UNSPECIFIED', 'SOMETHING_NEW',
+  ])('%s', async (reason) => {
+    const events = await run([parts([{ text: 'partial ' }], { finishReason: reason })]);
+    expect(events).toEqual([{ type: 'text', text: 'partial ' }, { type: 'text', text: `Gemini stopped this response (reason: ${reason}).` }]);
+  });
+  it('STOP adds nothing', async () => {
+    expect(await run([parts([{ text: 'done' }], { finishReason: 'STOP' })])).toEqual([{ type: 'text', text: 'done' }]);
+  });
+  it('a hostile finishReason goes through redaction and the cap', async () => {
+    const events = await run([chunk({ candidates: [{ finishReason: `x sk-test-placeholder ${'y'.repeat(5000)}` }] })]);
+    const text = (events[0] as any).text as string;
+    expect(text).not.toContain('sk-test-placeholder');
+    expect(text).toContain('***');
+    expect(text.length).toBeLessThan(1000);
   });
 });
 
@@ -87,7 +243,7 @@ describe('parseStream', () => {
   });
   it('usage reported on every chunk is emitted once', async () => {
     const um = (p: number, c: number) => ({ usageMetadata: { promptTokenCount: p, candidatesTokenCount: c } });
-    const events = await run([chunk({ candidates: [{ content: { parts: [{ text: 'a' }] } }], ...um(5, 1) }), chunk({ candidates: [{ content: { parts: [{ text: 'b' }] } }], ...um(5, 4) })]);
+    const events = await run([chunk({ candidates: [{ content: { parts: [{ text: 'a' }] } }], ...um(5, 1) }), chunk({ candidates: [{ content: { parts: [{ text: 'b' }] }, finishReason: 'STOP' }], ...um(5, 4) })]);
     expect(events.filter((e) => e.type === 'usage')).toEqual([{ type: 'usage', inputTokens: 5, outputTokens: 4 }]);
   });
   it('safety and blocked stops become a visible message', async () => {
@@ -103,13 +259,13 @@ describe('parseStream', () => {
     await expect(run([parts([{ text: 'cut' }], { finishReason: 'MAX_TOKENS' })])).resolves.toEqual([{ type: 'text', text: 'cut' }]);
   });
   it('skips thought parts so reasoning never reaches the chat', async () => {
-    const events = await run([parts([{ text: 'secret reasoning', thought: true }, { text: 'answer' }])]);
+    const events = await run([parts([{ text: 'secret reasoning', thought: true }, { text: 'answer' }], { finishReason: 'STOP' })]);
     expect(events).toEqual([{ type: 'text', text: 'answer' }]);
   });
   it('skips chunks that are not JSON objects instead of throwing', async () => {
     const events = await run([
       { data: 'null' }, { data: '7' }, { data: '"str"' }, { data: 'not json at all' }, { data: '[]' },
-      parts([{ text: 'ok' }]),
+      parts([{ text: 'ok' }], { finishReason: 'STOP' }),
     ]);
     expect(events).toEqual([{ type: 'text', text: 'ok' }]);
   });
@@ -274,6 +430,32 @@ describe('classifyError', () => {
     const ctx = makeCtx('gemini');
     expect(classifyHttpError(geminiDialect, ctx, 400, new Headers(), badKeyBody)).toBeInstanceOf(AuthError);
     expect(classifyHttpError(geminiDialect, ctx, 400, new Headers(), '{"error":{"message":"Invalid JSON payload"}}').constructor).toBe(AiProviderError);
+  });
+});
+
+describe('403 split: a key-level PERMISSION_DENIED is a credential failure, any other 403 is not', () => {
+  const denied = JSON.stringify({ error: { code: 403, message: 'Method doesn\'t allow unregistered callers.', status: 'PERMISSION_DENIED' } });
+  it('PERMISSION_DENIED stays an AuthError in the usual message shape', () => {
+    const e = geminiDialect.classifyError!(403, new Headers(), denied) as any;
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.status).toBe(403);
+    expect(e.message).toBe('Gemini API error (403): Method doesn\'t allow unregistered callers.');
+    const viaHttp = classifyHttpError(geminiDialect, makeCtx('gemini'), 403, new Headers(), denied);
+    expect(viaHttp).toBeInstanceOf(AuthError);
+    expect(viaHttp.status).toBe(403);
+    expect(viaHttp.provider).toBe('gemini');
+    expect(viaHttp.message).toBe('Gemini API error (403): Method doesn\'t allow unregistered callers.');
+  });
+  it.each([
+    ['a different status', JSON.stringify({ error: { code: 403, message: 'nope', status: 'FORBIDDEN' } })],
+    ['no status', JSON.stringify({ error: { code: 403, message: 'PERMISSION_DENIED in the text only' } })],
+    ['a non-JSON body', '<html>403 PERMISSION_DENIED</html>'],
+    ['an empty body', ''],
+  ])('a 403 with %s falls through to the generic path', (_label, body) => {
+    expect(geminiDialect.classifyError!(403, new Headers(), body)).toBeUndefined();
+  });
+  it('PERMISSION_DENIED on another status is left alone', () => {
+    expect(geminiDialect.classifyError!(400, new Headers(), denied)).toBeUndefined();
   });
 });
 

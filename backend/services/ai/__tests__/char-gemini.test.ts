@@ -87,7 +87,7 @@ describe('gemini', () => {
   describe('message history (tool results)', () => {
     it('should format tool results as functionResponse parts', async () => {
       const stub = stubFetch(() => sseResponse([
-        chunk({ candidates: [{ content: { parts: [{ text: 'response' }] } }] }),
+        chunk({ candidates: [{ content: { parts: [{ text: 'response' }] }, finishReason: 'STOP' }] }),
       ]));
       const messages: AiMessage[] = [
         { role: 'user', content: 'use a tool' },
@@ -105,7 +105,10 @@ describe('gemini', () => {
       // tool_result message becomes a "user" role with functionResponse part
       const toolResultMsg = body.contents[2];
       expect(toolResultMsg.role).toBe('user');
+      // Was no id on either part. Now an id the model could have sent is echoed on both, since Gemini 3
+      // matches each result to its call by id; ids this app made up itself are never sent.
       expect(toolResultMsg.parts[0].functionResponse).toEqual({
+        id: 'tc1',
         name: 'get_info', // was the literal 'tool_result'; now the name of the call this result answers
         response: { result: 'tool output here' },
       });
@@ -114,6 +117,7 @@ describe('gemini', () => {
       const assistantMsg = body.contents[1];
       expect(assistantMsg.role).toBe('model');
       expect(assistantMsg.parts[0].functionCall).toEqual({
+        id: 'tc1',
         name: 'get_info',
         args: { q: 'test' },
       });
@@ -136,21 +140,22 @@ describe('gemini', () => {
       ];
       await run(messages);
       // Was: an empty { text: '' } part kept in the model turn, and one user turn per result, each named
-      // 'tool_result'. Now empty text parts are dropped and the results share one turn with real names.
+      // 'tool_result'. Now empty text parts are dropped and the results share one turn with real names
+      // and the call ids echoed.
       expect(stub.calls[0].body.contents).toEqual([
         { role: 'user', parts: [{ text: 'go' }] },
         {
           role: 'model',
           parts: [
-            { functionCall: { name: 'tool_a', args: {} } },
-            { functionCall: { name: 'tool_b', args: { n: 1 } } },
+            { functionCall: { id: 'a', name: 'tool_a', args: {} } },
+            { functionCall: { id: 'b', name: 'tool_b', args: { n: 1 } } },
           ],
         },
         {
           role: 'user',
           parts: [
-            { functionResponse: { name: 'tool_a', response: { result: 'ra' } } },
-            { functionResponse: { name: 'tool_b', response: { result: 'rb' } } },
+            { functionResponse: { id: 'a', name: 'tool_a', response: { result: 'ra' } } },
+            { functionResponse: { id: 'b', name: 'tool_b', response: { result: 'rb' } } },
           ],
         },
       ]);
@@ -180,33 +185,48 @@ describe('gemini', () => {
     });
 
     it('generates a non-empty tool-call id by default', async () => {
-      stubFetch(() => sseResponse([chunk({ candidates: [{ content: { parts: [{ functionCall: { name: 'f', args: {} } }] } }] })]));
+      stubFetch(() => sseResponse([chunk({ candidates: [{ content: { parts: [{ functionCall: { name: 'f', args: {} } }] }, finishReason: 'STOP' }] })]));
       const [tool] = (await run()) as Extract<AiStreamEvent, { type: 'tool_use' }>[];
       expect(tool.id).toMatch(/^call_[0-9a-f]{24}$/);
     });
 
     it('defaults missing functionCall args to an empty object', async () => {
-      stubFetch(() => sseResponse([chunk({ candidates: [{ content: { parts: [{ functionCall: { name: 'noargs' } }] } }] })]));
+      stubFetch(() => sseResponse([chunk({ candidates: [{ content: { parts: [{ functionCall: { name: 'noargs' } }] }, finishReason: 'STOP' }] })]));
       const events = await run();
       expect(events).toMatchObject([{ type: 'tool_use', name: 'noargs', input: {} }]);
     });
 
     it('ends without an error on a safety stop with no parts, and says why', async () => {
       stubFetch(() => sseResponse([chunk({ candidates: [{ finishReason: 'SAFETY' }] })]));
-      // Was a silent empty reply; safety, blocked, and malformed-call stops now show a message.
+      // Was a silent empty reply; every stop other than STOP and MAX_TOKENS now shows a message.
       expect(await run()).toEqual([{ type: 'text', text: 'Gemini stopped this response (reason: SAFETY).' }]);
+    });
+
+    it('rejects a stream that closes without a finishReason, and an empty one', async () => {
+      // Was accepted as a complete reply, so a dropped connection looked like a short answer. Now it is an error.
+      stubFetch(() => sseResponse([chunk({ candidates: [{ content: { parts: [{ text: 'half a sent' }] } }] })]));
+      await expect(run()).rejects.toMatchObject({ name: 'AiProviderError', message: 'Gemini stream ended before finishReason' });
+      stubFetch(() => sseResponse([]));
+      await expect(run()).rejects.toMatchObject({ message: 'Gemini returned an empty response' });
+    });
+
+    it('sends a low thinking setting for inline completion so thinking cannot use up the output budget', async () => {
+      // Was no thinkingConfig at all, so gemini-2.5-flash could spend all 256 tokens thinking and return "".
+      const stub = stubFetch(() => okStream('gemini'));
+      await gemini({ apiKey: 'k' }).complete({ prefix: 'a', suffix: 'b', maxOutputTokens: 256 });
+      expect(stub.calls[0].body.generationConfig).toEqual({ maxOutputTokens: 256, thinkingConfig: { thinkingBudget: 0 } });
     });
 
     it('skips unparseable data lines and accepts a stream with no terminator', async () => {
       stubFetch(() => sseResponse([
         { data: 'not json' },
-        chunk({ candidates: [{ content: { parts: [{ text: 'fine' }] } }] }),
+        chunk({ candidates: [{ content: { parts: [{ text: 'fine' }] }, finishReason: 'STOP' }] }),
       ]));
       expect(await run()).toEqual([{ type: 'text', text: 'fine' }]);
     });
 
     it('reassembles a chunk split across network reads, with CRLF endings', async () => {
-      const line = 'data: {"candidates":[{"content":{"parts":[{"text":"split ok"}]}}]}\r\n\r\n';
+      const line = 'data: {"candidates":[{"content":{"parts":[{"text":"split ok"}]},"finishReason":"STOP"}]}\r\n\r\n';
       stubFetch(() => chunkedResponse([line.slice(0, 20), line.slice(20, line.length - 3), line.slice(line.length - 3)]));
       expect(await run()).toEqual([{ type: 'text', text: 'split ok' }]);
     });
