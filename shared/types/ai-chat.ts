@@ -65,8 +65,11 @@ export interface AiStreamToolUseEvent {
 
 export interface AiStreamUsageEvent {
   type: 'usage';
+  /** Total prompt tokens for this call, including cache reads and writes. */
   inputTokens: number;
   outputTokens: number;
+  /** Prompt tokens served from the provider's cache (reads only). */
+  cachedInputTokens?: number;
 }
 
 /** Events emitted by the LLM provider during streaming */
