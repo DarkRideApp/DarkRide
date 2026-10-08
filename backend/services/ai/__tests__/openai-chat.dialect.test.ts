@@ -551,6 +551,25 @@ describe('parseStream', () => {
     });
   });
 
+  it('reports prompt_tokens_details.cached_tokens as cachedInputTokens; inputTokens stays prompt_tokens', async () => {
+    const events = await run(sseResponse([
+      delta({ content: 'a' }, 'stop'),
+      chunk({ choices: [], usage: { prompt_tokens: 2048, completion_tokens: 3, prompt_tokens_details: { cached_tokens: 1920 } } }),
+      { data: '[DONE]' },
+    ]));
+    expect(events).toEqual([{ type: 'text', text: 'a' }, { type: 'usage', inputTokens: 2048, outputTokens: 3, cachedInputTokens: 1920 }]);
+  });
+  it('no cachedInputTokens key when cached_tokens is zero, absent, or the details object is missing or null', async () => {
+    for (const usage of [
+      { prompt_tokens: 8, completion_tokens: 1, prompt_tokens_details: { cached_tokens: 0 } },
+      { prompt_tokens: 8, completion_tokens: 1, prompt_tokens_details: {} },
+      { prompt_tokens: 8, completion_tokens: 1, prompt_tokens_details: null },
+      { prompt_tokens: 8, completion_tokens: 1 },
+    ]) {
+      const events = await run(sseResponse([delta({ content: 'a' }, 'stop'), chunk({ choices: [], usage }), { data: '[DONE]' }]));
+      expect(events).toEqual([{ type: 'text', text: 'a' }, { type: 'usage', inputTokens: 8, outputTokens: 1 }]);
+    }
+  });
   it('a usage-only stream yields just usage', async () => {
     const events = await run(sseResponse([chunk({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 0 } }), { data: '[DONE]' }]));
     expect(events).toEqual([{ type: 'usage', inputTokens: 5, outputTokens: 0 }]);

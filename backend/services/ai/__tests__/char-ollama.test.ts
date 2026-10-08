@@ -152,7 +152,7 @@ describe('ollama', () => {
         { type: 'tool_use', id: 'call-1', name: 'obj_args', input: { a: 1 } },
         { type: 'tool_use', id: 'given', name: 'str_args', input: { b: 2 } },
         { type: 'tool_use', id: 'bad', name: 'bad_args', input: {} },
-        { type: 'usage', inputTokens: 12, outputTokens: 6 },
+        { type: 'usage', inputTokens: 12, outputTokens: 6, model: 'llama3.1', providerType: 'ollama' },
       ]);
     });
 
@@ -170,7 +170,7 @@ describe('ollama', () => {
       ]));
       expect(await run()).toEqual([
         { type: 'text', text: 'split ok' },
-        { type: 'usage', inputTokens: 1, outputTokens: 1 },
+        { type: 'usage', inputTokens: 1, outputTokens: 1, model: 'llama3.1', providerType: 'ollama' },
       ]);
     });
 
@@ -179,7 +179,7 @@ describe('ollama', () => {
       // Was: the NDJSON reader only emitted complete lines, so an unterminated last line (here the usage line) was lost.
       // Now: a stream that ends without a done line is an error, so the reader parses an unterminated last line
       // instead of turning a complete answer into a failure.
-      expect(await run()).toEqual([{ type: 'text', text: 'a' }, { type: 'usage', inputTokens: 2, outputTokens: 2 }]);
+      expect(await run()).toEqual([{ type: 'text', text: 'a' }, { type: 'usage', inputTokens: 2, outputTokens: 2, model: 'llama3.1', providerType: 'ollama' }]);
     });
 
     it('a stream cut off before the done line is an error', async () => {

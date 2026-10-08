@@ -6,6 +6,7 @@ import {
   buildSystemPrompt,
   parseTextBasedToolUses,
   containsUnparsedToolCallAttempt,
+  getRunUsageFromError,
   type TierConfig,
   type AgentIdentity,
 } from './ai-agent';
@@ -870,8 +871,11 @@ describe('AiAgent', () => {
     });
 
     expect(result.error).toBeUndefined();
-    expect(result.usage).toEqual({ inputTokens: 100_000, outputTokens: 20 });
-    expect(percents.at(-1)).toBe(50);          // 100000 of the agent's 200000-token window
+    expect(result.usage).toMatchObject({ inputTokens: 100_000, outputTokens: 20 });
+    expect(result.run?.requests).toEqual([
+      { inputTokens: 100_000, cacheReadTokens: 90_000, cacheWriteTokens: 0, outputTokens: 20, startedAt: expect.any(Number) },
+    ]);
+    expect(percents.at(-1)).toBe(50);         // 100000 of the agent's 200000-token window
   });
 
   it.skip('should handle tool that returns null', async () => {
@@ -2346,6 +2350,259 @@ describe('AiAgent', () => {
       expect(onToolStart).toHaveBeenCalledWith(
         'w1', 'write_notes', { text: 'from expensive' }, expect.any(Number), expect.any(Number),
       );
+    });
+  });
+
+  describe('per-request usage for the call log', () => {
+    const identity: AgentIdentity = {
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: ['devices:read', 'devices:write'],
+      onBehalfOfService: 'test',
+    };
+    const run = (agent: AiAgent, extra: Record<string, unknown> = {}) => agent.handleMessageWithIdentity(identity, {
+      conversationId: null,
+      message: 'go',
+      pageContext: 'devices',
+      contextId: '',
+      onToken: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolResult: vi.fn(),
+      mode: 'streaming',
+      ...extra,
+    });
+    /** A provider whose Nth request runs the Nth script. */
+    const scripted = (...scripts: Array<() => AsyncIterable<AiStreamEvent>>) => {
+      let n = 0;
+      const fn = vi.fn(() => {
+        const script = scripts[Math.min(n++, scripts.length - 1)];
+        return script();
+      });
+      return { provider: makeMockProvider(fn), fn };
+    };
+    const strip = (reqs: any[] | undefined) => (reqs ?? []).map(({ startedAt, ...r }) => {
+      expect(typeof startedAt).toBe('number');
+      return r;
+    });
+
+    it('records one merged entry per request on the standard path, with model and cache fields', async () => {
+      const fallbacks = [{ model: 'claude-opus-5-5', error: 'rate limited' }];
+      const { provider } = scripted(
+        async function* () {
+          // Prompt first (with cache counts), then two output deltas, as an Anthropic stream reports them.
+          yield { type: 'usage', inputTokens: 1000, outputTokens: 0, cachedInputTokens: 800, cacheCreationInputTokens: 100,
+            model: 'claude-sonnet-5-5', providerType: 'anthropic', fallbacks };
+          yield { type: 'tool_use', id: 't1', name: 'ok_tool', input: {} };
+          yield { type: 'tool_use', id: 't2', name: 'bad_tool', input: {} };
+          yield { type: 'usage', inputTokens: 0, outputTokens: 30, model: 'claude-sonnet-5-5', providerType: 'anthropic', fallbacks };
+          yield { type: 'usage', inputTokens: 0, outputTokens: 20, model: 'claude-sonnet-5-5', providerType: 'anthropic', fallbacks };
+        },
+        async function* () {
+          yield { type: 'usage', inputTokens: 1200, outputTokens: 0, cachedInputTokens: 1000, model: 'claude-sonnet-5-5', providerType: 'anthropic' };
+          yield { type: 'text', text: 'done' };
+          yield { type: 'usage', inputTokens: 0, outputTokens: 7 };
+        },
+      );
+      const registry = makeRegistry([
+        { name: 'ok_tool', execute: async () => 'fine' },
+        { name: 'bad_tool', execute: async () => { throw new Error('nope'); } },
+      ]);
+      const result = await run(new AiAgent(db, registry, provider));
+
+      expect(result.error).toBeUndefined();
+      expect(strip(result.run?.requests)).toEqual([
+        { model: 'claude-sonnet-5-5', providerType: 'anthropic', inputTokens: 1000, cacheReadTokens: 800, cacheWriteTokens: 100, outputTokens: 50, fallbacks },
+        { model: 'claude-sonnet-5-5', providerType: 'anthropic', inputTokens: 1200, cacheReadTokens: 1000, cacheWriteTokens: 0, outputTokens: 7 },
+      ]);
+      expect(result.run?.turns).toBe(2);
+      expect(result.run?.toolCalls).toBe(2);   // the failing tool was attempted, so it counts
+      expect(result.usage).toMatchObject({ inputTokens: 2200, outputTokens: 57 });
+    });
+
+    it('keeps result.usage to the two displayed token totals and puts the per-request detail in result.run', async () => {
+      const { provider } = scripted(async function* () {
+        yield { type: 'usage', inputTokens: 500, outputTokens: 0, model: 'claude-haiku-5-5', providerType: 'anthropic',
+          fallbacks: [{ model: 'claude-opus-5-5', error: 'rate limited' }] };
+        yield { type: 'text', text: 'x' };
+        yield { type: 'usage', inputTokens: 0, outputTokens: 9 };
+      });
+      const result = await run(new AiAgent(db, makeRegistry(), provider));
+      // usage is broadcast to browsers, so it must never carry model ids or fallback errors.
+      expect(Object.keys(result.usage!).sort()).toEqual(['inputTokens', 'outputTokens']);
+      expect(result.usage).not.toHaveProperty('requests');
+      expect(result).not.toHaveProperty('turns');
+      expect(result).not.toHaveProperty('toolCalls');
+      expect(result.run?.turns).toBe(1);
+      expect(result.run?.toolCalls).toBe(0);
+      expect(result.run?.requests.map((r) => r.model)).toEqual(['claude-haiku-5-5']);
+    });
+
+    it('does not add up a prompt count that a provider repeats on several events of one request', async () => {
+      const { provider } = scripted(async function* () {
+        yield { type: 'usage', inputTokens: 500, outputTokens: 0, cachedInputTokens: 300 };
+        yield { type: 'text', text: 'x' };
+        yield { type: 'usage', inputTokens: 500, outputTokens: 9, cachedInputTokens: 300 };
+      });
+      const result = await run(new AiAgent(db, makeRegistry(), provider));
+      expect(strip(result.run?.requests)).toEqual([
+        { inputTokens: 500, cacheReadTokens: 300, cacheWriteTokens: 0, outputTokens: 9 },
+      ]);
+    });
+
+    it('does not count denied tool calls or request_tools', async () => {
+      const { provider } = scripted(
+        async function* () {
+          yield { type: 'tool_use', id: 't1', name: 'guarded', input: {} };
+          yield { type: 'tool_use', id: 't2', name: 'request_tools', input: { contexts: [] } };
+          yield { type: 'usage', inputTokens: 10, outputTokens: 1 };
+        },
+        () => textOnlyStream('ok'),
+      );
+      const registry = makeRegistry([{ name: 'guarded', requiresConfirmation: true }]);
+      const result = await run(new AiAgent(db, registry, provider), { onToolConfirm: async () => false });
+      expect(result.run?.toolCalls).toBe(0);
+      expect(result.run?.turns).toBe(2);
+      expect(result.run?.requests).toHaveLength(2);
+    });
+
+    it('records both the research and the write request when a tiered turn escalates', async () => {
+      const research = scripted(
+        async function* () {
+          yield { type: 'tool_use', id: 'r1', name: 'write_notes', input: { text: 'cheap' } };
+          yield { type: 'usage', inputTokens: 10, outputTokens: 5, model: 'claude-haiku-5-5', providerType: 'anthropic' };
+        },
+        async function* () {
+          yield { type: 'text', text: 'Done' };
+          yield { type: 'usage', inputTokens: 20, outputTokens: 8, model: 'claude-haiku-5-5', providerType: 'anthropic' };
+        },
+      );
+      const write = scripted(async function* () {
+        yield { type: 'usage', inputTokens: 30, outputTokens: 0, cacheCreationInputTokens: 25, model: 'claude-opus-5-5', providerType: 'anthropic' };
+        yield { type: 'tool_use', id: 'w1', name: 'write_notes', input: { text: 'expensive' } };
+        yield { type: 'usage', inputTokens: 0, outputTokens: 15, model: 'claude-opus-5-5', providerType: 'anthropic' };
+      });
+      const registry = makeRegistry([{ name: 'write_notes', execute: async () => 'ok' }]);
+      const result = await run(new AiAgent(db, registry, research.provider), {
+        tierConfig: { researchProvider: research.provider, writeProvider: write.provider, writeToolNames: ['write_notes'] },
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(strip(result.run?.requests)).toEqual([
+        { model: 'claude-haiku-5-5', providerType: 'anthropic', inputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 5 },
+        { model: 'claude-opus-5-5', providerType: 'anthropic', inputTokens: 30, cacheReadTokens: 0, cacheWriteTokens: 25, outputTokens: 15 },
+        { model: 'claude-haiku-5-5', providerType: 'anthropic', inputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 8 },
+      ]);
+      expect(result.run?.turns).toBe(2);
+      expect(result.run?.toolCalls).toBe(1);
+    });
+
+    it('records the discarded research request once on a parse-miss escalation and keeps the displayed totals', async () => {
+      const research = scripted(
+        async function* () {
+          yield { type: 'text', text: 'I will call get_apps(filter=games)' };
+          yield { type: 'usage', inputTokens: 10, outputTokens: 5, model: 'claude-haiku-5-5' };
+        },
+        async function* () {
+          yield { type: 'text', text: 'Done' };
+          yield { type: 'usage', inputTokens: 20, outputTokens: 8, model: 'claude-haiku-5-5' };
+        },
+      );
+      const write = scripted(async function* () {
+        yield { type: 'tool_use', id: 'w1', name: 'get_apps', input: {} };
+        yield { type: 'usage', inputTokens: 30, outputTokens: 15, model: 'claude-opus-5-5' };
+      });
+      const registry = makeRegistry([{ name: 'get_apps', execute: async () => '[]' }]);
+      const result = await run(new AiAgent(db, registry, research.provider), {
+        tierConfig: { researchProvider: research.provider, writeProvider: write.provider, writeToolNames: [] },
+      });
+
+      expect(result.run?.requests?.map((r) => [r.model, r.inputTokens, r.outputTokens])).toEqual([
+        ['claude-haiku-5-5', 10, 5],
+        ['claude-opus-5-5', 30, 15],
+        ['claude-haiku-5-5', 20, 8],
+      ]);
+      // Displayed totals keep their existing accounting.
+      expect(result.usage).toMatchObject({ inputTokens: 60, outputTokens: 28 });
+    });
+
+    it('records the compaction summary request without counting it as a turn', async () => {
+      const { provider, fn } = scripted(
+        async function* () {
+          yield { type: 'tool_use', id: 't1', name: 'ok_tool', input: {} };
+          // Over the compaction threshold of the agent's context window.
+          yield { type: 'usage', inputTokens: 150_000, outputTokens: 10, model: 'claude-sonnet-5-5' };
+        },
+        async function* () {
+          yield { type: 'usage', inputTokens: 150_500, outputTokens: 0, cachedInputTokens: 150_000, model: 'claude-sonnet-5-5' };
+          yield { type: 'text', text: 'summary of the work so far' };
+          yield { type: 'usage', inputTokens: 0, outputTokens: 400 };
+        },
+        async function* () {
+          yield { type: 'text', text: 'finished' };
+          yield { type: 'usage', inputTokens: 2000, outputTokens: 5, model: 'claude-sonnet-5-5' };
+        },
+      );
+      const registry = makeRegistry([{ name: 'ok_tool' }]);
+      const result = await run(new AiAgent(db, registry, provider));
+
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(fn.mock.calls[1][2]).toEqual([]);   // the compaction request sends no tools
+      expect(result.run?.requests?.map((r) => [r.inputTokens, r.cacheReadTokens, r.outputTokens])).toEqual([
+        [150_000, 0, 10],
+        [150_500, 150_000, 400],
+        [2000, 0, 5],
+      ]);
+      expect(result.run?.turns).toBe(2);
+    });
+
+    it('returns the partial requests of a cancelled run and marks it aborted', async () => {
+      const controller = new AbortController();
+      const { provider } = scripted(
+        async function* () {
+          yield { type: 'tool_use', id: 't1', name: 'ok_tool', input: {} };
+          yield { type: 'usage', inputTokens: 100, outputTokens: 10, model: 'claude-sonnet-5-5' };
+        },
+        async function* () {
+          yield { type: 'usage', inputTokens: 150, outputTokens: 0, model: 'claude-sonnet-5-5' };
+          yield { type: 'text', text: 'partial' };
+          controller.abort();
+        },
+      );
+      const registry = makeRegistry([{ name: 'ok_tool' }]);
+      const result = await run(new AiAgent(db, registry, provider), { signal: controller.signal });
+
+      expect(result.error).toBe('Request was cancelled');
+      expect(result.aborted).toBe(true);
+      expect(result.run?.requests?.map((r) => r.inputTokens)).toEqual([100, 150]);
+      expect(result.run?.turns).toBe(2);
+      expect(result.run?.toolCalls).toBe(1);
+    });
+
+    it('does not mark a completed run as aborted', async () => {
+      const result = await run(new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('hi'))));
+      expect(result.aborted).toBeFalsy();
+    });
+
+    it('attaches the partial usage to an error the run throws', async () => {
+      const { provider } = scripted(
+        async function* () {
+          yield { type: 'tool_use', id: 't1', name: 'ok_tool', input: {} };
+          yield { type: 'usage', inputTokens: 40, outputTokens: 4, model: 'claude-haiku-5-5' };
+        },
+        async function* () {
+          yield { type: 'usage', inputTokens: 60, outputTokens: 0, model: 'claude-haiku-5-5' };
+          throw new Error('stream exploded');
+        },
+      );
+      const registry = makeRegistry([{ name: 'ok_tool' }]);
+      const err = await run(new AiAgent(db, registry, provider)).catch((e) => e);
+
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toBe('stream exploded');
+      const usage = getRunUsageFromError(err);
+      expect(usage?.requests.map((r) => r.inputTokens)).toEqual([40, 60]);
+      expect(usage?.turns).toBe(2);
+      expect(usage?.toolCalls).toBe(1);
     });
   });
 });

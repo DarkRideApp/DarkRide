@@ -4,6 +4,7 @@ import { useToast } from '@darkrideapp/plugin-sdk/react';
 import { Modal } from '@darkrideapp/plugin-sdk/react';
 import { ConfirmDialog } from '@darkrideapp/plugin-sdk/react';
 import { AiRateLimitsPanel } from '../AiRateLimitsPanel';
+import { AiUsagePanel } from './AiUsagePanel';
 import {
   SectionCard, SectionHeading,
   ProviderTypeBadge, ProviderStatusBadge, ModelStatusBadge,
@@ -798,6 +799,9 @@ export function AISection() {
           <AiRateLimitsPanel />
         </div>
       </SectionCard>
+
+      {/* ── AI usage (its own card: cost and cache behaviour of recent runs) ── */}
+      <AiUsagePanel />
 
       {/* ── Provider Modal ── */}
       {showProviderModal && (

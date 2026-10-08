@@ -72,8 +72,13 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
         const u = p.message?.usage;
         if (u) {
           const cacheRead = u.cache_read_input_tokens ?? 0;
-          const total = (u.input_tokens ?? 0) + cacheRead + (u.cache_creation_input_tokens ?? 0);
-          yield { type: 'usage', inputTokens: total, outputTokens: 0, ...(cacheRead > 0 ? { cachedInputTokens: cacheRead } : {}) };
+          const cacheWrite = u.cache_creation_input_tokens ?? 0;
+          const total = (u.input_tokens ?? 0) + cacheRead + cacheWrite;
+          yield {
+            type: 'usage', inputTokens: total, outputTokens: 0,
+            ...(cacheRead > 0 ? { cachedInputTokens: cacheRead } : {}),
+            ...(cacheWrite > 0 ? { cacheCreationInputTokens: cacheWrite } : {}),
+          };
         }
         break;
       }

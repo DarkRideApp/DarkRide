@@ -762,9 +762,35 @@ export const aiCallLog = sqliteTable('ai_call_log', {
   inputTokens: integer('input_tokens'),
   outputTokens: integer('output_tokens'),
   turns: integer('turns'),
+  /** Tool calls the agent executed during the run (denied calls are not counted). */
+  toolCalls: integer('tool_calls'),
+  /** Estimated cost: sum of priced requests, or null when no request had a known price. */
   costUsd: real('cost_usd'),
   outcome: text('outcome', { enum: ['success', 'error', 'aborted'] as const }),
   error: text('error'),
+});
+
+/**
+ * One row per model request made inside an agent run. Records every usage event a provider returned,
+ * including requests whose output the agent later discarded, so the totals reflect what was billed.
+ */
+export const aiCallRequest = sqliteTable('ai_call_request', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  callId: integer('call_id')
+    .notNull()
+    .references(() => aiCallLog.id, { onDelete: 'cascade' }),
+  seq: integer('seq').notNull(),
+  startedAt: integer('started_at', { mode: 'timestamp' }).notNull(),
+  model: text('model'),
+  providerType: text('provider_type'),
+  /** Total prompt tokens, including cache reads and writes. */
+  inputTokens: integer('input_tokens').notNull().default(0),
+  cacheReadTokens: integer('cache_read_tokens').notNull().default(0),
+  cacheWriteTokens: integer('cache_write_tokens').notNull().default(0),
+  outputTokens: integer('output_tokens').notNull().default(0),
+  /** Estimated cost in USD; null when the model has no known price. */
+  costUsd: real('cost_usd'),
+  fallbacks: text('fallbacks', { mode: 'json' }).$type<Array<{ model: string; error: string }>>(),
 });
 
 export * from './oauth-schema';

@@ -156,6 +156,33 @@ id starts with `codestral` uses FIM. Every other model gets a chat request with 
 marked `<CURSOR>` and no tools. Output is capped at 256 tokens and cut at the first run of
 three newlines. If the Low tier has no usable model, the deprecated settings below apply.
 
+## Usage and cost
+
+Every agent run (chat, APK analysis, APK diff, and plugin AI runs) is recorded in `ai_call_log`,
+and each model request inside a run in `ai_call_request`: the model id, the provider type,
+prompt tokens (including cache), cache read and write tokens, output tokens, an estimated cost,
+and the models that were skipped or failed before this one served the request. Billed requests
+are what count, so a research-tier request whose output was thrown away after escalating to the
+write model is recorded, and so is the summary request made when a long conversation is
+compacted. Prompts and replies are not stored.
+
+Settings → AI → "AI usage" shows this for the last 7, 30 or 90 days: totals, cache hit rate,
+cost per purpose (chat, APK analysis, APK diff, each plugin), cost per day, and the most recent
+runs with their models, turns, tool calls and fallbacks. The same data is available from
+`GET /v1/ai/usage/report` (see `docs/api.md`).
+
+Costs are estimates. The price table covers Anthropic models and comes from Anthropic's pricing
+page (fetched 2026-10-08). It ignores batch discounts, fast mode and negotiated pricing, and it
+prices cache writes at the 5-minute rate because requests use the default 5-minute cache. A
+model with no price in the table, including an alias such as `sonnet` and any model on another
+provider, shows `n/a`, never zero. To add or replace prices, set `ai_model_prices` to a JSON
+object keyed by model id, each value `{ "input": 3, "output": 15, "cacheRead": 0.3,
+"cacheWrite": 3.75 }` in USD per million tokens. An invalid value is rejected with a 400.
+
+Not recorded: inline completion (the provider returns text only), requests cancelled before
+their first output, and the per-request detail of runs from before this feature (their token
+totals still count, their cost shows `n/a`).
+
 ## Deprecated settings
 
 `ai_provider`, `anthropic_api_key`, `gemini_api_key`, `openrouter_api_key`,

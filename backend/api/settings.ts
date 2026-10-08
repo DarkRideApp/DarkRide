@@ -3,6 +3,7 @@ import { registerEndpoint } from './api-service';
 import { settings } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { APK_RETENTION_FLOOR } from '../services/apk-retention';
+import { validateModelPriceOverrides } from '../../shared/lib/ai-model-pricing';
 
 const ALLOWED_KEYS = new Set([
   'nordvpn_username', 'nordvpn_password',
@@ -28,6 +29,7 @@ const ALLOWED_KEYS = new Set([
   'apk_local_retention_count',
   'qq_fetch_default', // 'true' | 'false' — default enablement for QQ on newly-tracked apps
   'xiaomi_fetch_default', // 'true' | 'false' — default enablement for Xiaomi GetApps (availability-only)
+  'ai_model_prices', // JSON price overrides for the AI usage cost estimate, see shared/lib/ai-model-pricing.ts
 ]);
 const PASSWORD_KEYS = new Set([
   'nordvpn_password',
@@ -109,6 +111,13 @@ export function registerSettingsEndpoints(db: AppDatabase, defaults: SettingsDef
       if (!Number.isFinite(n) || n < APK_RETENTION_FLOOR) {
         value = String(APK_RETENTION_FLOOR);
         warning = `apk_local_retention_count clamped up to ${APK_RETENTION_FLOOR} — that is the hard minimum.`;
+      }
+    }
+    if (key === 'ai_model_prices') {
+      const problem = validateModelPriceOverrides(value);
+      if (problem) {
+        res.status(400).json({ success: false, error: problem });
+        return;
       }
     }
 

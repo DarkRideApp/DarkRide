@@ -74,7 +74,11 @@ export class DialectProvider implements AiProvider {
     const d = this.descriptor;
     if (!res.body) throw new AiProviderError(`${d.shortName} response has no body`, { provider: d.id });
     try {
-      yield* this.dialect.parseStream(res, used, req.signal);
+      // Usage carries the model actually requested (after the default) and the provider type, so cost can be
+      // attributed per request. A value the dialect set itself wins.
+      for await (const e of this.dialect.parseStream(res, used, req.signal)) {
+        yield e.type === 'usage' ? { ...e, model: e.model ?? used.model, providerType: e.providerType ?? d.id } : e;
+      }
     } catch (err) {
       if (err instanceof LineTooLongError) throw new AiProviderError(`${d.shortName} sent a line longer than 8 MB`, { provider: d.id });
       if (err instanceof StreamReadError) {

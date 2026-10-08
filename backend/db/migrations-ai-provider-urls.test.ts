@@ -40,7 +40,8 @@ describe('migration 0100: null base_url on providers that ignored it', () => {
     const j = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../migrations/meta/_journal.json'), 'utf8'));
     const entry = j.entries.find((e: any) => e.idx === 100);
     expect(entry?.tag).toBe('0100_ai_provider_ignored_base_urls');
-    const maxOther = Math.max(...j.entries.filter((e: any) => e.idx !== 100).map((e: any) => e.when));
-    expect(entry.when).toBeGreaterThan(maxOther);
+    // Only entries before this migration count: later migrations legitimately have a greater `when`.
+    const maxEarlier = Math.max(...j.entries.filter((e: any) => e.idx < 100).map((e: any) => e.when));
+    expect(entry.when).toBeGreaterThan(maxEarlier);
   });
 });

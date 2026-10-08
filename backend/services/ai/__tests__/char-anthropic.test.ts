@@ -128,11 +128,12 @@ describe('anthropic', () => {
       expect(usageEvents[1]).toMatchObject({ inputTokens: 0, outputTokens: 5 });
 
       // Full ordered sequence, so a reordering or an extra event is caught too.
+      // New: the provider stamps each usage event with the model it requested and its provider type.
       expect(events).toEqual([
-        { type: 'usage', inputTokens: 10, outputTokens: 0 },
+        { type: 'usage', inputTokens: 10, outputTokens: 0, model: 'claude-sonnet-5-5', providerType: 'anthropic' },
         { type: 'text', text: 'Hello' },
         { type: 'text', text: ' world' },
-        { type: 'usage', inputTokens: 0, outputTokens: 5 },
+        { type: 'usage', inputTokens: 0, outputTokens: 5, model: 'claude-sonnet-5-5', providerType: 'anthropic' },
       ]);
     });
 
@@ -197,7 +198,7 @@ describe('anthropic', () => {
         for await (const e of anthropic().createStreamingRequest(msgs, 's', noTools)) seen.push(e);
       })()).rejects.toThrow('Anthropic stream error: api_error');
       expect(seen).toEqual([
-        { type: 'usage', inputTokens: 1, outputTokens: 0 },
+        { type: 'usage', inputTokens: 1, outputTokens: 0, model: 'claude-sonnet-5-5', providerType: 'anthropic' },
         { type: 'text', text: 'partial' },
       ]);
     });
@@ -305,7 +306,7 @@ describe('anthropic', () => {
       // Current behaviour: the parser checks the signal between reads and stops; no error is thrown
       // and the missing message_stop is excused because the caller aborted.
       expect(seen).toEqual([
-        { type: 'usage', inputTokens: 4, outputTokens: 0 },
+        { type: 'usage', inputTokens: 4, outputTokens: 0, model: 'claude-sonnet-5-5', providerType: 'anthropic' },
         { type: 'text', text: 'first' },
       ]);
     });

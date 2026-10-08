@@ -159,7 +159,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   const shortName = ctx.descriptor.shortName;
   if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
   const provider = ctx.descriptor.id;
-  let usage: { input: number; output: number } | undefined;
+  let usage: { input: number; output: number; cached: number } | undefined;
   let sawChunk = false;
   let finished = false;
   let produced = false;   // any visible text or tool call so far
@@ -201,9 +201,11 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     }
 
     if (p.usageMetadata) {
+      // promptTokenCount already includes the cached content; cachedContentTokenCount is the share read from cache.
       usage = {
         input: p.usageMetadata.promptTokenCount ?? 0,
         output: (p.usageMetadata.candidatesTokenCount ?? 0) + (p.usageMetadata.thoughtsTokenCount ?? 0),
+        cached: p.usageMetadata.cachedContentTokenCount ?? 0,
       };
     }
   }
@@ -211,7 +213,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   // A 200 that closes early (a dropped connection, a proxy timeout) must not pass for a complete answer.
   if (!sawChunk) throw new AiProviderError(`${shortName} returned an empty response`, { provider });
   if (!finished) throw new AiProviderError(`${shortName} stream ended before finishReason`, { provider });
-  if (usage) yield { type: 'usage', inputTokens: usage.input, outputTokens: usage.output };
+  if (usage) yield { type: 'usage', inputTokens: usage.input, outputTokens: usage.output, ...(usage.cached > 0 ? { cachedInputTokens: usage.cached } : {}) };
 }
 
 export const geminiDialect: Dialect = {

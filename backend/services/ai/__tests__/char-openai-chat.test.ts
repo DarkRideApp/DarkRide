@@ -302,7 +302,7 @@ describe('openai-chat tool call buffering', () => {
     // additive, so the stream now reports once, at the end.
     expect(await runWith('openrouter', { apiKey: 'k' })).toEqual([
       { type: 'text', text: 'a' },
-      { type: 'usage', inputTokens: 5, outputTokens: 2 },
+      { type: 'usage', inputTokens: 5, outputTokens: 2, model: 'openrouter/auto', providerType: 'openrouter' },
     ]);
   });
 

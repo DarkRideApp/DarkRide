@@ -589,6 +589,13 @@
       "when": 1791447452244,
       "tag": "0100_ai_provider_ignored_base_urls",
       "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1791494784563,
+      "tag": "0101_ai_call_request",
+      "breakpoints": true
     }
   ]
 }

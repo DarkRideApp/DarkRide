@@ -3,9 +3,19 @@ import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { users } from '../db/schema';
 import type { ServiceUserManager } from '../auth/service-user-manager';
 import type { ApiKeyManager } from '../auth/api-key-manager';
-import type { AiAgentInterface, AgentIdentity, HandleMessageParams, HandleMessageResult } from './ai-agent';
+import {
+  getRunUsageFromError,
+  type AiAgentInterface,
+  type AgentIdentity,
+  type AgentRequestUsage,
+  type HandleMessageParams,
+  type HandleMessageResult,
+} from './ai-agent';
 import { CORE_SERVICE_IDENTITIES, type CoreServiceKey } from './core-service-identities';
 import { scopeIntersect } from '../auth/scope-matcher';
+import { createLoggers } from '../logs';
+
+const { error: logError } = createLoggers('ai-agent-factory');
 
 // Some callers (bootstrap, claim-manager, system-user, api-key-manager,
 // admin-users) pre-stringify scopes before Drizzle's mode:'json' stringifies
@@ -22,12 +32,24 @@ function coerceScopes(raw: unknown): string[] {
   return [];
 }
 
+function sum(requests: AgentRequestUsage[], key: 'inputTokens' | 'outputTokens'): number {
+  return requests.reduce((n, r) => n + r[key], 0);
+}
+
 export interface AiCallLoggerLike {
   startCall(identity: AgentIdentity, params: Partial<HandleMessageParams>): number;
   endCall(
     logId: number,
     outcome: 'success' | 'error' | 'aborted',
-    usage?: { inputTokens?: number; outputTokens?: number; turns?: number; costUsd?: number },
+    usage?: {
+      inputTokens?: number;
+      outputTokens?: number;
+      turns?: number;
+      toolCalls?: number;
+      costUsd?: number;
+      /** Every model request of the run, in order; the logger prices each one. */
+      requests?: AgentRequestUsage[];
+    },
     error?: string,
   ): void;
 }
@@ -142,22 +164,63 @@ export class AiAgentFactory {
       async handleMessage(params: HandleMessageParams): Promise<HandleMessageResult> {
         const provider = deps.providerFactory(options);
         if (!provider) throw new Error('No AI provider configured');
-        const logId = deps.logger.startCall(identity, params);
+        // Call logging is bookkeeping: a logger failure is reported and never changes the run's outcome.
+        let logId = -1;
         try {
-          const result = await provider.handleMessageWithIdentity(identity, params);
-          deps.logger.endCall(
-            logId,
-            result.error ? 'error' : 'success',
-            result.usage
-              ? { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens }
-              : undefined,
-            result.error,
-          );
-          return result;
+          logId = deps.logger.startCall(identity, params);
+        } catch (logErr) {
+          logError(`AI call log start failed: ${String(logErr)}`);
+        }
+        const endCall = (...args: Parameters<AiCallLoggerLike['endCall']>) => {
+          if (logId === -1) return;
+          try {
+            deps.logger.endCall(...args);
+          } catch (logErr) {
+            logError(`AI call log end failed for run ${logId}: ${String(logErr)}`);
+          }
+        };
+
+        let result: HandleMessageResult;
+        try {
+          result = await provider.handleMessageWithIdentity(identity, params);
         } catch (err) {
-          deps.logger.endCall(logId, 'error', undefined, String(err));
+          // A run that throws still paid for the requests it made before failing. A user cancel mid-stream
+          // surfaces here as the signal's AbortError; a turn timeout aborts a different signal and stays an error.
+          const cancelled = params.signal?.aborted === true;
+          const partial = getRunUsageFromError(err);
+          endCall(
+            logId,
+            cancelled ? 'aborted' : 'error',
+            partial
+              ? {
+                inputTokens: sum(partial.requests, 'inputTokens'),
+                outputTokens: sum(partial.requests, 'outputTokens'),
+                requests: partial.requests,
+                turns: partial.turns,
+                toolCalls: partial.toolCalls,
+              }
+              : undefined,
+            cancelled ? 'Request was cancelled' : String(err),
+          );
           throw err;
         }
+        const { run, ...rest } = result;
+        endCall(
+          logId,
+          result.aborted ? 'aborted' : result.error ? 'error' : 'success',
+          result.usage || run
+            ? {
+              inputTokens: result.usage?.inputTokens,
+              outputTokens: result.usage?.outputTokens,
+              requests: run?.requests,
+              turns: run?.turns,
+              toolCalls: run?.toolCalls,
+            }
+            : undefined,
+          result.error,
+        );
+        // The per-request detail is for the call log only; callers (including plugin code) never see it.
+        return rest;
       },
     };
   }

@@ -84,7 +84,7 @@ describe('parseStream usage', () => {
       text('hi'), msgDelta('end_turn', 20), stop(),
     ]);
     expect(events).toEqual([
-      { type: 'usage', inputTokens: 460, outputTokens: 0, cachedInputTokens: 400 },
+      { type: 'usage', inputTokens: 460, outputTokens: 0, cachedInputTokens: 400, cacheCreationInputTokens: 50 },
       { type: 'text', text: 'hi' },
       { type: 'usage', inputTokens: 0, outputTokens: 20 },
     ]);
@@ -103,6 +103,33 @@ describe('parseStream usage', () => {
   it('no cachedInputTokens key when nothing was read from cache', async () => {
     const events = await run([start(), msgDelta('end_turn', 1), stop()]);
     expect((events[0] as any).cachedInputTokens).toBeUndefined();
+  });
+  it('reports cache writes as cacheCreationInputTokens next to cache reads, with the total as inputTokens', async () => {
+    const events = await run([
+      start({ input_tokens: 12, cache_read_input_tokens: 3000, cache_creation_input_tokens: 800 }),
+      text('a'), msgDelta('end_turn', 4), stop(),
+    ]);
+    expect(events[0]).toEqual({ type: 'usage', inputTokens: 3812, outputTokens: 0, cachedInputTokens: 3000, cacheCreationInputTokens: 800 });
+  });
+  it('reports a cache write with no cache read', async () => {
+    const events = await run([start({ input_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 900 }), msgDelta('end_turn', 1), stop()]);
+    expect(events[0]).toEqual({ type: 'usage', inputTokens: 905, outputTokens: 0, cacheCreationInputTokens: 900 });
+  });
+  it('no cacheCreationInputTokens key when nothing was written to cache', async () => {
+    const zero = await run([start({ input_tokens: 5, cache_read_input_tokens: 40, cache_creation_input_tokens: 0 }), msgDelta('end_turn', 1), stop()]);
+    expect(zero[0]).toEqual({ type: 'usage', inputTokens: 45, outputTokens: 0, cachedInputTokens: 40 });
+    const absent = await run([start({ input_tokens: 5 }), msgDelta('end_turn', 1), stop()]);
+    expect('cacheCreationInputTokens' in (absent[0] as object)).toBe(false);
+  });
+  it('cache fields stay on the message_start event; output usage is still a delta of the cumulative count', async () => {
+    const events = await run([
+      start({ input_tokens: 1, cache_creation_input_tokens: 100 }), text('a'), msgDelta('end_turn', 6), msgDelta('end_turn', 10), stop(),
+    ]);
+    expect(events.filter((e) => e.type === 'usage')).toEqual([
+      { type: 'usage', inputTokens: 101, outputTokens: 0, cacheCreationInputTokens: 100 },
+      { type: 'usage', inputTokens: 0, outputTokens: 6 },
+      { type: 'usage', inputTokens: 0, outputTokens: 4 },
+    ]);
   });
 });
 

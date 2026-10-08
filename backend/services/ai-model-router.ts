@@ -324,8 +324,14 @@ export class AiModelRouter {
       signal?.throwIfAborted();
       let yielded = false;
       const held: AiStreamEvent[] = [];
+      // The models passed over before this one, attached to every usage event it reports so the
+      // fallback chain can be recorded with the request. Absent when the first candidate serves.
+      const passedOver = attempts.slice();
+      const withChain = (e: AiStreamEvent): AiStreamEvent =>
+        e.type === 'usage' && passedOver.length > 0 ? { ...e, fallbacks: passedOver.map((a) => ({ ...a })) } : e;
       try {
-        for await (const event of provider.createStreamingRequest(messages, systemPrompt, tools, options)) {
+        for await (const raw of provider.createStreamingRequest(messages, systemPrompt, tools, options)) {
+          const event = withChain(raw);
           if (!yielded) {
             if (event.type === 'usage') { held.push(event); continue; }
             yielded = true;

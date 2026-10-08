@@ -272,6 +272,27 @@ describe('parseStream', () => {
     const events = await run([chunk({ candidates: [{ content: { parts: [{ text: 'a' }] } }], ...um(5, 1) }), chunk({ candidates: [{ content: { parts: [{ text: 'b' }] }, finishReason: 'STOP' }], ...um(5, 4) })]);
     expect(events.filter((e) => e.type === 'usage')).toEqual([{ type: 'usage', inputTokens: 5, outputTokens: 4 }]);
   });
+  it('reports cachedContentTokenCount as cachedInputTokens; promptTokenCount already includes it and thinking still counts as output', async () => {
+    const events = await run([chunk({
+      candidates: [{ content: { parts: [{ text: 'a' }] }, finishReason: 'STOP' }],
+      usageMetadata: { promptTokenCount: 5000, cachedContentTokenCount: 4096, candidatesTokenCount: 7, thoughtsTokenCount: 30 },
+    })]);
+    expect(events.filter((e) => e.type === 'usage')).toEqual([{ type: 'usage', inputTokens: 5000, outputTokens: 37, cachedInputTokens: 4096 }]);
+  });
+  it('no cachedInputTokens key when cachedContentTokenCount is absent or zero', async () => {
+    for (const extra of [{}, { cachedContentTokenCount: 0 }]) {
+      const events = await run([chunk({
+        candidates: [{ content: { parts: [{ text: 'a' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 1, ...extra },
+      })]);
+      expect(events.filter((e) => e.type === 'usage')).toEqual([{ type: 'usage', inputTokens: 9, outputTokens: 1 }]);
+    }
+  });
+  it('takes the cached count from the last chunk that reports usage', async () => {
+    const um = (cached: number) => ({ usageMetadata: { promptTokenCount: 50, cachedContentTokenCount: cached, candidatesTokenCount: 1 } });
+    const events = await run([chunk({ candidates: [{ content: { parts: [{ text: 'a' }] } }], ...um(32) }), chunk({ candidates: [{ content: { parts: [{ text: 'b' }] }, finishReason: 'STOP' }], ...um(40) })]);
+    expect(events.filter((e) => e.type === 'usage')).toEqual([{ type: 'usage', inputTokens: 50, outputTokens: 1, cachedInputTokens: 40 }]);
+  });
   it('safety and blocked stops become a visible message', async () => {
     for (const reason of ['SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII', 'MALFORMED_FUNCTION_CALL']) {
       const events = await run([chunk({ candidates: [{ finishReason: reason }] })]);

@@ -7,6 +7,7 @@ import { createProvider, getDialect } from '../registry';
 import { AI_PROVIDER_CATALOG, getProviderDescriptor } from '../../../../shared/lib/ai-provider-catalog';
 import { DialectProvider } from '../provider';
 import { parseSSEStream } from '../http';
+import { __resetOpenAiChatMemo } from '../dialects/openai-chat';
 import type { Dialect } from '../dialect';
 import { UnknownProviderError, AiProviderError, ConnectionError, isFallbackEligible } from '../errors';
 import { stubFetch, sseResponse, jsonResponse, textResponse, collect, callHeader } from '../test-helpers';
@@ -420,5 +421,71 @@ describe('DialectProvider against a real local server', () => {
     }
     for (let i = 0; i < 100 && !closed; i++) await new Promise((r) => setTimeout(r, 10));
     expect(closed).toBe(true);
+  });
+});
+
+describe('DialectProvider usage stamping', () => {
+  const usageOf = (events: any[]) => events.filter((e) => e.type === 'usage');
+  const anthropicStream = () => sseResponse([
+    { event: 'message_start', data: JSON.stringify({ type: 'message_start', message: { usage: { input_tokens: 3 } } }) },
+    { event: 'content_block_delta', data: JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'ok' } }) },
+    { event: 'message_delta', data: JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } }) },
+    { event: 'message_stop', data: JSON.stringify({ type: 'message_stop' }) },
+  ]);
+  const openAiStream = () => sseResponse([
+    { data: JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] }) },
+    { data: JSON.stringify({ choices: [], usage: { prompt_tokens: 4, completion_tokens: 1 } }) },
+    { data: '[DONE]' },
+  ]);
+
+  it('stamps every usage event with the default model when the row has no model, and the descriptor id', async () => {
+    const stub = stubFetch(anthropicStream);
+    for (const model of [undefined, '', '  ']) {
+      const events = await collect(createProvider('anthropic', { apiKey: 'k', model }).createStreamingRequest([{ role: 'user', content: 'hi' }], '', []));
+      expect(usageOf(events)).toEqual([
+        { type: 'usage', inputTokens: 3, outputTokens: 0, model: 'claude-sonnet-5-5', providerType: 'anthropic' },
+        { type: 'usage', inputTokens: 0, outputTokens: 2, model: 'claude-sonnet-5-5', providerType: 'anthropic' },
+      ]);
+    }
+    expect(stub.calls.every((c) => c.body.model === 'claude-sonnet-5-5')).toBe(true);
+  });
+
+  it('stamps the explicit model (trimmed, as sent in the request) and leaves text events alone', async () => {
+    const stub = stubFetch(openAiStream);
+    const events = await collect(createProvider('openrouter', { apiKey: 'k', model: ' vendor/some-model ' }).createStreamingRequest([{ role: 'user', content: 'hi' }], '', []));
+    expect(stub.calls[0].body.model).toBe('vendor/some-model');
+    expect(events).toEqual([
+      { type: 'text', text: 'ok' },
+      { type: 'usage', inputTokens: 4, outputTokens: 1, model: 'vendor/some-model', providerType: 'openrouter' },
+    ]);
+  });
+
+  it('providerType is the descriptor id, not the dialect id', async () => {
+    stubFetch(openAiStream);
+    const events = await collect(createProvider('openai-compatible', { baseUrl: 'http://127.0.0.1:4999/v1', model: 'local-model' }).createStreamingRequest([{ role: 'user', content: 'hi' }], '', []));
+    expect(usageOf(events)).toEqual([{ type: 'usage', inputTokens: 4, outputTokens: 1, model: 'local-model', providerType: 'openai-compatible' }]);
+  });
+
+  it('stamps usage from the retried request after a stream_options rejection', async () => {
+    __resetOpenAiChatMemo();
+    const stub = stubFetch((call, n) => (n === 0 && call.body.stream_options ? textResponse('Unrecognized request argument: stream_options', 400) : openAiStream()));
+    const events = await collect(createProvider('codestral', { apiKey: 'k' }).createStreamingRequest([{ role: 'user', content: 'hi' }], '', []));
+    expect(stub.calls).toHaveLength(2);
+    expect(stub.calls[1].body.stream_options).toBeUndefined();
+    expect(usageOf(events)).toEqual([{ type: 'usage', inputTokens: 4, outputTokens: 1, model: 'codestral-latest', providerType: 'codestral' }]);
+    __resetOpenAiChatMemo();
+  });
+
+  it('does not overwrite a model or providerType the dialect already set', async () => {
+    stubFetch(oneOk);
+    const base = getDialect('openai-chat');
+    const dialect: Dialect = {
+      ...base,
+      async *parseStream() { yield { type: 'usage', inputTokens: 1, outputTokens: 1, model: 'served-snapshot', providerType: 'upstream' }; },
+    };
+    const p = new DialectProvider(getProviderDescriptor('openrouter')!, dialect, { apiKey: 'k', model: 'alias' });
+    expect(await collect(p.createStreamingRequest([{ role: 'user', content: 'hi' }], '', []))).toEqual([
+      { type: 'usage', inputTokens: 1, outputTokens: 1, model: 'served-snapshot', providerType: 'upstream' },
+    ]);
   });
 });
