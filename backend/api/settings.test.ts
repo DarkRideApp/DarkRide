@@ -100,6 +100,26 @@ describe('Settings API Endpoints', () => {
       expect(row.value).toBe('supersecret');
     });
 
+    it('accepts a well-formed ai_model_prices override', async () => {
+      const value = JSON.stringify({ 'local-llm': { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25 } });
+      const res = await request(app).put('/v1/settings/ai_model_prices').send({ value });
+      expect(res.status).toBe(200);
+      expect(res.body.data.value).toBe(value);
+      const row = db.select().from(settings).where(eq(settings.key, 'ai_model_prices')).all()[0];
+      expect(row.value).toBe(value);
+    });
+
+    it('rejects a malformed ai_model_prices value and stores nothing', async () => {
+      for (const value of ['{nope', '[]', '{"m":{"input":1}}', '{"m":{"input":-1,"output":1,"cacheRead":0,"cacheWrite":0}}']) {
+        const res = await request(app).put('/v1/settings/ai_model_prices').send({ value });
+        expect(res.status).toBe(400);
+        expect(res.body.success).toBe(false);
+        expect(res.body.error).toMatch(/ai_model_prices/);
+        expect(res.body.error).not.toMatch(/Unknown setting key/);
+      }
+      expect(db.select().from(settings).where(eq(settings.key, 'ai_model_prices')).all()).toHaveLength(0);
+    });
+
     it('should clamp apk_local_retention_count below floor to 2 with a warning', async () => {
       const res = await request(app)
         .put('/v1/settings/apk_local_retention_count')

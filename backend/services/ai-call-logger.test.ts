@@ -88,6 +88,104 @@ describe('AiCallLogger', () => {
     expect(row.onBehalfOfService).toBe('apk-diff-engine');
   });
 
+  describe('per-request usage', () => {
+    const startRun = () => logger.startCall({ identityType: 'user', actorUserId: userId, effectiveScopes: [] }, {} as any);
+    const requestRows = (id: number) => db.select().from(schema.aiCallRequest)
+      .where(eq(schema.aiCallRequest.callId, id)).orderBy(schema.aiCallRequest.seq).all();
+    const runRow = (id: number) => db.select().from(schema.aiCallLog).where(eq(schema.aiCallLog.id, id)).get()!;
+    const round = (n: number | null | undefined) => (n == null ? n : Math.round(n * 1e9) / 1e9);
+
+    it('writes one row per request in order and sums their estimated cost onto the run', () => {
+      const id = startRun();
+      logger.endCall(id, 'success', {
+        inputTokens: 3_000_000, outputTokens: 1_000_000, turns: 2, toolCalls: 3,
+        requests: [
+          // Opus 5.5: 1M uncached ($4) + 1M cache read ($0.20) + 0 write, 0.5M output ($10) = $14.20
+          { model: 'claude-opus-5-5', providerType: 'anthropic', inputTokens: 2_000_000, cacheReadTokens: 1_000_000, cacheWriteTokens: 0, outputTokens: 500_000 },
+          // Sonnet 5.5: 1M cache write ($2.50), 0.5M output ($5) = $7.50
+          { model: 'claude-sonnet-5-5', providerType: 'anthropic', inputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 1_000_000, outputTokens: 500_000,
+            fallbacks: [{ model: 'claude-opus-5-5', error: 'rate limited' }] },
+        ],
+      });
+      const rows = requestRows(id);
+      expect(rows.map((r) => [r.seq, r.model, r.providerType, r.inputTokens, r.cacheReadTokens, r.cacheWriteTokens, r.outputTokens]))
+        .toEqual([
+          [0, 'claude-opus-5-5', 'anthropic', 2_000_000, 1_000_000, 0, 500_000],
+          [1, 'claude-sonnet-5-5', 'anthropic', 1_000_000, 0, 1_000_000, 500_000],
+        ]);
+      expect(round(rows[0].costUsd)).toBe(14.2);
+      expect(round(rows[1].costUsd)).toBe(7.5);
+      expect(rows[0].fallbacks).toBeNull();
+      expect(rows[1].fallbacks).toEqual([{ model: 'claude-opus-5-5', error: 'rate limited' }]);
+      expect(rows[0].startedAt).toBeInstanceOf(Date);
+      const run = runRow(id);
+      expect(round(run.costUsd)).toBe(21.7);
+      expect(run.turns).toBe(2);
+      expect(run.toolCalls).toBe(3);
+      expect(run.inputTokens).toBe(3_000_000);
+    });
+
+    it('stores a null cost for an unpriced request and sums only the priced ones', () => {
+      const id = startRun();
+      logger.endCall(id, 'success', {
+        inputTokens: 2, outputTokens: 0,
+        requests: [
+          { model: 'mystery-model', inputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 },
+          { model: 'claude-sonnet-5-5', inputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 },
+        ],
+      });
+      const rows = requestRows(id);
+      expect(rows[0].costUsd).toBeNull();
+      expect(round(rows[1].costUsd)).toBe(2);
+      expect(round(runRow(id).costUsd)).toBe(2);
+    });
+
+    it('leaves the run cost null when no request has a known price', () => {
+      const id = startRun();
+      logger.endCall(id, 'success', {
+        inputTokens: 10, outputTokens: 5,
+        requests: [{ inputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 5 }],
+      });
+      expect(requestRows(id)).toHaveLength(1);
+      expect(requestRows(id)[0].model).toBeNull();
+      expect(runRow(id).costUsd).toBeNull();
+    });
+
+    it('leaves the run cost null when there were no requests', () => {
+      const id = startRun();
+      logger.endCall(id, 'error', { inputTokens: 0, outputTokens: 0, turns: 0, toolCalls: 0, requests: [] }, 'boom');
+      expect(requestRows(id)).toHaveLength(0);
+      const run = runRow(id);
+      expect(run.costUsd).toBeNull();
+      expect(run.turns).toBe(0);
+      expect(run.toolCalls).toBe(0);
+    });
+
+    it('prices with the ai_model_prices setting when it covers the model', () => {
+      db.insert(schema.settings).values({
+        key: 'ai_model_prices',
+        value: JSON.stringify({ 'local-llm': { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }),
+      }).run();
+      const id = startRun();
+      logger.endCall(id, 'success', {
+        inputTokens: 1_000_000, outputTokens: 1_000_000,
+        requests: [{ model: 'local-llm', providerType: 'ollama', inputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 1_000_000 }],
+      });
+      expect(round(requestRows(id)[0].costUsd)).toBe(3);
+      expect(round(runRow(id).costUsd)).toBe(3);
+    });
+
+    it('ignores a malformed ai_model_prices setting and still records the run', () => {
+      db.insert(schema.settings).values({ key: 'ai_model_prices', value: '{not json' }).run();
+      const id = startRun();
+      logger.endCall(id, 'success', {
+        inputTokens: 1_000_000, outputTokens: 0,
+        requests: [{ model: 'claude-sonnet-5-5', inputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 }],
+      });
+      expect(round(runRow(id).costUsd)).toBe(2);
+    });
+  });
+
   it('endCall with error status stores error text', () => {
     const id = logger.startCall(
       { identityType: 'user', actorUserId: userId, effectiveScopes: [] },

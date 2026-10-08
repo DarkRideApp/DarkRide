@@ -13,6 +13,7 @@ import type {
   AiTextBlock,
   AiToolDefinition,
   AiStreamEvent,
+  AiStreamUsageEvent,
 } from '../../shared/types/ai-chat';
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -63,11 +64,77 @@ export interface HandleMessageParams {
   mode: 'silent' | 'streaming';
 }
 
+/**
+ * Billed usage of one model request inside a run. A provider may report usage in several events for one
+ * request (prompt tokens first, output tokens at the end); they are merged into one entry per request.
+ */
+export interface AgentRequestUsage {
+  model?: string;
+  providerType?: string;
+  /** Total prompt tokens, including cache reads and writes. */
+  inputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+  /** Models skipped or failed before this one served the request. */
+  fallbacks?: Array<{ model: string; error: string }>;
+  /** When the request was sent, in epoch milliseconds. */
+  startedAt?: number;
+}
+
+/** What a run used, for the call log. Also attached to an error the run throws (see `getRunUsageFromError`). */
+export interface AgentRunUsage {
+  /** Every request a provider reported usage for, in order, including ones whose output was discarded. */
+  requests: AgentRequestUsage[];
+  /** Loop iterations that sent a model request (the compaction request is not a turn). */
+  turns: number;
+  /** Tool calls executed, including ones that failed; denied calls and `request_tools` are not counted. */
+  toolCalls: number;
+}
+
 export interface HandleMessageResult {
   conversationId: number;
+  /** Displayed token totals. Callers broadcast this to browsers, so it carries nothing else. */
   usage?: { inputTokens: number; outputTokens: number };
   error?: string;
   turnLimitReached?: boolean;
+  /** True when the caller's signal cancelled the run (a turn timeout is an error, not an abort). */
+  aborted?: boolean;
+  /** Billed per-request detail for the call log. Server-side only; do not send it to clients. */
+  run?: AgentRunUsage;
+}
+
+const runUsageByError = new WeakMap<object, AgentRunUsage>();
+
+/** The partial usage of a run that threw, when the error came from `handleMessageWithIdentity`. */
+export function getRunUsageFromError(err: unknown): AgentRunUsage | undefined {
+  return err !== null && typeof err === 'object' ? runUsageByError.get(err) : undefined;
+}
+
+/**
+ * Returns a recorder for one model request (one provider stream). Providers report a request's usage in
+ * several events: the prompt (with cache counts) once, usually first, and the output as one or more deltas
+ * with `inputTokens: 0`. Prompt and cache counts therefore take the largest value seen, never a sum, and
+ * output tokens are summed. The entry is added to `requests` on the first usage event, so entries keep the
+ * order providers reported them in, a request that fails mid-stream keeps what it reported, and a request
+ * that reported nothing adds nothing.
+ */
+function requestUsageRecorder(requests: AgentRequestUsage[]): (event: AiStreamUsageEvent) => void {
+  const startedAt = Date.now();
+  let entry: AgentRequestUsage | null = null;
+  return (event) => {
+    if (!entry) {
+      entry = { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, startedAt };
+      requests.push(entry);
+    }
+    entry.inputTokens = Math.max(entry.inputTokens, event.inputTokens || 0);
+    entry.cacheReadTokens = Math.max(entry.cacheReadTokens, event.cachedInputTokens || 0);
+    entry.cacheWriteTokens = Math.max(entry.cacheWriteTokens, event.cacheCreationInputTokens || 0);
+    entry.outputTokens += event.outputTokens || 0;
+    if (event.model && !entry.model) entry.model = event.model;
+    if (event.providerType && !entry.providerType) entry.providerType = event.providerType;
+    if (event.fallbacks?.length && !entry.fallbacks) entry.fallbacks = event.fallbacks.map((f) => ({ ...f }));
+  };
 }
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -310,11 +377,23 @@ export class AiAgent implements AiAgentInterface {
   }
 
   public async handleMessageWithIdentity(identity: AgentIdentity, params: HandleMessageParams): Promise<HandleMessageResult> {
-    return this._runMessage(identity, params);
+    const runUsage: AgentRunUsage = { requests: [], turns: 0, toolCalls: 0 };
+    try {
+      const result = await this._runMessage(identity, params, runUsage);
+      return { ...result, run: runUsage };
+    } catch (err) {
+      // The requests made before the failure were still billed; let the caller log them.
+      if (err !== null && typeof err === 'object') runUsageByError.set(err, runUsage);
+      throw err;
+    }
   }
 
   /** @internal — real implementation used by handleMessageWithIdentity */
-  private async _runMessage(identity: AgentIdentity, params: HandleMessageParams): Promise<HandleMessageResult> {
+  private async _runMessage(
+    identity: AgentIdentity,
+    params: HandleMessageParams,
+    runUsage: AgentRunUsage,
+  ): Promise<HandleMessageResult> {
     const {
       message,
       pageContext,
@@ -382,11 +461,12 @@ export class AiAgent implements AiAgentInterface {
       let textChunks: string[];
       let toolUses: AiToolUseBlock[];
       let turnInputTokens: number;
+      runUsage.turns++;
 
       if (tierConfig) {
         // Tiered execution: cheap model first, escalate on write tools
         const tiered = await this.runTieredTurn(
-          tierConfig, messages, systemPrompt, tools, totalUsage, { signal: turnSignal },
+          tierConfig, messages, systemPrompt, tools, totalUsage, runUsage.requests, { signal: turnSignal },
         );
         textChunks = tiered.textChunks;
         toolUses = tiered.toolUses;
@@ -411,6 +491,7 @@ export class AiAgent implements AiAgentInterface {
         const stream = this.provider.createStreamingRequest(
           messages, systemPrompt, tools, { signal: turnSignal },
         );
+        const recordUsage = requestUsageRecorder(runUsage.requests);
 
         for await (const event of stream) {
           if (signal?.aborted) break;
@@ -432,6 +513,7 @@ export class AiAgent implements AiAgentInterface {
               });
               break;
             case 'usage':
+              recordUsage(event);
               if (event.inputTokens > 0) turnInputTokens = event.inputTokens;
               totalUsage.inputTokens += event.inputTokens;
               totalUsage.outputTokens += event.outputTokens;
@@ -534,6 +616,7 @@ export class AiAgent implements AiAgentInterface {
             }
           }
 
+          runUsage.toolCalls++;
           onToolStart(toolCall.id, toolCall.name, toolCall.input, ++toolUseCount, maxTurns - turn - 1);
           const startTime = Date.now();
 
@@ -582,7 +665,7 @@ export class AiAgent implements AiAgentInterface {
       if (turnInputTokens > 0 && turnInputTokens / CONTEXT_WINDOW_TOKENS >= COMPACTION_THRESHOLD) {
         const percentUsed = Math.round((turnInputTokens / CONTEXT_WINDOW_TOKENS) * 100);
         log(`Context at ${percentUsed}% — compacting conversation for turn ${turn + 1}`);
-        messages = await this.compactMessages(messages, systemPrompt, tools, totalUsage, tierConfig?.researchProvider);
+        messages = await this.compactMessages(messages, systemPrompt, tools, totalUsage, runUsage.requests, tierConfig?.researchProvider);
       }
 
       // Check if we've hit the turn limit (last iteration)
@@ -629,6 +712,7 @@ export class AiAgent implements AiAgentInterface {
       usage: totalUsage,
       error,
       turnLimitReached,
+      ...(signal?.aborted && error ? { aborted: true } : {}),
     };
   }
 
@@ -640,14 +724,18 @@ export class AiAgent implements AiAgentInterface {
     systemPrompt: string,
     tools: AiToolDefinition[],
     totalUsage: { inputTokens: number; outputTokens: number },
+    requests: AgentRequestUsage[],
     options?: { signal?: AbortSignal },
   ): Promise<{ textChunks: string[]; toolUses: AiToolUseBlock[]; turnInputTokens: number; parseMissAttempt: boolean }> {
-    // Phase 1: Run cheap research model, buffering all events
+    // Phase 1: Run cheap research model, buffering all events. Usage is recorded for the call log as it
+    // arrives, whichever response is used later: a discarded response was still billed.
     const buffered: AiStreamEvent[] = [];
     const researchStream = tierConfig.researchProvider.createStreamingRequest(
       messages, systemPrompt, tools, options,
     );
+    const recordResearch = requestUsageRecorder(requests);
     for await (const event of researchStream) {
+      if (event.type === 'usage') recordResearch(event);
       buffered.push(event);
     }
 
@@ -737,7 +825,9 @@ export class AiAgent implements AiAgentInterface {
       const writeStream = tierConfig.writeProvider.createStreamingRequest(
         messages, systemPrompt, tools, options,
       );
+      const recordWrite = requestUsageRecorder(requests);
       for await (const event of writeStream) {
+        if (event.type === 'usage') recordWrite(event);
         writeBuffered.push(event);
       }
     } catch (writeErr: any) {
@@ -800,6 +890,7 @@ export class AiAgent implements AiAgentInterface {
     systemPrompt: string,
     tools: AiToolDefinition[],
     totalUsage: { inputTokens: number; outputTokens: number },
+    requests: AgentRequestUsage[],
     provider?: AiStreamingProvider,
   ): Promise<AiMessage[]> {
     const compactionPrompt: AiMessage[] = [
@@ -818,9 +909,11 @@ export class AiAgent implements AiAgentInterface {
         systemPrompt,
         [], // no tools during compaction
       );
+      const recordUsage = requestUsageRecorder(requests);
       for await (const event of stream) {
         if (event.type === 'text') summaryChunks.push(event.text);
         if (event.type === 'usage') {
+          recordUsage(event);
           totalUsage.inputTokens += event.inputTokens;
           totalUsage.outputTokens += event.outputTokens;
         }

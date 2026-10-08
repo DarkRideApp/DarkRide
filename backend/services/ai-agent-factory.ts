@@ -3,7 +3,14 @@ import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { users } from '../db/schema';
 import type { ServiceUserManager } from '../auth/service-user-manager';
 import type { ApiKeyManager } from '../auth/api-key-manager';
-import type { AiAgentInterface, AgentIdentity, HandleMessageParams, HandleMessageResult } from './ai-agent';
+import {
+  getRunUsageFromError,
+  type AiAgentInterface,
+  type AgentIdentity,
+  type AgentRequestUsage,
+  type HandleMessageParams,
+  type HandleMessageResult,
+} from './ai-agent';
 import { CORE_SERVICE_IDENTITIES, type CoreServiceKey } from './core-service-identities';
 import { scopeIntersect } from '../auth/scope-matcher';
 
@@ -22,12 +29,24 @@ function coerceScopes(raw: unknown): string[] {
   return [];
 }
 
+function sum(requests: AgentRequestUsage[], key: 'inputTokens' | 'outputTokens'): number {
+  return requests.reduce((n, r) => n + r[key], 0);
+}
+
 export interface AiCallLoggerLike {
   startCall(identity: AgentIdentity, params: Partial<HandleMessageParams>): number;
   endCall(
     logId: number,
     outcome: 'success' | 'error' | 'aborted',
-    usage?: { inputTokens?: number; outputTokens?: number; turns?: number; costUsd?: number },
+    usage?: {
+      inputTokens?: number;
+      outputTokens?: number;
+      turns?: number;
+      toolCalls?: number;
+      costUsd?: number;
+      /** Every model request of the run, in order; the logger prices each one. */
+      requests?: AgentRequestUsage[];
+    },
     error?: string,
   ): void;
 }
@@ -143,21 +162,43 @@ export class AiAgentFactory {
         const provider = deps.providerFactory(options);
         if (!provider) throw new Error('No AI provider configured');
         const logId = deps.logger.startCall(identity, params);
+        let result: HandleMessageResult;
         try {
-          const result = await provider.handleMessageWithIdentity(identity, params);
+          result = await provider.handleMessageWithIdentity(identity, params);
+        } catch (err) {
+          // A run that throws still paid for the requests it made before failing.
+          const partial = getRunUsageFromError(err);
           deps.logger.endCall(
             logId,
-            result.error ? 'error' : 'success',
-            result.usage
-              ? { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens }
+            'error',
+            partial
+              ? {
+                inputTokens: sum(partial.requests, 'inputTokens'),
+                outputTokens: sum(partial.requests, 'outputTokens'),
+                requests: partial.requests,
+                turns: partial.turns,
+                toolCalls: partial.toolCalls,
+              }
               : undefined,
-            result.error,
+            String(err),
           );
-          return result;
-        } catch (err) {
-          deps.logger.endCall(logId, 'error', undefined, String(err));
           throw err;
         }
+        deps.logger.endCall(
+          logId,
+          result.aborted ? 'aborted' : result.error ? 'error' : 'success',
+          result.usage || result.run
+            ? {
+              inputTokens: result.usage?.inputTokens,
+              outputTokens: result.usage?.outputTokens,
+              requests: result.run?.requests,
+              turns: result.run?.turns,
+              toolCalls: result.run?.toolCalls,
+            }
+            : undefined,
+          result.error,
+        );
+        return result;
       },
     };
   }

@@ -164,6 +164,133 @@ describe('AiAgentFactory', () => {
     expect(providerFactory).toHaveBeenCalledWith({ tier: 'Low' });
   });
 
+  describe('call logging', () => {
+    const requests = [
+      { model: 'claude-haiku-5-5', providerType: 'anthropic', inputTokens: 100, cacheReadTokens: 80, cacheWriteTokens: 0, outputTokens: 10 },
+      { model: 'claude-opus-5-5', providerType: 'anthropic', inputTokens: 200, cacheReadTokens: 0, cacheWriteTokens: 150, outputTokens: 20 },
+    ];
+
+    function setup(handle: (...args: any[]) => Promise<any>) {
+      const logger = { startCall: vi.fn().mockReturnValue(7), endCall: vi.fn() };
+      const f = new AiAgentFactory({
+        db, serviceUsers: svcUsers, apiKeys,
+        providerFactory: () => ({ handleMessageWithIdentity: vi.fn(handle) } as any),
+        logger,
+      });
+      return { logger, agent: f.forUser(humanUserId) };
+    }
+    const send = (agent: { handleMessage: (p: any) => Promise<any> }) =>
+      agent.handleMessage({
+        message: 'hi', conversationId: null, pageContext: 'chat', contextId: '', mode: 'streaming',
+        onToken: vi.fn(), onToolStart: vi.fn(), onToolResult: vi.fn(),
+      } as any);
+
+    it('passes requests, turns and tool calls to the logger', async () => {
+      const { logger, agent } = setup(async () => ({
+        conversationId: 1,
+        usage: { inputTokens: 300, outputTokens: 30 },
+        run: { requests, turns: 2, toolCalls: 1 },
+      }));
+      await send(agent);
+      expect(logger.endCall).toHaveBeenCalledWith(
+        7, 'success',
+        { inputTokens: 300, outputTokens: 30, requests, turns: 2, toolCalls: 1 },
+        undefined,
+      );
+    });
+
+    it('logs a cancelled run as aborted with its partial usage', async () => {
+      const { logger, agent } = setup(async () => ({
+        conversationId: 1,
+        usage: { inputTokens: 100, outputTokens: 10 },
+        run: { requests: requests.slice(0, 1), turns: 1, toolCalls: 0 },
+        error: 'Request was cancelled',
+        aborted: true,
+      }));
+      await send(agent);
+      expect(logger.endCall).toHaveBeenCalledWith(
+        7, 'aborted',
+        { inputTokens: 100, outputTokens: 10, requests: requests.slice(0, 1), turns: 1, toolCalls: 0 },
+        'Request was cancelled',
+      );
+    });
+
+    it('still logs an error row, with the partial usage, when the agent throws', async () => {
+      const { getRunUsageFromError, AiAgent } = await import('./ai-agent');
+      // A real agent whose second request fails, so the thrown error carries the first request's usage.
+      let call = 0;
+      const provider = {
+        name: 'mock',
+        createStreamingRequest: () => (async function* () {
+          call++;
+          if (call === 1) {
+            yield { type: 'tool_use' as const, id: 't1', name: 'request_tools', input: { contexts: [] } };
+            yield { type: 'usage' as const, inputTokens: 50, outputTokens: 5, model: 'claude-haiku-5-5', providerType: 'anthropic' };
+            return;
+          }
+          throw new Error('stream exploded');
+        })(),
+      };
+      const { AiToolRegistry } = await import('./ai-tools');
+      const realAgent = new AiAgent(db as any, new AiToolRegistry(), provider as any);
+      const logger = { startCall: vi.fn().mockReturnValue(9), endCall: vi.fn() };
+      const f = new AiAgentFactory({
+        db, serviceUsers: svcUsers, apiKeys, providerFactory: () => realAgent, logger,
+      });
+      const err = await send(f.forUser(humanUserId)).catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(getRunUsageFromError(err)?.requests).toHaveLength(1);
+      expect(logger.endCall).toHaveBeenCalledTimes(1);
+      const [id, outcome, usage, message] = logger.endCall.mock.calls[0];
+      expect([id, outcome, message]).toEqual([9, 'error', 'Error: stream exploded']);
+      expect(usage).toMatchObject({
+        inputTokens: 50, outputTokens: 5, turns: 2, toolCalls: 0,
+        requests: [{ model: 'claude-haiku-5-5', providerType: 'anthropic', inputTokens: 50, outputTokens: 5 }],
+      });
+    });
+
+    it('writes exactly one request row for a stream that reports usage in a start event and two output deltas', async () => {
+      const { AiAgent } = await import('./ai-agent');
+      const { AiToolRegistry } = await import('./ai-tools');
+      const { AiCallLogger } = await import('./ai-call-logger');
+      const ev = { model: 'claude-haiku-5-5', providerType: 'anthropic' };
+      const provider = {
+        name: 'mock',
+        createStreamingRequest: () => (async function* () {
+          yield { type: 'usage' as const, inputTokens: 150_000, outputTokens: 0, cachedInputTokens: 40_000, cacheCreationInputTokens: 10_000, ...ev };
+          yield { type: 'text' as const, text: 'hello' };
+          yield { type: 'usage' as const, inputTokens: 0, outputTokens: 600, ...ev };
+          yield { type: 'usage' as const, inputTokens: 0, outputTokens: 400, ...ev };
+        })(),
+      };
+      const realAgent = new AiAgent(db as any, new AiToolRegistry(), provider as any);
+      const f = new AiAgentFactory({
+        db, serviceUsers: svcUsers, apiKeys, providerFactory: () => realAgent, logger: new AiCallLogger(db),
+      });
+      await send(f.forUser(humanUserId));
+
+      const run = db.select().from(schema.aiCallLog).get()!;
+      const rows = db.select().from(schema.aiCallRequest).all();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        callId: run.id, seq: 0, model: 'claude-haiku-5-5', providerType: 'anthropic',
+        inputTokens: 150_000, cacheReadTokens: 40_000, cacheWriteTokens: 10_000, outputTokens: 1000,
+      });
+      // The prompt is over Haiku 5.5's 100,000-token tier, judged on the whole request, so the higher rates apply:
+      // 100k uncached x $0.50 + 40k read x $0.05 + 10k write x $0.625 + 1k output x $2.50, per million.
+      const expected = (100_000 * 0.5 + 40_000 * 0.05 + 10_000 * 0.625 + 1000 * 2.5) / 1e6;
+      expect(rows[0].costUsd).toBeCloseTo(expected, 12);
+      expect(run).toMatchObject({ outcome: 'success', turns: 1, toolCalls: 0, inputTokens: 150_000, outputTokens: 1000 });
+      expect(run.costUsd).toBeCloseTo(expected, 12);
+    });
+
+    it('logs an error row with no usage when a non-agent provider throws', async () => {
+      const { logger, agent } = setup(async () => { throw new Error('boom'); });
+      await expect(send(agent)).rejects.toThrow('boom');
+      expect(logger.endCall).toHaveBeenCalledWith(7, 'error', undefined, 'Error: boom');
+    });
+  });
+
   it('forPluginActingForInternal handles double-encoded user scopes', () => {
     const now = new Date();
     db.insert(schema.users).values({
