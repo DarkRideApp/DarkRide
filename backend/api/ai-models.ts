@@ -1,11 +1,29 @@
 import { asc, eq } from 'drizzle-orm';
-import { ClaudeCliProvider } from '../services/claude-cli-provider';
 import { registerEndpoint } from './api-service';
 import { aiModels, aiProviders, aiTiers } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import type { AiModelRouter } from '../services/ai-model-router';
 import type { RateLimitCache } from '../services/ai-model-router';
 import type { AiModelConfig } from '../../shared/types/ai-models';
+import { getProviderDescriptor } from '../../shared/lib/ai-provider-catalog';
+import { testModel } from '../services/ai/provider-ops';
+
+/** A model name as stored: trimmed, with blank meaning "use the provider's default". */
+function storedModel(raw: unknown): string | null {
+  return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : null;
+}
+
+/**
+ * A blank model falls back to the provider's default. A provider type without one (such as
+ * openai-compatible, where every server names its own models) cannot run a blank row, so it is rejected
+ * here rather than failing at request time. Returns the error, or null when the pair is valid. Types that
+ * are no longer in the catalog are not checked: the router skips them anyway.
+ */
+function missingModelError(providerType: string, model: string | null): string | null {
+  const d = getProviderDescriptor(providerType);
+  if (!d || d.defaultModel || model !== null) return null;
+  return `${d.label} has no default model. Choose a model.`;
+}
 
 export function registerAiModelEndpoints(
   db: AppDatabase,
@@ -70,6 +88,13 @@ export function registerAiModelEndpoints(
       return;
     }
 
+    const modelName = storedModel(model);
+    const modelError = missingModelError(provider.type, modelName);
+    if (modelError) {
+      res.status(400).json({ success: false, error: modelError });
+      return;
+    }
+
     // Default to the High tier's id if tierId not provided OR explicitly null.
     // The UI's add-model form initializes tierId to null until the tiers list
     // loads; an early submit posts tierId: null, which must not orphan the
@@ -88,7 +113,7 @@ export function registerAiModelEndpoints(
       name,
       provider: provider.type,
       providerId,
-      model: model || null,
+      model: modelName,
       enabled: enabled !== false,
       priority: maxPriority + 1,
       cooldownMinutes: cooldownMinutes ?? 10,
@@ -176,16 +201,28 @@ export function registerAiModelEndpoints(
     const { name, providerId, model, enabled, cooldownMinutes, tierId } = req.body;
 
     if (name !== undefined) updates.name = name;
+    let finalProvider: typeof aiProviders.$inferSelect | undefined;
     if (providerId !== undefined) {
-      const provider = db.select().from(aiProviders).where(eq(aiProviders.id, providerId)).get();
-      if (!provider) {
+      finalProvider = db.select().from(aiProviders).where(eq(aiProviders.id, providerId)).get();
+      if (!finalProvider) {
         res.status(400).json({ success: false, error: 'Provider not found' });
         return;
       }
       updates.providerId = providerId;
-      updates.provider = provider.type;
+      updates.provider = finalProvider.type;
+    } else if (existing.providerId !== null) {
+      finalProvider = db.select().from(aiProviders).where(eq(aiProviders.id, existing.providerId)).get();
     }
-    if (model !== undefined) updates.model = model || null;
+    const finalModel = model !== undefined ? storedModel(model) : storedModel(existing.model);
+    // Checked on every PUT, not only when providerId or model is in the body. That is safe because every row
+    // that predates this rule sits on a provider type with a default. If a type ever loses its default, its
+    // blank rows need a data migration first, or they could no longer be edited (the toggle endpoint is unaffected).
+    const modelError = finalProvider ? missingModelError(finalProvider.type, finalModel) : null;
+    if (modelError) {
+      res.status(400).json({ success: false, error: modelError });
+      return;
+    }
+    if (model !== undefined) updates.model = storedModel(model);
     if (enabled !== undefined) updates.enabled = enabled;
     if (cooldownMinutes !== undefined) updates.cooldownMinutes = cooldownMinutes;
     if (tierId !== undefined) {
@@ -331,10 +368,9 @@ export function registerAiModelEndpoints(
     }
 
     try {
-      const result = await testModelConnection(provider, model);
-      res.json(result);
+      res.json(await testModel(provider, model));
     } catch (err: any) {
-      res.json({ success: false, error: err.message || 'Unknown error' });
+      res.json({ success: false, error: err?.message || 'Unknown error' });
     }
   }, { requires: ['core.settings:write'] });
 
@@ -372,113 +408,4 @@ function buildProviderMap(db: AppDatabase): Map<number, typeof aiProviders.$infe
   const map = new Map<number, typeof aiProviders.$inferSelect>();
   for (const p of all) map.set(p.id, p);
   return map;
-}
-
-async function testModelConnection(
-  provider: typeof aiProviders.$inferSelect,
-  model: typeof aiModels.$inferSelect,
-): Promise<{ success: true; model: string } | { success: false; error: string }> {
-  const type = provider.type;
-  const apiKey = provider.apiKey || undefined;
-  const modelName = model.model;
-  const baseUrl = provider.baseUrl || undefined;
-
-  try {
-    switch (type) {
-      case 'anthropic': {
-        if (!apiKey) return { success: false, error: 'No Anthropic API key configured' };
-        const m = modelName || 'claude-sonnet-4-20250514';
-        return await callTestEndpoint(`${baseUrl || 'https://api.anthropic.com'}/v1/messages`, {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        }, {
-          model: m, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }],
-        }, m);
-      }
-
-      case 'gemini': {
-        if (!apiKey) return { success: false, error: 'No Gemini API key configured' };
-        const m = modelName || 'gemini-2.0-flash';
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey}`;
-        return await callTestEndpoint(url, {}, {
-          contents: [{ parts: [{ text: 'hi' }] }],
-          generationConfig: { maxOutputTokens: 1 },
-        }, m);
-      }
-
-      case 'ollama': {
-        const base = baseUrl || 'http://localhost:11434';
-        const m = modelName || 'llama3.2';
-        return await callTestEndpoint(`${base}/api/chat`, {}, {
-          model: m, messages: [{ role: 'user', content: 'hi' }], stream: false,
-          options: { num_predict: 1 },
-        }, m);
-      }
-
-      case 'openrouter': {
-        if (!apiKey) return { success: false, error: 'No OpenRouter API key configured' };
-        const m = modelName || 'anthropic/claude-sonnet-4-20250514';
-        return await callTestEndpoint('https://openrouter.ai/api/v1/chat/completions', {
-          'Authorization': `Bearer ${apiKey}`,
-        }, {
-          model: m, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }],
-        }, m);
-      }
-
-      case 'codestral': {
-        if (!apiKey) return { success: false, error: 'No Codestral API key configured' };
-        const m = modelName || 'codestral-latest';
-        return await callTestEndpoint('https://codestral.mistral.ai/v1/chat/completions', {
-          'Authorization': `Bearer ${apiKey}`,
-        }, {
-          model: m, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }],
-        }, m);
-      }
-
-      case 'claude-cli': {
-        // Claude Code models run via the local `claude` CLI, not an HTTP
-        // endpoint. apiKey, when set, is a CLAUDE_CODE_OAUTH_TOKEN. Verify both
-        // that the binary works AND that it can actually drive a tool with this
-        // auth — a wrong/stale token authenticates but text-leaks tool calls,
-        // so a version check alone would falsely pass.
-        const version = await ClaudeCliProvider.getVersion(apiKey);
-        if (!version) return { success: false, error: 'Claude CLI not found or not working' };
-        const tool = await ClaudeCliProvider.testToolUse(apiKey, modelName || 'sonnet');
-        if (!tool.ok) return { success: false, error: tool.reason || 'Claude CLI cannot use tools' };
-        return { success: true, model: modelName || 'claude-cli' };
-      }
-
-      default:
-        return { success: false, error: `Unknown provider: ${type}` };
-    }
-  } catch (err: any) {
-    return { success: false, error: err.message || 'Unknown error' };
-  }
-}
-
-async function callTestEndpoint(
-  url: string,
-  extraHeaders: Record<string, string>,
-  body: any,
-  model: string,
-): Promise<{ success: true; model: string } | { success: false; error: string }> {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...extraHeaders },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15000),
-  });
-
-  if (res.ok || res.status === 429) {
-    return { success: true, model };
-  }
-
-  const errorBody = await res.text();
-  try {
-    const parsed = JSON.parse(errorBody);
-    const msg = parsed.error?.message || parsed.error?.type || parsed.error || errorBody;
-    return { success: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
-  } catch {
-    return { success: false, error: `HTTP ${res.status}: ${errorBody.slice(0, 200)}` };
-  }
 }

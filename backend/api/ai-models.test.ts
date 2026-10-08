@@ -8,6 +8,7 @@ import { registerAiModelEndpoints } from './ai-models';
 import { RateLimitCache, AiModelRouter } from '../services/ai-model-router';
 import { createTestDb } from '../test-utils/create-test-db';
 import { ClaudeCliProvider } from '../services/claude-cli-provider';
+import { stubFetch, okStream } from '../services/ai/test-helpers';
 
 const { aiModels, aiProviders, aiTiers } = schema;
 
@@ -512,6 +513,90 @@ describe('AI Models API Endpoints', () => {
 
       expect(res.body.success).toBe(false);
       expect(res.body.error).toContain('not found');
+    });
+  });
+
+  describe('model required when the provider has no default', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    it('POST rejects a blank model on an openai-compatible provider', async () => {
+      const p = insertProvider(db, { name: 'Local', type: 'openai-compatible', apiKey: null, baseUrl: 'http://127.0.0.1:1234/v1' });
+      for (const model of [undefined, '', '   ', null]) {
+        const res = await request(app).post('/v1/ai/models').send({ name: 'm', providerId: p, model });
+        expect(res.status).toBe(400);
+        expect(res.body.error).toContain('has no default model');
+      }
+      expect(db.select().from(aiModels).all()).toHaveLength(0);
+    });
+
+    it('POST accepts a named model on an openai-compatible provider', async () => {
+      const p = insertProvider(db, { name: 'Local', type: 'openai-compatible', apiKey: null, baseUrl: 'http://127.0.0.1:1234/v1' });
+      const res = await request(app).post('/v1/ai/models').send({ name: 'm', providerId: p, model: 'qwen2.5-coder' });
+      expect(res.status).toBe(200);
+      expect(res.body.data.model).toBe('qwen2.5-coder');
+    });
+
+    it('POST accepts a blank model on a provider with a default', async () => {
+      const p = insertProvider(db, { name: 'Anthropic', type: 'anthropic', apiKey: 'sk-test-placeholder' });
+      const res = await request(app).post('/v1/ai/models').send({ name: 'm', providerId: p, model: '' });
+      expect(res.status).toBe(200);
+      expect(res.body.data.model).toBeNull();
+    });
+
+    it('PUT rejects moving a blank-model row to a provider with no default', async () => {
+      const p = insertProvider(db, { name: 'Local', type: 'openai-compatible', apiKey: null, baseUrl: 'http://127.0.0.1:1234/v1' });
+      insertModel(db, defaultProviderId, { model: null });
+      const id = db.select().from(aiModels).all()[0].id;
+      const res = await request(app).put(`/v1/ai/models/${id}`).send({ providerId: p });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('has no default model');
+      expect(db.select().from(aiModels).all()[0].providerId).toBe(defaultProviderId);
+    });
+
+    it('PUT accepts moving to a provider with no default when a model is supplied', async () => {
+      const p = insertProvider(db, { name: 'Local', type: 'openai-compatible', apiKey: null, baseUrl: 'http://127.0.0.1:1234/v1' });
+      insertModel(db, defaultProviderId, { model: null });
+      const id = db.select().from(aiModels).all()[0].id;
+      const res = await request(app).put(`/v1/ai/models/${id}`).send({ providerId: p, model: 'qwen2.5-coder' });
+      expect(res.status).toBe(200);
+      expect(res.body.data.provider).toBe('openai-compatible');
+    });
+
+    it('PUT rejects blanking the model of a row on a provider with no default', async () => {
+      const p = insertProvider(db, { name: 'Local', type: 'openai-compatible', apiKey: null, baseUrl: 'http://127.0.0.1:1234/v1' });
+      insertModel(db, p, { provider: 'openai-compatible', model: 'qwen2.5-coder' });
+      const id = db.select().from(aiModels).all()[0].id;
+      const res = await request(app).put(`/v1/ai/models/${id}`).send({ model: '' });
+      expect(res.status).toBe(400);
+      expect(db.select().from(aiModels).all()[0].model).toBe('qwen2.5-coder');
+    });
+
+    it('PUT renames a row whose provider type is no longer in the catalog', async () => {
+      const p = insertProvider(db, { name: 'Old', type: 'retired-type' });
+      insertModel(db, p, { provider: 'retired-type', model: null });
+      const id = db.select().from(aiModels).all()[0].id;
+      const res = await request(app).put(`/v1/ai/models/${id}`).send({ name: 'Renamed' });
+      expect(res.status).toBe(200);
+      expect(res.body.data.name).toBe('Renamed');
+    });
+
+    it('POST /:id/test sends the model row\'s model name', async () => {
+      insertModel(db, defaultProviderId, { provider: 'openrouter', model: 'meta-llama/llama-3.3-70b-instruct' });
+      const id = db.select().from(aiModels).all()[0].id;
+      const { calls } = stubFetch(() => okStream('openai-chat'));
+      const res = await request(app).post(`/v1/ai/models/${id}/test`);
+      expect(res.body).toEqual({ success: true, model: 'meta-llama/llama-3.3-70b-instruct' });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].body.model).toBe('meta-llama/llama-3.3-70b-instruct');
+    });
+
+    it('POST /:id/test reports an unknown provider type instead of throwing', async () => {
+      const p = insertProvider(db, { name: 'Old', type: 'retired-type' });
+      insertModel(db, p, { provider: 'retired-type', model: 'x' });
+      const id = db.select().from(aiModels).all()[0].id;
+      const res = await request(app).post(`/v1/ai/models/${id}/test`);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toContain('retired-type');
     });
   });
 
