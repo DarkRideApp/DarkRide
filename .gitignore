@@ -25,6 +25,7 @@ scripts/__pycache__/
 screenshots/
 !docs/screenshots/
 .playwright-mcp/
+test-results/
 flutter/*
 .worktrees/
 changelog.json
