@@ -18,7 +18,10 @@ export interface AiUsageTotals {
   cacheHitRate: number | null;
   /** Estimated cost in USD, summed over priced requests; `null` when no request had a price. */
   costUsd: number | null;
-  /** Runs that had at least one request on a model with no known price (their cost is partial or missing). */
+  /**
+   * Runs with no known price or no per-request detail: Claude CLI runs, runs from before request logging, and runs
+   * with a request on a model without a price. Their cost is partial or missing.
+   */
   unpricedRuns: number;
 }
 

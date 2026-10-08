@@ -106,10 +106,19 @@ function formatDay(key: string, style: 'long' | 'short'): string {
   return new Intl.DateTimeFormat(userLocale(), options).format(date);
 }
 
-function unpricedText(count: number): string {
+/**
+ * A run counts as unpriced when a request used a model with no known price, or when the run has no
+ * per-request detail at all (Claude CLI runs, runs from before request logging). Both mean its cost
+ * is missing or partial, so the wording names both.
+ */
+function unpricedShortText(count: number): string {
   return count === 1
-    ? '1 run includes a model with no known price'
-    : `${count} runs include models with no known price`;
+    ? '1 run has no known price or no per-request detail'
+    : `${count} runs have no known price or no per-request detail`;
+}
+
+function unpricedText(count: number): string {
+  return `${unpricedShortText(count)} (Claude CLI runs, runs from before request logging, models without a price)`;
 }
 
 function runsText(count: number): string {
@@ -344,7 +353,10 @@ function SummaryCards({ totals }: { totals: AiUsageResponse['totals'] }) {
         <div className="stat-label">Estimated cost</div>
         <div className="stat-detail" data-testid="ai-usage-estimate-note">estimate</div>
         {totals.unpricedRuns > 0 && (
-          <div className="stat-detail" data-testid="ai-usage-unpriced-note">{unpricedText(totals.unpricedRuns)}</div>
+          // The tile is narrow, so the short wording shows and the full explanation is the tooltip.
+          <div className="stat-detail" data-testid="ai-usage-unpriced-note" title={unpricedText(totals.unpricedRuns)}>
+            {unpricedShortText(totals.unpricedRuns)}
+          </div>
         )}
       </div>
     </div>
@@ -359,13 +371,13 @@ function ByPurposeTable({ rows }: { rows: AiUsageByPurpose[] }) {
         <table className="data-table" data-density="compact">
           <thead>
             <tr>
-              <th style={plainHeader}>Purpose</th>
-              <th style={plainNumberHeader}>Runs</th>
-              <th style={plainNumberHeader}>Est. cost</th>
-              <th style={plainNumberHeader}>Median cost / run</th>
-              <th style={plainNumberHeader}>P90 cost / run</th>
-              <th style={plainNumberHeader}>Median turns</th>
-              <th style={plainNumberHeader}>Cache hit</th>
+              <th scope="col" style={plainHeader}>Purpose</th>
+              <th scope="col" style={plainNumberHeader}>Runs</th>
+              <th scope="col" style={plainNumberHeader}>Est. cost</th>
+              <th scope="col" style={plainNumberHeader}>Median cost / run</th>
+              <th scope="col" style={plainNumberHeader}>P90 cost / run</th>
+              <th scope="col" style={plainNumberHeader}>Median turns</th>
+              <th scope="col" style={plainNumberHeader}>Cache hit</th>
             </tr>
           </thead>
           <tbody>
@@ -487,14 +499,14 @@ function RecentRunsTable({ runs }: { runs: AiUsageRun[] }) {
         <table className="data-table" data-density="compact">
           <thead>
             <tr>
-              <th style={runHeader}>Time</th>
-              <th style={runHeader}>Purpose</th>
-              <th style={runHeader}>Models</th>
-              <th style={runNumberHeader}>Est. cost</th>
-              <th style={runNumberHeader} title="Model turns / tool calls">Turns / tools</th>
-              <th style={runNumberHeader} title="Tokens sent / tokens received">Tokens in / out</th>
-              <th style={runNumberHeader} title="Tokens read from the cache / tokens written to the cache">Cache read / written</th>
-              <th style={runHeader}>Outcome</th>
+              <th scope="col" style={runHeader}>Time</th>
+              <th scope="col" style={runHeader}>Purpose</th>
+              <th scope="col" style={runHeader}>Models</th>
+              <th scope="col" style={runNumberHeader}>Est. cost</th>
+              <th scope="col" style={runNumberHeader} title="Model turns / tool calls">Turns / tools</th>
+              <th scope="col" style={runNumberHeader} title="Tokens sent / tokens received">Tokens in / out</th>
+              <th scope="col" style={runNumberHeader} title="Tokens read from the cache / tokens written to the cache">Cache read / written</th>
+              <th scope="col" style={runHeader}>Outcome</th>
             </tr>
           </thead>
           <tbody>

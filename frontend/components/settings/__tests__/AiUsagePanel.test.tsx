@@ -226,12 +226,27 @@ describe('AiUsagePanel: summary cards', () => {
     renderPanel(makeWs(() => ok(usage({ totals: totals({ unpricedRuns: 2 }) }))));
     const cost = await screen.findByTestId('ai-usage-cost');
     expect(cost).toHaveTextContent(/estimate/i);
-    expect(cost).toHaveTextContent('2 runs include models with no known price');
+    expect(cost).toHaveTextContent('2 runs have no known price or no per-request detail');
+  });
+
+  it('explains in the note tooltip which runs count as unpriced, not only runs on unpriced models', async () => {
+    renderPanel(makeWs(() => ok(usage({ totals: totals({ unpricedRuns: 2 }) }))));
+    const note = await screen.findByTestId('ai-usage-unpriced-note');
+    expect(note).toHaveAttribute(
+      'title',
+      '2 runs have no known price or no per-request detail (Claude CLI runs, runs from before request logging, models without a price)',
+    );
+    expect(note).not.toHaveTextContent(/include models/i);
   });
 
   it('words the unpriced note correctly for a single run', async () => {
     renderPanel(makeWs(() => ok(usage({ totals: totals({ unpricedRuns: 1 }) }))));
-    expect(await screen.findByTestId('ai-usage-cost')).toHaveTextContent('1 run includes a model with no known price');
+    const note = await screen.findByTestId('ai-usage-unpriced-note');
+    expect(note).toHaveTextContent('1 run has no known price or no per-request detail');
+    expect(note).toHaveAttribute(
+      'title',
+      '1 run has no known price or no per-request detail (Claude CLI runs, runs from before request logging, models without a price)',
+    );
   });
 
   it('shows no unpriced note when every run was priced, but still says estimate', async () => {
@@ -306,12 +321,24 @@ describe('AiUsagePanel: by purpose', () => {
     expect(chatCells.slice(2)).toEqual(['n/a', 'n/a', 'n/a', 'n/a', 'n/a']);
   });
 
-  it('marks a purpose cost as partial when some of its runs have no known price', async () => {
+  it('marks a purpose cost as partial when some of its runs have no known price or no per-request detail', async () => {
     const rows = [purpose({ purpose: 'chat', label: 'Chat', costUsd: 0.05, unpricedRuns: 2 })];
     renderPanel(makeWs(() => ok(usage({ byPurpose: rows }))));
     const row = await screen.findByTestId('ai-usage-purpose-chat');
     expect(row).toHaveTextContent('$0.0500');
-    expect(within(row).getByTitle('2 runs include models with no known price')).toBeInTheDocument();
+    expect(within(row).getByTitle(
+      '2 runs have no known price or no per-request detail (Claude CLI runs, runs from before request logging, models without a price)',
+    )).toBeInTheDocument();
+  });
+
+  it('marks every column header in both tables as a column header for assistive technology', async () => {
+    renderPanel(makeWs(() => ok(usage())));
+    for (const id of ['ai-usage-by-purpose', 'ai-usage-runs']) {
+      const table = await screen.findByTestId(id);
+      const headers = within(table).getAllByRole('columnheader');
+      expect(headers.length).toBeGreaterThan(0);
+      for (const header of headers) expect(header).toHaveAttribute('scope', 'col');
+    }
   });
 });
 

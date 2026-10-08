@@ -350,7 +350,7 @@ Purpose keys:
 
 Notes:
 
-- Costs are estimates in USD from a built-in price table ([`shared/lib/ai-model-pricing.ts`](../shared/lib/ai-model-pricing.ts)). A request on a model with no known price has a `null` cost, never zero. A run with any such request counts in `unpricedRuns`, and its `costUsd` covers only its priced requests. Add or replace prices with the `ai_model_prices` setting: a JSON object keyed by model id, each value `{ "input", "output", "cacheRead", "cacheWrite" }` in USD per million tokens.
+- Costs are estimates in USD from a built-in price table ([`shared/lib/ai-model-pricing.ts`](../shared/lib/ai-model-pricing.ts)). A request on a model with no known price has a `null` cost, never zero. A run counts in `unpricedRuns` when any of its requests is on such a model or when it has no per-request detail at all (Claude CLI runs, runs from before request logging), and its `costUsd` covers only its priced requests. Add or replace prices with the `ai_model_prices` setting: a JSON object keyed by model id, each value `{ "input", "output", "cacheRead", "cacheWrite" }` in USD per million tokens.
 - Tokens are what providers billed, including requests whose output the agent discarded and context compaction requests.
 - Inline completion (`POST /v1/ai/complete`) is not included: it records no usage.
 - Only runs recorded after usage recording shipped have per-request detail. Older runs report their stored input and output totals, zero cache tokens, no models and a `null` cost, and count as unpriced.
