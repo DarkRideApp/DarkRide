@@ -11,15 +11,28 @@ export function scanSource(fileName: string, text: string, ids: readonly string[
   const sf = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, kind);
   const hits: Hit[] = [];
 
-  const isIdLiteral = (n: ts.Node): boolean =>
-    (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && idSet.has(n.text);
-  const add = (n: ts.Node) => {
-    const { line } = sf.getLineAndCharacterOfPosition(n.getStart(sf));
-    hits.push({ line: line + 1, text: n.getText(sf).slice(0, 80) });
+  // Peel wrappers that do not change the runtime value: `('x' as string)`,
+  // `<string>'x'`, `'x' satisfies string`, `x!`, `(x)`.
+  const unwrap = (n: ts.Node): ts.Node => {
+    let cur = n;
+    while (
+      ts.isParenthesizedExpression(cur) || ts.isAsExpression(cur) || ts.isTypeAssertionExpression(cur) ||
+      ts.isSatisfiesExpression(cur) || ts.isNonNullExpression(cur)
+    ) cur = cur.expression;
+    return cur;
+  };
+  const isIdLiteral = (n: ts.Node): boolean => {
+    const u = unwrap(n);
+    return (ts.isStringLiteral(u) || ts.isNoSubstitutionTemplateLiteral(u)) && idSet.has(u.text);
+  };
+  // `at` fixes the reported line; `shown` is the node whose source is reported.
+  const add = (at: ts.Node, shown: ts.Node = at) => {
+    const { line } = sf.getLineAndCharacterOfPosition(at.getStart(sf));
+    hits.push({ line: line + 1, text: shown.getText(sf).slice(0, 80) });
   };
 
   const visit = (n: ts.Node): void => {
-    if (ts.isCaseClause(n) && isIdLiteral(n.expression)) add(n);
+    if (ts.isCaseClause(n) && isIdLiteral(n.expression)) add(n, n.expression);
     if (ts.isBinaryExpression(n)) {
       const op = n.operatorToken.kind;
       if (
@@ -29,9 +42,10 @@ export function scanSource(fileName: string, text: string, ids: readonly string[
       ) add(n);
     }
     if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === 'includes') {
-      if (n.arguments.some(isIdLiteral)) add(n);
-      const target = n.expression.expression;
-      if (ts.isArrayLiteralExpression(target) && target.elements.some(isIdLiteral)) add(n);
+      const target = unwrap(n.expression.expression);
+      const argHit = n.arguments.some(isIdLiteral);
+      const elemHit = ts.isArrayLiteralExpression(target) && target.elements.some(isIdLiteral);
+      if (argHit || elemHit) add(n);
     }
     ts.forEachChild(n, visit);
   };
