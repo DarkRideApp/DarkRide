@@ -434,8 +434,8 @@ registerCaptureEndpoints(captureManager);
 registerBlocklistEndpoints(db);
 registerHiddenlistEndpoints(db);
 registerCredentialsEndpoints(db);
-// Settings registration is deferred until after diff engine is set up (needs DEFAULT_DIFF_PROMPT)
-registerAiCompleteEndpoints(db);
+// Settings registration is deferred until after diff engine is set up (needs DEFAULT_DIFF_PROMPT).
+// Inline completion registers after the AI model router is created, below.
 registerAiChatApiEndpoints(db, getClaudeCliProvider);
 registerUtilsEndpoints(DATABASE_PATH, db);
 registerSavedTrafficEndpoints(savedTrafficStore, db);
@@ -526,6 +526,8 @@ registerAiTiersRoutes({ tierStore: aiTierStore, db });
 const rateLimitCache = new RateLimitCache();
 const aiModelRouter = new AiModelRouter(db, rateLimitCache);
 registerAiModelEndpoints(db, aiModelRouter, rateLimitCache);
+// Completion registers after the router exists so its cooldowns are shared.
+registerAiCompleteEndpoints(db, aiModelRouter);
 
 // Router-based provider facade: delegates createStreamingRequest to the router.
 // When `tier` is provided, the facade injects it into every createStreamingRequest
