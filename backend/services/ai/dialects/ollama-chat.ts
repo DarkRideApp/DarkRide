@@ -16,7 +16,8 @@ function formatMessages(messages: AiMessage[], systemPrompt: string): any[] {
       const toolCalls: any[] = [];
       for (const b of msg.content) {
         if (b.type === 'text') text += b.text;
-        else toolCalls.push({ id: b.id, type: 'function', function: { name: b.name, arguments: JSON.stringify(b.input) } });
+        // docs: Ollama native API takes an object; the old code sent a string (BC-24)
+        else toolCalls.push({ id: b.id, type: 'function', function: { name: b.name, arguments: b.input } });
       }
       const entry: any = { role: 'assistant', content: text };
       if (toolCalls.length > 0) entry.tool_calls = toolCalls;
@@ -38,6 +39,19 @@ function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError
   return new AiProviderError(`${ctx.descriptor.shortName} stream error: ${safeText(msg, ctx)}`, { provider: ctx.descriptor.id });
 }
 
+function isPlainObject(v: unknown): v is Record<string, any> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** Tool input is always a plain object: a string is parsed, anything that is not an object at the end becomes {}. */
+function toolInput(args: unknown): Record<string, any> {
+  let value = args;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { return {}; }
+  }
+  return isPlainObject(value) ? value : {};
+}
+
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   if (!res.body) throw new AiProviderError(`${ctx.descriptor.shortName} response has no body`);
   for await (const chunk of parseNDJSONStream(res.body, signal)) {
@@ -45,10 +59,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     if (chunk.message?.content) yield { type: 'text', text: chunk.message.content };
     for (const tc of chunk.message?.tool_calls ?? []) {
       if (!tc.function) continue;
-      let input: Record<string, any> = {};
-      if (typeof tc.function.arguments === 'string') { try { input = JSON.parse(tc.function.arguments); } catch { /* keep {} */ } }
-      else if (tc.function.arguments) input = tc.function.arguments;
-      yield { type: 'tool_use', id: tc.id || ctx.newId(), name: tc.function.name, input };
+      yield { type: 'tool_use', id: tc.id || ctx.newId(), name: tc.function.name, input: toolInput(tc.function.arguments) };
     }
     if (chunk.done && (chunk.prompt_eval_count || chunk.eval_count)) {
       yield { type: 'usage', inputTokens: chunk.prompt_eval_count ?? 0, outputTokens: chunk.eval_count ?? 0 };
@@ -75,6 +86,11 @@ export const ollamaDialect: Dialect = {
     return { url: `${ctx.baseUrl}/api/tags`, headers: { 'Content-Type': 'application/json' } };
   },
   parseModels(json: any) {
-    return { models: (json?.models ?? []).map((m: any) => ({ id: m.model || m.name, name: m.name })) };
+    return {
+      models: (json?.models ?? []).map((m: any) => {
+        const id = m.model || m.name;
+        return { id, name: m.name ?? id };
+      }),
+    };
   },
 };
