@@ -30,7 +30,6 @@ import { CloudStoragePage } from './pages/settings/CloudStoragePage';
 import { CertificatesPage } from './pages/settings/CertificatesPage';
 import { TrafficSettingsPage } from './pages/settings/TrafficSettingsPage';
 import { ChangelogPage } from './pages/settings/ChangelogPage';
-import { LicensePage } from './pages/settings/LicensePage';
 import { Credentials } from './pages/Credentials';
 import { SessionHistory } from './pages/SessionHistory';
 import { ProxiedRequests } from './pages/ProxiedRequests';
@@ -305,7 +304,6 @@ function AuthenticatedApp() {
               <Route path="utils" element={<Utils />} />
               <Route path="sdk-catalog" element={<SdkCatalog />} />
               <Route path="changelog" element={<ChangelogPage />} />
-              <Route path="license" element={<LicensePage />} />
               {pluginSettings.map(s => (
                 <Route
                   key={s.pluginName}

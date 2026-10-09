@@ -37,6 +37,11 @@ describe('SettingsSidebar', () => {
     expect(screen.getByRole('button', { name: /Restart Server/ })).toBeInTheDocument();
   });
 
+  it('has no License entry: DarkRide is free, there is no paid tier to activate', () => {
+    renderSidebar();
+    expect(screen.queryByRole('link', { name: /License/ })).toBeNull();
+  });
+
   it('renders plugin-registered settings entries under Plugins group', () => {
     pluginRegistry.registerSettings('demo-plugin', { label: 'Demo Plugin', component: NoopPage });
     // Simulate the disabled-plugin list having loaded (empty = no disabled plugins).

@@ -34,7 +34,6 @@ const ADVANCED: SidebarItem[] = [
 
 const ABOUT: SidebarItem[] = [
   { label: 'Changelog', path: '/ui/settings/changelog' },
-  { label: 'License', path: '/ui/settings/license' },
 ];
 
 const RESTART_SCOPE = 'core.plugins:manage';

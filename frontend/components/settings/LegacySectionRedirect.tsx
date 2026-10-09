@@ -13,7 +13,6 @@ const SECTION_MAP: Record<string, string> = {
   certificates: 'traffic',
   traffic: 'traffic',
   changelog: 'changelog',
-  license: 'license',
 };
 
 export function LegacySectionRedirect() {

@@ -39,9 +39,6 @@
 - **Extension points** — 15 surfaces a plugin can contribute to: nav, pages, routes, DB tables, AI tools, AI tool contexts, scopes, auth providers, jobs, settings, commands, notifications, protocol decoders, hooks, UI slots
 - **Plugin marketplace sources** — configurable registries, per-source auth tokens, license verification, install-from-URL fallback
 
-### Commercial
-- **Pro tier (Stripe Checkout)** [PRO] — $99/yr subscription, JWS-signed licence tokens with periodic refresh, gated features via licence verifier
-
 ### iOS Support (Phase 1)
 - **Device discovery** — pymobiledevice3 via USB, auto-pairing
 - **HTTPS traffic capture** — WireGuard config + QR code generation, reuses existing mitmproxy infrastructure
@@ -104,7 +101,7 @@ The APK page has grown organically and is now messy and tricky to navigate. Rest
 - **Less list-of-lists; more focused detail panels** — collapse incidental tables and lift the primary action (analyse, diff, download, push to device) into clearer affordances.
 - **Drag-and-drop APK upload** — drop `.apk` files anywhere on the page to upload and analyse, instead of going through the file picker dialog.
 
-### Script Git Storage [PRO]
+### Script Git Storage
 
 Automations and Frida scripts currently live in SQLite rows on the host. For users running DarkRide alongside their normal dev workflow, that's a poor fit:
 
@@ -219,20 +216,20 @@ Today the only path to a device is a USB-attached one. Many use cases (CI, demoi
 
 - **"Add device" from the UI** — point-and-click flow to provision a new device entry, choose between physical/emulated/cloud, and walk through any device-specific setup
 - **Emulated Android devices** — orchestrate local Android Emulator instances directly from DarkRide: pick an AVD, boot it, ADB connect automatically, lifecycle-manage with the rest of the device list
-- **Cloud-hosted device support** [PRO] — integrate with one or more cloud device providers (Genymotion Cloud, BrowserStack App Live, AWS Device Farm or equivalent); credentials handled via the existing credentials store; same automation API regardless of where the device runs
+- **Cloud-hosted device support** — integrate with one or more cloud device providers (Genymotion Cloud, BrowserStack App Live, AWS Device Farm or equivalent); credentials handled via the existing credentials store; same automation API regardless of where the device runs
 - **Snapshot & reset** — emulated devices should support easy snapshot/restore so automations can run from a known state
 - **AI assistant** — for selecting the right emulator / cloud device for a given task
 
-### VS Code Editing for Scripts [PRO]
+### VS Code Editing for Scripts
 
 The in-browser Monaco editor covers most authoring, but power users want their real IDE — extensions, custom keybindings, AI completion of their choice, side-by-side files.
 
-- **VS Code extension** — connect to a running DarkRide instance from VS Code; edit automations and Frida scripts in-place against the host's script storage (pairs with [Script Git Storage [PRO]](#script-git-storage-pro))
+- **VS Code extension** — connect to a running DarkRide instance from VS Code; edit automations and Frida scripts in-place against the host's script storage (pairs with [Script Git Storage](#script-git-storage))
 - **Live run + log streaming** — trigger a run from the editor, stream logs back into the VS Code output panel, jump to source on error
 - **Workspace sync** — open the host's full script library as a VS Code workspace folder; changes round-trip through the host's storage layer
 - **Auth via API key** — uses an existing scoped API key, no separate VS Code auth flow
 
-### Team Invites [PRO]
+### Team Invites
 
 The host already supports multiple users with scope-based RBAC, but creating new accounts today requires the admin to run `darkride admin create` or hand out claim URLs manually.
 
