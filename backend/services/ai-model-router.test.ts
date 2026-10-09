@@ -9,7 +9,7 @@ import { createProvider } from './ai/registry';
 import { createTestDb } from '../test-utils/create-test-db';
 import {
   QuotaExhaustedError, AuthError, OverloadedError, ConnectionError, OutputLimitError, AllModelsFailedError,
-  NoModelsConfiguredError, UnknownProviderError, PermissionDeniedError, RateLimitError as RLE,
+  NoModelsConfiguredError, UnknownProviderError, PermissionDeniedError, ModelRefusedError, RateLimitError as RLE,
 } from './ai/errors';
 
 const { aiModels, aiProviders } = schema;
@@ -1148,6 +1148,53 @@ describe('AiModelRouter', () => {
         ]);
         expect(cache.get(idOf('A'))).toBeUndefined();
         expect(cache.isInCooldown(idOf('B'), 10)).toBe(false);
+      });
+    });
+
+    describe('a model refusal (ModelRefusedError)', () => {
+      const refused = (who = 'Claude') => new ModelRefusedError(`${who} declined this request (category: cyber).`, { provider: 'anthropic' });
+      const idOf = (name: string) => r.getModels().find((m) => m.name === name)!.id;
+
+      it('falls back to the next model, and nothing is put on cooldown because the prompt was refused, not the model', async () => {
+        const factory = scripted(scripts);
+        r = new AiModelRouter(db as any, cache, { providerFactory: factory });
+        two([{ type: 'throw', value: refused() }], [{ type: 'text', value: 'from B' }]);
+        expect(await run()).toEqual([{ type: 'text', text: 'from B' }]);
+        // B recorded its own success; A, which refused, has no entry at all.
+        expect(cache.get(idOf('A'))).toBeUndefined();
+        expect(cache.isInCooldown(idOf('A'), 10)).toBe(false);
+
+        // The next request tries A again first.
+        scripts.A = [{ type: 'text', value: 'from A' }];
+        expect(await run()).toEqual([{ type: 'text', text: 'from A' }]);
+        expect(factory.mock.calls.map((c) => c[1].model)).toEqual(['A', 'B', 'A']);
+      });
+
+      it('when every model refuses it throws the first refusal itself, not the generic "rate-limited or unavailable" error', async () => {
+        two([{ type: 'throw', value: refused('Claude') }], [{ type: 'throw', value: refused('Gemini') }]);
+        const err: any = await run().catch((e) => e);
+        expect(err).toBeInstanceOf(ModelRefusedError);
+        expect(err).not.toBeInstanceOf(AllModelsFailedError);
+        expect(err.message).toBe('Claude declined this request (category: cyber).');
+        expect(cache.getAll().size).toBe(0);
+      });
+
+      it('a refusal mixed with another kind of failure is listed with it', async () => {
+        two([{ type: 'throw', value: refused() }], [{ type: 'throw', value: new OverloadedError('busy') }]);
+        const err: any = await run().catch((e) => e);
+        expect(err).toBeInstanceOf(AllModelsFailedError);
+        expect(err.attempts).toEqual([
+          { model: 'A', error: 'Claude declined this request (category: cyber).' },
+          { model: 'B', error: 'busy' },
+        ]);
+      });
+
+      it('after content was yielded it is rethrown, with no fallback', async () => {
+        const factory = scripted(scripts);
+        r = new AiModelRouter(db as any, cache, { providerFactory: factory });
+        two([{ type: 'text', value: 'partial' }, { type: 'throw', value: refused() }], [{ type: 'text', value: 'B' }]);
+        await expect(run()).rejects.toBeInstanceOf(ModelRefusedError);
+        expect(factory.mock.calls.map((c) => c[1].model)).toEqual(['A']);
       });
     });
 

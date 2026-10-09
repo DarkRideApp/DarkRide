@@ -4,7 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { openAiChatDialect, __resetOpenAiChatMemo } from '../dialects/openai-chat';
 import { makeCtx } from '../test-ctx';
 import { sseResponse, sseBody, chunkedResponse, collect } from '../test-helpers';
-import { OutputLimitError, AiProviderError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
+import { OutputLimitError, AiProviderError, ModelRefusedError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiToolDefinition } from '../../../../shared/types/ai-chat';
 
 const { logSpy } = vi.hoisted(() => ({ logSpy: vi.fn() }));
@@ -465,7 +465,14 @@ describe('parseStream', () => {
     });
   });
 
-  it('finish_reason content_filter yields a visible message instead of ending silently', async () => {
+  it('finish_reason content_filter with nothing produced throws ModelRefusedError, so the router can try another model', async () => {
+    const err: any = await run(sseResponse([delta({}, 'content_filter'), { data: '[DONE]' }]), 'openai').catch((e) => e);
+    expect(err).toBeInstanceOf(ModelRefusedError);
+    expect(err.message).toBe('OpenAI stopped this response (reason: content_filter).');
+    expect(err.provider).toBe('openai');
+  });
+
+  it('finish_reason content_filter after content keeps it and adds a visible message instead of throwing', async () => {
     const events = await run(sseResponse([delta({ content: 'Sure, ' }), delta({}, 'content_filter'), { data: '[DONE]' }]), 'openai');
     expect(events).toEqual([
       { type: 'text', text: 'Sure, ' },

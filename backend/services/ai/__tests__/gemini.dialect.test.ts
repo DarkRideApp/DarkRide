@@ -4,7 +4,7 @@ import { geminiDialect } from '../dialects/gemini-generate';
 import { makeCtx } from '../test-ctx';
 import { sseResponse, collect } from '../test-helpers';
 import { classifyHttpError } from '../http';
-import { AiProviderError, AuthError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
+import { AiProviderError, AuthError, ModelRefusedError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 
 const chunk = (o: unknown) => ({ data: JSON.stringify(o) });
 const parts = (p: unknown[], extra: object = {}) => chunk({ candidates: [{ content: { role: 'model', parts: p }, ...extra }] });
@@ -224,7 +224,8 @@ describe('a stream that ends without saying it finished', () => {
   it('a finishReason on an earlier chunk counts, and so does a prompt block', async () => {
     await expect(run([parts([{ text: 'a' }], { finishReason: 'STOP' }), chunk({ usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } })]))
       .resolves.toEqual([{ type: 'text', text: 'a' }, { type: 'usage', inputTokens: 1, outputTokens: 1 }]);
-    await expect(run([chunk({ promptFeedback: { blockReason: 'SAFETY' } })])).resolves.toHaveLength(1);
+    // A prompt block is a complete (refused) response, not a dropped connection, and it is the router's cue to try another model.
+    await expect(run([chunk({ promptFeedback: { blockReason: 'SAFETY' } })])).rejects.toBeInstanceOf(ModelRefusedError);
   });
   it('an aborted call ends quietly however far it got', async () => {
     const ac = new AbortController();
@@ -293,14 +294,29 @@ describe('parseStream', () => {
     const events = await run([chunk({ candidates: [{ content: { parts: [{ text: 'a' }] } }], ...um(32) }), chunk({ candidates: [{ content: { parts: [{ text: 'b' }] }, finishReason: 'STOP' }], ...um(40) })]);
     expect(events.filter((e) => e.type === 'usage')).toEqual([{ type: 'usage', inputTokens: 50, outputTokens: 1, cachedInputTokens: 40 }]);
   });
-  it('safety and blocked stops become a visible message', async () => {
-    for (const reason of ['SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII', 'MALFORMED_FUNCTION_CALL']) {
-      const events = await run([chunk({ candidates: [{ finishReason: reason }] })]);
-      const t = events.find((e) => e.type === 'text') as any;
-      expect(t.text).toContain(reason);
+  it('a safety or block stop with nothing produced throws ModelRefusedError carrying the reason', async () => {
+    for (const reason of ['SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII', 'RECITATION', 'IMAGE_SAFETY', 'IMAGE_PROHIBITED_CONTENT', 'IMAGE_RECITATION']) {
+      const err: any = await run([chunk({ candidates: [{ finishReason: reason }] })]).catch((e) => e);
+      expect(err, reason).toBeInstanceOf(ModelRefusedError);
+      expect(err.message).toBe(`Gemini stopped this response (reason: ${reason}).`);
+      expect(err.provider).toBe('gemini');
     }
-    const blocked = await run([chunk({ promptFeedback: { blockReason: 'OTHER' } })]);
-    expect((blocked.find((e) => e.type === 'text') as any).text).toContain('OTHER');
+  });
+  it('a stop that is not a block stays a visible message even when nothing was produced', async () => {
+    for (const reason of ['MALFORMED_FUNCTION_CALL', 'OTHER', 'LANGUAGE', 'UNEXPECTED_TOOL_CALL']) {
+      const events = await run([chunk({ candidates: [{ finishReason: reason }] })]);
+      expect((events.find((e) => e.type === 'text') as any).text).toContain(reason);
+    }
+  });
+  it('a prompt block throws ModelRefusedError carrying the reason', async () => {
+    const err: any = await run([chunk({ promptFeedback: { blockReason: 'OTHER' } })]).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelRefusedError);
+    expect(err.message).toBe('Gemini blocked this request (reason: OTHER).');
+  });
+  it('a block after a function call was already produced keeps the call and appends the message instead of throwing', async () => {
+    const events = await run([parts([{ functionCall: { name: 'get_apps', args: {} } }], { finishReason: 'SAFETY' })]);
+    expect(events.filter((e) => e.type === 'tool_use')).toHaveLength(1);
+    expect((events.filter((e) => e.type === 'text') as any[]).map((e) => e.text)).toEqual(['Gemini stopped this response (reason: SAFETY).']);
   });
   it('MAX_TOKENS does not throw and still yields the text it produced', async () => {
     await expect(run([parts([{ text: 'cut' }], { finishReason: 'MAX_TOKENS' })])).resolves.toEqual([{ type: 'text', text: 'cut' }]);
@@ -317,10 +333,10 @@ describe('parseStream', () => {
     expect(events).toEqual([{ type: 'text', text: 'ok' }]);
   });
   it('redacts the key out of a hostile blockReason', async () => {
-    const events = await run([chunk({ promptFeedback: { blockReason: 'bad sk-test-placeholder bad' } })]);
-    const text = (events.find((e) => e.type === 'text') as any).text as string;
-    expect(text).toContain('***');
-    expect(text).not.toContain('sk-test-placeholder');
+    const err: any = await run([chunk({ promptFeedback: { blockReason: 'bad sk-test-placeholder bad' } })]).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelRefusedError);
+    expect(err.message).toContain('***');
+    expect(err.message).not.toContain('sk-test-placeholder');
   });
 });
 

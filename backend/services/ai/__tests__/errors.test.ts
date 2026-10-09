@@ -1,10 +1,19 @@
 import { describe, it, expect } from 'vitest';
 import {
   AiProviderError, RateLimitError, QuotaExhaustedError, OverloadedError, AuthError, ConnectionError,
-  OutputLimitError, AllModelsFailedError, NoModelsConfiguredError, PermissionDeniedError, isFallbackEligible,
+  OutputLimitError, AllModelsFailedError, NoModelsConfiguredError, PermissionDeniedError, ModelRefusedError, isFallbackEligible,
 } from '../errors';
 
 describe('errors', () => {
+  it('ModelRefusedError is a provider error the router may fall back on', () => {
+    const e = new ModelRefusedError('Claude declined this request (category: cyber).', { provider: 'anthropic' });
+    expect(e).toBeInstanceOf(AiProviderError);
+    expect(e.name).toBe('ModelRefusedError');
+    expect(e.provider).toBe('anthropic');
+    expect(e.message).toBe('Claude declined this request (category: cyber).');
+    expect(isFallbackEligible(e)).toBe(true);
+  });
+
   it('RateLimitError keeps (message, headers) and name', () => {
     const h = new Headers({ 'x-ratelimit-limit-requests': '100' });
     const e = new RateLimitError('rate limited', h);

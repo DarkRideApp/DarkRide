@@ -1,7 +1,7 @@
 // backend/services/ai/dialects/anthropic-messages.ts
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { parseSSEStream, safeText } from '../http';
-import { AiProviderError, OutputLimitError, OverloadedError, RateLimitError } from '../errors';
+import { AiProviderError, ModelRefusedError, OutputLimitError, OverloadedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 import { toolInput } from '../tool-input';
 
@@ -57,6 +57,9 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   let stopReason: string | undefined;
   let refusalCategory: string | undefined;
   let emittedOut = 0;
+  // Whether any text or tool call has gone out. A refusal before that is an error the router can fall back on; after it,
+  // the partial answer stays and the message is appended, because a fallback would duplicate what the caller already has.
+  let produced = false;
 
   for await (const sse of parseSSEStream(res.body, signal)) {
     if (!sse.data || sse.data === '[DONE]') continue;
@@ -87,7 +90,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
         break;
       case 'content_block_delta': {
         const d = p.delta;
-        if (d?.type === 'text_delta') yield { type: 'text', text: d.text };
+        if (d?.type === 'text_delta') { produced = true; yield { type: 'text', text: d.text }; }
         else if (d?.type === 'input_json_delta') toolJson += d.partial_json;
         break;
       }
@@ -95,6 +98,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
         if (toolId && toolName) {
           let input: Record<string, any> = {};
           try { input = toolInput(JSON.parse(toolJson)); } catch { /* keep {} */ }
+          produced = true;
           yield { type: 'tool_use', id: toolId, name: toolName, input };
           toolId = toolName = toolJson = '';
         }
@@ -126,7 +130,9 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   if (stopReason === 'model_context_window_exceeded') throw new OutputLimitError(`${shortName} response reached its context window limit`, { provider: ctx.descriptor.id });
   if (stopReason === 'refusal') {
     const cat = refusalCategory ? ` (category: ${safeText(refusalCategory, ctx)})` : '';
-    yield { type: 'text', text: `Claude declined this request${cat}.${refusalCategory === 'cyber' ? CYBER_NOTE : ''}` };
+    const message = `Claude declined this request${cat}.${refusalCategory === 'cyber' ? CYBER_NOTE : ''}`;
+    if (!produced) throw new ModelRefusedError(message, { provider: ctx.descriptor.id });
+    yield { type: 'text', text: message };
   }
 }
 

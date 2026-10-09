@@ -943,6 +943,12 @@ export class ApkAnalyzerService {
         },
       })
       .then((result) => {
+        // A run can end without throwing and still have failed: a turn timeout or a provider error comes back as
+        // `error`. Reporting that as completed left the page empty with nothing to say why. A caller cancel is not a failure.
+        if (result.error && !result.aborted) {
+          this.recordAiFailure(versionId, result.error);
+          return;
+        }
         log(`AI agent completed for version ${versionId} (${result.usage?.inputTokens ?? 0} input, ${result.usage?.outputTokens ?? 0} output tokens)`);
         broadcastToAll({
           type: 'apk:ai-agent-update',
@@ -952,27 +958,32 @@ export class ApkAnalyzerService {
         });
       })
       .catch((err: any) => {
-        error(`AI agent failed for version ${versionId}: ${err.message}`);
-        broadcastToAll({
-          type: 'apk:ai-agent-update',
-          versionId,
-          status: 'failed',
-          error: err.message || String(err),
-        });
-        // Append error note so the user can see why AI review is missing
-        try {
-          const errorNote = `\n## AI Analysis Failed\n\nThe automated AI review could not complete: ${err.message}\n\nPlease review findings manually or re-run AI Review.\n`;
-          const existing = getNote(this.db, versionId);
-          const updated = existing ? existing + errorNote : errorNote.trimStart();
-          setNote(this.db, versionId, updated);
-          broadcastToAll({ type: 'apk:notes-updated', versionId, notes: updated });
-        } catch (noteErr: any) {
-          error(`Failed to write AI error note for version ${versionId}: ${noteErr.message}`);
-        }
+        this.recordAiFailure(versionId, err.message || String(err));
       })
       .finally(() => {
         this.activeAiAgentRuns.delete(versionId);
       });
+  }
+
+  /** An AI run failed: tell the open page and leave a note, so the reason is visible where the analysis should be. */
+  private recordAiFailure(versionId: number, message: string): void {
+    error(`AI agent failed for version ${versionId}: ${message}`);
+    broadcastToAll({
+      type: 'apk:ai-agent-update',
+      versionId,
+      status: 'failed',
+      error: message,
+    });
+    // Append error note so the user can see why AI review is missing
+    try {
+      const errorNote = `\n## AI Analysis Failed\n\nThe automated AI review could not complete: ${message}\n\nPlease review findings manually or re-run AI Review.\n`;
+      const existing = getNote(this.db, versionId);
+      const updated = existing ? existing + errorNote : errorNote.trimStart();
+      setNote(this.db, versionId, updated);
+      broadcastToAll({ type: 'apk:notes-updated', versionId, notes: updated });
+    } catch (noteErr: any) {
+      error(`Failed to write AI error note for version ${versionId}: ${noteErr.message}`);
+    }
   }
 
   private handleJobFailed(jobId: number, errorMsg: string): void {

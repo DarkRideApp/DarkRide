@@ -168,13 +168,16 @@ describe('anthropic', () => {
       await expect(run()).rejects.toThrow('Anthropic response reached its context window limit');
     });
 
-    it('treats a refusal stop as a normal end of stream, with a visible message', async () => {
+    it('treats a refusal stop with nothing produced as a ModelRefusedError, so the router can try another model', async () => {
       stubFetch(() => sseResponse([
         ev('message_delta', { delta: { stop_reason: 'refusal' } }),
         stop(),
       ]));
-      // Was a silent empty reply; a refusal now shows a message and still ends without an error.
-      expect(await run()).toEqual([{ type: 'text', text: 'Claude declined this request.' }]);
+      // Was a silent empty reply, then a visible message that ended the run as a success. A refusal is now an
+      // error with the same message, which the router falls back on and the unattended callers record as a failure.
+      const err: any = await run().catch((e) => e);
+      expect(err.name).toBe('ModelRefusedError');
+      expect(err.message).toBe('Claude declined this request.');
     });
 
     it('surfaces an Anthropic SSE error event', async () => {

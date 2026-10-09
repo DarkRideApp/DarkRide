@@ -90,7 +90,7 @@ default. A Base URL is checked when you save it and again before each request.
 
 ## Errors and fallback
 
-Provider failures fall into six classes:
+Provider failures fall into seven classes:
 
 | Class | Typical cause |
 |---|---|
@@ -99,10 +99,11 @@ Provider failures fall into six classes:
 | Overload | HTTP 502, 503, 529, 408 |
 | Rejected key | HTTP 401; for Gemini also a 403 with status `PERMISSION_DENIED` (a leaked, disabled or restricted key) and a 400 `API_KEY_INVALID` |
 | Permission denied | any other HTTP 403: a moderation or guardrail block, a key without access to one model, a region or organisation restriction |
+| Refusal | the model declined the request: an Anthropic `refusal` stop (for example its cyber safeguard), a Gemini safety or prompt block, an OpenAI-style `content_filter` |
 | Connection | network failure, no response headers in time, a redirect, a dropped connection while a response is being read or streamed |
 
 Models in a tier are tried in priority order. The router moves to the next model when a call
-fails with one of these six classes **before any output has been produced**. After text or a
+fails with one of these seven classes **before any output has been produced**. After text or a
 tool call has been produced, the error is surfaced instead, because falling back would
 duplicate output. Any other error, such as a 400 or 404, is surfaced immediately. A 403 is not
 treated as a rejected key because most providers use it for a blocked request or a model the
@@ -111,12 +112,23 @@ the next model and starts no cooldown, since it is often specific to one prompt.
 cancel is never a provider failure: no fallback and no cooldown. A failure that was already in
 flight when you saved the provider does not start a cooldown either.
 
+A refusal is about the request, not the model, so it falls back to the next model and starts no
+cooldown. If every model that was tried refused, the request fails with the first model's own
+message (for Anthropic it names the category and, for `cyber`, the Cyber Verification Program)
+instead of the generic "rate-limited or unavailable" text. A refusal that arrives after the model
+has already started answering keeps the partial answer and adds the message, as before.
+
+APK analysis and APK diff runs go through the same fallback: each tier of the run is served by
+the router, so a refusal or a rate limit on the first model moves the run to the next model of the
+tier instead of ending it. When a run still fails, the APK page gets an "AI Analysis Failed" note
+with the reason.
+
 Cooldowns last the model's cooldown minutes (default 10):
 
 - A rate limit or a connection failure cools down only that model.
 - Exhausted credits and a rejected key belong to the credential, so every model on the same
   provider entry cools down.
-- Overload and permission denied start no cooldown. A key that is refused on every model
+- Overload, permission denied and refusals start no cooldown. A key that is refused on every model
   therefore costs one failed request per model on each call.
 - Saving a provider clears the cooldowns of its models, so a corrected key works at once.
 

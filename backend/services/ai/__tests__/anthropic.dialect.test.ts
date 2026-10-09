@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest';
 import { anthropicDialect } from '../dialects/anthropic-messages';
 import { makeCtx } from '../test-ctx';
 import { sseResponse, sseBody, chunkedResponse, collect } from '../test-helpers';
-import { OutputLimitError, OverloadedError, RateLimitError, AiProviderError } from '../errors';
+import { OutputLimitError, OverloadedError, RateLimitError, AiProviderError, ModelRefusedError } from '../errors';
 import type { AiToolDefinition } from '../../../../shared/types/ai-chat';
 
 const ev = (type: string, extra: object = {}) => ({ event: type, data: JSON.stringify({ type, ...extra }) });
@@ -171,65 +171,66 @@ describe('parseStream content', () => {
     ]);
     expect(events.filter((e) => e.type === 'text')).toEqual([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]);
   });
-  it('a refusal becomes one visible message and does not throw', async () => {
-    const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'cyber' } }), stop()]);
-    const t = events.filter((e) => e.type === 'text') as any[];
-    expect(t).toHaveLength(1);
-    expect(t[0].text).toContain('Claude declined this request');
-    expect(t[0].text).toContain('cyber');
-    expect(t[0].text).toContain('Cyber Verification Program');
+  const refusal = (category: unknown = 'cyber', extraDeltas: any[] = []) => [
+    start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category } }), ...extraDeltas, stop(),
+  ];
+  const refusedWith = async (events: any[]) => {
+    const err: any = await run(events).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelRefusedError);
+    return err as ModelRefusedError;
+  };
+  it('a refusal before any content throws ModelRefusedError, so the router can try another model', async () => {
+    const err = await refusedWith(refusal());
+    expect(err.message).toContain('Claude declined this request');
+    expect(err.message).toContain('cyber');
+    expect(err.message).toContain('Cyber Verification Program');
+    expect(err.provider).toBe('anthropic');
   });
   it('a refusal with a null category still reads sensibly', async () => {
-    const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: null } }), stop()]);
-    expect((events.find((e) => e.type === 'text') as any).text).toBe('Claude declined this request.');
+    expect((await refusedWith(refusal(null))).message).toBe('Claude declined this request.');
   });
   it('keeps the refusal category when a later usage-only message_delta arrives', async () => {
-    const events = await run([
-      start(),
-      msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'cyber' } }),
-      ev('message_delta', { delta: {}, usage: { output_tokens: 4 } }),
-      stop(),
-    ]);
-    const t = events.filter((e) => e.type === 'text') as any[];
-    expect(t).toHaveLength(1);
-    expect(t[0].text).toContain('(category: cyber)');
-    expect(t[0].text).toContain('Cyber Verification Program');
+    const err = await refusedWith(refusal('cyber', [ev('message_delta', { delta: {}, usage: { output_tokens: 4 } })]));
+    expect(err.message).toContain('(category: cyber)');
+    expect(err.message).toContain('Cyber Verification Program');
   });
   it('keeps the refusal category when a repeated refusal delta carries no stop_details', async () => {
-    const events = await run([
-      start(),
-      msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'cyber' } }),
-      msgDelta('refusal', 0),
-      stop(),
-    ]);
-    expect((events.find((e) => e.type === 'text') as any).text).toContain('(category: cyber)');
+    const err = await refusedWith(refusal('cyber', [msgDelta('refusal', 0)]));
+    expect(err.message).toContain('(category: cyber)');
   });
   it('reads stop_details from the top level of the message_delta event as well as from delta', async () => {
-    const events = await run([
+    const err = await refusedWith([
       start(),
       ev('message_delta', { delta: { stop_reason: 'refusal' }, stop_details: { type: 'refusal', category: 'cyber' }, usage: { output_tokens: 0 } }),
       stop(),
     ]);
-    const t = events.filter((e) => e.type === 'text') as any[];
-    expect(t).toHaveLength(1);
-    expect(t[0].text).toContain('(category: cyber)');
-    expect(t[0].text).toContain('Cyber Verification Program');
+    expect(err.message).toContain('(category: cyber)');
+    expect(err.message).toContain('Cyber Verification Program');
   });
   it('ignores a non-string refusal category', async () => {
     for (const category of [42, { a: 1 }, ['cyber'], true]) {
-      const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category } }), stop()]);
-      expect((events.find((e) => e.type === 'text') as any).text).toBe('Claude declined this request.');
+      expect((await refusedWith(refusal(category))).message).toBe('Claude declined this request.');
     }
   });
   it('redacts the api key if it appears inside the refusal category', async () => {
-    const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'x-sk-test-placeholder-y' } }), stop()]);
-    const text = (events.find((e) => e.type === 'text') as any).text as string;
-    expect(text).not.toContain('sk-test-placeholder');
-    expect(text).toContain('(category: x-***-y)');
+    const err = await refusedWith(refusal('x-sk-test-placeholder-y'));
+    expect(err.message).not.toContain('sk-test-placeholder');
+    expect(err.message).toContain('(category: x-***-y)');
   });
   it('caps an oversized refusal category', async () => {
-    const events = await run([start(), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'a'.repeat(5000) } }), stop()]);
-    expect(((events.find((e) => e.type === 'text') as any).text as string).length).toBeLessThan(700);
+    expect((await refusedWith(refusal('a'.repeat(5000)))).message.length).toBeLessThan(700);
+  });
+  it('a refusal after text was already produced keeps that text and appends the message instead of throwing', async () => {
+    const events = await run([start(), text('Sure, '), msgDelta('refusal', 3, { stop_details: { type: 'refusal', category: 'cyber' } }), stop()]);
+    const t = events.filter((e) => e.type === 'text') as any[];
+    expect(t.map((e) => e.text)[0]).toBe('Sure, ');
+    expect(t).toHaveLength(2);
+    expect(t[1].text).toContain('Claude declined this request');
+  });
+  it('a refusal after a tool call was already produced keeps the call and appends the message instead of throwing', async () => {
+    const events = await run([start(), toolStart('tu_1', 'get_apps'), toolDelta('{}'), blockStop(), msgDelta('refusal', 3), stop()]);
+    expect(events.filter((e) => e.type === 'tool_use')).toHaveLength(1);
+    expect((events.filter((e) => e.type === 'text') as any[]).map((e) => e.text)).toEqual(['Claude declined this request.']);
   });
   it('a tool_use block with no input_json_delta yields an empty input object', async () => {
     const events = await run([start(), toolStart('tu_1', 'get_apps'), blockStop(), msgDelta('tool_use', 3), stop()]);

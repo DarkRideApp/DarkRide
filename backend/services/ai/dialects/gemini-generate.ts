@@ -1,13 +1,19 @@
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
 import { parseSSEStream, safeText } from '../http';
-import { AiProviderError, AuthError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
+import { AiProviderError, AuthError, ModelRefusedError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 import { toolInput } from '../tool-input';
 
 const { log } = createLoggers('ai-gemini');
 /** Finish reasons that mean the model ended normally. Every other reason is shown to the user. */
 const NORMAL_FINISH = new Set(['STOP', 'MAX_TOKENS']);
+// Stops where Google withheld the answer. With nothing produced yet each becomes a ModelRefusedError so the router can try another
+// model; any other unexpected stop (a malformed call, an unknown reason) stays a visible message.
+const BLOCK_FINISH = new Set([
+  'SAFETY', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'RECITATION',
+  'IMAGE_SAFETY', 'IMAGE_PROHIBITED_CONTENT', 'IMAGE_RECITATION',
+]);
 /** Documented stand-in for a thought signature we do not have (a replayed or injected call). */
 const SKIP_SIGNATURE = 'skip_thought_signature_validator';
 const isGemini3 = (model: string): boolean => /^gemini-3/i.test(model);
@@ -174,7 +180,9 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
 
     if (p.promptFeedback?.blockReason && !p.candidates?.length) {
       finished = true;
-      yield { type: 'text', text: `${shortName} blocked this request (reason: ${safeText(p.promptFeedback.blockReason, ctx)}).` };
+      const message = `${shortName} blocked this request (reason: ${safeText(p.promptFeedback.blockReason, ctx)}).`;
+      if (!produced) throw new ModelRefusedError(message, { provider });
+      yield { type: 'text', text: message };
     }
     const cand = p.candidates?.[0];
     for (const part of cand?.content?.parts ?? []) {
@@ -196,7 +204,9 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
         if (!produced) throw new OutputLimitError(`${shortName} response was cut off by the output token limit before any text.`, { provider });
         log(`${shortName} response was cut off by the output token limit`);
       } else if (!NORMAL_FINISH.has(String(fr))) {
-        yield { type: 'text', text: `${shortName} stopped this response (reason: ${safeText(fr, ctx)}).` };
+        const message = `${shortName} stopped this response (reason: ${safeText(fr, ctx)}).`;
+        if (!produced && BLOCK_FINISH.has(String(fr))) throw new ModelRefusedError(message, { provider });
+        yield { type: 'text', text: message };
       }
     }
 
