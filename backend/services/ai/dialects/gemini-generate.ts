@@ -206,6 +206,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
       } else if (!NORMAL_FINISH.has(String(fr))) {
         const message = `${shortName} stopped this response (reason: ${safeText(fr, ctx)}).`;
         if (!produced && BLOCK_FINISH.has(String(fr))) throw new ModelRefusedError(message, { provider });
+        produced = true;
         yield { type: 'text', text: message };
       }
     }

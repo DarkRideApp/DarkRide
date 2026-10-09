@@ -57,6 +57,20 @@ export function patchNoteSection(
   return updated;
 }
 
+/**
+ * Remove a `## <section>` block. Returns the new note, or null when the section was not there (nothing is written).
+ * The heading must match whole: removing "AI Analysis Failed" leaves "AI Analysis Failed Again" alone.
+ */
+export function removeNoteSection(db: AppDatabase, versionId: number, section: string): string | null {
+  const existing = getNote(db, versionId);
+  const sectionRegex = new RegExp(`(^|\\n)${escapeRegex(`## ${section}`)}\\n[\\s\\S]*?(?=\\n## |$)`);
+  if (!sectionRegex.test(existing)) return null;
+  let updated = existing.replace(sectionRegex, '').replace(/^\n+/, '');
+  if (updated !== '' && !updated.endsWith('\n')) updated += '\n';
+  setNote(db, versionId, updated);
+  return updated;
+}
+
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

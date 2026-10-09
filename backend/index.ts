@@ -526,18 +526,14 @@ registerAiCompleteEndpoints(db, aiModelRouter);
 // Usage report over recorded agent runs (read-only).
 registerAiUsageEndpoints(db);
 
-// Router-based provider facade: delegates createStreamingRequest to the router.
-// When `tier` is provided, the facade injects it into every createStreamingRequest
-// call so the router picks models from the correct tier (not the default 'High').
+// Router-based provider for one run: delegates createStreamingRequest to the router.
+// When `tier` is provided, it is injected into every createStreamingRequest call so the
+// router picks models from the correct tier (not the default 'High'). Each call makes a
+// new provider, so a model that declines a request is skipped for the rest of that run only.
 function getAiProvider(tier?: string): AiStreamingProvider | null {
   const models = aiModelRouter.getEnabledModels();
   if (models.length === 0) return null;
-
-  return {
-    name: 'router',
-    createStreamingRequest: (messages, systemPrompt, tools, options) =>
-      aiModelRouter.createStreamingRequest(messages, systemPrompt, tools, { ...options, tier: tier ?? options?.tier }),
-  };
+  return aiModelRouter.providerForTier(tier);
 }
 
 function getAiAgent(options?: { tier?: string }): AiAgentInterface | null {

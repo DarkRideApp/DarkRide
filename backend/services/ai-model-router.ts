@@ -217,9 +217,14 @@ export class AiModelRouter {
   private *candidates(
     models: ModelRow[],
     attempts: Attempt[],
+    refusedModels?: ReadonlySet<number>,
   ): Generator<{ model: ModelRow; row: ProviderRow; provider: AiProvider }> {
     const providerMap = new Map(this.db.select().from(aiProviders).all().map((p) => [p.id, p]));
     for (const model of models) {
+      if (refusedModels?.has(model.id)) {
+        attempts.push({ model: model.name, error: 'declined an earlier request in this run' });
+        continue;
+      }
       const row = model.providerId ? providerMap.get(model.providerId) : undefined;
       const typeId: string = row?.type ?? model.provider;
       if (isCliProvider(typeId)) {
@@ -323,7 +328,7 @@ export class AiModelRouter {
     let failures = 0;
     const refusals: ModelRefusedError[] = [];
 
-    for (const { model, row, provider } of this.candidates(models, attempts)) {
+    for (const { model, row, provider } of this.candidates(models, attempts, options?.refusedModels)) {
       signal?.throwIfAborted();
       let yielded = false;
       const held: AiStreamEvent[] = [];
@@ -353,7 +358,10 @@ export class AiModelRouter {
         attempts.push({ model: model.name, error: this.describeAttempt(err) });
         lastError = err;
         failures++;
-        if (err instanceof ModelRefusedError) refusals.push(err);
+        if (err instanceof ModelRefusedError) {
+          refusals.push(err);
+          options?.refusedModels?.add(model.id);
+        }
         continue;
       }
       // A stream that stopped because the caller aborted says nothing about the provider, and the
@@ -373,15 +381,19 @@ export class AiModelRouter {
   }
 
   /**
-   * A streaming provider bound to one tier: each request goes through this router, so it falls back past rate limits,
-   * outages and refusals within the tier (and on to the next). Unlike `createProviderForModelId` it is not pinned to a
-   * single model, and it respects cooldowns.
+   * A streaming provider for one run, bound to a tier: each request goes through this router, so it falls back past rate
+   * limits, outages and refusals to the next model of the tier. Unlike `createProviderForModelId` it is not pinned to a
+   * single model, and it respects cooldowns. Without a tier, the tier named by each request is used.
+   *
+   * Make one per run. A model that declines a request is remembered for the life of the provider and skipped by its later
+   * requests, since a refusal starts no cooldown and the context that was refused is still in the conversation. Pass
+   * `refusedModels` to share that memory between providers of one run (the research and write providers of a tiered run).
    */
-  providerForTier(tier: string): AiStreamingProvider {
+  providerForTier(tier?: string, refusedModels: Set<number> = new Set()): AiStreamingProvider {
     return {
       name: 'router',
       createStreamingRequest: (messages, systemPrompt, tools, options) =>
-        this.createStreamingRequest(messages, systemPrompt, tools, { ...options, tier }),
+        this.createStreamingRequest(messages, systemPrompt, tools, { ...options, tier: tier ?? options?.tier, refusedModels }),
     };
   }
 
@@ -395,6 +407,8 @@ export class AiModelRouter {
     const models = this.getModelsForTier(opts.tier, { strict: opts.strict });
     const attempts: Attempt[] = [];
     let lastError: unknown;
+    let failures = 0;
+    const refusals: ModelRefusedError[] = [];
 
     for (const { model, row, provider } of this.candidates(models, attempts)) {
       signal?.throwIfAborted();
@@ -418,10 +432,14 @@ export class AiModelRouter {
         this.recordFailure(model, row, err);
         attempts.push({ model: model.name, error: this.describeAttempt(err) });
         lastError = err;
+        failures++;
+        if (err instanceof ModelRefusedError) refusals.push(err);
       }
     }
 
     signal?.throwIfAborted();
+    // Same rule as streaming: when every model that ran refused, the first refusal is the useful message.
+    if (failures > 0 && refusals.length === failures) throw refusals[0];
     throw new AllModelsFailedError(attempts, lastError !== undefined ? { cause: lastError } : {});
   }
 

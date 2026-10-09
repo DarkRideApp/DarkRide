@@ -15,7 +15,7 @@ import { completeHandler, registerAiCompleteEndpoints } from './ai-complete';
 import { createTestDb } from '../test-utils/create-test-db';
 import { stubFetch, jsonResponse, textResponse, okStream, callHeader } from '../services/ai/test-helpers';
 import { AiModelRouter, RateLimitCache } from '../services/ai-model-router';
-import { AuthError, ConnectionError, PermissionDeniedError, QuotaExhaustedError } from '../services/ai/errors';
+import { AuthError, ConnectionError, ModelRefusedError, PermissionDeniedError, QuotaExhaustedError } from '../services/ai/errors';
 import { getRecentLogs } from '../logs';
 import { buildAiReferencePrompt } from '../../shared/api-reference';
 
@@ -157,6 +157,25 @@ describe('AI Complete API Endpoint', () => {
       expect(res.status).toBe(502);
       expect(res.body.error).toMatch(/^All AI models are rate-limited or unavailable:/);
       expect(res.body.error).toContain('OpenRouter request failed: refused');
+    });
+
+    it('a refusal from every model is a 502 carrying the refusal itself, not the generic unavailable message', async () => {
+      const router = routerWith({ low: ['A', 'B'] }, { complete: async () => { throw new ModelRefusedError('Claude declined this request (category: cyber).', { provider: 'anthropic' }); } });
+      const res = await request(createApp(db, router)).post('/v1/ai/complete').send({ prefix: 'a' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toBe('Claude declined this request (category: cyber).');
+    });
+
+    it('a refusal from the first model falls back to the next, which serves the completion', async () => {
+      let n = 0;
+      const router = routerWith({ low: ['A', 'B'] }, { complete: async () => {
+        n++;
+        if (n === 1) throw new ModelRefusedError('Claude declined this request.', { provider: 'anthropic' });
+        return 'from B';
+      } });
+      const res = await request(createApp(db, router)).post('/v1/ai/complete').send({ prefix: 'a' });
+      expect(res.status).toBe(200);
+      expect(res.body.data.completion).toBe('from B');
     });
 
     it.each([

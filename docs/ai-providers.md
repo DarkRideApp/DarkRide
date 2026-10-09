@@ -36,8 +36,9 @@ as exhausted credits and moves on to the next model.
 - **Anthropic Messages**: sends `anthropic-version: 2023-06-01`. Omits `x-api-key` when no key
   is set and omits `system` when the system prompt is empty. `max_tokens` is 16000 unless the
   caller sets one. Never sends `temperature`, `top_p`, `top_k`, `thinking`, or `tool_choice`.
-  Reported input tokens include cache reads and writes. A model refusal is shown as a message
-  instead of an empty reply.
+  Reported input tokens include cache reads and writes. A model refusal before any output is an
+  error the router falls back on (see Errors and fallback); a refusal after the model has started
+  answering is appended to the partial answer as a message.
 - **Gemini**: the key goes in the `x-goog-api-key` header, never the URL. Omits
   `systemInstruction` when the system prompt is empty. Tool results carry the real function
   name. `thought` parts are not shown, and thinking tokens count as output tokens. An invalid
@@ -116,12 +117,28 @@ A refusal is about the request, not the model, so it falls back to the next mode
 cooldown. If every model that was tried refused, the request fails with the first model's own
 message (for Anthropic it names the category and, for `cyber`, the Cyber Verification Program)
 instead of the generic "rate-limited or unavailable" text. A refusal that arrives after the model
-has already started answering keeps the partial answer and adds the message, as before.
+has already started answering keeps the partial answer and adds the message, as before. In a
+background run that message is just text, so such a run is not recorded as failed.
+
+Within one run, a model that refused is not asked again by that run's later requests, and the
+research and write providers of a tiered run share that memory. Refusals start no cooldown, so
+without it a run whose context holds the refused content would pay for a refused request on
+every turn. The next run starts fresh.
 
 APK analysis and APK diff runs go through the same fallback: each tier of the run is served by
 the router, so a refusal or a rate limit on the first model moves the run to the next model of the
-tier instead of ending it. When a run still fails, the APK page gets an "AI Analysis Failed" note
-with the reason.
+tier instead of ending it. The fallback only helps when the tier holds more than one enabled
+model. If the write tier declines a write the research model asked for, the research model's write
+is used, as when a write model declines for any other reason. Tiered runs now respect cooldowns,
+like chat: a model cooled down by inline completion is skipped.
+
+When an APK analysis run fails, the APK page gets one "AI Analysis Failed" note with the latest
+reason, and a later run that completes removes it. The APK diff summary only logs a failure and
+does not write a note.
+
+Anthropic bills a refusal before any output only in the `bio`, `frontier_llm` and
+`reasoning_extraction` categories. The usage monitor does not record the tokens of a refused
+attempt that fell back, so a refusal in one of those categories is billed but not counted there.
 
 Cooldowns last the model's cooldown minutes (default 10):
 

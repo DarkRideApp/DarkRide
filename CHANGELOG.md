@@ -15,7 +15,7 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 
 ### Changed
 
-- Anthropic: blank-model rows now default to `claude-sonnet-5-5`; `max_tokens` is 16000; a model refusal is shown as a message instead of an empty reply. Requests no longer send `temperature`, no longer send an empty `x-api-key` header when no key is set, and omit an empty system prompt. Reported input tokens now include cached tokens.
+- Anthropic: blank-model rows now default to `claude-sonnet-5-5`; `max_tokens` is 16000; a model refusal is no longer an empty reply (see the refusal entry below). Requests no longer send `temperature`, no longer send an empty `x-api-key` header when no key is set, and omit an empty system prompt. Reported input tokens now include cached tokens.
 - Gemini: the API key is sent in the `x-goog-api-key` header instead of the URL; default model is `gemini-2.5-flash` (Google shut down 2.0 Flash on 2026-06-01). Tool results now carry the real function name, thinking tokens count as output tokens, `thought` parts are not shown, and an empty system prompt is omitted. Tool calls are replayed with the ids Google sent, and Gemini 3 turns carry Google's documented placeholder thought signature so multi-step tool use is accepted (real signatures are not kept yet). Safety, recitation and other unexpected stops now show a message instead of an empty reply, and a reply that is cut off before any text is an error.
 - OpenRouter: blank-model rows now default to `openrouter/auto`.
 - OpenRouter and Gemini now honour the Base URL field. Existing stored values for these two types are cleared by a one-time migration because they were never used.
@@ -28,10 +28,11 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 - Provider errors read `<Name> API error (<status>): <provider message>`, with the API key masked.
 - Requests fail with `<Name> did not respond within 60s` when no response headers arrive in 60 s (Ollama: 180 s). The connection test, model test, and model listing give up after 15 s with `<Name> did not respond within 15s`.
 - Inline code completion (`/v1/ai/complete`) now uses the enabled models of the `Low` tier only, with the fallback above, and skips Claude CLI models. Installs without a usable `Low` tier model keep working through the old settings keys, which are deprecated. A provider error returns 502 with a redacted message (it was 500 for a network failure). An unexpected error returns 500 with the fixed message `Inline completion failed`. A client that disconnects cancels the upstream request and gets no response. On Gemini models that think by default, completion turns thinking down so the 256-token budget is not spent before any text.
-- OpenAI-style streams: a tool call cut off by the output limit now fails with an output-limit error instead of running with empty arguments. A content-filter stop shows a message, Mistral's `model_length` stop is handled like an output limit, and a single streamed line over 8 MB is rejected. A model list over 50,000 entries is rejected.
+- OpenAI-style streams: a tool call cut off by the output limit now fails with an output-limit error instead of running with empty arguments. A content-filter stop is reported instead of ending silently, Mistral's `model_length` stop is handled like an output limit, and a single streamed line over 8 MB is rejected. A model list over 50,000 entries is rejected.
 - A model whose provider has no default (OpenAI, Mistral, OpenAI-compatible) must be chosen explicitly. Saving a blank model for one of these is rejected with 400 and a message such as `OpenAI has no default model. Choose a model.`
-- **A model that declines a request no longer ends the run.** When Anthropic stops a response with a refusal (for example its cyber safeguard), Gemini blocks a prompt or response for safety, or an OpenAI-style server answers `content_filter`, and nothing has been produced yet, the next model in the tier is tried, and the model that declined is not put on cooldown. If every model declines, the first one's message is shown; for Anthropic it names the category and the Cyber Verification Program. A refusal after the model has started answering keeps the partial answer and adds the message, as before.
-- APK analysis and APK diff runs now fall back across the models of a tier the way chat does. They used to be pinned to the first model of each tier, so one rate limit or refusal ended the run.
+- **A model that declines a request no longer ends the run.** When Anthropic stops a response with a refusal (for example its cyber safeguard), Gemini blocks a prompt or response for safety, or an OpenAI-style server answers `content_filter`, and nothing has been produced yet, the next model in the tier is tried, and the model that declined is not put on cooldown. If every model declines, the first one's message is shown; for Anthropic it names the category, and for the `cyber` category the Cyber Verification Program. A refusal after the model has started answering keeps the partial answer and adds the message, as before. Within one run a model that refused is not asked again.
+- APK analysis and APK diff runs now fall back across the models of a tier the way chat does. They used to be pinned to the first model of each tier, so one rate limit or refusal ended the run. They also respect model cooldowns now.
+- Inline completion no longer inserts a model's refusal message as the completion. Every model refusing returns the refusal as an error.
 
 ### Deprecated
 
@@ -43,7 +44,7 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 
 ### Fixed
 
-- **APK AI analysis no longer ends "completed" with empty notes when the model declines or the run times out.** The page gets an "AI Analysis Failed" note with the reason, and the run shows as failed.
+- **APK AI analysis no longer ends "completed" with empty notes when the model declines or the run times out.** The page gets one "AI Analysis Failed" note with the latest reason, the run shows as failed, and a later run that completes removes the note.
 
 ## [1.0.0] — 2026-05-17
 

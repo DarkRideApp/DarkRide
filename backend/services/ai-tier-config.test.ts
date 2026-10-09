@@ -90,7 +90,20 @@ describe('resolveTierConfig', () => {
 
     expect(await drain(cfg.researchProvider.createStreamingRequest([], '', []))).toEqual([{ type: 'text', text: 'from Backup' }]);
     expect(await drain(cfg.writeProvider.createStreamingRequest([], '', []))).toEqual([{ type: 'text', text: 'from Backup' }]);
-    expect(calls).toEqual(['Opus', 'Backup', 'Opus', 'Backup']);
+    // Opus refused the research request, so the write request of the same run does not ask it again.
+    expect(calls).toEqual(['Opus', 'Backup', 'Backup']);
+  });
+
+  it('a new run starts over: a model that refused earlier is tried again', async () => {
+    const p = addProvider(db);
+    addModel(db, 'Opus', high, p, 'anthropic', 0);
+    addModel(db, 'Backup', high, p, 'anthropic', 1);
+    refuses.add('Opus');
+    const first = resolveTierConfig(router, { research: 'High', write: 'High' }, ['patch_analysis_section'])!;
+    await drain(first.researchProvider.createStreamingRequest([], '', []));
+    refuses.delete('Opus');
+    const second = resolveTierConfig(router, { research: 'High', write: 'High' }, ['patch_analysis_section'])!;
+    expect(await drain(second.researchProvider.createStreamingRequest([], '', []))).toEqual([{ type: 'text', text: 'from Opus' }]);
   });
 
   it('each provider serves from its own tier', async () => {

@@ -177,6 +177,9 @@ test.describe('AI refusal fallback', () => {
       await page.waitForLoadState('networkidle');
       await page.getByTestId('ai-chat-fab').click();
       await expect(page.getByTestId('ai-chat-panel')).toBeVisible({ timeout: 10_000 });
+      // Playwright's database outlives a retry, and the chat restores the last conversation of its page context.
+      // Start from an empty one so the message indexes below hold on every attempt.
+      await page.getByTestId('ai-chat-new-btn').click();
 
       // ── The first model refuses; the second one answers, and the user sees that answer ──
       await chat(page, 0, 'First refusal fallback question', REPLY_TEXT);

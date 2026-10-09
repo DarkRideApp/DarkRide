@@ -15,9 +15,12 @@ import { createLoggers } from '../logs';
 import { APK_DIR, apkFilePath, resolveApkLocal, apkCloudKey, ensureApkLocal, analysisDir as getAnalysisDir } from '../utils/apk-paths';
 import { getPythonPath } from '../utils/python-path';
 import { extractIconFromLocalApk } from './apk-tracker';
-import { getNote, setNote } from './apk-notes';
+import { patchNoteSection, removeNoteSection } from './apk-notes';
 
 const { log, error } = createLoggers('apk-analyzer');
+
+/** Heading of the note section that says why the AI review did not finish. */
+const AI_FAILURE_SECTION = 'AI Analysis Failed';
 const POLL_INTERVAL_MS = 2000;
 const RESTART_DELAY_MS = 2000;
 const COMMAND_TIMEOUT_MS = 300000; // 5 minutes per command
@@ -950,6 +953,7 @@ export class ApkAnalyzerService {
           return;
         }
         log(`AI agent completed for version ${versionId} (${result.usage?.inputTokens ?? 0} input, ${result.usage?.outputTokens ?? 0} output tokens)`);
+        this.clearAiFailure(versionId);
         broadcastToAll({
           type: 'apk:ai-agent-update',
           versionId,
@@ -974,15 +978,25 @@ export class ApkAnalyzerService {
       status: 'failed',
       error: message,
     });
-    // Append error note so the user can see why AI review is missing
+    // One failure section holding the latest reason, so repeated failures do not stack up.
     try {
-      const errorNote = `\n## AI Analysis Failed\n\nThe automated AI review could not complete: ${message}\n\nPlease review findings manually or re-run AI Review.\n`;
-      const existing = getNote(this.db, versionId);
-      const updated = existing ? existing + errorNote : errorNote.trimStart();
-      setNote(this.db, versionId, updated);
+      const updated = patchNoteSection(
+        this.db, versionId, AI_FAILURE_SECTION,
+        `The automated AI review could not complete: ${message}\n\nPlease review findings manually or re-run AI Review.`,
+      );
       broadcastToAll({ type: 'apk:notes-updated', versionId, notes: updated });
     } catch (noteErr: any) {
       error(`Failed to write AI error note for version ${versionId}: ${noteErr.message}`);
+    }
+  }
+
+  /** A run completed: an earlier failure note is stale, so take it out and leave the analysis as it is. */
+  private clearAiFailure(versionId: number): void {
+    try {
+      const updated = removeNoteSection(this.db, versionId, AI_FAILURE_SECTION);
+      if (updated !== null) broadcastToAll({ type: 'apk:notes-updated', versionId, notes: updated });
+    } catch (noteErr: any) {
+      error(`Failed to clear AI error note for version ${versionId}: ${noteErr.message}`);
     }
   }
 

@@ -90,7 +90,8 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
         break;
       case 'content_block_delta': {
         const d = p.delta;
-        if (d?.type === 'text_delta') { produced = true; yield { type: 'text', text: d.text }; }
+        // An empty delta carries nothing: it must not count as output, or a refusal right after it could no longer fall back.
+        if (d?.type === 'text_delta') { if (d.text) { produced = true; yield { type: 'text', text: d.text }; } }
         else if (d?.type === 'input_json_delta') toolJson += d.partial_json;
         break;
       }

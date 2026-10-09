@@ -313,6 +313,20 @@ describe('parseStream', () => {
     expect(err).toBeInstanceOf(ModelRefusedError);
     expect(err.message).toBe('Gemini blocked this request (reason: OTHER).');
   });
+  it('thought-only and empty-text parts before a block produce nothing, so the block still throws', async () => {
+    const err: any = await run([parts([{ text: 'thinking', thought: true }, { text: '' }]), chunk({ candidates: [{ finishReason: 'SAFETY' }] })]).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelRefusedError);
+  });
+  it('a visible non-block stop counts as output: a block in a later chunk keeps both messages instead of throwing', async () => {
+    const events = await run([
+      chunk({ candidates: [{ finishReason: 'MALFORMED_FUNCTION_CALL' }] }),
+      chunk({ candidates: [{ finishReason: 'SAFETY' }] }),
+    ]);
+    expect((events.filter((e) => e.type === 'text') as any[]).map((e) => e.text)).toEqual([
+      'Gemini stopped this response (reason: MALFORMED_FUNCTION_CALL).',
+      'Gemini stopped this response (reason: SAFETY).',
+    ]);
+  });
   it('a block after a function call was already produced keeps the call and appends the message instead of throwing', async () => {
     const events = await run([parts([{ functionCall: { name: 'get_apps', args: {} } }], { finishReason: 'SAFETY' })]);
     expect(events.filter((e) => e.type === 'tool_use')).toHaveLength(1);

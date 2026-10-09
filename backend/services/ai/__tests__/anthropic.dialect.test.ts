@@ -220,6 +220,17 @@ describe('parseStream content', () => {
   it('caps an oversized refusal category', async () => {
     expect((await refusedWith(refusal('a'.repeat(5000)))).message.length).toBeLessThan(700);
   });
+  it('an empty text_delta before a refusal produces nothing, so the refusal still throws', async () => {
+    const err = await refusedWith([start(), text(''), msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'cyber' } }), stop()]);
+    expect(err.message).toContain('Claude declined this request');
+  });
+  it('thinking-only output before a refusal produces nothing, so the refusal still throws', async () => {
+    const thinking = ev('content_block_delta', { delta: { type: 'thinking_delta', thinking: 'hmm' } });
+    await refusedWith([start(), thinking, msgDelta('refusal', 0, { stop_details: { type: 'refusal', category: 'cyber' } }), stop()]);
+  });
+  it('a tool_use block that never finished before a refusal produces nothing, so the refusal still throws', async () => {
+    await refusedWith([start(), toolStart('tu_1', 'get_apps'), toolDelta('{"q":'), msgDelta('refusal', 0), stop()]);
+  });
   it('a refusal after text was already produced keeps that text and appends the message instead of throwing', async () => {
     const events = await run([start(), text('Sure, '), msgDelta('refusal', 3, { stop_details: { type: 'refusal', category: 'cyber' } }), stop()]);
     const t = events.filter((e) => e.type === 'text') as any[];

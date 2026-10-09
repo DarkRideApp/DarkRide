@@ -53,7 +53,7 @@ vi.mock('../logs', () => ({
 
 import { ApkAnalyzerService } from './apk-analyzer';
 import { broadcastToAll } from '../websocket/index';
-import { getNote } from './apk-notes';
+import { getNote, patchNoteSection } from './apk-notes';
 import { createTestDb } from '../test-utils/create-test-db';
 
 function insertTrackedApp(db: BetterSQLite3Database<typeof schema>, packageName: string): number {
@@ -1046,6 +1046,35 @@ describe('ApkAnalyzerService', () => {
         const note = getNote(db, versionId);
         expect(note).toContain('## AI Analysis Failed');
         expect(note).toContain('Claude declined this request (category: cyber).');
+      });
+
+      it('repeated failures leave one failure section holding the latest reason, not one per run', async () => {
+        await runWith(vi.fn().mockRejectedValue(new Error('first reason')));
+        await runWith(vi.fn().mockRejectedValue(new Error('second reason')));
+        const note = getNote(db, versionId);
+        expect(note.match(/## AI Analysis Failed/g)).toHaveLength(1);
+        expect(note).toContain('second reason');
+        expect(note).not.toContain('first reason');
+      });
+
+      it('a run that completes removes an earlier failure section and keeps the analysis', async () => {
+        patchNoteSection(db, versionId, 'Overview', 'kept');
+        await runWith(vi.fn().mockRejectedValue(new Error('first reason')));
+        expect(getNote(db, versionId)).toContain('## AI Analysis Failed');
+
+        (broadcastToAll as any).mockClear();
+        const forUser = vi.fn().mockReturnValue({
+          identity: { identityType: 'user', actorUserId: 42, effectiveScopes: ['core.apk:read'] },
+          handleMessage: vi.fn().mockResolvedValue({ usage: {}, conversationId: 1 }),
+        });
+        service.setAiFactory({ forUser, forCoreService: vi.fn() } as any);
+        service.triggerAiAgentManual(versionId, 42);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+        expect(getNote(db, versionId)).toBe('## Overview\nkept\n');
+        const broadcasts = (broadcastToAll as any).mock.calls.map((c: any) => c[0]);
+        expect(broadcasts.some((m: any) => m.type === 'apk:notes-updated' && m.notes === '## Overview\nkept\n')).toBe(true);
       });
 
       it('a run that returns an error instead of throwing (a turn timeout) is recorded as failed, not completed', async () => {

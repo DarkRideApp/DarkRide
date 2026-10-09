@@ -12,6 +12,9 @@ const { error } = createLoggers('ai-tier-config');
  * limited, down, or refuses the request. It used to be pinned to the top model of each tier, which meant a refusal (or a
  * rate limit) on that one model ended the run even with other models configured.
  *
+ * Call this once per run: the two providers share one memory of the models that refused, so a model that declined the
+ * research request is not asked again by the write request, or by any later turn of the same run.
+ *
  * Null when no model is configured at all, or when the top model of either tier runs through the CLI, which cannot do
  * the buffered two-phase streaming a tiered turn needs. An empty tier is served by the nearest tier that has models,
  * the same way the router resolves it for every other request.
@@ -26,9 +29,10 @@ export function resolveTierConfig(
     const researchModels = router.getModelsForTier(tiers.research);
     const writeModels = router.getModelsForTier(tiers.write);
     if (router.isCliModel(researchModels[0]) || router.isCliModel(writeModels[0])) return null;
+    const refusedModels = new Set<number>();
     return {
-      researchProvider: router.providerForTier(tiers.research),
-      writeProvider: router.providerForTier(tiers.write),
+      researchProvider: router.providerForTier(tiers.research, refusedModels),
+      writeProvider: router.providerForTier(tiers.write, refusedModels),
       writeToolNames,
     };
   } catch (err) {

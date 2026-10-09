@@ -472,6 +472,17 @@ describe('parseStream', () => {
     expect(err.provider).toBe('openai');
   });
 
+  it('content_filter after a completed tool call keeps the call and adds the message instead of throwing', async () => {
+    const events = await run(sseResponse([delta(tc({ index: 0, id: 'a', name: 'f', args: '{"q":"abc"}' })), delta({}, 'content_filter'), { data: '[DONE]' }]), 'openai');
+    expect(events.filter((e) => e.type === 'tool_use')).toEqual([{ type: 'tool_use', id: 'a', name: 'f', input: { q: 'abc' } }]);
+    expect((events.filter((e) => e.type === 'text') as any[]).map((e) => e.text)).toEqual(['OpenAI stopped this response (reason: content_filter).']);
+  });
+
+  it('content_filter with only a partial tool call buffered produced nothing, so it throws', async () => {
+    const err: any = await run(sseResponse([delta(tc({ index: 0, id: 'a', name: 'f', args: '{"q":"abc' })), delta({}, 'content_filter'), { data: '[DONE]' }]), 'openai').catch((e) => e);
+    expect(err).toBeInstanceOf(ModelRefusedError);
+  });
+
   it('finish_reason content_filter after content keeps it and adds a visible message instead of throwing', async () => {
     const events = await run(sseResponse([delta({ content: 'Sure, ' }), delta({}, 'content_filter'), { data: '[DONE]' }]), 'openai');
     expect(events).toEqual([

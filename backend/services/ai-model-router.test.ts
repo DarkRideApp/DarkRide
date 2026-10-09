@@ -1196,6 +1196,95 @@ describe('AiModelRouter', () => {
         await expect(run()).rejects.toBeInstanceOf(ModelRefusedError);
         expect(factory.mock.calls.map((c) => c[1].model)).toEqual(['A']);
       });
+
+      it('a refusal after an earlier failure of another kind is listed with it, not thrown alone', async () => {
+        two([{ type: 'throw', value: new OverloadedError('busy') }], [{ type: 'throw', value: refused('Gemini') }]);
+        const err: any = await run().catch((e) => e);
+        expect(err).toBeInstanceOf(AllModelsFailedError);
+        expect(err.attempts).toEqual([
+          { model: 'A', error: 'busy' },
+          { model: 'B', error: 'Gemini declined this request (category: cyber).' },
+        ]);
+      });
+
+      it('a refusal next to a model skipped for cooldown is still thrown alone: only models that ran count', async () => {
+        two([{ type: 'text', value: 'A' }], [{ type: 'throw', value: refused('Gemini') }]);
+        cache.record429(idOf('A'));
+        const err: any = await run().catch((e) => e);
+        expect(err).toBeInstanceOf(ModelRefusedError);
+        expect(err.message).toBe('Gemini declined this request (category: cyber).');
+      });
+
+      it('completeText throws the first refusal itself when every model refuses, as streaming does', async () => {
+        const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+        db.update(aiModels).set({ tierId: low.id }).run();
+        scripts.A = [{ type: 'throw', value: refused('Claude') }];
+        scripts.B = [{ type: 'throw', value: refused('Gemini') }];
+        const err: any = await r.completeText({ prefix: 'a', suffix: 'b' }, { tier: 'Low', strict: true }).catch((e) => e);
+        expect(err).toBeInstanceOf(ModelRefusedError);
+        expect(err.message).toBe('Claude declined this request (category: cyber).');
+        expect(cache.getAll().size).toBe(0);
+      });
+
+      describe('within one run (refusedModels)', () => {
+        const ask = (opts: Record<string, unknown> = {}) =>
+          collectAsyncIterator(r.createStreamingRequest([{ role: 'user', content: 'x' }], 's', [], opts as any));
+
+        it('a model that refused is not tried again by later requests that share the set', async () => {
+          const factory = scripted(scripts);
+          r = new AiModelRouter(db as any, cache, { providerFactory: factory });
+          two([{ type: 'throw', value: refused() }], [{ type: 'text', value: 'from B' }]);
+          const refusedModels = new Set<number>();
+
+          await ask({ refusedModels });
+          await ask({ refusedModels });
+          // The second request never even builds a provider for A.
+          expect(factory.mock.calls.map((c) => c[1].model)).toEqual(['A', 'B', 'B']);
+          expect([...refusedModels]).toEqual([idOf('A')]);
+
+          // A request that does not share the set is a new run and tries A first again.
+          await ask();
+          expect(factory.mock.calls.map((c) => c[1].model)).toEqual(['A', 'B', 'B', 'A', 'B']);
+        });
+
+        it('the skipped model shows up in the fallback chain recorded with the request', async () => {
+          two([{ type: 'throw', value: refused() }], [{ type: 'text', value: 'from B' }, { type: 'usage', value: [5, 7] }]);
+          const refusedModels = new Set<number>([idOf('A')]);
+          const events = await ask({ refusedModels });
+          const usage = events.find((e: any) => e.type === 'usage') as any;
+          expect(usage.fallbacks).toEqual([{ model: 'A', error: 'declined an earlier request in this run' }]);
+        });
+
+        it('a refusal that ended the run does not poison the next one: only the shared set remembers it', async () => {
+          two([{ type: 'throw', value: refused() }], [{ type: 'throw', value: refused('Gemini') }]);
+          const refusedModels = new Set<number>();
+          await expect(ask({ refusedModels })).rejects.toBeInstanceOf(ModelRefusedError);
+          expect([...refusedModels].sort()).toEqual([idOf('A'), idOf('B')].sort());
+          scripts.A = [{ type: 'text', value: 'from A' }];
+          expect(await ask()).toEqual([{ type: 'text', text: 'from A' }]);
+        });
+
+        it('providerForTier gives each provider its own memory and serves the tier it was bound to', async () => {
+          const factory = scripted(scripts);
+          r = new AiModelRouter(db as any, cache, { providerFactory: factory });
+          two([{ type: 'throw', value: refused() }], [{ type: 'text', value: 'from B' }]);
+          const first = r.providerForTier('High');
+          await collectAsyncIterator(first.createStreamingRequest([{ role: 'user', content: 'x' }], 's', []));
+          await collectAsyncIterator(first.createStreamingRequest([{ role: 'user', content: 'x' }], 's', []));
+          expect(factory.mock.calls.map((c) => c[1].model)).toEqual(['A', 'B', 'B']);
+
+          const fresh = r.providerForTier('High');
+          await collectAsyncIterator(fresh.createStreamingRequest([{ role: 'user', content: 'x' }], 's', []));
+          expect(factory.mock.calls.map((c) => c[1].model)).toEqual(['A', 'B', 'B', 'A', 'B']);
+
+          // The tier it was bound to wins over a tier passed in the options.
+          const low = db.select().from(schema.aiTiers).all().find((t) => t.name === 'Low')!;
+          insertModel(db, { name: 'L', model: 'L', priority: 0, tierId: low.id, _providerId: defaultProviderId });
+          scripts.L = [{ type: 'text', value: 'from L' }];
+          const bound = r.providerForTier('Low');
+          expect(await collectAsyncIterator(bound.createStreamingRequest([{ role: 'user', content: 'x' }], 's', [], { tier: 'High' }))).toEqual([{ type: 'text', text: 'from L' }]);
+        });
+      });
     });
 
     it('a connection failure cools the model down and falls back', async () => {
