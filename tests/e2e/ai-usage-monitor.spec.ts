@@ -375,12 +375,9 @@ test.describe('AI usage monitor', () => {
       await expect(runsTable.getByTestId(`ai-usage-run-${run1.id}`).getByTestId('ai-usage-run-fallback')).toHaveCount(0);
 
       // The card is taller than the default viewport and the page scrolls inside its own container, so a
-      // taller window lets the whole card be captured without the fixed header and footer over it.
+      // taller window keeps the whole card, and the controls below, in view.
       await page.setViewportSize({ width: 1280, height: 2400 });
       await page.locator('#section-ai-usage').scrollIntoViewIfNeeded();
-      await page.locator('#section-ai-usage').screenshot({
-        path: '/tmp/claude-1000/-home-cube-projects-darkride/bb62fa7a-0e91-425b-b053-ddb5d3a88c31/scratchpad/usage-panel.png',
-      });
 
       // ── Switching the window to 7 days asks the server again and still shows the runs ──
       await panel.getByTestId('ai-usage-window').selectOption('7');
