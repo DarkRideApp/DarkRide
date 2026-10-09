@@ -136,6 +136,7 @@ import { checkBootstrap } from './auth/bootstrap';
 import { registerOAuthRoutes } from './api/oauth';
 import { registerOAuthGrantsRoutes } from './api/oauth-grants';
 import { ensureSystemUser } from './auth/system-user';
+import { resolveTierConfig } from './services/ai-tier-config';
 import { AiAgentFactory } from './services/ai-agent-factory';
 import { AiCallLogger } from './services/ai-call-logger';
 import { ServiceUserManager } from './auth/service-user-manager';
@@ -525,18 +526,14 @@ registerAiCompleteEndpoints(db, aiModelRouter);
 // Usage report over recorded agent runs (read-only).
 registerAiUsageEndpoints(db);
 
-// Router-based provider facade: delegates createStreamingRequest to the router.
-// When `tier` is provided, the facade injects it into every createStreamingRequest
-// call so the router picks models from the correct tier (not the default 'High').
+// Router-based provider for one run: delegates createStreamingRequest to the router.
+// When `tier` is provided, it is injected into every createStreamingRequest call so the
+// router picks models from the correct tier (not the default 'High'). Each call makes a
+// new provider, so a model that declines a request is skipped for the rest of that run only.
 function getAiProvider(tier?: string): AiStreamingProvider | null {
   const models = aiModelRouter.getEnabledModels();
   if (models.length === 0) return null;
-
-  return {
-    name: 'router',
-    createStreamingRequest: (messages, systemPrompt, tools, options) =>
-      aiModelRouter.createStreamingRequest(messages, systemPrompt, tools, { ...options, tier: tier ?? options?.tier }),
-  };
+  return aiModelRouter.providerForTier(tier);
 }
 
 function getAiAgent(options?: { tier?: string }): AiAgentInterface | null {
@@ -570,26 +567,7 @@ function getTierConfig(writeToolNames: string[]): TierConfig | null {
     .where(eq(settings.key, 'analysis_tier_research')).all()[0]?.value ?? 'Low';
   const writeTier = db.select().from(settings)
     .where(eq(settings.key, 'analysis_tier_write')).all()[0]?.value ?? 'High';
-
-  try {
-    const researchModels = aiModelRouter.getModelsForTier(researchTier);
-    const writeModels = aiModelRouter.getModelsForTier(writeTier);
-    if (researchModels.length === 0 || writeModels.length === 0) return null;
-
-    const researchModel = researchModels[0];
-    const writeModel = writeModels[0];
-
-    // TierConfig is not supported for claude-cli models (inherits prior behaviour).
-    if (aiModelRouter.isCliModel(researchModel) || aiModelRouter.isCliModel(writeModel)) return null;
-
-    return {
-      researchProvider: aiModelRouter.createProviderForModelId(researchModel.id),
-      writeProvider: aiModelRouter.createProviderForModelId(writeModel.id),
-      writeToolNames,
-    };
-  } catch {
-    return null;
-  }
+  return resolveTierConfig(aiModelRouter, { research: researchTier, write: writeTier }, writeToolNames);
 }
 
 const apkTracker = new ApkTracker(db, deviceManager);

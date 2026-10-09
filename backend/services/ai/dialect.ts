@@ -34,6 +34,12 @@ export interface AiStreamOptions {
   temperature?: number;
   effort?: 'low';
   cache?: boolean;
+  /**
+   * Ids of models that already declined a request in this run. The router skips them and adds any model that refuses.
+   * A refusal starts no cooldown, so without this a run whose context holds the refused content would ask the same model
+   * again on every turn. One set per run; leave it unset for a one-off request.
+   */
+  refusedModels?: Set<number>;
 }
 
 export interface DialectContext {

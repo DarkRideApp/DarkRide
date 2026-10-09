@@ -13,6 +13,7 @@ import {
 import { AiToolRegistry, type AiToolRegistration } from './ai-tools';
 import type { AiStreamingProvider } from './ai/dialect';
 import { createTestDb } from '../test-utils/create-test-db';
+import { ModelRefusedError, OverloadedError } from './ai/errors';
 import type {
   AiStreamEvent,
   AiMessage,
@@ -2279,6 +2280,72 @@ describe('AiAgent', () => {
       expect(onToolStart).toHaveBeenCalledWith(
         'w1', 'get_installed_apps', { filter: 'x' }, expect.any(Number), expect.any(Number),
       );
+    });
+
+    it('a write model that refuses is treated as declining to write: the research response is used, the run does not fail', async () => {
+      const registry = makeRegistry([
+        { name: 'write_notes', context: ['devices'], execute: async () => 'written' },
+      ]);
+      let researchCallCount = 0;
+      const researchProvider = makeMockProvider(() => {
+        researchCallCount++;
+        if (researchCallCount === 1) {
+          return (async function* () {
+            yield { type: 'tool_use' as const, id: 'w1', name: 'write_notes', input: { text: 'from cheap' } };
+            yield { type: 'usage' as const, inputTokens: 100, outputTokens: 50 };
+          })();
+        }
+        return (async function* () {
+          yield { type: 'text' as const, text: 'Done' };
+          yield { type: 'usage' as const, inputTokens: 80, outputTokens: 40 };
+        })();
+      });
+      // Every model of the write tier declines: the router has already tried them and throws the refusal.
+      const writeProvider = makeMockProvider(() => (async function* () {
+        throw new ModelRefusedError('Claude declined this request (category: cyber).', { provider: 'anthropic' });
+      })());
+
+      const onToolStart = vi.fn();
+      const agent = new AiAgent(db, registry, researchProvider);
+      const result = await agent.handleMessageWithIdentity(coreIdentity, {
+        conversationId: null,
+        message: 'Write',
+        pageContext: 'devices',
+        contextId: '',
+        onToken: vi.fn(),
+        onToolStart,
+        onToolResult: vi.fn(),
+        tierConfig: makeTierConfig({ researchProvider, writeProvider, writeToolNames: ['write_notes'] }),
+        mode: 'streaming',
+      });
+
+      expect(onToolStart.mock.calls.map((c: any[]) => c[1])).toContain('write_notes');
+      expect(result.error).toBeUndefined();
+    });
+
+    it('any other write-provider failure still fails the run rather than being masked by the research response', async () => {
+      const registry = makeRegistry([
+        { name: 'write_notes', context: ['devices'], execute: async () => 'written' },
+      ]);
+      const researchProvider = makeMockProvider(() => (async function* () {
+        yield { type: 'tool_use' as const, id: 'w1', name: 'write_notes', input: { text: 'x' } };
+        yield { type: 'usage' as const, inputTokens: 100, outputTokens: 50 };
+      })());
+      const writeProvider = makeMockProvider(() => (async function* () {
+        throw new OverloadedError('Anthropic stream error: busy');
+      })());
+      const agent = new AiAgent(db, registry, researchProvider);
+      await expect(agent.handleMessageWithIdentity(coreIdentity, {
+        conversationId: null,
+        message: 'Write',
+        pageContext: 'devices',
+        contextId: '',
+        onToken: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolResult: vi.fn(),
+        tierConfig: makeTierConfig({ researchProvider, writeProvider, writeToolNames: ['write_notes'] }),
+        mode: 'streaming',
+      })).rejects.toBeInstanceOf(OverloadedError);
     });
 
     it('escalates when the cheap model emits a write-class tool in TEXT format', async () => {

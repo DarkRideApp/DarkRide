@@ -196,10 +196,13 @@ describe('gemini', () => {
       expect(events).toMatchObject([{ type: 'tool_use', name: 'noargs', input: {} }]);
     });
 
-    it('ends without an error on a safety stop with no parts, and says why', async () => {
+    it('fails with a ModelRefusedError on a safety stop with no parts, and says why', async () => {
       stubFetch(() => sseResponse([chunk({ candidates: [{ finishReason: 'SAFETY' }] })]));
-      // Was a silent empty reply; every stop other than STOP and MAX_TOKENS now shows a message.
-      expect(await run()).toEqual([{ type: 'text', text: 'Gemini stopped this response (reason: SAFETY).' }]);
+      // Was a silent empty reply, then a visible message that ended the run as a success. A block with nothing
+      // produced is now an error with the same message, which the router falls back on.
+      const err: any = await run().catch((e) => e);
+      expect(err.name).toBe('ModelRefusedError');
+      expect(err.message).toBe('Gemini stopped this response (reason: SAFETY).');
     });
 
     it('rejects a stream that closes without a finishReason, and an empty one', async () => {

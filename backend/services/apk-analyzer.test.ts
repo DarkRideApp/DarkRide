@@ -53,6 +53,7 @@ vi.mock('../logs', () => ({
 
 import { ApkAnalyzerService } from './apk-analyzer';
 import { broadcastToAll } from '../websocket/index';
+import { getNote, patchNoteSection } from './apk-notes';
 import { createTestDb } from '../test-utils/create-test-db';
 
 function insertTrackedApp(db: BetterSQLite3Database<typeof schema>, packageName: string): number {
@@ -1015,6 +1016,80 @@ describe('ApkAnalyzerService', () => {
       // New API: no userId field, uses mode: 'silent' instead of unattended
       expect(callArg).toMatchObject({ mode: 'silent', pageContext: 'apk-analysis' });
       expect(callArg.userId).toBeUndefined();
+    });
+
+    describe('how an AI run ends is recorded on the page', () => {
+      const runWith = async (handleMessage: ReturnType<typeof vi.fn>) => {
+        const forUser = vi.fn().mockReturnValue({
+          identity: { identityType: 'user', actorUserId: 42, effectiveScopes: ['core.apk:read'] },
+          handleMessage,
+        });
+        service.setAiConfig(() => 'test prompt', () => true);
+        service.setAiFactory({ forUser, forCoreService: vi.fn() } as any);
+        (broadcastToAll as any).mockClear();
+        service.triggerAiAgentManual(versionId, 42);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        return (broadcastToAll as any).mock.calls.map((c: any) => c[0]).filter((m: any) => m.type === 'apk:ai-agent-update');
+      };
+
+      it('a run that completes without error is reported completed and leaves no failure note', async () => {
+        const updates = await runWith(vi.fn().mockResolvedValue({ usage: { inputTokens: 5, outputTokens: 7 }, conversationId: 1 }));
+        expect(updates.map((u: any) => u.status)).toEqual(['running', 'completed']);
+        expect(getNote(db, versionId)).toBe('');
+      });
+
+      it('a run that throws, such as one where every model refused, is recorded as failed with the reason on the page', async () => {
+        const updates = await runWith(vi.fn().mockRejectedValue(new Error('Claude declined this request (category: cyber).')));
+        expect(updates.map((u: any) => u.status)).toEqual(['running', 'failed']);
+        expect(updates[1].error).toBe('Claude declined this request (category: cyber).');
+        const note = getNote(db, versionId);
+        expect(note).toContain('## AI Analysis Failed');
+        expect(note).toContain('Claude declined this request (category: cyber).');
+      });
+
+      it('repeated failures leave one failure section holding the latest reason, not one per run', async () => {
+        await runWith(vi.fn().mockRejectedValue(new Error('first reason')));
+        await runWith(vi.fn().mockRejectedValue(new Error('second reason')));
+        const note = getNote(db, versionId);
+        expect(note.match(/## AI Analysis Failed/g)).toHaveLength(1);
+        expect(note).toContain('second reason');
+        expect(note).not.toContain('first reason');
+      });
+
+      it('a run that completes removes an earlier failure section and keeps the analysis', async () => {
+        patchNoteSection(db, versionId, 'Overview', 'kept');
+        await runWith(vi.fn().mockRejectedValue(new Error('first reason')));
+        expect(getNote(db, versionId)).toContain('## AI Analysis Failed');
+
+        (broadcastToAll as any).mockClear();
+        const forUser = vi.fn().mockReturnValue({
+          identity: { identityType: 'user', actorUserId: 42, effectiveScopes: ['core.apk:read'] },
+          handleMessage: vi.fn().mockResolvedValue({ usage: {}, conversationId: 1 }),
+        });
+        service.setAiFactory({ forUser, forCoreService: vi.fn() } as any);
+        service.triggerAiAgentManual(versionId, 42);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+        expect(getNote(db, versionId)).toBe('## Overview\nkept\n');
+        const broadcasts = (broadcastToAll as any).mock.calls.map((c: any) => c[0]);
+        expect(broadcasts.some((m: any) => m.type === 'apk:notes-updated' && m.notes === '## Overview\nkept\n')).toBe(true);
+      });
+
+      it('a run that returns an error instead of throwing (a turn timeout) is recorded as failed, not completed', async () => {
+        const updates = await runWith(vi.fn().mockResolvedValue({ usage: { inputTokens: 5, outputTokens: 0 }, conversationId: 1, error: 'AI response timed out after 2 minutes' }));
+        expect(updates.map((u: any) => u.status)).toEqual(['running', 'failed']);
+        expect(updates[1].error).toBe('AI response timed out after 2 minutes');
+        expect(getNote(db, versionId)).toContain('## AI Analysis Failed');
+        expect(getNote(db, versionId)).toContain('AI response timed out after 2 minutes');
+      });
+
+      it('a cancelled run is not recorded as a failure', async () => {
+        const updates = await runWith(vi.fn().mockResolvedValue({ usage: {}, conversationId: 1, error: 'Request was cancelled', aborted: true }));
+        expect(updates.map((u: any) => u.status)).toEqual(['running', 'completed']);
+        expect(getNote(db, versionId)).toBe('');
+      });
     });
 
     it('returns not-started when aiFactory is not set', () => {

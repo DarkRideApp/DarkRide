@@ -27,6 +27,12 @@ export class AuthError extends AiProviderError {}
  * put on cooldown.
  */
 export class PermissionDeniedError extends AiProviderError {}
+/**
+ * The model declined to answer: an Anthropic `refusal` stop (for example the cyber safeguard), a Gemini safety or prompt
+ * block, an OpenAI-style `content_filter`. It says something about this request and nothing about the model's health, so
+ * the router tries the next model but starts no cooldown. The message is what the user should read.
+ */
+export class ModelRefusedError extends AiProviderError {}
 export class ConnectionError extends AiProviderError {}
 export class OutputLimitError extends AiProviderError {}
 export class UnknownProviderError extends AiProviderError {}
@@ -57,6 +63,7 @@ export function isFallbackEligible(err: unknown): boolean {
     err instanceof OverloadedError ||
     err instanceof AuthError ||
     err instanceof PermissionDeniedError ||
+    err instanceof ModelRefusedError ||
     err instanceof ConnectionError
   );
 }

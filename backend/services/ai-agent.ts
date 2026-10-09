@@ -3,6 +3,7 @@ import type { AppDatabase } from '../db/index';
 import { aiConversations } from '../db/schema';
 import type { AiToolRegistry } from './ai-tools';
 import type { AiStreamingProvider } from './ai/dialect';
+import { ModelRefusedError } from './ai/errors';
 import { createLoggers } from '../logs';
 
 const { log, error: logError } = createLoggers('ai-agent');
@@ -831,9 +832,16 @@ export class AiAgent implements AiAgentInterface {
         writeBuffered.push(event);
       }
     } catch (writeErr: any) {
-      // Do not mask a write-provider stream failure with an earlier response.
-      logError(`Write provider escalation failed: ${writeErr.message} — falling back to research model`);
-      throw writeErr;
+      if (writeErr instanceof ModelRefusedError) {
+        // The write tier declined (the router already tried every model in it). That is the write model declining to
+        // write, which the code below handles by using the research response, not a failure to hide.
+        log(`Write tier declined the request: ${writeErr.message}`);
+        writeBuffered = [];
+      } else {
+        // Do not mask a write-provider stream failure with an earlier response.
+        logError(`Write provider escalation failed, failing the turn: ${writeErr.message}`);
+        throw writeErr;
+      }
     }
 
     // If write model didn't actually use a write tool, fall back to cheap model's response

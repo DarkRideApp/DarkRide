@@ -31,5 +31,10 @@ export interface PluginAgent {
     onBehalfOfPlugin?: string;
     actingForUserId?: number;
   };
+  /**
+   * Rejects when no model could serve the request, including when every model declined it
+   * (`ModelRefusedError`). A model that declines before producing anything is retried on the next model
+   * of the tier first. A refusal after the model started answering is part of the returned text, not a rejection.
+   */
   handleMessage(params: PluginAgentHandleMessageParams): Promise<PluginAgentHandleMessageResult>;
 }

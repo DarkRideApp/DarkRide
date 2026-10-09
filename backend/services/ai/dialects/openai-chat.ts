@@ -2,7 +2,7 @@
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
 import { OPENAI_QUOTA_CODES, OVERLOADED_CODES, OVERLOADED_STATUSES, RATE_LIMIT_CODES, parseSSEStream, safeText } from '../http';
-import { AiProviderError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
+import { AiProviderError, ModelRefusedError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiCompleteRequest, AiRequest, Dialect, DialectContext } from '../dialect';
 import { isPlainObject, toolInput } from '../tool-input';
 
@@ -178,8 +178,10 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
       if (cutOff(finish)) log(`${shortName} response was cut off by the output token limit`);
       // A filtered response would otherwise just stop, which reads like a finished (or empty) answer.
       if (finish === 'content_filter') {
-        sawContent = true;
-        yield { type: 'text', text: `${shortName} stopped this response (reason: ${safeText(finish, ctx)}).` };
+        const message = `${shortName} stopped this response (reason: ${safeText(finish, ctx)}).`;
+        // Nothing produced yet: an error the router can fall back on. Otherwise keep what arrived and add the message.
+        if (!sawContent) throw new ModelRefusedError(message, { provider: ctx.descriptor.id });
+        yield { type: 'text', text: message };
         if (signal?.aborted) return;
       }
     }
