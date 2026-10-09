@@ -40,8 +40,8 @@ import { Frida } from './pages/Frida';
 import { CloudBrowser } from './pages/CloudBrowser';
 import { ApiExplorer } from './pages/ApiExplorer';
 import { Jobs } from './pages/Jobs';
-import { PluginManager } from './pages/PluginManager';
-import { PluginMarketplace } from './pages/PluginMarketplace';
+import { PluginsWorkspace } from './pages/plugins/PluginsWorkspace';
+import { LegacyPluginsRedirect } from './pages/plugins/LegacyPluginsRedirect';
 import { ProfilePage } from './pages/ProfilePage';
 import { AdminUsersPage } from './pages/AdminUsersPage';
 import { McpSettings } from './pages/McpSettings';
@@ -278,7 +278,11 @@ function AuthenticatedApp() {
             <Route path="apps/:trackedAppId" element={<AppDetail />} />
             <Route path="apps/:trackedAppId/analysis/:versionId" element={<ApkAnalysis />} />
             <Route path="frida" element={<Frida />} />
-            <Route path="marketplace" element={<PluginMarketplace />} />
+            {/* Plugins: Installed + Discover in one workspace (same shape as Network
+                above). The old Marketplace and Settings > Plugins routes redirect in,
+                query string included, so existing links and docs keep working. */}
+            <Route path="plugins" element={<PluginsWorkspace />} />
+            <Route path="marketplace" element={<LegacyPluginsRedirect tab="discover" />} />
             <Route path="cloud" element={<CloudBrowser />} />
             <Route path="api-catalogue" element={<LegacyNetworkRedirect pane="catalogue" />} />
             <Route path="api-catalogue/groups/:groupId/explorer" element={<ApiExplorer />} />
@@ -291,12 +295,8 @@ function AuthenticatedApp() {
               <Route path="cloud-storage" element={<CloudStoragePage />} />
               <Route path="certificates" element={<CertificatesPage />} />
               <Route path="traffic" element={<TrafficSettingsPage />} />
-              <Route path="plugins" element={<PluginManager />} />
-              {/* Marketplace is now top-level at /ui/marketplace. Keep this
-                  inner route as a back-compat redirect so deep links / docs
-                  pointing at /ui/settings/plugins/marketplace land in the
-                  right place. */}
-              <Route path="plugins/marketplace" element={<Navigate to="/ui/marketplace" replace />} />
+              <Route path="plugins" element={<LegacyPluginsRedirect tab="installed" />} />
+              <Route path="plugins/marketplace" element={<LegacyPluginsRedirect tab="discover" />} />
               <Route path="proxies" element={<Proxies />} />
               <Route path="credentials" element={<Credentials />} />
               <Route path="jobs" element={<Jobs />} />
@@ -312,7 +312,7 @@ function AuthenticatedApp() {
                 />
               ))}
             </Route>
-            <Route path="settings/marketplace" element={<Navigate to="/ui/marketplace" replace />} />
+            <Route path="settings/marketplace" element={<LegacyPluginsRedirect tab="discover" />} />
             <Route path="settings/cloud" element={<Navigate to="/ui/settings/cloud-storage" replace />} />
             <Route path="oauth/consent" element={<ConsentPage />} />
             <Route path="profile" element={<ProfilePage />} />

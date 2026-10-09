@@ -3,7 +3,7 @@
  *
  * Verifies that the kitchen-sink plugin loads correctly, its nav item appears,
  * health checks complete (some may fail in a no-device environment), and the
- * plugin card appears on the installed-plugins settings page.
+ * plugin appears in the Installed tab of the Plugins workspace.
  *
  * Run: npx playwright test plugins/kitchen-sink/__tests__/e2e/kitchen-sink.spec.ts
  */
@@ -151,34 +151,19 @@ test.describe('Kitchen Sink plugin', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 5. Plugin appears in installed-plugins list on settings page
+  // 5. Plugin appears in the Installed tab of the Plugins workspace
   // ---------------------------------------------------------------------------
-  test('kitchen-sink plugin card appears in installed plugins', async ({ page }) => {
-    await page.goto('/ui/settings/plugins');
+  test('kitchen-sink plugin appears in installed plugins', async ({ page }) => {
+    await page.goto('/ui/plugins?tab=installed');
     await page.waitForLoadState('networkidle');
 
     // Wait for the plugin list to finish loading
-    await expect(
-      page.locator('.plugin-card, .plugin-empty').first(),
-    ).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId('plugins-workspace')).toHaveAttribute('aria-busy', 'false', { timeout: 15_000 });
 
-    // There should be at least one plugin card
-    const cards = page.locator('.plugin-card');
-    await expect(cards).not.toHaveCount(0, { timeout: 5_000 });
+    const row = page.locator('[data-testid="plugin-row"][data-plugin="kitchen-sink"]');
+    await expect(row).toBeVisible({ timeout: 10_000 });
 
-    // Find the kitchen-sink card specifically
-    const kitchenSinkCard = page.locator('.plugin-card').filter({
-      has: page.locator('.plugin-card-title h3', { hasText: 'kitchen-sink' }),
-    });
-
-    await expect(kitchenSinkCard).toBeVisible({ timeout: 10_000 });
-
-    // The card should show the plugin badge
-    await expect(kitchenSinkCard.locator('.plugin-card-badge')).toBeVisible();
-
-    // The card should have an enable/disable toggle
-    await expect(
-      kitchenSinkCard.locator('button', { hasText: /Enabled|Disabled/ }),
-    ).toBeVisible();
+    // The row has an enable switch
+    await expect(row.getByRole('switch')).toBeVisible();
   });
 });

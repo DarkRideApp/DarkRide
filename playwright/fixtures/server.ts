@@ -21,11 +21,12 @@ const PROJECT_ROOT = resolve(__dirname, '../..');
  * Each test gets its own dataDir + a free port. restart() SIGTERMs and
  * respawns with the same dataDir/port so DB and on-disk state persist.
  */
-export async function startServer(opts: { port?: number } = {}): Promise<TestServer> {
+export async function startServer(opts: { port?: number; env?: Record<string, string> } = {}): Promise<TestServer> {
   const port = opts.port ?? await pickPort();
   const dataDir = mkdtempSync(`${tmpdir()}/darkride-e2e-`);
   const dbPath = `${dataDir}/db.sqlite`;
-  let proc = await spawnAndWait(port, dataDir, dbPath);
+  const extraEnv = opts.env ?? {};
+  let proc = await spawnAndWait(port, dataDir, dbPath, extraEnv);
 
   return {
     baseUrl: `http://127.0.0.1:${port}`,
@@ -36,7 +37,7 @@ export async function startServer(opts: { port?: number } = {}): Promise<TestSer
       // Brief pause to let the OS release the port — SIGKILL exits instantly but
       // the kernel may not free the listen socket for a few ms.
       await new Promise(r => setTimeout(r, 500));
-      proc = await spawnAndWait(port, dataDir, dbPath);
+      proc = await spawnAndWait(port, dataDir, dbPath, extraEnv);
     },
     async stop() {
       await stopProc(proc);
@@ -45,7 +46,12 @@ export async function startServer(opts: { port?: number } = {}): Promise<TestSer
   };
 }
 
-async function spawnAndWait(port: number, dataDir: string, dbPath: string): Promise<ChildProcess> {
+async function spawnAndWait(
+  port: number,
+  dataDir: string,
+  dbPath: string,
+  extraEnv: Record<string, string> = {},
+): Promise<ChildProcess> {
   const proc = spawn('npx', ['tsx', 'backend/index.ts'], {
     cwd: PROJECT_ROOT,
     env: {
@@ -59,6 +65,7 @@ async function spawnAndWait(port: number, dataDir: string, dbPath: string): Prom
       // sets these — mirror so endpoints requiring scope checks pass).
       DARKRIDE_BOOTSTRAP_ADMIN_USERNAME: 'e2e-admin',
       DARKRIDE_BOOTSTRAP_ADMIN_PASSWORD: 'e2e-test-password-123',
+      ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     // detached: true so the process becomes a process group leader.
@@ -126,7 +133,8 @@ async function stopProc(proc: ChildProcess): Promise<void> {
   });
 }
 
-async function pickPort(): Promise<number> {
+/** Ask the OS for a free TCP port. */
+export async function pickPort(): Promise<number> {
   return new Promise<number>((resolveP, reject) => {
     const srv = net.createServer();
     srv.listen(0, () => {

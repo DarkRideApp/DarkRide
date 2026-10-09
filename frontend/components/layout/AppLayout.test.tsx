@@ -159,4 +159,52 @@ describe('AppLayout', () => {
     renderWithRouter('/ui/', { auth: mockAuth });
     expect(screen.getByText('Network', { selector: 'a *, a' })).toBeInTheDocument();
   });
+
+  describe('Plugins nav entry', () => {
+    const managerAuth: AuthState = { ...mockAuth, hasScope: () => true };
+
+    function wsWithUpdates(count: number): WebSocketContextValue {
+      const plugins = Array.from({ length: count }, (_, i) => ({ name: `p${i}`, updateAvailable: true }));
+      return {
+        ...mockWs,
+        sendRestApi: vi.fn().mockResolvedValue({
+          type: 'restapi', id: '1', status: 200,
+          body: { success: true, data: { plugins } },
+        }),
+      };
+    }
+
+    function renderWith(ws: WebSocketContextValue, auth: AuthState, entry = '/ui/') {
+      return render(
+        <AuthContext.Provider value={auth}>
+          <WebSocketContext.Provider value={ws}>
+            <MemoryRouter initialEntries={[entry]}>
+              <AppLayout />
+            </MemoryRouter>
+          </WebSocketContext.Provider>
+        </AuthContext.Provider>,
+      );
+    }
+
+    it('is one Plugins link to the workspace, with no separate Marketplace entry', () => {
+      renderWith(wsWithUpdates(0), managerAuth);
+      expect(screen.getByRole('link', { name: 'Plugins' })).toHaveAttribute('href', '/ui/plugins');
+      expect(screen.queryByRole('link', { name: /Marketplace/ })).toBeNull();
+    });
+
+    it('is hidden from a user without core.plugins:manage', () => {
+      renderWith(wsWithUpdates(0), mockAuth);
+      expect(screen.queryByRole('link', { name: /Plugins/ })).toBeNull();
+    });
+
+    it('carries the number of available updates', async () => {
+      renderWith(wsWithUpdates(2), managerAuth);
+      expect(await screen.findByLabelText('2 updates available')).toHaveTextContent('2');
+    });
+
+    it('is highlighted on the workspace', () => {
+      renderWith(wsWithUpdates(0), managerAuth, '/ui/plugins?tab=discover');
+      expect(screen.getByRole('link', { name: 'Plugins' })).toHaveClass('active');
+    });
+  });
 });
