@@ -3955,9 +3955,21 @@ Expected: FAIL — module doesn't exist.
 
 - [ ] **Step 7: Write `SidePanel`**
 
+**Correction made before this task was dispatched:** this task's own opening line promises the
+panel "mirrors `frontend/pages/plugins/PluginDrawer.tsx`'s role/structure (`role="dialog"`, a
+close button, focus management)" — but the draft below has no focus management at all: no
+move-focus-in on open, no restore-focus-on-close, no Escape-to-close. Given the explicit bar for
+this tool ("world-class leading, intuitive UI/UX"), a dialog panel without keyboard support isn't
+a nice-to-have gap, it's the promised behavior simply missing. Fixed by hoisting the dialog chrome
+(the `<aside role="dialog">`, the close button, and PluginDrawer's own two `useEffect`s verbatim —
+`frontend/pages/plugins/PluginDrawer.tsx:105-122`) into the outer `SidePanel`, so it exists exactly
+once rather than being duplicated (or omitted) per kind; each kind now renders only its own body
+content into that shared shell — which also reads cleaner against the "DRY without premature
+abstraction" review bar than three copies of the same dialog scaffolding would have:
+
 ```tsx
 // frontend/pages/ai-jobs/SidePanel.tsx
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { resolvePreview } from './templatePreview';
 
 interface SchemaField { field: string; type: string; description: string }
@@ -3969,22 +3981,44 @@ export function SidePanel({ node, triggerSchema, onClose, onSave }: {
   onClose: () => void;
   onSave: (nodeId: string, patch: Record<string, unknown>) => void;
 }) {
-  if (node.config.kind === 'AgentCall') {
-    return <AgentCallPanel node={node} triggerSchema={triggerSchema} onClose={onClose} onSave={onSave} />;
-  }
-  if (node.config.kind === 'Report') {
-    return <ReportPanel node={node} onClose={onClose} />;
-  }
+  const closeRef = useRef<HTMLButtonElement>(null);
+
+  // Move focus into the panel on open, hand it back to whatever opened it on close.
+  // Verbatim pattern from frontend/pages/plugins/PluginDrawer.tsx:105-113.
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    closeRef.current?.focus();
+    return () => {
+      if (opener && document.contains(opener)) opener.focus();
+    };
+  }, []);
+
+  // Escape closes the panel, unless a modal above it already took the key.
+  // Verbatim pattern from frontend/pages/plugins/PluginDrawer.tsx:116-122.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.defaultPrevented) onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   return (
     <aside role="dialog" aria-label={`${node.id} details`}>
-      <button onClick={onClose} aria-label="Close details">×</button>
-      <dl>{Object.entries(node.config).map(([k, v]) => <div key={k}><dt>{k}</dt><dd>{JSON.stringify(v)}</dd></div>)}</dl>
+      <button ref={closeRef} type="button" aria-label="Close details" onClick={onClose}>×</button>
+      {node.config.kind === 'AgentCall' ? (
+        <AgentCallBody node={node} triggerSchema={triggerSchema} onSave={onSave} />
+      ) : node.config.kind === 'Report' ? (
+        <ReportBody node={node} />
+      ) : (
+        <dl>{Object.entries(node.config).map(([k, v]) => <div key={k}><dt>{k}</dt><dd>{JSON.stringify(v)}</dd></div>)}</dl>
+      )}
     </aside>
   );
 }
 
-function AgentCallPanel({ node, triggerSchema, onClose, onSave }: {
-  node: NodeLike; triggerSchema: SchemaField[]; onClose: () => void; onSave: (nodeId: string, patch: Record<string, unknown>) => void;
+function AgentCallBody({ node, triggerSchema, onSave }: {
+  node: NodeLike; triggerSchema: SchemaField[]; onSave: (nodeId: string, patch: Record<string, unknown>) => void;
 }) {
   const [template, setTemplate] = useState<string>(node.config.instructionTemplate);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -4001,8 +4035,7 @@ function AgentCallPanel({ node, triggerSchema, onClose, onSave }: {
   }
 
   return (
-    <aside role="dialog" aria-label={`${node.id} details`}>
-      <button onClick={onClose} aria-label="Close details">×</button>
+    <>
       <textarea
         ref={taRef}
         value={template}
@@ -4012,24 +4045,26 @@ function AgentCallPanel({ node, triggerSchema, onClose, onSave }: {
         <button key={f.field} onClick={() => insertVar(f.field)}>+ trigger.{f.field}</button>
       ))}
       <div data-testid="prompt-preview">{resolvePreview(template, sampleScope)}</div>
-    </aside>
+    </>
   );
 }
 
-function ReportPanel({ node, onClose }: { node: NodeLike; onClose: () => void }) {
+function ReportBody({ node }: { node: NodeLike }) {
   const sections = node.config.sections as Array<{ title: string; from: string }>;
   return (
-    <aside role="dialog" aria-label={`${node.id} details`}>
-      <button onClick={onClose} aria-label="Close details">×</button>
-      <ol>
-        {sections.map((s, i) => (
-          <li key={s.from} data-testid="report-section-row">{i + 1}. {s.title} ← {s.from}</li>
-        ))}
-      </ol>
-    </aside>
+    <ol>
+      {sections.map((s, i) => (
+        <li key={s.from} data-testid="report-section-row">{i + 1}. {s.title} ← {s.from}</li>
+      ))}
+    </ol>
   );
 }
 ```
+
+Add one more case to the Step 5 test file alongside the existing three: closing via the Escape key
+calls `onClose` (`fireEvent.keyDown(document, { key: 'Escape' })`), matching the equivalent
+coverage `PluginDrawer.test.tsx` already has for its own Escape handling — grep that file for its
+Escape test and mirror its shape.
 
 - [ ] **Step 8: Run test to verify it passes**
 
