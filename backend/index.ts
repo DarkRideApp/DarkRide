@@ -105,6 +105,7 @@ import { JobRegistry } from './services/job-registry';
 import { registerJobEndpoints } from './api/jobs';
 import { registerAiPipelineEndpoints } from './api/ai-pipelines';
 import { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, seedApkAnalysisPipeline } from './services/ai-jobs/apk-analysis-pipeline';
+import { isPipelinesEnabled, resetRunningPipelineRuns } from './services/ai-jobs/run-executor';
 import { PluginManager } from './plugins/plugin-manager';
 import { computeLoadOrder } from './plugins/load-order';
 import { discoverPlugins, discoverNpmPlugins, applyPluginFilter } from './plugins/discover';
@@ -607,10 +608,7 @@ apkAnalyzer.setAiConfig(
 // Note: apkAnalyzer.setAiFactory(aiFactory) is called after aiFactory is constructed below.
 
 // Gate for the new pipeline-engine path (Task 21). Defaults to false — opt in deliberately.
-apkAnalyzer.setPipelinesEnabled(() => {
-  const row = db.select().from(settings).where(eq(settings.key, 'ai_pipelines_enabled')).all()[0];
-  return row?.value === 'true';
-});
+apkAnalyzer.setPipelinesEnabled(() => isPipelinesEnabled(db));
 
 // Wire up APK diff engine
 const apkDiffEngine = new ApkDiffEngine(db);
@@ -833,6 +831,8 @@ registerAiPipelineEndpoints({
   db,
   executors: buildApkAnalysisExecutors(),
   buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }),
+  // Same flag as apkAnalyzer.setPipelinesEnabled above: with it off, /run answers 403.
+  getPipelinesEnabled: (db) => isPipelinesEnabled(db),
 });
 
 // Wire notification service to broadcast events not handled by direct service hooks
@@ -1411,6 +1411,10 @@ httpServer.listen(PORT, HOST, () => {
     log('APK tracker skipped (job disabled)');
   }
   apkAnalyzer.resetRunningJobs();
+  // Same idea for pipeline runs: a restart mid-run would otherwise leave the row 'running' and
+  // 409 every later run of that pipeline version forever. Before apkAnalyzer.start(), so a run
+  // it kicks off on boot can never be caught by this reset.
+  resetRunningPipelineRuns(db);
   apkAnalyzer.start();
   // Seed the Astérix pattern pipeline + its published version — idempotent, safe on every boot.
   seedApkAnalysisPipeline(db);

@@ -109,9 +109,10 @@ function createApp(
   executors: NodeExecutors,
   scopes: string[] = ['core.apk:read', 'core.apk:manage'],
   buildCtx: AiPipelineDeps['buildCtx'] = (_identity, _input): ExecutionCtx => ({}),
+  getPipelinesEnabled?: AiPipelineDeps['getPipelinesEnabled'],
 ) {
   clearEndpoints();
-  const deps: AiPipelineDeps = { db, executors, buildCtx };
+  const deps: AiPipelineDeps = { db, executors, buildCtx, ...(getPipelinesEnabled ? { getPipelinesEnabled } : {}) };
   registerAiPipelineEndpoints(deps);
   const app = express();
   app.use(express.json());
@@ -121,6 +122,16 @@ function createApp(
   });
   app.use(getApiRouter());
   return app;
+}
+
+/** /run now answers as soon as the run is recorded; poll the run-detail endpoint until it settles. */
+async function waitForRunToSettle(app: express.Express, runId: number): Promise<any> {
+  for (let i = 0; i < 50; i++) {
+    const res = await request(app).get(`/v1/ai-pipelines/runs/${runId}`);
+    if (res.body.data?.run && res.body.data.run.status !== 'running') return res.body.data;
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  throw new Error(`run ${runId} never settled`);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────
@@ -269,6 +280,8 @@ describe('POST /v1/ai-pipelines/:id/run — concurrency guard', () => {
 
     expect(res.status).toBe(200);
     const runId = res.body.data.runId;
+    // The POST resolves as soon as the run is recorded — node-run rows land when it settles.
+    await waitForRunToSettle(app, runId);
     const nodeRuns = db.select().from(schema.aiPipelineNodeRuns).where(eq(schema.aiPipelineNodeRuns.runId, runId)).all();
     const agentNodeRun = nodeRuns.find(n => n.nodeId === 'agent');
     expect(agentNodeRun).toBeDefined();
@@ -276,9 +289,10 @@ describe('POST /v1/ai-pipelines/:id/run — concurrency guard', () => {
   });
 
   it('marks a crashed run "failed" instead of leaving it stuck "running" forever, so the next run is not permanently 409d', async () => {
-    // Regression guard: nothing between inserting the 'running' row and finalizing it was
-    // wrapped in try/catch, so a throw from buildCtx (or runPipeline, or a node-run insert)
-    // left the row 'running' forever — every later /run for this version 409d permanently.
+    // Regression guard: a throw from buildCtx (or runPipeline, or a node-run insert) used to leave
+    // the row 'running' forever — every later /run for this version 409d permanently. Since the
+    // final-review fix, /run responds 200 with a runId as soon as the row exists (it no longer
+    // waits for the run), so the crash shows up on the run row, not the HTTP status.
     let shouldThrow = true;
     const buildCtx: AiPipelineDeps['buildCtx'] = (_identity, _input) => {
       if (shouldThrow) { shouldThrow = false; throw new Error('buildCtx boom'); }
@@ -288,14 +302,103 @@ describe('POST /v1/ai-pipelines/:id/run — concurrency guard', () => {
     const app = createApp(db, executors, ['core.apk:read', 'core.apk:manage'], buildCtx);
 
     const crashRes = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
-    expect(crashRes.status).toBe(500);
+    expect(crashRes.status).toBe(200);
+    expect(crashRes.body.data).toEqual({ runId: expect.any(Number), status: 'running' });
 
-    const runs = db.select().from(schema.aiPipelineRuns).all();
-    expect(runs.length).toBe(1);
-    expect(runs[0].status).toBe('failed');
+    const settled = await waitForRunToSettle(app, crashRes.body.data.runId);
+    expect(settled.run.status).toBe('failed');
+    expect(executors.Trigger).not.toHaveBeenCalled();
+    expect(db.select().from(schema.aiPipelineRuns).all()).toHaveLength(1);
 
     const retryRes = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
     expect(retryRes.status).toBe(200);
+    const retried = await waitForRunToSettle(app, retryRes.body.data.runId);
+    expect(retried.run.status).toBe('ok');
+  });
+
+  it('responds before the pipeline finishes — a slow run does not hold the HTTP response open', async () => {
+    // C1 regression guard: /run used to await the whole pipeline before responding, so any real
+    // multi-AgentCall run outlived the client's 30s REST timeout.
+    let releaseAgent!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseAgent = resolve; });
+    const executors = fakeExecutors({ AgentCall: vi.fn(async () => { await gate; return { text: 'slow' }; }) });
+    const app = createApp(db, executors);
+
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: { versionId: 3 } });
+    expect(res.status).toBe(200);
+    expect(res.body.data.status).toBe('running');
+    const runId = res.body.data.runId;
+
+    const midRun = await request(app).get(`/v1/ai-pipelines/runs/${runId}`);
+    expect(midRun.body.data.run.status).toBe('running');
+    expect(midRun.body.data.run.input).toEqual({ versionId: 3 });
+
+    // A second run against the same version while this one is in flight is still refused.
+    const concurrent = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
+    expect(concurrent.status).toBe(409);
+
+    releaseAgent();
+    const settled = await waitForRunToSettle(app, runId);
+    expect(settled.run.status).toBe('ok');
+    expect(settled.nodes.find((n: any) => n.nodeId === 'agent').output).toEqual({ text: 'slow' });
+  });
+});
+
+describe('POST /v1/ai-pipelines/:id/run — ai_pipelines_enabled gate', () => {
+  let db: Db;
+  let pipelineId: number;
+
+  beforeEach(() => {
+    db = makeDb();
+    pipelineId = seedPipeline(db);
+    seedVersion(db, pipelineId, 1, graphWithOneTrigger(), 'published');
+  });
+
+  it('returns 403 and never runs anything when getPipelinesEnabled returns false', async () => {
+    const executors = fakeExecutors();
+    const getPipelinesEnabled = vi.fn(() => false);
+    const app = createApp(db, executors, undefined, undefined, getPipelinesEnabled);
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/disabled/i);
+    expect(getPipelinesEnabled).toHaveBeenCalledWith(db);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(executors.Trigger).not.toHaveBeenCalled();
+    expect(db.select().from(schema.aiPipelineRuns).all()).toHaveLength(0);
+  });
+
+  it('runs when getPipelinesEnabled returns true', async () => {
+    const executors = fakeExecutors();
+    const app = createApp(db, executors, undefined, undefined, () => true);
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
+
+    expect(res.status).toBe(200);
+    await waitForRunToSettle(app, res.body.data.runId);
+    expect(executors.Trigger).toHaveBeenCalled();
+  });
+
+  it('defaults to enabled when getPipelinesEnabled is omitted', async () => {
+    const executors = fakeExecutors();
+    const app = createApp(db, executors);
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
+
+    expect(res.status).toBe(200);
+    await waitForRunToSettle(app, res.body.data.runId);
+    expect(executors.Trigger).toHaveBeenCalled();
+  });
+});
+
+describe('POST /v1/ai-pipelines/:id/run — identity', () => {
+  it('runs as the authenticated user (buildCtx receives a user identity)', async () => {
+    const db = makeDb();
+    const pipelineId = seedPipeline(db);
+    seedVersion(db, pipelineId, 1, graphWithOneTrigger(), 'published');
+    const buildCtx = vi.fn((): ExecutionCtx => ({}));
+    const app = createApp(db, fakeExecutors(), undefined, buildCtx);
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: { versionId: 4 } });
+    await waitForRunToSettle(app, res.body.data.runId);
+    expect(buildCtx).toHaveBeenCalledWith({ type: 'user', userId: 1 }, { versionId: 4 });
   });
 });
 
