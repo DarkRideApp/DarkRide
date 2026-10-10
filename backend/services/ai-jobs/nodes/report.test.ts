@@ -27,6 +27,18 @@ describe('runReport', () => {
     expect(result.markdown).toContain('A React Native app.');
   });
 
+  it('also returns the per-section breakdown, in declared order, with placeholders for unavailable sources', () => {
+    const result = runReport(config, {
+      'agent-overview': { status: 'ok', output: { text: 'A React Native app.\n' } },
+      'agent-wait-times': { status: 'failed', error: 'boom' },
+    });
+    expect(result.sections).toEqual([
+      { title: 'Overview', body: 'A React Native app.' },
+      { title: 'Wait Times', body: '— Wait Times unavailable this run. Its source node did not complete.' },
+      { title: 'Bypass Script', body: '— Bypass Script unavailable this run. Its source node did not complete.' },
+    ]);
+  });
+
   it('substitutes an explicit placeholder for a failed section, never throws, never silently omits it', () => {
     const envelopes: Record<string, Envelope<{ text: string }>> = {
       'agent-overview': { status: 'ok', output: { text: 'A React Native app.' } },
@@ -68,7 +80,7 @@ describe('runReport', () => {
       'agent-wait-times': { status: 'ok', output: { chosenEdge: 'primary' } as any },
       'agent-bypass': { status: 'ok', output: { text: 'Frida script here.' } },
     };
-    let result: { markdown: string } | undefined;
+    let result: { markdown: string; sections: Array<{ title: string; body: string }> } | undefined;
     expect(() => {
       result = runReport(config, envelopes);
     }).not.toThrow();

@@ -1,6 +1,6 @@
 import type { SinkConfig } from '../types';
 import type { AppDatabase } from '../../../db/index';
-import { patchNoteSection, setNote } from '../../apk-notes';
+import { patchNoteSection } from '../../apk-notes';
 
 export interface SinkCtx {
   db: AppDatabase;
@@ -26,9 +26,18 @@ export async function runSink(config: SinkConfig, input: Record<string, unknown>
   await fn(config, input, ctx);
 }
 
+// Patches each Report section in place rather than overwriting the whole note. Found in the final
+// review: the old setNote() overwrite wiped everything else in the note, including the Quick
+// Rescan zone's own "Diff Summary" section and anything an analyst wrote by hand, so the two
+// zones of the same pipeline undid each other. A source with no sections writes nothing.
 registerSink('apk-analysis/write-full-document', async (config, input, ctx) => {
-  const source = config.from ? (input[config.from] as { markdown?: string } | undefined) : undefined;
-  setNote(ctx.db, ctx.versionId, source?.markdown ?? '');
+  const source = config.from
+    ? (input[config.from] as { markdown?: string; sections?: Array<{ title: string; body: string }> } | undefined)
+    : undefined;
+  if (!source?.sections) return;
+  for (const section of source.sections) {
+    patchNoteSection(ctx.db, ctx.versionId, section.title, section.body);
+  }
 });
 
 registerSink('apk-analysis/write-section', async (config, input, ctx) => {
