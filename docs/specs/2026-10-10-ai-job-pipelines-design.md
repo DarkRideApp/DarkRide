@@ -1,7 +1,7 @@
 # AI job pipelines: design
 
 Date: 2026-10-10
-Status: **Decided (Approach A), not yet built.** Scope, approach and first migration target were chosen by Cube; node contracts, data model and rollout were settled during design. Revised 2026-10-10 after an adversarial review (background agent) found a load-bearing contradiction and several understated claims — see the end of this doc for what changed and why.
+Status: **Decided (Approach A), not yet built.** Scope, approach and first migration target were chosen by Cube; node contracts, data model and rollout were settled during design. Revised 2026-10-10 twice: after an adversarial review found a load-bearing contradiction, then again after Cube's multi-trigger and memoization questions surfaced two more real gaps — see the end of this doc for what changed and why, in order.
 
 ## The problem
 
@@ -38,7 +38,7 @@ Three layers:
 
 | Kind | Does | Notes |
 |---|---|---|
-| `Trigger` | Entry point, declares and expands the run's input | Pluggable per job family, same as `Sink`. For `apk-analysis`: takes `{ versionId }` (what `job-registry`/the APK-analysis-complete hook actually has), expands it into an `ApkContext` struct (`appName`, `packageName`, `versionName`, `versionCode`, `fileSizeBytes`, `downloadedAt`, `source`, …) using the same data `get_apk_overview`/`get_app_versions` already expose. Exactly one `Trigger` per pipeline version, zero incoming edges, always the graph's root — the executor rejects a graph with zero or more than one. |
+| `Trigger` | Entry point, declares and expands the run's input | Pluggable per job family, same as `Sink`. For `apk-analysis`: takes `{ versionId }` (what `job-registry`/the APK-analysis-complete hook actually has), expands it into an `ApkContext` struct (`appName`, `packageName`, `versionName`, `versionCode`, `fileSizeBytes`, `downloadedAt`, `source`, …) using the same data `get_apk_overview`/`get_app_versions` already expose. **One or more `Trigger` nodes per pipeline version** — each is an independent root (zero incoming edges). Every `Trigger` in a pipeline must declare the **same output schema**, so a downstream `{{trigger.field}}` template never needs to know which entry point fired. Each node in the graph must be reachable from exactly **one** `Trigger` — triggers partition the graph into disjoint zones; the executor rejects a graph where a node is reachable from more than one (see Executor semantics — this is what keeps multi-trigger from reopening the AND-join ambiguity). A run fires exactly one `Trigger`; nodes outside its reachable zone are `inactive` for that run, not `skipped`. |
 | `AgentCall` | Runs one scoped, **read-only** agent turn-loop | `{ tier, instructionTemplate, toolAllowlist }`. Never holds a write-class tool (see Executor semantics — `Sink` owns writing). Scoped tools + scoped instruction text is the actual fix for problem 1: a `Secrets` node only ever carries the secrets instruction, an `Overview` node only ever carries the default prompt. No single model call bundles unrelated trigger instructions, so one node's refusal can't touch another's quality. |
 | `Transform` | Deterministic reshape/merge | A named, pre-registered pure TS function, picked by name in the graph — not freeform code stored in the DB. E.g. `mergeNotesSections`, `dedupeFindings`. This is the deterministic half of every job: the LLM nodes produce raw material, `Transform` nodes make it consistent. |
 | `Branch` | Picks an outgoing edge | Predicate over the upstream node's output and/or run status (e.g. `status !== 'ok'` → the fallback edge). To actually catch a failure, a `Branch` must be wired as the **immediate** child of the node it's watching — see Executor semantics. |
@@ -63,7 +63,7 @@ New tables in `backend/db/schema.ts` (Drizzle, sqlite, matching existing convent
 
 ```ts
 type PipelineGraph = { nodes: PipelineNode[]; edges: PipelineEdge[] };
-type NodeRunStatus = 'ok' | 'failed' | 'skipped';
+type NodeRunStatus = 'ok' | 'failed' | 'skipped' | 'inactive'; // inactive: outside the fired Trigger's reachable zone
 type RunStatus = 'running' | 'ok' | 'failed' | 'partial';
 
 export const aiPipelines = sqliteTable('ai_pipelines', {
@@ -87,9 +87,11 @@ export const aiPipelineVersions = sqliteTable('ai_pipeline_versions', {
 export const aiPipelineRuns = sqliteTable('ai_pipeline_runs', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   pipelineVersionId: integer('pipeline_version_id').notNull().references(() => aiPipelineVersions.id, { onDelete: 'cascade' }),
+  triggerNodeId: text('trigger_node_id').notNull(), // which Trigger node (graph node id) fired this run
   triggeredBy: text('triggered_by').notNull(), // 'job-registry' | 'manual' | 'apk-analysis-complete'
-  input: text('input', { mode: 'json' }).$type<Record<string, unknown>>(), // raw input the Trigger node expands, e.g. { versionId }
-  status: text('status', { enum: ['running', 'ok', 'failed', 'partial'] }).notNull().default('running'),
+  input: text('input', { mode: 'json' }).$type<Record<string, unknown>>(), // raw input the fired Trigger expands, e.g. { versionId }
+  reuseUnchanged: integer('reuse_unchanged', { mode: 'boolean' }).notNull().default(false), // memoization opt-in for this run
+  status: text('status', { enum: ['running', 'ok', 'failed', 'partial'] }).notNull().default('running'), // rolled up over active-zone nodes only — inactive nodes don't count
   startedAt: integer('started_at', { mode: 'timestamp' }).notNull(),
   finishedAt: integer('finished_at', { mode: 'timestamp' }),
 });
@@ -98,8 +100,10 @@ export const aiPipelineNodeRuns = sqliteTable('ai_pipeline_node_runs', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   runId: integer('run_id').notNull().references(() => aiPipelineRuns.id, { onDelete: 'cascade' }),
   nodeId: text('node_id').notNull(), // node id within the graph, not a row id
-  status: text('status', { enum: ['ok', 'failed', 'skipped'] }).notNull(),
+  status: text('status', { enum: ['ok', 'failed', 'skipped', 'inactive'] }).notNull(),
   input: text('input', { mode: 'json' }).$type<Record<string, unknown>>(),
+  inputHash: text('input_hash'), // sha256 of resolved input; memoization cache key is (nodeId, pipelineVersionId, inputHash)
+  wasMemoized: integer('was_memoized', { mode: 'boolean' }).notNull().default(false), // output reused from a prior run, not freshly computed
   output: text('output', { mode: 'json' }).$type<Record<string, unknown>>(),
   error: text('error'),
   modelUsed: text('model_used'), // null for Trigger/Transform/Branch/ForEach/Sink — only AgentCall calls a model
@@ -116,14 +120,27 @@ Per-node run records are what let the editor show pass/fail/output per node afte
 
 ## Executor semantics
 
+- **A run fires exactly one `Trigger`.** Before anything else, the executor computes that `Trigger`'s reachable zone (every node reachable from it by following edges forward) and marks every node *outside* that zone `inactive` — not `skipped`, not counted toward `ok`/`partial`/`failed` rollup, just "not part of this run." Because the graph validator already guarantees every node is reachable from exactly one `Trigger` (see Node primitives), this is an unambiguous partition, not a fuzzy "mostly reachable" judgment call.
 - Topological order; nodes with no unmet dependency run concurrently (the four benign `AgentCall` nodes in the Astérix pipeline run in parallel, same as the three trigger-instruction nodes).
 - A node that fails (its tier's fallback chain exhausted, or a `Sink` write throwing) is marked `failed` in its node-run record. The executor does **not** abort the run. Its direct downstream nodes are marked `skipped`.
 - **Skip propagates transitively**, same as failure: a `skipped` node's own downstream is also `skipped`, not run with absent input. A node with two or more incoming edges runs only if *every* edge resolved `ok` (strict AND-join) — the only join policy the Astérix graph needs, since nothing in it has more than one incoming edge; a job that needs an OR-join is future work, not assumed here.
 - **`Branch` is the one kind exempt from the default skip rule** — it always runs once its predecessors settle (`ok`, `failed`, or `skipped`), receiving an envelope describing the outcome, not just a value. This only works if the `Branch` is wired as the **immediate** child of the node it's meant to catch: skip propagation marks everything between a failure and a non-adjacent `Branch` as `skipped` before the `Branch` ever evaluates, same as any other node, so a fallback edge that isn't a direct child never fires. Document this on the node when building a pipeline that uses `Branch` for failure handling.
 - **`ForEach` failure is data, not an executor-level status.** A `ForEach` node runs its per-item subgraph via `Promise.allSettled`; per-item outcomes (`ok`/`failed` + error) live *inside* its output array. The `ForEach` node itself reports `ok` as long as it didn't throw outright (e.g. its input list was malformed) — it does not go `failed` just because some items did. Downstream nodes (typically a `Transform`) decide what a partial item-failure rate means for the job; the generic executor stays domain-agnostic rather than guessing a threshold.
-- Run status is `ok` (every node `ok`), `partial` (some `failed`/`skipped`, at least one `ok`), or `failed` (nothing produced). `partial` is an expected, visible outcome — not a bug — for a run where, say, the Bypass node declines but Overview/Wait Times/Maps all land. This is the direct fix for "one write-model decline wipes the whole notes doc."
+- Run status is `ok` (every **active-zone** node `ok`), `partial` (some `failed`/`skipped` in the active zone, at least one `ok`), or `failed` (nothing in the active zone produced). `inactive` nodes never factor in — a "Quick Rescan" run reports against its own 2-node zone, not "1/15 nodes ok" because the other 13 were never in scope. `partial` is an expected, visible outcome — not a bug — for a run where, say, the Bypass node declines but Overview/Wait Times/Maps all land. This is the direct fix for "one write-model decline wipes the whole notes doc."
 - Each `AgentCall` node calls `resolveTierConfig`/`ai-model-router` independently through `BoundAgent.handleMessage`, with its own fresh `refusedModels` set scoped to that one node's turn-loop — one tier, no research/write pair (see Architecture: `Sink` owns writing, so there is nothing to escalate to a second model). Nodes do not share refusal memory with each other: `Bypass Script` failing over to Sonnet 5 tells the executor nothing about whether `Overview` should also skip Opus. Call logging and usage reporting (`ai-call-logger.ts`, `ai-usage-report.ts`) are untouched; they already key off individual requests.
 - **Concurrent `Sink` writes to the same notes doc rely on an existing, previously-undocumented invariant.** `patchNoteSection` (`apk-notes.ts`) does a synchronous read-splice-write with no `await` between the read and the write, so same-tick concurrent `Sink` calls happen to serialize correctly today — not because anything here guarantees it. Flagging it as load-bearing: a gate test must assert four concurrent `Sink` writes to four different sections of the same run all land (no lost update), and if `apk-notes.ts`'s storage ever goes async, that test is what catches the regression before a notes doc silently loses a section again.
+
+## Memoization (opt-in, per run)
+
+Added per Cube's feedback — a real gap, not in the first draft at all.
+
+- **Off by default.** A run is always fresh unless the caller passes `reuseUnchanged: true` (the manual-run form in the editor exposes this as a checkbox next to Run). No surprise staleness: forgetting the flag just means normal behavior.
+- **Cache key**: `(nodeId, pipelineVersionId, inputHash)` — `inputHash` is a stable hash of the node's fully *resolved* input (for `AgentCall`, that's the resolved instruction text, tool allowlist and tier together, not the template string). Scoped to one pipeline version deliberately: editing the graph publishes a new version, and cross-version cache reuse is not attempted in v1 — simpler, and avoids a stale cache surviving a structural change to the node it's attached to.
+- **Lookup**: before executing a node, the executor checks for the most recent prior run of the same pipeline version with a node-run row for this `nodeId` whose `inputHash` matches and whose `status` was `ok`. A hit sets `wasMemoized: true` and reuses that row's `output` instead of calling `handleMessage`/the `Sink` function again.
+- **`AgentCall` memoization is a cost/speed tradeoff, not a correctness guarantee.** Reusing a prior answer for unchanged input is not the same claim a build-system cache makes ("identical input *guarantees* identical output") — an LLM given the same prompt twice is not guaranteed to answer identically. This is a deliberate "accept the last answer instead of paying for a new one," and the editor labels a memoized node `CACHED`, visually distinct from a freshly-produced `OK`, so it's never ambiguous which guarantee applies to what you're looking at.
+- **`Sink` memoization is safe for a different reason**: its writes are idempotent (`patch_analysis_section` replaces a section wholesale), so skipping a write whose input is byte-identical to the write that already landed changes nothing about the resulting notes doc.
+- **`Trigger` is never memoized.** It's cheap (a DB/file lookup, not a model call) and its entire job is reading current external state — memoizing the one node whose point is "what does the world look like right now" would defeat it.
+- This is the actual mechanism for "I only changed the Bypass Script prompt, don't re-run everything" — not a second `Trigger`. A second `Trigger` is for a genuinely different, non-overlapping scope (see below); memoization is for cheaply re-running the *same* scope after a small edit.
 
 ## The Astérix pipeline (worked example)
 
@@ -131,20 +148,27 @@ Per-node run records are what let the editor show pass/fail/output per node afte
                   ┌─ Overview ──────┐
                   ├─ Wait Times ─────┤→ Sink(patch_analysis_section) × 4, in parallel
 Trigger ──┬───────┤ Opening Hours ──┤
-(ApkContext)      └─ Maps ───────────┘
+"Full Analysis"   └─ Maps ───────────┘
+(ApkContext)
           │
           └───────┌─ Secrets ────────┐
                    ├─ Curl Examples ──┤→ Sink(patch_analysis_section) × 3, in parallel
                    └─ Bypass Script ──┘
+
+Trigger ──────── AgentCall(Diff Summary) ──→ Sink(patch_analysis_section)
+"Quick Rescan"
+(ApkContext, same schema as "Full Analysis")
 ```
 
-`Trigger` takes `{ versionId: 431 }` from the APK-analysis-complete hook and expands it into the `ApkContext` struct (`appName: "Parc Astérix"`, `packageName: "fr.parcasterix.appli.android"`, `versionName: "6.10.1"`, …), available to all seven `AgentCall` nodes via `{{trigger.*}}`. `Overview`'s `instructionTemplate` opens with something like `Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}.` instead of a static string — the same instruction text every version's Overview node gets, but now driven by real data instead of being re-typed per app.
+`Trigger` ("Full Analysis") takes `{ versionId: 431 }` from the APK-analysis-complete hook and expands it into the `ApkContext` struct (`appName: "Parc Astérix"`, `packageName: "fr.parcasterix.appli.android"`, `versionName: "6.10.1"`, …), available to all seven `AgentCall` nodes in its zone via `{{trigger.*}}`. `Overview`'s `instructionTemplate` opens with something like `Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}.` instead of a static string — the same instruction text every version's Overview node gets, but now driven by real data instead of being re-typed per app.
 
-All seven `AgentCall` nodes are High tier. The first four carry the default instruction only. The last three each carry exactly one of the custom rules — expected, going in, to fall back from Opus to Sonnet 5 on every run (that's the known, accepted behavior, not a bug to chase). A decline on `Bypass Script`'s `AgentCall` now produces a `partial` run with six sections written, that one `Sink` skipped (never invoked — its upstream `AgentCall` is the one marked `failed`), and both red in the editor — not a one-paragraph stub standing in for the whole analysis.
+The second `Trigger`, "Quick Rescan," is a disjoint zone of its own — one `AgentCall` that only checks what changed since the last analyzed version, one `Sink`. It declares the identical `ApkContext` output schema as "Full Analysis" (the adopted constraint), so its one `AgentCall`'s template can also use `{{trigger.versionName}}` with no special-casing — but it shares no nodes and no edges with the seven-node zone above it. Firing it marks all seven `Full Analysis`-zone `AgentCall`/`Sink` pairs `inactive` for that run; firing `Full Analysis` marks `Diff Summary` and its `Sink` `inactive`. Neither run's status rollup counts the other zone's nodes.
+
+All seven `Full Analysis` `AgentCall` nodes are High tier. The first four carry the default instruction only. The last three each carry exactly one of the custom rules — expected, going in, to fall back from Opus to Sonnet 5 on every run (that's the known, accepted behavior, not a bug to chase). A decline on `Bypass Script`'s `AgentCall` now produces a `partial` run with six sections written, that one `Sink` skipped (never invoked — its upstream `AgentCall` is the one marked `failed`), and both red in the editor — not a one-paragraph stub standing in for the whole analysis. Re-running with `reuseUnchanged: true` after only editing `Bypass Script`'s template reuses the other six `AgentCall`/`Sink` pairs as `CACHED` and only re-executes `Bypass Script` and its `Sink` fresh.
 
 ## Frontend
 
-New route `/ui/settings/ai-jobs` (Settings sidebar, matches where `APK Analysis` settings already live). `@xyflow/react` canvas: a node palette (the six kinds above), click a node to edit its config in a side panel (mirrors the plugin detail drawer pattern — for `AgentCall` that's the prompt editor described above). A "Run" button first shows a small form built from the `Trigger` node's declared input shape — for `apk-analysis`, a picker over tracked APK versions rather than free-typed fields — then POSTs a manual run and streams per-node status over the existing WebSocket channel the way Live Log already does.
+New route `/ui/settings/ai-jobs` (Settings sidebar, matches where `APK Analysis` settings already live). `@xyflow/react` canvas: a node palette (the six kinds above), click a node to edit its config in a side panel (mirrors the plugin detail drawer pattern — for `AgentCall` that's the prompt editor described above). When a pipeline version has more than one `Trigger`, an entry-point picker next to Run selects which one fires (defaults to the only one when there's just one); a "Reuse unchanged nodes" checkbox next to it sets `reuseUnchanged`. Run first shows a small form built from the fired `Trigger`'s declared input shape — for `apk-analysis`, a picker over tracked APK versions rather than free-typed fields — then POSTs a manual run and streams per-node status over the existing WebSocket channel the way Live Log already does. A node outside the fired `Trigger`'s zone renders dimmed with an `INACTIVE` badge rather than idle/ok/failed styling, so it reads as "not part of this run," not as a stalled node.
 
 ## Security
 
@@ -153,7 +177,7 @@ New route `/ui/settings/ai-jobs` (Settings sidebar, matches where `APK Analysis`
 
 ## API surface
 
-New REST endpoints under `/v1/ai-pipelines`: CRUD on pipelines and versions, `POST /:id/publish`, `POST /:id/run`, `GET /runs/:runId` (status + per-node results) — scopes as above. The `apk-analysis-complete` hook and `job-registry` call `runPipeline(pipelineId, input)` directly (no HTTP hop) — same as the "keep existing triggers" decision; this project does not touch scheduling.
+New REST endpoints under `/v1/ai-pipelines`: CRUD on pipelines and versions, `POST /:id/publish`, `POST /:id/run` (body: `{ triggerNodeId, input, reuseUnchanged? }` — `triggerNodeId` required once a version has more than one `Trigger`, optional and inferred when it has exactly one), `GET /runs/:runId` (status + per-node results, including each node's `inactive`/`wasMemoized` state) — scopes as above. The `apk-analysis-complete` hook and `job-registry` call `runPipeline(pipelineId, triggerNodeId, input)` directly (no HTTP hop) — same as the "keep existing triggers" decision; this project does not touch scheduling.
 
 ## Migration & rollout
 
@@ -163,7 +187,7 @@ New REST endpoints under `/v1/ai-pipelines`: CRUD on pipelines and versions, `PO
 
 ## Testing
 
-- **Gate tests** (mocked router, <2s): one suite per node kind (`Trigger`, `AgentCall`, `Transform`, `Branch`, `ForEach`, `Sink`), one for template resolution (dotted-path success, unresolved-placeholder throws), one for the concurrent-`Sink`-writes invariant (four concurrent writes to four sections of one run, no lost update), and one for executor traversal — linear, branch (adjacent vs. non-adjacent to the failure), forEach (per-item failure stays data, node itself stays `ok`), partial-failure-continues-independent-branches, skip-propagates-transitively.
+- **Gate tests** (mocked router, <2s): one suite per node kind (`Trigger`, `AgentCall`, `Transform`, `Branch`, `ForEach`, `Sink`), one for template resolution (dotted-path success, unresolved-placeholder throws), one for the concurrent-`Sink`-writes invariant (four concurrent writes to four sections of one run, no lost update), one for executor traversal — linear, branch (adjacent vs. non-adjacent to the failure), forEach (per-item failure stays data, node itself stays `ok`), partial-failure-continues-independent-branches, skip-propagates-transitively — and one for multi-trigger: the graph validator rejects a node reachable from two `Trigger`s, firing one `Trigger` marks the other zone's nodes `inactive` (not counted in rollup), and a memoization hit sets `wasMemoized` and skips re-execution while a miss (changed `inputHash`) runs fresh.
 - **Periodic eval**: run the real Astérix pipeline (and at least one more known-good APK) against live models, assert (a) no single node failure empties more than its own `Sink`'s section, (b) total token cost doesn't regress against today's single-run design — now straightforward to check, since `AgentCall` is single-tier with no write-escalation replay burning extra tokens, (c) the benign sections stay on the High tier's top model when the trigger-instruction nodes are the only ones falling back, (d) the Group B fallback rate (see Security) isn't worse scoped than it is in today's diluted whole-run version.
 - **E2E** (Playwright): build a small pipeline (`Trigger` → `AgentCall` → `Sink`) in the editor, including a templated prompt referencing a `Trigger` variable, run it against a mocked provider, see per-node status go green and output land in notes — same pattern as the plugins-workspace e2e suite.
 
@@ -174,6 +198,8 @@ New REST endpoints under `/v1/ai-pipelines`: CRUD on pipelines and versions, `PO
 - Migrating `apk-diff-engine.ts` or `disney-menus-fetcher` in this phase. `apk-diff-engine.ts` reads the same global settings keys `apk-analyzer.ts` uses today (`analysis_tier_research`/`analysis_tier_write`, `index.ts:566-569`) — those keys stay live and owned by the old (non-pipeline) path until `apk-diff-engine.ts` migrates too; this phase does not retire or repurpose them, even though the new per-node `tier` field replaces their role for the migrated APK-analysis pipeline specifically.
 - Reusing or extending `automation-sandbox.ts` — different trust model, wrong fit (see Options considered).
 - Multi-input ports on a node. A node needing two independent inputs from upstream is two nodes.
+- Reconverging/overlapping `Trigger` zones — a node reachable from two different `Trigger`s in the same graph. The AND-join rule would need to treat an edge from a non-fired `Trigger`'s zone as "not applicable" rather than "failed precondition," which is a real, unresolved semantics question, not a simple extension. Today's answer to "cheaply re-run part of a zone I already ran" is memoization, not a second overlapping `Trigger` — see Open questions.
+- Cross-pipeline-version memoization. A cache hit only matches within the same `pipelineVersionId`; editing and republishing the graph starts every node cold again, even for nodes whose config didn't change.
 
 ## What changed after the first draft
 
@@ -192,3 +218,9 @@ Separately, Cube's mid-review feedback added the `Trigger` node kind and prompt-
 
 - Whether `AgentCall` node prompts should support versioned templates independent of the pipeline version (useful once more than one job reuses a prompt fragment) — not needed for the Astérix pipeline, revisit once a second job migrates.
 - Human-in-the-loop / approval nodes (pause a run for a manual check before a `Sink` fires) — no current job needs it; noting it so the node-kind enum isn't assumed closed forever.
+- Reconverging `Trigger` zones (Non-goals) — if a real job ever needs "two entry points that both legitimately want to re-run the exact same downstream nodes," that's the point to revisit the AND-join rule, not before. Likely needs a per-edge "optional" flag or a redefined join semantics, not a quick patch.
+- Cross-version memoization — once pipelines are edited often enough that a full cold re-run after every small edit is annoying, revisit whether a node's cache can survive a version bump when its own config (not just its resolved input) is unchanged. Needs a stable per-node identity across versions first, which the current `nodeId`-within-`graph` model doesn't guarantee today.
+
+## 2026-10-10, later: multi-trigger and memoization
+
+Cube asked two follow-up questions after seeing the mockup: can a pipeline have multiple triggers (with the constraint that they share input variables, for simplicity), and are nodes memoized. Both were real gaps — neither was in the first draft or the review. Added: multiple `Trigger` nodes per pipeline version, each an independent root, constrained to disjoint reachable zones (no node fed by two triggers — reconvergence is a genuinely harder problem, deferred, see Non-goals) and a shared output schema (Cube's proposed constraint, adopted outright); a new `inactive` node-run status for nodes outside the fired trigger's zone, excluded from run-status rollup; and opt-in, per-run memoization (`reuseUnchanged`) keyed on `(nodeId, pipelineVersionId, resolved-input-hash)`, with an explicit caveat that `AgentCall` memoization is a cost tradeoff, not a correctness guarantee, since an LLM isn't a pure function. The two features turned out to answer overlapping intuitions from different angles: multi-trigger is for genuinely disjoint scopes (a full analysis vs. a quick diff-only check); memoization is what actually delivers "cheaply re-run just the node I edited" within one scope, which is a better fit for that need than a second, reconverging trigger would have been.
