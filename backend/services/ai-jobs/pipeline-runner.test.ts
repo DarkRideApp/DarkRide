@@ -210,3 +210,110 @@ describe('runPipeline — concurrency and transitive skip', () => {
     expect(seenInputs[1].trigger).toEqual({ appName: 'x', versionId: 431 });
   });
 });
+
+describe('runPipeline — envelope nodes', () => {
+  function branchGraph(): PipelineGraph {
+    return {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary', 'fallback'] } },
+        { id: 'primary-sink', config: { kind: 'Sink', writeFn: 'x' } },
+        { id: 'fallback-sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'agent' },
+        { from: 'agent', to: 'branch' },
+        { from: 'branch', to: 'primary-sink', label: 'primary' },
+        { from: 'branch', to: 'fallback-sink', label: 'fallback' },
+      ],
+    };
+  }
+
+  it('Branch runs even when its immediate parent failed, and routes only the chosen edge', async () => {
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => { throw new Error('boom'); }),
+      Branch: vi.fn((_config, envelope: any) => (envelope.status === 'failed' ? 'fallback' : 'primary')),
+    });
+    const result = await runPipeline(branchGraph(), 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'agent')!.status).toBe('failed');
+    expect(result.nodes.find(n => n.nodeId === 'branch')!.status).toBe('ok'); // envelope node — not skipped
+    expect(result.nodes.find(n => n.nodeId === 'fallback-sink')!.status).toBe('ok'); // chosen edge
+    // 'inactive', not 'skipped' — a Branch's non-chosen edge was never going to run regardless of
+    // whether anything upstream failed; it is structurally outside this run's chosen path, the same
+    // concept Task 16 uses for a whole non-fired Trigger zone. This matters for the rollup (see the
+    // new test below): if this were 'skipped', a perfectly healthy Branch-routed run would report
+    // 'partial' overall purely because one edge was never taken, which is wrong. Caught in Task 13's
+    // review, fixed here before this task's code was ever written, not as a later patch.
+    expect(result.nodes.find(n => n.nodeId === 'primary-sink')!.status).toBe('inactive'); // not chosen
+    expect(executors.Branch).toHaveBeenCalledWith(expect.anything(), { status: 'failed', error: expect.stringContaining('boom') }, {});
+  });
+
+  it('a healthy Branch-routed run reports "ok" overall, not "partial" — the non-chosen edge is inactive, not a negative outcome', async () => {
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => ({ text: 'ok' })), // succeeds this time, unlike the test above
+      Branch: vi.fn(() => 'primary'),
+    });
+    const result = await runPipeline(branchGraph(), 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'agent')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'branch')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'primary-sink')!.status).toBe('ok'); // chosen edge
+    expect(result.nodes.find(n => n.nodeId === 'fallback-sink')!.status).toBe('inactive'); // not chosen, not a failure
+    // The whole point of this test: an untaken branch must never drag a fully healthy run down to
+    // 'partial'. Relies on the rollup already excluding 'inactive' from its ok/some-ok/none-ok vote
+    // (added as a forward-compatible no-op during Task 13's own fix round, for exactly this case).
+    expect(result.status).toBe('ok');
+  });
+
+  it('a Branch that is NOT the immediate child of a failure sees "skipped", not "failed" — the adjacency rule in practice', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'transform', config: { kind: 'Transform', fn: 'x' } }, // sits between the failure and the Branch
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary'] } },
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'agent' }, { from: 'agent', to: 'transform' },
+        { from: 'transform', to: 'branch' }, { from: 'branch', to: 'sink', label: 'primary' },
+      ],
+    };
+    let seenEnvelope: any;
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => { throw new Error('boom'); }),
+      Branch: vi.fn((_c, envelope: any) => { seenEnvelope = envelope; return 'primary'; }),
+    });
+    await runPipeline(graph, 'trigger', {}, executors, {});
+    expect(seenEnvelope).toEqual({ status: 'skipped' }); // not { status: 'failed', error: 'boom' } — transform absorbed it
+  });
+
+  it('Report gathers an envelope per section source and assembles once all settle', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'a1', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'ok', toolAllowlist: [] } },
+        { id: 'a2', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'FAIL', toolAllowlist: [] } },
+        { id: 'report', config: { kind: 'Report', sections: [{ title: 'One', from: 'a1' }, { title: 'Two', from: 'a2' }] } },
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'a1' }, { from: 'trigger', to: 'a2' },
+        { from: 'a1', to: 'report' }, { from: 'a2', to: 'report' }, { from: 'report', to: 'sink' },
+      ],
+    };
+    let seenEnvelopes: any;
+    const agentCall = vi.fn(async (config: any) => { if (config.instructionTemplate === 'FAIL') throw new Error('nope'); return { text: 'ok' }; });
+    const report = vi.fn((_c, envelopes: any) => { seenEnvelopes = envelopes; return { markdown: 'x' }; });
+    const result = await runPipeline(graph, 'trigger', {}, fakeExecutors({ AgentCall: agentCall, Report: report }), {});
+
+    expect(result.nodes.find(n => n.nodeId === 'report')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'sink')!.status).toBe('ok'); // Report's own output always flows onward
+    expect(seenEnvelopes).toEqual({
+      a1: { status: 'ok', output: { text: 'ok' } },
+      a2: { status: 'failed', error: expect.stringContaining('nope') },
+    });
+  });
+});

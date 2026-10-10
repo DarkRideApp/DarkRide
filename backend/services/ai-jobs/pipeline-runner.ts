@@ -1,5 +1,5 @@
 import type {
-  PipelineGraph, NodeConfig, NodeRunStatus, RunStatus, Envelope,
+  PipelineGraph, PipelineNode, NodeConfig, NodeRunStatus, RunStatus, Envelope,
   TriggerConfig, AgentCallConfig, TransformConfig, BranchConfig, ReportConfig, ForEachConfig, SinkConfig,
 } from './types';
 
@@ -39,8 +39,12 @@ export interface RunResult {
  * status propagates transitively across however many hops separate it from the failure —
  * not just to the immediate child.
  *
- * Still outstanding, for Tasks 15-17 to add to this same function in place:
- *   - Task 15: envelope wiring for Branch/Report (they currently throw — see runOne below)
+ * `Branch`/`Report` are envelope nodes: they are exempt from the skip above and instead receive
+ * an `Envelope` built from `results` (which, unlike `input`, carries failure/skip/inactive
+ * info). A `Branch`'s non-chosen outgoing edge marks its target `'inactive'` rather than
+ * `'skipped'` — see `unavailabilityStatus` below for why the two must never be conflated.
+ *
+ * Still outstanding, for Tasks 16-17 to add to this same function in place:
  *   - Task 16: multi-trigger zone partitioning (graph-validator.ts already enforces this
  *     statically; the executor still needs to run each zone from its own trigger)
  *   - Task 17: opt-in memoization
@@ -77,14 +81,23 @@ export async function runPipeline(
       remaining.delete(nodeId);
       const node = byId.get(nodeId)!;
       const incoming = graph.edges.filter(e => e.to === nodeId).map(e => e.from);
-      const parentUnavailable = incoming.some((p) => {
-        const s = results.get(p)?.status;
-        return s === 'failed' || s === 'skipped';
-      });
+      const unavailability = unavailabilityStatus(nodeId, graph, byId, results);
 
-      if (parentUnavailable) {
-        results.set(nodeId, { nodeId, status: 'skipped' });
+      // Branch/Report are envelope nodes: they run even when their immediate parent failed
+      // (they receive an Envelope describing what happened instead of being skipped), so this
+      // exemption must be checked before the skip decision below, not after.
+      const isEnvelopeNode = node.config.kind === 'Branch' || node.config.kind === 'Report';
+      if (unavailability && !isEnvelopeNode) {
+        results.set(nodeId, { nodeId, status: unavailability });
         return;
+      }
+
+      let branchEnvelope: Envelope | undefined;
+      let reportEnvelopes: Record<string, Envelope> | undefined;
+      if (node.config.kind === 'Branch') {
+        branchEnvelope = buildEnvelope(incoming[0], results);
+      } else if (node.config.kind === 'Report') {
+        reportEnvelopes = Object.fromEntries(incoming.map(p => [p, buildEnvelope(p, results)]));
       }
 
       const input = buildInput(incoming, outputs);
@@ -97,7 +110,7 @@ export async function runPipeline(
       // populated before any other node runs.
       input.trigger = outputs.get(triggerNodeId);
       try {
-        const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx);
+        const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx, branchEnvelope, reportEnvelopes);
         results.set(nodeId, { nodeId, status: 'ok', output });
         outputs.set(nodeId, output);
       } catch (err) {
@@ -114,10 +127,10 @@ export async function runPipeline(
   // single-chain failure, where the only "ok" left after excluding the Trigger disappears,
   // so it can't rescue the run into 'partial').
   //
-  // 'inactive' is excluded from the same filter alongside Trigger-kind nodes: nothing produces
-  // it yet (Task 15's Branch routing and Task 16's multi-trigger zones are the first to), but
-  // it's cheaper to fold the correct exclusion into this line now than to have two later tasks
-  // each reopen this block — it's a no-op today since no current test ever produces 'inactive'.
+  // 'inactive' is excluded from the same filter alongside Trigger-kind nodes: a Branch's
+  // non-chosen edge (Task 15) or a non-fired Trigger zone (Task 16) was never going to run
+  // regardless of whether anything failed, so it must not count as a negative outcome — see
+  // `unavailabilityStatus` below for the full 'inactive' vs 'skipped' reasoning.
   //
   // Degenerate case: a graph with only a Trigger node (outcomeStatuses is empty) must report the
   // Trigger's own status, not a hardcoded 'ok' — if the sole Trigger node itself threw, the run
@@ -176,6 +189,8 @@ async function runOne(
   input: Record<string, unknown>,
   executors: NodeExecutors,
   ctx: ExecutionCtx,
+  branchEnvelope?: Envelope,
+  reportEnvelopes?: Record<string, Envelope>,
 ): Promise<Record<string, unknown>> {
   switch (config.kind) {
     case 'Trigger': return executors.Trigger(config, input, ctx);
@@ -184,10 +199,71 @@ async function runOne(
     case 'Sink': await executors.Sink(config, input, ctx); return {};
     case 'ForEach': return { items: await executors.ForEach(config, (input.items as unknown[]) ?? [], ctx) };
     // Branch/Report are envelope nodes — they receive Envelope-shaped predecessor data, not the
-    // plain output bag every other node gets. Task 15 wires that up; until then these two kinds
-    // are unreachable from any graph this task's tests exercise (no Branch/Report node in
-    // linearGraph), so throwing here is correct, not a placeholder to silently fall through.
-    case 'Branch': throw new Error('Branch requires envelope wiring — see Task 15');
-    case 'Report': throw new Error('Report requires envelope wiring — see Task 15');
+    // plain output bag every other node gets. The wave loop builds that envelope (or envelope
+    // map) before calling runOne, because it needs `results` (which carries failure info that
+    // `input` never does) — see `branchEnvelope`/`reportEnvelopes` above.
+    case 'Branch': {
+      // Branch has exactly one logical predecessor per the spec (it picks ONE outgoing edge from
+      // ONE input) — if a graph somehow wires more than one into a Branch, use the first; the
+      // graph validator (Task 12) doesn't currently forbid this, worth a follow-up if it matters.
+      const envelope = branchEnvelope!; // the wave loop always builds this before calling runOne for a Branch
+      const chosen = executors.Branch(config, envelope, ctx);
+      return { chosenEdge: chosen };
+    }
+    case 'Report': {
+      const envelopes = reportEnvelopes!; // the wave loop always builds this before calling runOne for a Report
+      return executors.Report(config, envelopes, ctx);
+    }
   }
+}
+
+/** Builds the Envelope a Branch/Report sees for one predecessor's outcome. */
+function buildEnvelope(parentId: string, results: Map<string, NodeRunResult>): Envelope {
+  const r = results.get(parentId);
+  if (!r) return { status: 'skipped' }; // defensive — shouldn't happen, the wave loop only runs a node once every incoming edge has a result
+  if (r.status === 'ok') return { status: 'ok', output: r.output ?? {} };
+  if (r.status === 'failed') return { status: 'failed', error: r.error ?? 'unknown error' };
+  return { status: r.status === 'inactive' ? 'inactive' : 'skipped' };
+}
+
+/**
+ * Decides whether a node is unavailable this run, and if so, which of the two distinct
+ * negative statuses applies:
+ *   - 'skipped' — a real ancestor failure/skip/inactive fed this node. A genuine negative
+ *     outcome; counts against the run in the ok/partial/failed rollup.
+ *   - 'inactive' — EVERY contributing reason is a Branch choosing a different edge, nothing
+ *     about this node's own incoming edges reflects an actual failure anywhere upstream. This
+ *     node was never going to run regardless of whether anything failed — structurally outside
+ *     this run's chosen path (the same concept Task 16 uses for a whole non-fired Trigger zone).
+ *     Excluded from the rollup entirely.
+ *
+ * Mixing the two is the bug this function exists to prevent: if a Branch-mismatch ever produced
+ * 'skipped', a perfectly healthy Branch-routed run (nothing failed, Branch just chose one of its
+ * valid edges) would incorrectly report 'partial' overall, purely because the other edge was
+ * never taken. Caught during Task 13's review, fixed here before this task's code was written.
+ */
+function unavailabilityStatus(
+  nodeId: string,
+  graph: PipelineGraph,
+  byId: Map<string, PipelineNode>,
+  results: Map<string, NodeRunResult>,
+): 'skipped' | 'inactive' | null {
+  const incomingEdges = graph.edges.filter(e => e.to === nodeId);
+  let anyUnavailable = false;
+  let branchMismatchOnly = true; // flips to false the moment a REAL ancestor failure/skip/inactive is found
+  for (const e of incomingEdges) {
+    const parentResult = results.get(e.from);
+    const s = parentResult?.status;
+    if (s === 'failed' || s === 'skipped' || s === 'inactive') {
+      anyUnavailable = true;
+      branchMismatchOnly = false;
+      continue;
+    }
+    if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
+      const chosenEdge = (parentResult?.output as { chosenEdge?: string } | undefined)?.chosenEdge;
+      if (chosenEdge !== e.label) anyUnavailable = true; // branchMismatchOnly stays true unless another edge says otherwise
+    }
+  }
+  if (!anyUnavailable) return null;
+  return branchMismatchOnly ? 'inactive' : 'skipped';
 }
