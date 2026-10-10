@@ -3204,7 +3204,18 @@ git commit -m "feat(ai-jobs): define the Astérix pattern pipeline, wire executo
 - Modify: `backend/index.ts` (extend the `apkAnalyzer.setAiConfig(...)` call site, or add a sibling `setPipelinesEnabled(...)` setter — match whichever is the smaller diff once Step 1's grep shows the real current call)
 
 **Interfaces:**
-- Consumes: `runPipeline`, `ASTERIX_PATTERN_GRAPH`, `buildApkAnalysisExecutors`, `buildApkAnalysisExecutionCtx` (Task 20).
+- Consumes: `runPipeline`, `buildApkAnalysisExecutors`, `buildApkAnalysisExecutionCtx` (Task 20), `aiPipelines`/`aiPipelineVersions` (Task 1).
+
+**Design correction made before this task was dispatched (raised when Cube asked how the
+APK service points at the pipeline it runs):** the graph a real run executes must come from
+the DB's current *published* version for the `apk-analysis` job kind, never a hardcoded
+`ASTERIX_PATTERN_GRAPH` import. `ASTERIX_PATTERN_GRAPH` (Task 20) is still real — it's the
+literal graph `seedApkAnalysisPipeline` inserts into the DB at boot, and what the executor's
+own tests exercise directly — but a running server has to follow whatever was last published
+through the `/ui/pipelines` editor (Tasks 22-24), not freeze at server-start. Importing the
+constant directly here, as an earlier draft of this task did, would mean every edit made in
+the UI and published has zero effect on real auto/manual-triggered runs — silently defeating
+the entire point of shipping an editable pipeline tool.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3213,22 +3224,35 @@ Grep `backend/services/apk-analyzer.test.ts` first for how `runAiAgent`/`trigger
 ```ts
 // append to apk-analyzer.test.ts
 describe('AI notes generation — pipeline path', () => {
-  it('calls runPipeline instead of agent.handleMessage directly when ai_pipelines_enabled is true', async () => {
+  it('calls runPipeline with the DB\'s published apk-analysis graph, not a hardcoded constant, when ai_pipelines_enabled is true', async () => {
     const runPipelineSpy = vi.fn(async () => ({ status: 'ok', nodes: [] }));
-    // Construct the ApkAnalyzerService the way the rest of this file already does, but with
-    // setPipelinesEnabled(() => true) (or whichever setter Step 3 below actually adds) and the
-    // runPipeline call point injected/mocked — adapt to this file's existing DI pattern (setAiConfig
-    // takes closures; whatever this task adds should match that shape, not introduce a new one).
+    // Seed an aiPipelines row (jobKind: 'apk-analysis') and TWO aiPipelineVersions rows on the
+    // test db: an older 'published' one with a distinguishable graph, and seed it as the ONLY
+    // published row. Construct the ApkAnalyzerService the way the rest of this file already
+    // does, but with setPipelinesEnabled(() => true) (or whichever setter Step 3 below actually
+    // adds) and the runPipeline call point injected/mocked — adapt to this file's existing DI
+    // pattern (setAiConfig takes closures; whatever this task adds should match that shape).
 
     analyzer.triggerAiAgentManual(431, userId);
     await flushMicrotasks(); // match whatever async-flush helper this test file already uses, if any
 
     expect(runPipelineSpy).toHaveBeenCalled();
+    // Assert the graph argument runPipeline received is the SEEDED published version's graph
+    // (deep-equal it, or at minimum assert it is NOT referentially the imported
+    // ASTERIX_PATTERN_GRAPH constant) — this is the test that would have caught the original
+    // hardcoded-import draft of this task.
   });
 
   it('keeps calling agent.handleMessage directly when ai_pipelines_enabled is false (the default)', async () => {
     // Same setup, setPipelinesEnabled(() => false). Assert the OLD path still runs —
     // this is the one test in this task that must never break across the rollout window.
+  });
+
+  it('logs and does not throw out of the request handler when no published apk-analysis pipeline row exists', async () => {
+    // setPipelinesEnabled(() => true), but don't seed any aiPipelines/aiPipelineVersions row.
+    // This should only ever happen if Task 20's seedApkAnalysisPipeline never ran — still,
+    // triggerAiAgentManual must not throw synchronously into its caller; the failure belongs in
+    // the same activeAiAgentRuns-tracked async path as any other run failure.
   });
 });
 ```
@@ -3280,13 +3304,32 @@ private async runAiPipeline(
   versionId: number,
   identity: { type: 'core-service' } | { type: 'user'; userId: number },
 ): Promise<void> {
-  const { ASTERIX_PATTERN_GRAPH, buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx } =
+  const { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx } =
     await import('./ai-jobs/apk-analysis-pipeline');
   const { runPipeline } = await import('./ai-jobs/pipeline-runner');
+  const { aiPipelines, aiPipelineVersions } = await import('../db/schema');
+  const { eq, and, desc } = await import('drizzle-orm');
+
+  // The graph comes from the DB's published version for this job kind, never the
+  // ASTERIX_PATTERN_GRAPH constant directly — see the design-correction note above this task.
+  const pipeline = this.db.select().from(aiPipelines).where(eq(aiPipelines.jobKind, 'apk-analysis')).all()[0];
+  if (!pipeline) {
+    log(`AI pipeline for version ${versionId}: no apk-analysis pipeline row found — did seedApkAnalysisPipeline run at boot?`);
+    broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: 'failed' });
+    return;
+  }
+  const version = this.db.select().from(aiPipelineVersions)
+    .where(and(eq(aiPipelineVersions.pipelineId, pipeline.id), eq(aiPipelineVersions.status, 'published')))
+    .orderBy(desc(aiPipelineVersions.version)).all()[0];
+  if (!version) {
+    log(`AI pipeline for version ${versionId}: pipeline "${pipeline.name}" (id ${pipeline.id}) has no published version`);
+    broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: 'failed' });
+    return;
+  }
 
   const triggerNodeId = 'trigger-full'; // auto/manual re-analysis both use the Full Analysis entry point
   const result = await runPipeline(
-    ASTERIX_PATTERN_GRAPH, triggerNodeId, { versionId },
+    version.graph as import('./ai-jobs/types').PipelineGraph, triggerNodeId, { versionId },
     buildApkAnalysisExecutors(),
     buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId }),
   );
@@ -3343,12 +3386,26 @@ A working, verified interactive mockup of this editor already exists (published 
 - Create: `frontend/pages/ai-jobs/Canvas.tsx`
 - Create: `frontend/pages/ai-jobs/testing.tsx` (fixture builders + mock ws, same shape as `frontend/pages/plugins/testing.tsx`)
 - Create: `frontend/pages/ai-jobs/AiJobsWorkspace.test.tsx`
-- Modify: `frontend/App.tsx` (add the route, next to the other `Route path="settings"` children)
-- Modify: `frontend/components/settings/SettingsSidebar.tsx` (add the nav entry)
+- Modify: `frontend/App.tsx` (add the route as a **top-level** route, not nested under `settings`)
+- Modify: `frontend/components/layout/AppLayout.tsx` (add a top-level nav entry — **not** `SettingsSidebar.tsx`)
+- Modify: `frontend/components/layout/AppLayout.test.tsx` (one-line assertion that the new nav entry renders)
+
+**Design correction made before this task was dispatched** (Cube asked directly whether this
+would get its own section "like Automations"): it does. `AppLayout.tsx`'s `CORE_NAV_GROUPS`
+gives `Automations` (`/ui/automations`) its own top-level nav entry, not a line inside the
+Settings page — this tool is heading the same direction (general-purpose, used for more than
+APK analysis later per Cube's stated goal), so an earlier draft of this task that buried it
+under Settings alongside things like notification preferences was the wrong call. Route moves
+to `/ui/pipelines`, as a sibling of `automations`/`devices`/`apks` in `App.tsx`'s route list,
+with a nav entry in the `'Tools'` group (next to `APKs`/`Frida`/`Plugins` in
+`AppLayout.tsx:88-98`) labeled `'Pipelines'`, using the `Workflow` icon from `lucide-react`
+(add it to the existing icon import block) and `requiredScope: 'core.apk:read'` (same scope
+`APKs` already uses — reuse per Global Constraints, no new scope string). The internal
+directory name `frontend/pages/ai-jobs/` stays as-is; only the public route/nav label change.
 
 **Interfaces:**
-- Consumes: `GET /v1/ai-pipelines` (Task 19) via the existing `useWebSocket`/`sendRestApi` pattern (same as every other settings page — see `frontend/pages/plugins/usePluginCatalog.ts` for the pattern to follow, not reinvent).
-- Produces: the `/ui/settings/ai-jobs` route rendering a read-only canvas for the `apk-analysis` pipeline's published version.
+- Consumes: `GET /v1/ai-pipelines` (Task 19) via the existing `useWebSocket`/`sendRestApi` pattern (same pattern as `frontend/pages/plugins/usePluginCatalog.ts` — follow it, don't reinvent).
+- Produces: the `/ui/pipelines` route rendering a read-only canvas for the `apk-analysis` pipeline's published version.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3431,6 +3488,7 @@ export function AiJobsWorkspace() {
   useDocumentTitle('AI Job Pipelines');
   const { sendRestApi } = useWebSocket();
   const [graph, setGraph] = useState<PipelineGraph | null>(null);
+  const [pipelineId, setPipelineId] = useState<number | null>(null); // threaded into Task 24's Run call instead of a hardcoded id
   const [selected, setSelected] = useState<string | null>(null);
 
   useEffect(() => {
@@ -3438,12 +3496,12 @@ export function AiJobsWorkspace() {
     sendRestApi('GET', '/v1/ai-pipelines').then((res: any) => {
       if (cancelled) return;
       const apkPipeline = res.body?.data?.find((p: any) => p.jobKind === 'apk-analysis');
-      if (apkPipeline?.graph) setGraph(apkPipeline.graph);
+      if (apkPipeline?.graph) { setGraph(apkPipeline.graph); setPipelineId(apkPipeline.id); }
     });
     return () => { cancelled = true; };
   }, [sendRestApi]);
 
-  if (!graph) return <div className="page-header"><h1>Plugins</h1></div>; // loading state — replace with a real spinner in Task 23, not this task's concern
+  if (!graph) return <div className="page-header"><h1>Pipelines</h1></div>; // loading state — replace with a real spinner in Task 23, not this task's concern
 
   return (
     <div className="ai-jobs-root" style={{ height: '100vh' }}>
@@ -3454,22 +3512,30 @@ export function AiJobsWorkspace() {
 }
 ```
 
-`testing.tsx` mirrors `frontend/pages/plugins/testing.tsx`'s `createMockWs`/`withProviders` shape exactly — same `envelope()` helper, same `{ type: 'restapi', id, status, body }` response shape — plus a new `mockPipelineVersion()` fixture builder returning a `{ graph: ASTERIX_PATTERN_GRAPH-shaped-data }` object, and the mock ws's `GET /v1/ai-pipelines` route returning `{ success: true, data: [{ id: 1, jobKind: 'apk-analysis', graph: mockPipelineVersion().graph }] }`.
+`testing.tsx` mirrors `frontend/pages/plugins/testing.tsx`'s `createMockWs`/`withProviders` shape exactly — same `envelope()` helper, same `{ type: 'restapi', id, status, body }` response shape — plus a new `mockPipelineVersion()` fixture builder returning a `{ graph: ASTERIX_PATTERN_GRAPH-shaped-data }` object, and the mock ws's `GET /v1/ai-pipelines` route returning `{ success: true, data: [{ id: 1, jobKind: 'apk-analysis', graph: mockPipelineVersion().graph }] }` (matching Task 19's real response shape, which now folds each pipeline's published graph inline — see that task's pre-flight fix).
 
-Add the route to `App.tsx`, inside the `settings` route's children (alongside `analysis`, `ai`, etc.):
+Add the route to `App.tsx` as a **top-level** route — a sibling of `automations`/`devices`/`apks`, not nested under `settings`:
 
 ```tsx
-<Route path="ai-jobs" element={<AiJobsWorkspace />} />
+<Route path="pipelines" element={<AiJobsWorkspace />} />
 ```
 
 Add the import at the top of `App.tsx`: `import { AiJobsWorkspace } from './pages/ai-jobs/AiJobsWorkspace';`
 
-Add the nav entry to `SettingsSidebar.tsx` next to the existing `AI`/`Analysis` entries — match that file's existing `<NavLink>` pattern exactly (grep it for how `Analysis` is listed, copy the shape with `to="/ui/settings/ai-jobs"` and label `"AI Job Pipelines"`).
+Add a top-level nav entry to `AppLayout.tsx`'s `CORE_NAV_GROUPS`, in the `'Tools'` group (`AppLayout.tsx:88-98`, next to `APKs`/`Frida`/`Plugins`) — **not** `SettingsSidebar.tsx`, see the design-correction note above:
 
-- [ ] **Step 4: Run test to verify it passes**
+```tsx
+{ to: '/ui/pipelines', label: 'Pipelines', icon: Workflow, requiredScope: 'core.apk:read' },
+```
+
+Add `Workflow` to the existing `lucide-react` import block at the top of `AppLayout.tsx` (alongside `Package`, `Download`, etc.).
+
+- [ ] **Step 4: Run test to verify it passes, then extend `AppLayout.test.tsx` for the new nav entry**
 
 Run: `npm run test:frontend -- AiJobsWorkspace`
 Expected: PASS
+
+`AppLayout.test.tsx` already asserts `Automations` renders in the nav (`expect(screen.getByText('Automations')).toBeInTheDocument();`) — add the same one-line assertion for `'Pipelines'`, scoped to whatever auth fixture already grants `core.apk:read` in that file (several tests already do, for the existing `APKs` nav entry). Run `npm run test:frontend -- AppLayout` to confirm.
 
 - [ ] **Step 5: Throwaway `tsc` check (frontend isn't type-checked by the main build — project memory `frontend_not_typechecked.md`)**
 
@@ -3482,8 +3548,8 @@ Fix any real type errors it surfaces before committing — this is the only type
 - [ ] **Step 6: Commit**
 
 ```bash
-git add package.json package-lock.json frontend/pages/ai-jobs/ frontend/App.tsx frontend/components/settings/SettingsSidebar.tsx
-git commit -m "feat(ai-jobs): add @xyflow/react, /ui/settings/ai-jobs route, canvas renders a real pipeline"
+git add package.json package-lock.json frontend/pages/ai-jobs/ frontend/App.tsx frontend/components/layout/AppLayout.tsx frontend/components/layout/AppLayout.test.tsx
+git commit -m "feat(ai-jobs): add @xyflow/react, /ui/pipelines route, canvas renders a real pipeline"
 ```
 
 ### Task 23: Side panel — per-kind facts, the `AgentCall` prompt editor, the `Report` section list editor
@@ -3833,15 +3899,16 @@ const triggerNodes = graph.nodes.filter(n => n.config.kind === 'Trigger').map(n 
 const [nodeStatuses, setNodeStatuses] = useState<Record<string, { status: string; wasMemoized?: boolean }>>({});
 
 async function handleRun(triggerNodeId: string, reuseUnchanged: boolean) {
-  const res: any = await sendRestApi('POST', '/v1/ai-pipelines/1/run', { triggerNodeId, input: {}, reuseUnchanged });
+  // pipelineId comes from the `pipelineId` state Task 22's useEffect already sets alongside
+  // setGraph (the real id GET /v1/ai-pipelines returned for the apk-analysis entry) — never a
+  // hardcoded literal.
+  const res: any = await sendRestApi('POST', `/v1/ai-pipelines/${pipelineId}/run`, { triggerNodeId, input: {}, reuseUnchanged });
   const byId: Record<string, { status: string; wasMemoized?: boolean }> = {};
   for (const n of res.body?.data?.nodes ?? []) byId[n.nodeId] = { status: n.status, wasMemoized: n.wasMemoized };
   setNodeStatuses(byId);
   return res.body?.data;
 }
 ```
-
-(`'1'` as the pipeline id is a placeholder standing in for whatever id `GET /v1/ai-pipelines` actually returned for the `apk-analysis` entry fetched in Task 22 — thread that value through via a small `pipelineId` state variable set alongside `setGraph` in the existing `useEffect`, rather than hardcoding it; shown as a literal here only to keep this step focused on the request shape.)
 
 Render `<RunControls triggers={triggerNodes} onRun={handleRun} />` above the `Canvas`, and pass `nodeStatuses` into `Canvas` so node styling can reflect `ok`/`failed`/`cached`/`inactive` (extend `Canvas`'s `style` computation from Task 22 to read `nodeStatuses[n.id]?.status` and pick a border color accordingly — same `KIND_COLOR`-style lookup table pattern, one more small table for status colors).
 
@@ -3872,7 +3939,7 @@ test.describe('AI job pipelines', () => {
   test('canvas renders the Astérix pattern pipeline, Run produces a partial result with Bypass Script failed', async ({ page }) => {
     await loginAsAdmin(page);
     await waitForBackend(page.request);
-    await page.goto('/ui/settings/ai-jobs');
+    await page.goto('/ui/pipelines');
 
     await expect(page.getByText('Overview')).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText('Assemble notes')).toBeVisible();
