@@ -8,7 +8,7 @@ export interface TriggerCtx {
 
 export type TriggerExpander = (rawInput: Record<string, unknown>, ctx: TriggerCtx) => Promise<Record<string, unknown>>;
 
-export const TRIGGER_REGISTRY: Record<string, TriggerExpander> = {};
+export const TRIGGER_REGISTRY: Record<string, TriggerExpander> = Object.create(null);
 
 export function registerTrigger(name: string, fn: TriggerExpander): void {
   TRIGGER_REGISTRY[name] = fn;

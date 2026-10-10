@@ -47,4 +47,12 @@ describe('apk-analysis/apk-context trigger', () => {
     const expand = TRIGGER_REGISTRY['apk-analysis/apk-context'];
     await expect(expand({ versionId: 999 }, { db })).rejects.toThrow(/999/);
   });
+
+  // TRIGGER_REGISTRY has no runner/guard in this file — the executor (Task 12+, not yet
+  // built) is what will do `TRIGGER_REGISTRY[config.expandFn]` and throw "Unknown trigger
+  // expander ...". Until then, an inherited Object.prototype key must at least fail to
+  // resolve off the registry itself, the same direct-lookup shape this file's other tests use.
+  it('does not resolve an inherited Object.prototype key as a registered expander', () => {
+    expect(TRIGGER_REGISTRY['constructor']).toBeUndefined();
+  });
 });

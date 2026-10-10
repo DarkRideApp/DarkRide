@@ -2,7 +2,7 @@ import type { TransformConfig } from '../types';
 
 export type TransformFn = (input: Record<string, unknown>) => Record<string, unknown>;
 
-export const TRANSFORM_REGISTRY: Record<string, TransformFn> = {};
+export const TRANSFORM_REGISTRY: Record<string, TransformFn> = Object.create(null);
 
 export function registerTransform(name: string, fn: TransformFn): void {
   TRANSFORM_REGISTRY[name] = fn;

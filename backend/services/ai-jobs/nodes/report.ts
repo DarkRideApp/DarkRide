@@ -8,10 +8,10 @@ export interface AssembledSection {
 /** Turns resolved sections into one document. A job kind supplies its own formatting here. */
 export type ReportAssembler = (sections: AssembledSection[]) => string;
 
-export const REPORT_ASSEMBLERS: Record<string, ReportAssembler> = {
-  'apk-analysis': (sections) =>
-    sections.map((s) => `## ${s.title}\n${s.body}`).join('\n\n') + '\n',
-};
+export const REPORT_ASSEMBLERS: Record<string, ReportAssembler> = Object.create(null);
+
+REPORT_ASSEMBLERS['apk-analysis'] = (sections) =>
+  sections.map((s) => `## ${s.title}\n${s.body}`).join('\n\n') + '\n';
 
 export function registerReportAssembler(jobKind: string, fn: ReportAssembler): void {
   REPORT_ASSEMBLERS[jobKind] = fn;

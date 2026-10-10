@@ -40,4 +40,8 @@ describe('runForEach', () => {
   it('throws on an unregistered item function name before touching any item', async () => {
     await expect(runForEach({ itemFn: 'test/nope' }, [1, 2])).rejects.toThrow(/Unknown ForEach item function/);
   });
+
+  it('treats an inherited Object.prototype key as unregistered rather than resolving it', async () => {
+    await expect(runForEach({ itemFn: 'constructor' }, [1, 2])).rejects.toThrow(/Unknown ForEach item function "constructor"/);
+  });
 });
