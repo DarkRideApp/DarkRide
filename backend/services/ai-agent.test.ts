@@ -2747,5 +2747,53 @@ describe('AiAgent', () => {
         ['request_tools', 'tool_a', 'tool_b', 'tool_c'],
       );
     });
+
+    it('re-narrows the tool list after a request_tools escalation, instead of reverting to the full broader-context set', async () => {
+      const capturedToolCalls: AiToolDefinition[][] = [];
+      let callCount = 0;
+      const createStreamingRequest = vi.fn(
+        (_messages: AiMessage[], _systemPrompt: string, tools: AiToolDefinition[]) => {
+          capturedToolCalls.push(tools);
+          callCount++;
+          if (callCount === 1) {
+            // Model escalates: asks for tools from the 'other' context, which is NOT
+            // in the toolAllowlist — this must not widen what gets declared next turn.
+            return (async function* () {
+              yield { type: 'tool_use' as const, id: 'rt1', name: 'request_tools', input: { contexts: ['other'] } };
+              yield { type: 'usage' as const, inputTokens: 10, outputTokens: 5 };
+            })();
+          }
+          return textOnlyStream('Done');
+        },
+      );
+      const provider = makeMockProvider(createStreamingRequest);
+
+      const registry = makeRegistry([
+        { name: 'tool_a', context: ['devices'] },
+        { name: 'tool_b', context: ['devices'] },
+        { name: 'tool_x', context: ['other'] },
+      ]);
+      const agent = new AiAgent(db, registry, provider);
+
+      const result = await agent.handleMessageWithIdentity(identity, {
+        conversationId: null,
+        message: 'test',
+        pageContext: 'devices',
+        contextId: '1',
+        onToken: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolResult: vi.fn(),
+        mode: 'silent',
+        maxTurns: 5,
+        toolAllowlist: ['request_tools', 'tool_a'],
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(callCount).toBe(2);
+      // activeContexts grew to include 'other' (tool_x became reachable), but the
+      // second turn's declared tool list must still be exactly the original
+      // allowlist — not tool_b, not the newly-reachable tool_x.
+      expect(capturedToolCalls[1].map((t) => t.name).sort()).toEqual(['request_tools', 'tool_a']);
+    });
   });
 });

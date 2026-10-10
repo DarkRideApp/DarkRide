@@ -604,6 +604,10 @@ export class AiAgent implements AiAgentInterface {
             }
           }
           tools = this.toolRegistry.getToolDefinitionsForContextsForUser([...activeContexts], userScopes, unattended);
+          if (params.toolAllowlist) {
+            const allowed = new Set(params.toolAllowlist);
+            tools = tools.filter(t => allowed.has(t.name));
+          }
 
           // Add tool result for request_tools
           const contextList = [...activeContexts].join(', ');
