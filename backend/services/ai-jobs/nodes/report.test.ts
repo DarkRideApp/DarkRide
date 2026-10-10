@@ -60,6 +60,24 @@ describe('runReport', () => {
     expect((result.markdown.match(/unavailable this run/g) || []).length).toBe(2);
   });
 
+  it('substitutes the placeholder for an ok section whose output has no string text, never throws, keeps the other sections', () => {
+    // A Branch node's raw output is {chosenEdge}, not {text}. A Report section wired to it
+    // must degrade to the placeholder, not crash the whole report on .trimEnd().
+    const envelopes: Record<string, Envelope<{ text: string }>> = {
+      'agent-overview': { status: 'ok', output: { text: 'A React Native app.' } },
+      'agent-wait-times': { status: 'ok', output: { chosenEdge: 'primary' } as any },
+      'agent-bypass': { status: 'ok', output: { text: 'Frida script here.' } },
+    };
+    let result: { markdown: string } | undefined;
+    expect(() => {
+      result = runReport(config, envelopes);
+    }).not.toThrow();
+    expect(result!.markdown).toContain('A React Native app.');
+    expect(result!.markdown).toContain('Frida script here.');
+    expect(result!.markdown).toContain('## Wait Times\n— Wait Times unavailable this run. Its source node did not complete.');
+    expect(result!.markdown).not.toContain('undefined');
+  });
+
   it('treats an inherited Object.prototype key as an unregistered assembler rather than resolving it', () => {
     const envelopes: Record<string, Envelope<{ text: string }>> = {
       'agent-overview': { status: 'ok', output: { text: 'x' } },

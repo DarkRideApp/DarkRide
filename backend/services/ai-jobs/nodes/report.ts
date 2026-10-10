@@ -32,7 +32,7 @@ export function runReport(
   if (!assembler) throw new Error(`Unknown report assembler "${jobKind}"`);
   const sections = config.sections.map((section) => {
     const envelope = envelopes[section.from];
-    const body = envelope && envelope.status === 'ok'
+    const body = envelope && envelope.status === 'ok' && typeof envelope.output.text === 'string'
       ? envelope.output.text.trimEnd()
       : `— ${section.title} unavailable this run. Its source node did not complete.`;
     return { title: section.title, body };
