@@ -97,4 +97,22 @@ describe('runPipeline — linear chain', () => {
     expect(skippedBranchNodes).toHaveLength(1);
     expect(okOutcomeNodes).toHaveLength(2); // the surviving branch's AgentCall + Sink
   });
+
+  // Regression guard: when outcomeStatuses is empty (a graph with only a Trigger node), the
+  // rollup must report the Trigger's own actual status, not a hardcoded 'ok'. A Trigger-only
+  // graph whose Trigger itself throws did nothing and failed — reporting 'ok' would be wrong.
+  it('reports "failed" for a Trigger-only graph whose Trigger itself throws', async () => {
+    const triggerOnlyGraph: PipelineGraph = {
+      nodes: [{ id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } }],
+      edges: [],
+    };
+    const executors = fakeExecutors({
+      Trigger: vi.fn(async () => { throw new Error('trigger boom'); }),
+    });
+
+    const result = await runPipeline(triggerOnlyGraph, 'trigger', {}, executors, {});
+
+    expect(result.status).toBe('failed');
+    expect(result.nodes).toEqual([{ nodeId: 'trigger', status: 'failed', error: expect.stringMatching(/trigger boom/) }]);
+  });
 });
