@@ -62,24 +62,44 @@ export async function runPipeline(
 
   const order = topologicalOrder(graph);
 
-  for (const nodeId of order) {
-    const node = byId.get(nodeId)!;
-    const incoming = graph.edges.filter(e => e.to === nodeId).map(e => e.from);
-    const parentFailed = incoming.some(p => results.get(p)?.status === 'failed' || results.get(p)?.status === 'skipped');
+  const remaining = new Set(order);
+  while (remaining.size > 0) {
+    const ready = [...remaining].filter(id =>
+      graph.edges.filter(e => e.to === id).every(e => results.has(e.from)),
+    );
+    if (ready.length === 0) break; // shouldn't happen for a validated DAG; defensive exit over an infinite loop
 
-    if (parentFailed) {
-      results.set(nodeId, { nodeId, status: 'skipped' });
-      continue;
-    }
+    await Promise.all(ready.map(async (nodeId) => {
+      remaining.delete(nodeId);
+      const node = byId.get(nodeId)!;
+      const incoming = graph.edges.filter(e => e.to === nodeId).map(e => e.from);
+      const parentUnavailable = incoming.some((p) => {
+        const s = results.get(p)?.status;
+        return s === 'failed' || s === 'skipped';
+      });
 
-    const input = nodeId === triggerNodeId ? rawInput : buildInput(incoming, outputs);
-    try {
-      const output = await runOne(node.config, input, executors, ctx);
-      results.set(nodeId, { nodeId, status: 'ok', output });
-      outputs.set(nodeId, output);
-    } catch (err) {
-      results.set(nodeId, { nodeId, status: 'failed', error: err instanceof Error ? err.message : String(err) });
-    }
+      if (parentUnavailable) {
+        results.set(nodeId, { nodeId, status: 'skipped' });
+        return;
+      }
+
+      const input = buildInput(incoming, outputs);
+      // The spec requires `trigger` to resolve for EVERY node, "not just its direct children"
+      // (Node primitives) — buildInput only ever keys by source-node-id, so a direct child of
+      // the fired Trigger gets its output under that Trigger's real id (e.g. 'trigger-full'),
+      // never under the literal key 'trigger', and a non-direct descendant gets no trigger data
+      // at all. Both cases are wrong; this line is the fix for both at once. Safe to always set:
+      // the Trigger itself always completes in the first wave, so outputs.get(triggerNodeId) is
+      // populated before any other node runs.
+      input.trigger = outputs.get(triggerNodeId);
+      try {
+        const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx);
+        results.set(nodeId, { nodeId, status: 'ok', output });
+        outputs.set(nodeId, output);
+      } catch (err) {
+        results.set(nodeId, { nodeId, status: 'failed', error: String(err instanceof Error ? err.message : err) });
+      }
+    }));
   }
 
   // The Trigger's own status is excluded from this rollup: it merely expanded the raw input,

@@ -116,3 +116,97 @@ describe('runPipeline — linear chain', () => {
     expect(result.nodes).toEqual([{ nodeId: 'trigger', status: 'failed', error: expect.stringMatching(/trigger boom/) }]);
   });
 });
+
+describe('runPipeline — concurrency and transitive skip', () => {
+  const fanOutGraph: PipelineGraph = {
+    nodes: [
+      { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+      { id: 'a1', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      { id: 'a2', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      { id: 's1', config: { kind: 'Sink', writeFn: 'x' } },
+      { id: 's2', config: { kind: 'Sink', writeFn: 'x' } },
+    ],
+    edges: [
+      { from: 'trigger', to: 'a1' }, { from: 'trigger', to: 'a2' },
+      { from: 'a1', to: 's1' }, { from: 'a2', to: 's2' },
+    ],
+  };
+
+  it('runs independent branches concurrently, not sequentially', async () => {
+    const order: string[] = [];
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async (_c, _i) => {
+        order.push('agent-start');
+        await new Promise(r => setTimeout(r, 10));
+        order.push('agent-end');
+        return { text: 'ok' };
+      }),
+    });
+    await runPipeline(fanOutGraph, 'trigger', {}, executors, {});
+    // Both agents start before either finishes — sequential execution would interleave start/end/start/end.
+    expect(order).toEqual(['agent-start', 'agent-start', 'agent-end', 'agent-end']);
+  });
+
+  it('skip propagates transitively through a chain, not just one hop', async () => {
+    const chain: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'a', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'transform', config: { kind: 'Transform', fn: 'x' } },
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [{ from: 'trigger', to: 'a' }, { from: 'a', to: 'transform' }, { from: 'transform', to: 'sink' }],
+    };
+    const executors = fakeExecutors({ AgentCall: vi.fn(async () => { throw new Error('boom'); }) });
+    const result = await runPipeline(chain, 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'a')!.status).toBe('failed');
+    expect(result.nodes.find(n => n.nodeId === 'transform')!.status).toBe('skipped');
+    expect(result.nodes.find(n => n.nodeId === 'sink')!.status).toBe('skipped'); // two hops from the failure
+    expect(executors.Transform).not.toHaveBeenCalled();
+    expect(executors.Sink).not.toHaveBeenCalled();
+  });
+
+  it('one failed branch does not stop the sibling branch from completing (partial-failure-continues)', async () => {
+    // Make a1 fail, a2 succeed, by giving each AgentCall a distinguishable config field.
+    const graph: PipelineGraph = {
+      ...fanOutGraph,
+      nodes: fanOutGraph.nodes.map(n =>
+        n.id === 'a1' ? { ...n, config: { ...n.config, instructionTemplate: 'FAIL' } as any } : n,
+      ),
+    };
+    const agentCall = vi.fn(async (config: any) => {
+      if (config.instructionTemplate === 'FAIL') throw new Error('boom');
+      return { text: 'ok' };
+    });
+    const result = await runPipeline(graph, 'trigger', {}, fakeExecutors({ AgentCall: agentCall }), {});
+
+    expect(result.status).toBe('partial');
+    expect(result.nodes.find(n => n.nodeId === 'a1')!.status).toBe('failed');
+    expect(result.nodes.find(n => n.nodeId === 's1')!.status).toBe('skipped');
+    expect(result.nodes.find(n => n.nodeId === 'a2')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 's2')!.status).toBe('ok'); // sibling branch unaffected
+  });
+
+  it('"trigger" resolves for a non-direct descendant, and for a Trigger not literally named "trigger"', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger-full', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'transform', config: { kind: 'Transform', fn: 'x' } }, // sits between the Trigger and the next AgentCall
+        { id: 'agent2', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      ],
+      edges: [
+        { from: 'trigger-full', to: 'agent' }, { from: 'agent', to: 'transform' }, { from: 'transform', to: 'agent2' },
+      ],
+    };
+    const seenInputs: Record<string, unknown>[] = [];
+    const executors = fakeExecutors({ AgentCall: vi.fn(async (_c, input) => { seenInputs.push(input); return { text: 'ok' }; }) });
+    await runPipeline(graph, 'trigger-full', { versionId: 431 }, executors, {});
+
+    // Direct child — must resolve under the literal key "trigger", not under "trigger-full".
+    expect(seenInputs[0].trigger).toEqual({ appName: 'x', versionId: 431 });
+    // Two hops from the Trigger, behind a Transform — must still resolve.
+    expect(seenInputs[1].trigger).toEqual({ appName: 'x', versionId: 431 });
+  });
+});
