@@ -2433,15 +2433,24 @@ At the top of `runPipeline`, right after `const byId = new Map(...)`:
 
 Change the wave loop's `remaining` set to exclude the inactive nodes from the start (they already have a result, so `ready`'s `!results.has` style checks would naturally skip them if you compute `remaining` as `new Set(order.filter(id => activeZone.has(id)))` instead of `new Set(order)`).
 
-Change the run-status rollup to filter `inactive` out before computing `ok`/`partial`/`failed`:
+Change the run-status rollup to filter `inactive` out before computing `ok`/`partial`/`failed` —
+**this combines with, rather than replaces, the Trigger-exclusion fix Task 13 already applied
+to this same block** (its own first draft counted the fired Trigger's own `'ok'` status in the
+rollup, which made a single downstream failure alongside an otherwise-healthy Trigger
+incorrectly report `'partial'` instead of `'failed'` — fixed during that task's own review, and
+Task 14's "partial-failure-continues" test depends on the fix holding here too, since neither
+Task 14 nor this task replaces the whole block, only adds another filter to it):
 
 ```ts
   const activeResults = [...results.values()].filter(r => r.status !== 'inactive');
-  const runStatus: RunStatus = activeResults.every(r => r.status === 'ok')
-    ? 'ok'
-    : activeResults.some(r => r.status === 'ok')
-      ? 'partial'
-      : 'failed';
+  const outcomeResults = activeResults.filter(r => byId.get(r.nodeId)?.config.kind !== 'Trigger');
+  const runStatus: RunStatus =
+    outcomeResults.length === 0 ? 'ok' : // degenerate: no non-Trigger node in the active zone
+    outcomeResults.every(r => r.status === 'ok')
+      ? 'ok'
+      : outcomeResults.some(r => r.status === 'ok')
+        ? 'partial'
+        : 'failed';
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
