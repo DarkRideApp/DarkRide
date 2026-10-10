@@ -370,6 +370,13 @@ export interface ForEachConfig {
 export interface SinkConfig {
   /** Name of a pre-registered write function — see nodes/sink.ts's registry. */
   writeFn: string;
+  /** Which incoming predecessor's output to read the payload from — same convention as
+   *  Report's sections[].from. The executor wraps every node's input by source-node-id, even
+   *  with exactly one incoming edge (see Tasks 13-17), so a write function can never read a
+   *  field straight off the generic `input` bag; this says which key to unwrap first. */
+  from?: string;
+  /** Static section title — only meaningful for the 'apk-analysis/write-section' writeFn. */
+  section?: string;
 }
 
 export interface TriggerConfig {
@@ -1312,17 +1319,37 @@ function makeDb() {
   return db;
 }
 
+// Every node's input is wrapped by source-node-id, even with exactly one incoming edge —
+// Tasks 13-17 establish this for the whole executor (e.g. the linear-chain test's
+// `{ trigger: { appName: 'x', versionId: 431 } }`). The plan's first draft of this task had
+// write-full-document/write-section read `input.markdown`/`input.section` directly, which
+// would read `undefined` through the real executor and write the literal string "undefined"
+// into the note on every run — caught in the SDD pre-flight scan before this task was
+// dispatched. config.from names which predecessor's output to unwrap first, same convention
+// as Report's sections[].from; these tests use the real wrapped shape throughout.
 describe('runSink', () => {
   it('apk-analysis/write-full-document writes the whole assembled document in one call', async () => {
     const db = makeDb();
-    await runSink({ writeFn: 'apk-analysis/write-full-document' }, { markdown: '## Overview\nHello.\n' }, { db, versionId: 431 });
+    await runSink(
+      { writeFn: 'apk-analysis/write-full-document', from: 'report' },
+      { report: { markdown: '## Overview\nHello.\n' } },
+      { db, versionId: 431 },
+    );
     expect(getNote(db, 431)).toBe('## Overview\nHello.\n');
   });
 
   it('apk-analysis/write-section patches just one section, leaving others untouched', async () => {
     const db = makeDb();
-    await runSink({ writeFn: 'apk-analysis/write-full-document' }, { markdown: '## Overview\nOld.\n\n## Diff Summary\nOld diff.\n' }, { db, versionId: 431 });
-    await runSink({ writeFn: 'apk-analysis/write-section' }, { section: 'Diff Summary', text: 'New diff.' }, { db, versionId: 431 });
+    await runSink(
+      { writeFn: 'apk-analysis/write-full-document', from: 'report' },
+      { report: { markdown: '## Overview\nOld.\n\n## Diff Summary\nOld diff.\n' } },
+      { db, versionId: 431 },
+    );
+    await runSink(
+      { writeFn: 'apk-analysis/write-section', from: 'agent-diff', section: 'Diff Summary' },
+      { 'agent-diff': { text: 'New diff.' } },
+      { db, versionId: 431 },
+    );
     const note = getNote(db, 431);
     expect(note).toContain('## Overview\nOld.');
     expect(note).toContain('## Diff Summary\nNew diff.');
@@ -1331,13 +1358,19 @@ describe('runSink', () => {
   it('throws (not an unhandled rejection) when the target version does not exist', async () => {
     const db = makeDb();
     await expect(
-      runSink({ writeFn: 'apk-analysis/write-full-document' }, { markdown: 'x' }, { db, versionId: 999999 }),
+      runSink({ writeFn: 'apk-analysis/write-full-document', from: 'report' }, { report: { markdown: 'x' } }, { db, versionId: 999999 }),
     ).rejects.toThrow();
   });
 
   it('throws on an unregistered writeFn name', async () => {
     const db = makeDb();
     await expect(runSink({ writeFn: 'nope' }, {}, { db, versionId: 431 })).rejects.toThrow(/Unknown sink/);
+  });
+
+  it('write-full-document writes an empty string when "from" is omitted or its source produced nothing, never the literal text "undefined"', async () => {
+    const db = makeDb();
+    await runSink({ writeFn: 'apk-analysis/write-full-document' }, {}, { db, versionId: 431 });
+    expect(getNote(db, 431)).toBe('');
   });
 });
 ```
@@ -1362,7 +1395,12 @@ export interface SinkCtx {
   versionId: number;
 }
 
-export type SinkWriteFn = (input: Record<string, unknown>, ctx: SinkCtx) => Promise<void>;
+// Every node's input is wrapped by source-node-id, even with exactly one incoming edge (see
+// Tasks 13-17). A write function reading a field straight off `input` would read `undefined`
+// through the real executor, not whatever a unit test calling runSink directly handed it —
+// the config param lets a write function unwrap the right predecessor via config.from, the
+// same convention Report's sections[].from uses.
+export type SinkWriteFn = (config: SinkConfig, input: Record<string, unknown>, ctx: SinkCtx) => Promise<void>;
 
 export const SINK_REGISTRY: Record<string, SinkWriteFn> = {};
 
@@ -1373,15 +1411,17 @@ export function registerSink(name: string, fn: SinkWriteFn): void {
 export async function runSink(config: SinkConfig, input: Record<string, unknown>, ctx: SinkCtx): Promise<void> {
   const fn = SINK_REGISTRY[config.writeFn];
   if (!fn) throw new Error(`Unknown sink "${config.writeFn}"`);
-  await fn(input, ctx);
+  await fn(config, input, ctx);
 }
 
-registerSink('apk-analysis/write-full-document', async (input, ctx) => {
-  setNote(ctx.db, ctx.versionId, String(input.markdown));
+registerSink('apk-analysis/write-full-document', async (config, input, ctx) => {
+  const source = config.from ? (input[config.from] as { markdown?: string } | undefined) : undefined;
+  setNote(ctx.db, ctx.versionId, source?.markdown ?? '');
 });
 
-registerSink('apk-analysis/write-section', async (input, ctx) => {
-  patchNoteSection(ctx.db, ctx.versionId, String(input.section), String(input.text));
+registerSink('apk-analysis/write-section', async (config, input, ctx) => {
+  const source = config.from ? (input[config.from] as { text?: string } | undefined) : undefined;
+  patchNoteSection(ctx.db, ctx.versionId, config.section ?? 'Untitled', source?.text ?? '');
 });
 ```
 
@@ -1605,6 +1645,19 @@ export function validateGraph(graph: PipelineGraph): ValidationError[] {
     }
   }
 
+  // Same drift-detection pattern as Report's sections[].from and Branch's declared edges —
+  // a Sink's config.from, when present, must name a real incoming edge's source. Added
+  // alongside the SDD pre-flight fix to SinkConfig (Task 2) and sink.ts (Task 11): without
+  // this, a typo'd or stale `from` is only ever caught by a live run writing an empty section,
+  // not at publish time.
+  for (const n of graph.nodes) {
+    if (n.config.kind !== 'Sink' || !n.config.from) continue;
+    const incomingSources = new Set(graph.edges.filter(e => e.to === n.id).map(e => e.from));
+    if (!incomingSources.has(n.config.from)) {
+      errors.push({ nodeId: n.id, message: `Sink "${n.id}" declares from: "${n.config.from}", which is not a direct incoming edge into this Sink.` });
+    }
+  }
+
   return errors;
 }
 ```
@@ -1642,6 +1695,19 @@ it('rejects a Branch whose declared edges and real outgoing edge labels have dri
     ],
   };
   expect(validateGraph(graphExtraEdge).some(e => e.nodeId === 'branch' && /"undeclared"/.test(e.message))).toBe(true);
+});
+
+it('rejects a Sink whose declared "from" is not a direct incoming edge source', () => {
+  const graph: PipelineGraph = {
+    nodes: [
+      node('t1', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+      node('agent', { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] }),
+      node('sink', { kind: 'Sink', writeFn: 'x', from: 'not-a-real-edge-source' }),
+    ],
+    edges: [{ from: 't1', to: 'agent' }, { from: 'agent', to: 'sink' }],
+  };
+  const errors = validateGraph(graph);
+  expect(errors.some(e => e.nodeId === 'sink' && /not-a-real-edge-source/.test(e.message))).toBe(true);
 });
 ```
 
@@ -2646,14 +2712,14 @@ git commit -m "test(ai-jobs): pin the concurrent patchNoteSection no-lost-update
 - Produces: `registerAiPipelineEndpoints(deps: AiPipelineDeps): void` where `AiPipelineDeps = { db: AppDatabase; executors: NodeExecutors; buildCtx: (identity, input: Record<string, unknown>) => ExecutionCtx }` — `buildCtx` derives the run's identity from the authenticated request, not a fixed core-service identity, matching `triggerAiAgentManual`'s existing per-user-identity pattern.
 
 Routes (scopes match `patch_analysis_section`/`read_analysis_notes`'s existing `core.apk:manage`/`core.apk:read`, per Global Constraints):
-- `GET /v1/ai-pipelines` — list (`core.apk:read`)
+- `GET /v1/ai-pipelines` — list; each row includes its published (or latest draft) version's `graph` inline, since the frontend canvas needs it on first load and there's no sibling "get one pipeline" endpoint in this plan to fetch it separately (`core.apk:read`)
 - `POST /v1/ai-pipelines` — create a pipeline + its first draft version (`core.apk:manage`)
 - `POST /v1/ai-pipelines/:id/versions` — add a new draft version (`core.apk:manage`)
 - `POST /v1/ai-pipelines/:id/publish` — validates the latest draft version via `validateGraph`, 400s with the validation errors if invalid, else flips it to `published` (`core.apk:manage`)
 - `POST /v1/ai-pipelines/:id/run` — body `{ triggerNodeId, input, reuseUnchanged? }`; **rejects with 409 if a `running` row already exists for this pipeline's current published version** (Review Focus: cross-run concurrency) — otherwise inserts a `running` `aiPipelineRuns` row, calls `runPipeline`, persists every `NodeRunResult` as an `aiPipelineNodeRuns` row, updates the run row to its final status (`core.apk:manage`)
 - `GET /v1/ai-pipelines/runs/:runId` — status + every node-run row (`core.apk:read`)
 
-- [ ] **Step 1: Write the failing test for the 409 concurrency guard (Review Focus item)**
+- [ ] **Step 1: Write the failing test for the 409 concurrency guard (Review Focus item) and the GET list's inlined graph**
 
 ```ts
 // backend/api/ai-pipelines.test.ts
@@ -2665,6 +2731,16 @@ import { registerAiPipelineEndpoints } from './ai-pipelines';
 // Use the project's existing REST-over-WebSocket or supertest-style harness for api-service.ts
 // routes — grep an existing *.test.ts in backend/api/ for the pattern (e.g. apk-availability.test.ts)
 // and reuse it rather than inventing a new way to exercise registerEndpoint-registered routes.
+
+describe('GET /v1/ai-pipelines', () => {
+  it('includes each pipeline\'s published version graph inline, not just the bare pipeline row', async () => {
+    // Arrange: one pipeline with a draft v1 and a published v2 (different graphs).
+    // Act: GET /v1/ai-pipelines.
+    // Assert: the row's `graph` equals v2's graph (the published one), not v1's, and
+    // `pipelineVersionId` equals v2's id — a pipeline with no published version at all falls
+    // back to its latest draft instead of returning `graph: null` and leaving the canvas empty.
+  });
+});
 
 describe('POST /v1/ai-pipelines/:id/run — concurrency guard', () => {
   it('rejects a second run with 409 while one is already running for the same pipeline', async () => {
@@ -2724,8 +2800,20 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
   const { db } = deps;
 
   registerEndpoint('GET', '/v1/ai-pipelines', (req, res) => {
+    // Task 22's frontend reads `apkPipeline.graph` straight off a row from this endpoint — the
+    // pre-flight scan caught that a bare `aiPipelines` select has no graph column at all (it
+    // lives on `aiPipelineVersions`), which would leave the canvas stuck on its loading state
+    // against the real server even though Task 22's own test (mocking this response shape
+    // directly) would pass. Fold each pipeline's published version (falling back to its latest
+    // draft if none is published yet) in here instead of adding a second round-trip.
     const rows = db.select().from(aiPipelines).all();
-    res.json({ success: true, data: rows });
+    const data = rows.map((row) => {
+      const versions = db.select().from(aiPipelineVersions).where(eq(aiPipelineVersions.pipelineId, row.id))
+        .orderBy(aiPipelineVersions.version).all();
+      const version = versions.find(v => v.status === 'published') ?? versions.at(-1);
+      return { ...row, pipelineVersionId: version?.id ?? null, graph: version?.graph ?? null };
+    });
+    res.json({ success: true, data });
   }, { requires: ['core.apk:read'] });
 
   registerEndpoint('POST', '/v1/ai-pipelines', (req, res) => {
@@ -2850,21 +2938,26 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
 Run: `npx vitest run backend/api/ai-pipelines.test.ts`
 Expected: PASS
 
-- [ ] **Step 5: Wire it into `backend/index.ts`**
+- [ ] **Step 5: Add the `// TODO(Task 20)` placeholder in `backend/index.ts`**
 
-Near the other `register*Endpoints(...)` calls (e.g. `registerJobEndpoints(jobRegistry)` at line 768):
+`buildApkAnalysisExecutors`/`buildApkAnalysisExecutionCtx` don't exist until Task 20 — this step adds the registration call **commented out**, so this task's own build stays green in isolation. Near the other `register*Endpoints(...)` calls (e.g. `registerJobEndpoints(jobRegistry)` at line 768):
 
 ```ts
 import { registerAiPipelineEndpoints } from './api/ai-pipelines';
 // ...
-registerAiPipelineEndpoints({
-  db,
-  executors: aiJobExecutors, // built in Task 20, alongside the Astérix pipeline definition
-  buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }), // Task 20
-});
+// TODO(Task 20): uncomment once buildApkAnalysisExecutors/buildApkAnalysisExecutionCtx exist.
+// registerAiPipelineEndpoints({
+//   db,
+//   executors: buildApkAnalysisExecutors(),
+//   buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }),
+// });
 ```
 
-Leave this import commented with a `// TODO(Task 20)` note if Task 20 hasn't landed yet when this task is executed in isolation — but if following this plan in order, Task 20 lands next and this wiring becomes real immediately.
+**This plan runs its tasks in order, so Task 20 below carries an explicit step that comes
+back and finishes this — do not treat the TODO as done once it's merely written.** The
+pre-flight scan caught that the original draft of this plan left this as a dangling
+TODO with no task ever assigned to close it, which would have meant the REST API is
+never actually reachable on a running server even after every task "passes."
 
 - [ ] **Step 6: Commit**
 
@@ -2882,10 +2975,11 @@ git commit -m "feat(ai-jobs): REST API — CRUD, publish (validated), run (409 o
 **Files:**
 - Create: `backend/services/ai-jobs/apk-analysis-pipeline.ts`
 - Create: `backend/services/ai-jobs/apk-analysis-pipeline.test.ts`
+- Modify: `backend/index.ts` (seed the pipeline at boot, and complete Task 19's commented-out `registerAiPipelineEndpoints` wiring — Step 6 below)
 
 **Interfaces:**
-- Consumes: every `nodes/*.ts` file (Tasks 4, 6–11), `runPipeline`/`NodeExecutors`/`ExecutionCtx` (Tasks 13–17).
-- Produces: `buildApkAnalysisExecutors(): NodeExecutors`, `buildApkAnalysisExecutionCtx(deps: { db: AppDatabase; aiFactory: AiAgentFactory; identity: 'core-service' | { userId: number } }, triggerNodeId: string): ExecutionCtx`, `ASTERIX_PATTERN_GRAPH: PipelineGraph` (the literal worked-example graph from the spec — this is the actual pipeline definition seeded for `apk-analysis`, not a test fixture, even though it lives next to its own test file).
+- Consumes: every `nodes/*.ts` file (Tasks 4, 6–11), `runPipeline`/`NodeExecutors`/`ExecutionCtx` (Tasks 13–17), `registerAiPipelineEndpoints`/`AiPipelineDeps` (Task 19).
+- Produces: `buildApkAnalysisExecutors(): NodeExecutors`, `buildApkAnalysisExecutionCtx(deps: { db: AppDatabase; aiFactory: AiAgentFactory; identity: 'core-service' | { userId: number } }, triggerNodeId: string): ExecutionCtx`, `ASTERIX_PATTERN_GRAPH: PipelineGraph` (the literal worked-example graph from the spec — this is the actual pipeline definition seeded for `apk-analysis`, not a test fixture, even though it lives next to its own test file), `seedApkAnalysisPipeline(db): void`.
 
 - [ ] **Step 1: Write the failing test — the graph itself passes validation and has the right shape**
 
@@ -2983,10 +3077,13 @@ export const ASTERIX_PATTERN_GRAPH: PipelineGraph = {
       { title: 'cURL Examples', from: 'agent-curl' },
       { title: 'Bypass Script', from: 'agent-bypass' },
     ] } },
-    { id: 'sink-report', config: { kind: 'Sink', writeFn: 'apk-analysis/write-full-document' } },
+    // Both Sinks declare `from` — the executor wraps even a single predecessor's output by its
+    // node id (Tasks 13-17), so a write function needs to be told which key to unwrap. See the
+    // SDD pre-flight fix to SinkConfig (Task 2) and sink.ts (Task 11).
+    { id: 'sink-report', config: { kind: 'Sink', writeFn: 'apk-analysis/write-full-document', from: 'report' } },
 
     { id: 'agent-diff', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: ['get_app_versions', 'search_apk_findings'], instructionTemplate: 'Compare {{trigger.appName}} v{{trigger.versionName}} against the previously analyzed version. Summarize what changed — new endpoints, new permissions, new SDKs.' } },
-    { id: 'sink-diff', config: { kind: 'Sink', writeFn: 'apk-analysis/write-section' } },
+    { id: 'sink-diff', config: { kind: 'Sink', writeFn: 'apk-analysis/write-section', from: 'agent-diff', section: 'Diff Summary' } },
   ],
   edges: [
     ...['agent-overview', 'agent-wait-times', 'agent-opening-hours', 'agent-maps', 'agent-secrets', 'agent-curl', 'agent-bypass']
@@ -3075,11 +3172,28 @@ Expected: PASS
 
 Add a `seedApkAnalysisPipeline(db: AppDatabase): void` function to the same file — idempotent (checks for an existing `aiPipelines` row with `jobKind: 'apk-analysis'` and name `'Astérix pattern'` before inserting), called once from `backend/index.ts` near `apkAnalyzer.start()`. Write its own small test (insert twice, assert only one `aiPipelines` row and one `published` version exist) before wiring it into `index.ts`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Finish Task 19's `registerAiPipelineEndpoints` wiring in `backend/index.ts`**
+
+Task 19 left this commented out with a `// TODO(Task 20)` note because `buildApkAnalysisExecutors`/`buildApkAnalysisExecutionCtx` didn't exist yet. They do now — uncomment it and fix the one name that was never real (`aiJobExecutors` was always a placeholder, not an actual export anywhere):
+
+```ts
+registerAiPipelineEndpoints({
+  db,
+  executors: buildApkAnalysisExecutors(),
+  buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }),
+});
+```
+
+Add the import: `import { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, seedApkAnalysisPipeline, ASTERIX_PATTERN_GRAPH } from './services/ai-jobs/apk-analysis-pipeline';` (consolidate with whatever Step 5 already added for the seeding call, don't duplicate the import line). Confirm `aiFactory` and `db` are both in scope at this call site (they are — `aiFactory.registerCoreIdentity` already runs near here per the existing boot sequence). Without this step, `/v1/ai-pipelines` is never actually reachable on a running server, Task 22-25's frontend work has nothing real to call, and Task 25's e2e spec fails against the live backend even though every unit test up to this point is green — the TODO text from Task 19 is not a suggestion, it's a dependency on this exact step.
+
+- [ ] **Step 7: Run the full backend test suite, confirm no regression, then commit**
+
+Run: `npx vitest run`
+Expected: PASS — every existing test, plus everything from Tasks 1-20.
 
 ```bash
 git add backend/services/ai-jobs/apk-analysis-pipeline.ts backend/services/ai-jobs/apk-analysis-pipeline.test.ts backend/index.ts
-git commit -m "feat(ai-jobs): define the Astérix pattern pipeline, wire executors, seed it at boot"
+git commit -m "feat(ai-jobs): define the Astérix pattern pipeline, wire executors + REST endpoints, seed it at boot"
 ```
 
 ### Task 21: Migrate `apk-analyzer.ts` off the old loop, behind a setting
