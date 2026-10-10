@@ -4206,7 +4206,10 @@ import React, { useState } from 'react';
 
 export function RunControls({ triggers, onRun }: {
   triggers: Array<{ id: string; label: string }>;
-  onRun: (triggerNodeId: string, reuseUnchanged: boolean) => Promise<{ status: string; nodes: unknown[] }>;
+  // Deliberately `Promise<unknown>`, not a shaped result type: this component never reads the
+  // resolved value, only awaits it to toggle `running` — see the Step 5 correction for why the
+  // real caller (AiJobsWorkspace's handleRun) can't reliably promise a `nodes` field here.
+  onRun: (triggerNodeId: string, reuseUnchanged: boolean) => Promise<unknown>;
 }) {
   const [triggerNodeId, setTriggerNodeId] = useState(triggers[0]?.id ?? '');
   const [reuseUnchanged, setReuseUnchanged] = useState(false);
@@ -4251,6 +4254,17 @@ Expected: PASS
 
 - [ ] **Step 5: Wire it into `AiJobsWorkspace.tsx`**
 
+**Correction made before this task was dispatched:** the draft below read `res.body?.data?.nodes`
+straight off the `POST /run` response. The real endpoint (`backend/api/ai-pipelines.ts:154`,
+Task 19) only ever responds `{ success: true, data: { runId, status } }` — it never includes
+`nodes`; those are persisted to `aiPipelineNodeRuns` and only readable back via the sibling
+`GET /v1/ai-pipelines/runs/:runId` endpoint (`ai-pipelines.ts:166-172`, response shape
+`{ success: true, data: { run, nodes } }`, where each `nodes[i]` carries `nodeId`/`status`/
+`wasMemoized` — exactly the fields this task wants). Without this fix, `nodeStatuses` would stay
+`{}` forever, even after a fully successful run — the entire second half of this task's own
+deliverable (Canvas reflecting run results) would silently do nothing, on every run, always.
+Fixed by following up the `/run` call with a `GET` on the `runId` it returns:
+
 ```tsx
 const triggerNodes = graph.nodes.filter(n => n.config.kind === 'Trigger').map(n => ({ id: n.id, label: n.id })); // real label source is a follow-up — Task 20's graph has no human-readable Trigger display name field today, just its id; adding one is a small, separate schema/UI change, not blocking this task
 
@@ -4260,15 +4274,34 @@ async function handleRun(triggerNodeId: string, reuseUnchanged: boolean) {
   // pipelineId comes from the `pipelineId` state Task 22's useEffect already sets alongside
   // setGraph (the real id GET /v1/ai-pipelines returned for the apk-analysis entry) — never a
   // hardcoded literal.
-  const res: any = await sendRestApi('POST', `/v1/ai-pipelines/${pipelineId}/run`, { triggerNodeId, input: {}, reuseUnchanged });
-  const byId: Record<string, { status: string; wasMemoized?: boolean }> = {};
-  for (const n of res.body?.data?.nodes ?? []) byId[n.nodeId] = { status: n.status, wasMemoized: n.wasMemoized };
-  setNodeStatuses(byId);
-  return res.body?.data;
+  const runRes: any = await sendRestApi('POST', `/v1/ai-pipelines/${pipelineId}/run`, { triggerNodeId, input: {}, reuseUnchanged });
+  const runId = runRes.body?.data?.runId;
+  // The /run response never includes per-node results (see correction above) — fetch them from
+  // the run-detail endpoint. A failed POST (409 already-running, 400 bad trigger, 404, 500) has
+  // no runId, so this is skipped and nodeStatuses is simply left unchanged; surfacing a run
+  // failure to the user is real follow-up work (see Open Questions), not added here.
+  if (runId != null) {
+    const detailRes: any = await sendRestApi('GET', `/v1/ai-pipelines/runs/${runId}`);
+    const byId: Record<string, { status: string; wasMemoized?: boolean }> = {};
+    for (const n of detailRes.body?.data?.nodes ?? []) byId[n.nodeId] = { status: n.status, wasMemoized: n.wasMemoized };
+    setNodeStatuses(byId);
+  }
+  return runRes.body?.data;
 }
 ```
 
+Since `handleRun`'s resolved value no longer reliably carries a `nodes` field (the `/run` response
+never had one), loosen `RunControls`'s `onRun` prop type from `Promise<{ status: string; nodes:
+unknown[] }>` to `Promise<unknown>` in Step 3's code — `RunControls` never reads the resolved
+value's shape (it only awaits the promise to toggle `running`), so this type was unused ceremony
+that would otherwise force a mismatch against what `handleRun` can actually return.
+
 Render `<RunControls triggers={triggerNodes} onRun={handleRun} />` above the `Canvas`, and pass `nodeStatuses` into `Canvas` so node styling can reflect `ok`/`failed`/`cached`/`inactive` (extend `Canvas`'s `style` computation from Task 22 to read `nodeStatuses[n.id]?.status` and pick a border color accordingly — same `KIND_COLOR`-style lookup table pattern, one more small table for status colors).
+
+Add a test to `AiJobsWorkspace.test.tsx` proving this two-call sequence actually populates node
+styling: mock `POST .../run` returning `{ runId: 7, status: 'ok' }` and `GET .../runs/7` returning
+a couple of `nodes` entries, trigger a run, and assert the mock ws recorded both calls in order
+(`calledPaths`-style) and that the resulting node elements pick up the expected status styling.
 
 - [ ] **Step 6: `tsc` check + commit**
 
@@ -4338,6 +4371,7 @@ git commit -m "test(ai-jobs): e2e — canvas renders the real pipeline, prompt e
 ## Open Questions Carried Forward (not blocking, named so they aren't lost)
 
 - **Per-node live status streaming** (Task 24's scope note) — `/run` is synchronous today; broadcasting each `NodeRunResult` as it's produced, the way `apk:ai-agent-update` already works, is real follow-up work.
+- **A failed Run shows no feedback to the user** (Task 24, found during that task's pre-dispatch fix) — if `POST /run` responds 409/400/404/500, `handleRun` has no `runId` to fetch node detail with, so it simply returns with `nodeStatuses` unchanged and no error indicator anywhere in the UI; the Run button just re-enables as if nothing happened. Narrow in the sense that the happy path (what every test exercises) works correctly, but a real gap for anyone who double-clicks Run while one is in flight or hits a genuine crash. A small, separate follow-up (surface `runRes.body?.error` in an inline message or toast) — not added here to keep this task's diff scoped to the bug that made the feature non-functional even on success.
 - **Canvas layout** (Task 22) — nodes are placed in a naive grid, not the hand-tuned 2D layout with per-section `Report` ports the verified mockup used. A real layout pass (either a `dagre`/`elkjs` auto-layout or porting the mockup's exact coordinate math) is a follow-up, not required for this plan's tests to pass.
 - **Persisting an edited graph** (Task 23) — `SidePanel`'s `onSave` only updates local React state today; wiring it to `POST /v1/ai-pipelines/:id/versions` (Task 19 already has the endpoint) is a small follow-up.
 - Every "Open question" already named in the spec itself (reconverging Trigger zones, cross-version memoization, versioned prompt templates, human-in-the-loop nodes) — unchanged, still future work, not restated here.
