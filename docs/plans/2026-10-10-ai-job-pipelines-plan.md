@@ -140,6 +140,10 @@ export const aiPipelineVersions = sqliteTable('ai_pipeline_versions', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   pipelineId: integer('pipeline_id').notNull().references(() => aiPipelines.id, { onDelete: 'cascade' }),
   version: integer('version').notNull(),
+  // Deliberately the generic shape, not Task 2's real PipelineGraph — backend/db/schema.ts is
+  // more foundational than feature code under ai-jobs/ and shouldn't import from it (consumers
+  // like Task 19's REST handler cast `as PipelineGraph`, which is the intended, acceptable
+  // layering here, not a gap to close by reaching schema.ts into a higher-level module).
   graph: text('graph', { mode: 'json' }).$type<{ nodes: unknown[]; edges: unknown[] }>().notNull(),
   status: text('status', { enum: ['draft', 'published'] }).notNull().default('draft'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
@@ -681,7 +685,10 @@ git commit -m "feat(ai-jobs): add Trigger node kind + apk-analysis ApkContext ex
 ```ts
 // append to backend/services/ai-agent.test.ts — adapt the mock-provider setup to match
 // whatever harness the surrounding describe blocks in this file already use (it has one;
-// do not build a second one — grep the file for `describe('tiered execution'` or similar
+// do not build a second one — the live, working harness is describe('tiered execution — parseMissAttempt
+// escalation', ...) (it exercises handleMessageWithIdentity against a real AiToolRegistry + mock-provider
+// pattern); describe('tiered execution', ...) alone is describe.skip'd dead code — plan review caught that
+// the earlier draft of this note pointed at the skipped block, re-verify the line number at execution time
 // for the existing pattern and reuse its mock AI provider / toolRegistry fixtures).
 describe('toolAllowlist', () => {
   it('restricts the resolved tool list to just the allowlisted names', async () => {
@@ -829,10 +836,25 @@ describe('runAgentCall', () => {
     ).rejects.toThrow(/ModelRefusedError/);
   });
 
-  it('returns the final text output on success', async () => {
-    const agent = makeFakeAgent(async () => ({ finalText: 'Summary: a React Native app.', run: { requests: [] } }));
+  it('accumulates streamed onToken chunks into the returned text — HandleMessageResult has no text field to read instead', async () => {
+    const agent = makeFakeAgent(async (p: any) => {
+      p.onToken('Summary: ');
+      p.onToken('a React Native app.');
+      return { run: { requests: [] } };
+    });
     const result = await runAgentCall(config, { trigger: { appName: 'x', versionName: '1' } }, { agent: agent as any, contextId: '431' });
     expect(result).toEqual({ text: 'Summary: a React Native app.' });
+  });
+
+  it('supplies onToolStart and onToolResult — both are non-optional on HandleMessageParams', async () => {
+    const agent = makeFakeAgent(async (p: any) => {
+      expect(typeof p.onToolStart).toBe('function');
+      expect(typeof p.onToolResult).toBe('function');
+      p.onToolStart('id1', 'get_apk_overview', {}, 1, 49); // must not throw
+      p.onToolResult('id1', 'get_apk_overview', '{}', 10); // must not throw
+      return { run: { requests: [] } };
+    });
+    await runAgentCall(config, { trigger: { appName: 'x', versionName: '1' } }, { agent: agent as any, contextId: '431' });
   });
 });
 ```
@@ -844,7 +866,7 @@ Expected: FAIL — module `./agent-call` does not exist.
 
 - [ ] **Step 3: Write the implementation**
 
-Confirm `HandleMessageResult`'s real shape (`finalText`? `error`? `aborted`?) by grepping `ai-agent.ts` for its interface before writing this — the test above assumes fields based on what Task 5's work already touched; adjust field names to match reality if they differ.
+`HandleMessageResult` (`ai-agent.ts:96-106`, confirmed by plan review — grepped the whole repo, there is no `finalText` field anywhere in the codebase) has only `conversationId`, `usage`, `error`, `turnLimitReached`, `aborted`, `run`. No field carries the model's text. The only path the text ever reaches a caller is the streamed `onToken` callback — `runAgentCall` accumulates it itself rather than reading a result field that doesn't exist, which is what the first draft of this task did and would have silently returned an empty string from every real run.
 
 ```ts
 // backend/services/ai-jobs/nodes/agent-call.ts
@@ -866,6 +888,12 @@ export async function runAgentCall(
 ): Promise<Record<string, unknown>> {
   const message = resolveTemplate(config.instructionTemplate, input); // throws TemplateResolutionError, left uncaught on purpose
 
+  // HandleMessageResult has no text field — confirmed against ai-agent.ts:96-106 (only
+  // conversationId/usage/error/turnLimitReached/aborted/run). The model's text only ever
+  // reaches a caller through the streamed onToken callback; accumulate it here rather than
+  // reading a field that doesn't exist (the first draft of this task did exactly that and
+  // would have returned an empty string from every real run — caught in plan review).
+  let text = '';
   const result = await ctx.agent.handleMessage({
     conversationId: null,
     message,
@@ -874,13 +902,18 @@ export async function runAgentCall(
     mode: 'silent',
     maxTurns: AI_ANALYSIS_MAX_TURNS,
     toolAllowlist: config.toolAllowlist,
-    onToken: () => {},
+    onToken: (chunk) => { text += chunk; },
+    // Non-optional on HandleMessageParams (ai-agent.ts:37-66) — every real caller supplies
+    // them (apk-analyzer.ts:925-934); omitting them fails to compile and would throw at
+    // runtime on the first tool use.
+    onToolStart: () => {},
+    onToolResult: () => {},
   });
 
   if (result.error) throw new Error(result.error);
   if (result.aborted) throw new Error('AgentCall aborted');
 
-  return { text: result.finalText ?? '' };
+  return { text };
 }
 ```
 
@@ -1550,8 +1583,66 @@ export function validateGraph(graph: PipelineGraph): ValidationError[] {
     }
   }
 
+  // Same "authored data can drift from the graph" check Report gets above, for Branch's
+  // declared config.edges against its real outgoing edge labels — plan review caught that this
+  // was missing: a Branch with a declared edge that has no matching graph edge, or a graph edge
+  // whose label isn't declared, was only ever caught at runtime if a run happened to exercise
+  // that exact path, contradicting Review Focus item 3's own "catch this at publish time" goal.
+  for (const n of graph.nodes) {
+    if (n.config.kind !== 'Branch') continue;
+    const outgoingLabels = new Set(
+      graph.edges.filter(e => e.from === n.id).map(e => e.label).filter((l): l is string => !!l),
+    );
+    for (const declaredEdge of n.config.edges) {
+      if (!outgoingLabels.has(declaredEdge)) {
+        errors.push({ nodeId: n.id, message: `Branch "${n.id}" declares edge "${declaredEdge}" in its config, but no outgoing graph edge carries that label.` });
+      }
+    }
+    for (const label of outgoingLabels) {
+      if (!n.config.edges.includes(label)) {
+        errors.push({ nodeId: n.id, message: `Branch "${n.id}" has an outgoing edge labeled "${label}" that isn't declared in its config.edges.` });
+      }
+    }
+  }
+
   return errors;
 }
+```
+
+**Add this test** alongside the existing graph-validator tests:
+
+```ts
+it('rejects a Branch whose declared edges and real outgoing edge labels have drifted apart', () => {
+  const graphMissingEdge: PipelineGraph = {
+    nodes: [
+      node('t1', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+      node('agent', { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] }),
+      node('branch', { kind: 'Branch', predicate: 'x', edges: ['primary', 'fallback'] }), // declares 'fallback'...
+      node('sink', { kind: 'Sink', writeFn: 'x' }),
+    ],
+    edges: [
+      { from: 't1', to: 'agent' }, { from: 'agent', to: 'branch' },
+      { from: 'branch', to: 'sink', label: 'primary' }, // ...but no graph edge actually carries it
+    ],
+  };
+  expect(validateGraph(graphMissingEdge).some(e => e.nodeId === 'branch' && /"fallback"/.test(e.message))).toBe(true);
+
+  const graphExtraEdge: PipelineGraph = {
+    nodes: [
+      node('t1', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+      node('agent', { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] }),
+      node('branch', { kind: 'Branch', predicate: 'x', edges: ['primary'] }), // only declares 'primary'...
+      node('sink1', { kind: 'Sink', writeFn: 'x' }),
+      node('sink2', { kind: 'Sink', writeFn: 'x' }),
+    ],
+    edges: [
+      { from: 't1', to: 'agent' }, { from: 'agent', to: 'branch' },
+      { from: 'branch', to: 'sink1', label: 'primary' },
+      { from: 'branch', to: 'sink2', label: 'undeclared' }, // ...but a second, undeclared outgoing edge exists
+    ],
+  };
+  expect(validateGraph(graphExtraEdge).some(e => e.nodeId === 'branch' && /"undeclared"/.test(e.message))).toBe(true);
+});
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -1909,6 +2000,14 @@ Replace the `for (const nodeId of order)` block in `runPipeline` (keep everythin
       }
 
       const input = buildInput(incoming, outputs);
+      // The spec requires `trigger` to resolve for EVERY node, "not just its direct children"
+      // (Node primitives) — buildInput only ever keys by source-node-id, so a direct child of
+      // the fired Trigger gets its output under that Trigger's real id (e.g. 'trigger-full'),
+      // never under the literal key 'trigger', and a non-direct descendant gets no trigger data
+      // at all. Both cases are wrong; this line is the fix for both at once. Safe to always set:
+      // the Trigger itself always completes in the first wave, so outputs.get(triggerNodeId) is
+      // populated before any other node runs.
+      input.trigger = outputs.get(triggerNodeId);
       try {
         const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx);
         results.set(nodeId, { nodeId, status: 'ok', output });
@@ -1921,6 +2020,32 @@ Replace the `for (const nodeId of order)` block in `runPipeline` (keep everythin
 ```
 
 Delete the old `let aborted = false;` line and the sequential loop it belonged to — the wave loop above replaces it entirely. `order` (from Kahn's algorithm) is still used afterward, for `return { status: runStatus, nodes: order.map(id => results.get(id)!) }`, so keep computing it, just stop using it to drive execution order.
+
+**Add this test** (plan review caught the bug this line fixes, and flagged that the existing linear-chain test can't catch it — its test graph happens to name its Trigger node literally `'trigger'`, which makes source-id keying and the special `trigger` key coincide by accident):
+
+```ts
+it('"trigger" resolves for a non-direct descendant, and for a Trigger not literally named "trigger"', async () => {
+  const graph: PipelineGraph = {
+    nodes: [
+      { id: 'trigger-full', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+      { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      { id: 'transform', config: { kind: 'Transform', fn: 'x' } }, // sits between the Trigger and the next AgentCall
+      { id: 'agent2', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+    ],
+    edges: [
+      { from: 'trigger-full', to: 'agent' }, { from: 'agent', to: 'transform' }, { from: 'transform', to: 'agent2' },
+    ],
+  };
+  const seenInputs: Record<string, unknown>[] = [];
+  const executors = fakeExecutors({ AgentCall: vi.fn(async (_c, input) => { seenInputs.push(input); return { text: 'ok' }; }) });
+  await runPipeline(graph, 'trigger-full', { versionId: 431 }, executors, {});
+
+  // Direct child — must resolve under the literal key "trigger", not under "trigger-full".
+  expect(seenInputs[0].trigger).toEqual({ appName: 'x', versionId: 431 });
+  // Two hops from the Trigger, behind a Transform — must still resolve.
+  expect(seenInputs[1].trigger).toEqual({ appName: 'x', versionId: 431 });
+});
+```
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -2100,6 +2225,7 @@ and in the wave loop, right before the `runOne` call, branch on node kind to bui
       }
 
       const input = buildInput(incoming, outputs);
+      input.trigger = outputs.get(triggerNodeId); // see Task 14 — keep this line through every later rewrite of this block
       try {
         const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx, branchEnvelope, reportEnvelopes);
         results.set(nodeId, { nodeId, status: 'ok', output });
@@ -2186,6 +2312,12 @@ describe('runPipeline — multi-trigger zones', () => {
     const activeZoneNodes = result.nodes.filter(n => n.status !== 'inactive');
     expect(activeZoneNodes.map(n => n.nodeId).sort()).toEqual(['agent-rescan', 'rescan', 'sink-rescan']);
   });
+
+  it('throws on a triggerNodeId that does not name a real Trigger node, rather than silently reporting ok', async () => {
+    const executors = fakeExecutors();
+    await expect(runPipeline(twoTriggerGraph, 'not-a-real-node', {}, executors, {})).rejects.toThrow(/not a Trigger node/);
+    await expect(runPipeline(twoTriggerGraph, 'agent-full', {}, executors, {})).rejects.toThrow(/not a Trigger node/); // a real node, but not a Trigger
+  });
 });
 ```
 
@@ -2217,6 +2349,16 @@ function reachableFrom(nodeId: string, graph: PipelineGraph): Set<string> {
 At the top of `runPipeline`, right after `const byId = new Map(...)`:
 
 ```ts
+  const firedTrigger = byId.get(triggerNodeId);
+  if (!firedTrigger || firedTrigger.config.kind !== 'Trigger') {
+    // Without this, a typo'd or missing triggerNodeId makes activeZone = {triggerNodeId} only
+    // (reachableFrom still "succeeds" — it just finds one unknown node with no edges), every
+    // real node ends up `inactive`, activeResults is empty, and the ok/partial/failed rollup
+    // below is vacuously `true` on an empty array — the run reports 'ok' having executed and
+    // written nothing. Caught in plan review. Fail loud instead.
+    throw new Error(`runPipeline: "${triggerNodeId}" is not a Trigger node in this graph`);
+  }
+
   const activeZone = reachableFrom(triggerNodeId, graph);
   for (const n of graph.nodes) {
     if (!activeZone.has(n.id)) results.set(n.id, { nodeId: n.id, status: 'inactive' });
@@ -2333,7 +2475,13 @@ describe('runPipeline — memoization', () => {
   it('reuses a prior AgentCall output when reuseUnchanged is set and the hash matches, never calls the executor', async () => {
     const { computeInputHash } = await import('./memoization');
     const config = linearGraph.nodes[1].config; // the AgentCall node
-    const input = { trigger: { versionId: 431 } };
+    // Must match what the executor actually builds, not a guess — fakeExecutors' Trigger returns
+    // { appName: 'x', ...rawInput }, and every node's input.trigger is that output (Task 14's fix).
+    // The first draft of this test hashed { trigger: { versionId: 431 } } (missing appName),
+    // which never matched the runtime hash — the memoization lookup missed, AgentCall WAS
+    // called, and the test failed for a hash mismatch, not the behavior it claims to test.
+    // Caught in plan review.
+    const input = { trigger: { appName: 'x', versionId: 431 } };
     const priorHash = computeInputHash(config, input);
 
     const executors = fakeExecutors();
@@ -2374,7 +2522,7 @@ describe('runPipeline — memoization', () => {
   it('reuseUnchanged defaults to off — omitting it runs everything fresh even with priorNodeRuns supplied', async () => {
     const { computeInputHash } = await import('./memoization');
     const config = linearGraph.nodes[1].config;
-    const hash = computeInputHash(config, { trigger: { versionId: 431 } });
+    const hash = computeInputHash(config, { trigger: { appName: 'x', versionId: 431 } }); // the real resolved shape, same correction as the first test
     const executors = fakeExecutors();
     await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
       priorNodeRuns: { agent: { inputHash: hash, output: { text: 'should not be used' } } },
@@ -2528,6 +2676,20 @@ describe('POST /v1/ai-pipelines/:id/run — concurrency guard', () => {
   it('accepts a run once the prior one has finished (status is ok/partial/failed, not running)', async () => {
     // Same setup, but the existing row's status is 'ok'. Assert: 200, a new row created.
   });
+
+  it('infers triggerNodeId when the published version has exactly one Trigger and the request omits it', async () => {
+    // A published version with one Trigger, POST /run with no triggerNodeId in the body.
+    // Assert: 200, and the aiPipelineRuns row's triggerNodeId column was set to that one Trigger's id.
+  });
+
+  it('rejects with 400 when triggerNodeId is omitted and the version has more than one Trigger', async () => {
+    // A published version with two Triggers (same shape as ASTERIX_PATTERN_GRAPH), POST /run with no
+    // triggerNodeId. Assert: 400, body.error mentions how many Trigger nodes exist.
+  });
+
+  it('rejects with 400 when triggerNodeId is supplied but does not name a real Trigger node', async () => {
+    // POST /run with triggerNodeId: 'agent-overview' (a real node, but not a Trigger). Assert: 400.
+  });
 });
 ```
 
@@ -2599,12 +2761,30 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
 
   registerEndpoint('POST', '/v1/ai-pipelines/:id/run', async (req, res) => {
     const pipelineId = Number(req.params.id);
-    const { triggerNodeId, input, reuseUnchanged } = req.body as { triggerNodeId: string; input: Record<string, unknown>; reuseUnchanged?: boolean };
+    const { input, reuseUnchanged } = req.body as { triggerNodeId?: string; input: Record<string, unknown>; reuseUnchanged?: boolean };
+    let { triggerNodeId } = req.body as { triggerNodeId?: string };
 
     const version = db.select().from(aiPipelineVersions)
       .where(and(eq(aiPipelineVersions.pipelineId, pipelineId), eq(aiPipelineVersions.status, 'published')))
       .orderBy(aiPipelineVersions.version).all().pop();
     if (!version) { res.status(404).json({ success: false, error: 'No published version for this pipeline' }); return; }
+
+    // Spec (API surface): "triggerNodeId required once a version has more than one Trigger,
+    // optional and inferred when it has exactly one." The first draft of this handler never
+    // implemented that — it just passed whatever the body sent straight to runPipeline, which
+    // (before the validation fix above) would silently no-op on undefined. Implement it for real.
+    const graphForTriggerCheck = version.graph as PipelineGraph;
+    const triggerNodes = graphForTriggerCheck.nodes.filter(n => n.config.kind === 'Trigger');
+    if (!triggerNodeId) {
+      if (triggerNodes.length !== 1) {
+        res.status(400).json({ success: false, error: `triggerNodeId is required — this pipeline version has ${triggerNodes.length} Trigger nodes, not exactly one` });
+        return;
+      }
+      triggerNodeId = triggerNodes[0].id;
+    } else if (!triggerNodes.some(n => n.id === triggerNodeId)) {
+      res.status(400).json({ success: false, error: `"${triggerNodeId}" is not a Trigger node in this pipeline version` });
+      return;
+    }
 
     const alreadyRunning = db.select().from(aiPipelineRuns)
       .where(and(eq(aiPipelineRuns.pipelineVersionId, version.id), eq(aiPipelineRuns.status, 'running')))
@@ -2624,7 +2804,10 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
     let priorNodeRuns: Record<string, { inputHash: string; output: Record<string, unknown> }> | undefined;
     if (reuseUnchanged) {
       priorNodeRuns = {};
-      const priorRuns = db.select().from(aiPipelineRuns).where(eq(aiPipelineRuns.pipelineVersionId, version.id)).all();
+      // Ascending by id, so a later (more recent) run's node output always overwrites an earlier
+      // one's in the loop below — relying on unordered default row-scan order "worked" on
+      // better-sqlite3's rowid scan in practice but wasn't a guaranteed contract (plan review).
+      const priorRuns = db.select().from(aiPipelineRuns).where(eq(aiPipelineRuns.pipelineVersionId, version.id)).orderBy(aiPipelineRuns.id).all();
       for (const priorRun of priorRuns) {
         const priorNodes = db.select().from(aiPipelineNodeRuns)
           .where(and(eq(aiPipelineNodeRuns.runId, priorRun.id), eq(aiPipelineNodeRuns.status, 'ok')))
@@ -2636,7 +2819,7 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
     }
 
     const identity = req.authUser
-      ? { type: 'user' as const, userId: req.authUser.actorUserId }
+      ? { type: 'user' as const, userId: req.authUser.userId } // AuthUser (backend/auth/middleware.ts:9-18) has userId, not actorUserId — that field belongs to the unrelated AgentIdentity type; plan review caught this, as-written every manual run threw "forUser: user undefined not found"
       : { type: 'core-service' as const }; // defensive fallback — registerEndpoint's scope check already requires an authUser for a core.apk:manage route, this branch should be unreachable in practice
     const result = await runPipeline(graph, triggerNodeId, input, deps.executors, deps.buildCtx(identity, input), { reuseUnchanged, priorNodeRuns });
 
@@ -2840,7 +3023,11 @@ export function buildApkAnalysisExecutors(): NodeExecutors {
     },
     Transform: (config, input) => runTransform(config, input),
     Branch: (config, envelope) => runBranch(config, envelope),
-    Report: (config, envelopes) => runReport(config, envelopes as any),
+    // Every AgentCall in this job kind returns { text: string } (Task 6) by construction, but the
+    // generic NodeExecutors interface types a Report's envelopes as bare Envelope<unknown> — it
+    // has no way to know a given job's AgentCall output shape. Narrowing the cast (not `as any`,
+    // which hides any future shape mismatch) documents that assumption instead of erasing it.
+    Report: (config, envelopes) => runReport(config, envelopes as Record<string, import('./types').Envelope<{ text: string }>>),
     ForEach: async (config, items) => runForEach(config, items),
     Sink: async (config, input, ctx) => {
       const c = ctx as { db: AppDatabase; versionId: number };
@@ -2866,7 +3053,7 @@ export function buildApkAnalysisExecutionCtx(
 
 ```ts
 it('binds a fresh BoundAgent per AgentCall node, each with that node\'s own config.tier', async () => {
-  const forCoreService = vi.fn(() => ({ identity: {} as any, handleMessage: vi.fn(async () => ({ finalText: 'ok' })) }));
+  const forCoreService = vi.fn(() => ({ identity: {} as any, handleMessage: vi.fn(async (p: any) => { p.onToken('ok'); return { run: { requests: [] } }; }) }));
   const aiFactory = { forCoreService } as unknown as import('../ai-agent-factory').AiAgentFactory;
   const executors = buildApkAnalysisExecutors();
   const ctx = buildApkAnalysisExecutionCtx({ db: {} as any, aiFactory, identity: { type: 'core-service' }, versionId: 431 });
@@ -2990,6 +3177,14 @@ private async runAiPipeline(
     buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId }),
   );
 
+  // Scope gap, stated plainly rather than silently absorbed: `frontend/pages/ApkAnalysis.tsx:400`
+  // types `msg.status` as the literal union 'running' | 'completed' | 'failed' — there is no
+  // 'partial' value this event can carry without widening that union and updating the page to
+  // render it distinctly, and this task doesn't do either. A `partial` run (say, Bypass Script
+  // failed but the other six sections landed with Report's placeholder) broadcasts as plain
+  // "completed" on the one surface an analyst actually watches during a run — which quietly
+  // undercuts the spec's own stated motivation ("zero silent gaps") on exactly that surface.
+  // Real, valuable follow-up work; out of scope for this task. See Open Questions.
   broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: result.status === 'failed' ? 'failed' : 'completed' });
   log(`AI pipeline completed for version ${versionId}: ${result.status}`);
 }
