@@ -4317,7 +4317,9 @@ git commit -m "feat(ai-jobs): entry-point picker, reuse-unchanged toggle, Run wi
 - Create: `tests/e2e/ai-pipelines.spec.ts`
 
 **Interfaces:**
-- Consumes: the real server (via the project's existing Playwright `webServer` fixture — same isolated-DB pattern as `plugins-install-ui.spec.ts`, not the shared e2e server, since this spec publishes a pipeline version and triggers a real run against it).
+- Consumes: the real server, via the shared e2e `webServer` (same as `navigation.spec.ts`/`ai-tiers.spec.ts`) — **not** `plugins-install-ui.spec.ts`'s isolated-DB-and-Vite pattern. An earlier draft of this task claimed it needed isolation because it "publishes a pipeline version and triggers a real run," but the test below does neither — it only reads `GET /v1/ai-pipelines` (the `apk-analysis` pipeline is seeded with a published v1 at boot, unconditionally — `seedApkAnalysisPipeline`, Task 20, not gated by `ai_pipelines_enabled`) and exercises the canvas/panel UI entirely client-side (`SidePanel.onSave` only touches local React state — Task 23 — never `POST .../versions`). Nothing this test does mutates shared state, so isolation would only add the cost of spinning up a second backend+Vite instance for no benefit. If a future task adds a step that actually publishes or runs, promote it to the isolated pattern then.
+
+**Correction made before this task was dispatched:** the draft test clicked and asserted against `'Overview'`/`'Assemble notes'` to represent "the `agent-overview` AgentCall node" and "the Report node" respectively. Neither works against the real rendering (`frontend/pages/ai-jobs/Canvas.tsx`'s `NodeLabel`, Task 22/23): every node's label is its kind plus its own `id` (`'AgentCall'` / `'agent-overview'`), and a `Report` node additionally lists its section titles as separate lines — so `'Overview'` is the Report node's first section-title line, not the `agent-overview` AgentCall node's label, and `'Assemble notes'` doesn't exist anywhere in the real pipeline (Task 20's actual section titles are Overview/Wait Times/Opening Hours/Maps/Secrets/cURL Examples/Bypass Script — the exact same stale string Task 22's own unit test had to fix for the same reason). Clicking `'Overview'` as drafted would have opened the *Report* panel, not the AgentCall prompt editor the test claims to be testing. Fixed below by targeting each node's real id text, with `exact: true` so `'report'` doesn't also match `'sink-report'` as a substring. Also renamed the test — its old name ("Run produces a partial result with Bypass Script failed") described a live Run this test explicitly never performs (see the note after the code block, unchanged from the original draft).
 
 - [ ] **Step 1: Write the test**
 
@@ -4327,24 +4329,29 @@ import { test, expect } from '@playwright/test';
 import { loginAsAdmin, waitForBackend } from './helpers/auth';
 
 test.describe('AI job pipelines', () => {
-  test('canvas renders the Astérix pattern pipeline, Run produces a partial result with Bypass Script failed', async ({ page }) => {
+  test('canvas renders the real Astérix pipeline; prompt editor and Report sections show real content', async ({ page }) => {
     await loginAsAdmin(page);
     await waitForBackend(page.request);
     await page.goto('/ui/pipelines');
 
-    await expect(page.getByText('Overview')).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText('Assemble notes')).toBeVisible();
+    // Every node renders its own id as part of its label (Canvas.tsx's NodeLabel).
+    await expect(page.getByText('agent-overview', { exact: true })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('report', { exact: true })).toBeVisible();
 
-    // Click an AgentCall node, confirm the prompt editor opens with real content.
-    await page.getByText('Overview').click();
+    // Click the agent-overview AgentCall node, confirm the prompt editor opens with real content.
+    await page.getByText('agent-overview', { exact: true }).click();
     await expect(page.getByRole('textbox')).toHaveValue(/Analyze \{\{trigger\.appName\}\}/);
 
     // Insert a variable chip, confirm it lands in the textarea.
     await page.getByRole('button', { name: /trigger\.appName/i }).click();
     await expect(page.getByRole('textbox')).toHaveValue(/\{\{trigger\.appName\}\}.*\{\{trigger\.appName\}\}/s);
 
+    // Close this panel before opening the next one, rather than assume the Report node is
+    // reachable underneath whatever's currently open.
+    await page.getByRole('button', { name: /close/i }).click();
+
     // Click the Report node, confirm its ordered section list shows all seven, in order.
-    await page.getByText('Assemble notes').click();
+    await page.getByText('report', { exact: true }).click();
     const sectionRows = page.getByTestId('report-section-row');
     await expect(sectionRows).toHaveCount(7);
     await expect(sectionRows.nth(6)).toContainText('Bypass Script');
