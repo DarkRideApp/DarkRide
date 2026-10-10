@@ -104,6 +104,7 @@ import { registerNotificationEndpoints } from './api/notifications';
 import { JobRegistry } from './services/job-registry';
 import { registerJobEndpoints } from './api/jobs';
 import { registerAiPipelineEndpoints } from './api/ai-pipelines';
+import { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, seedApkAnalysisPipeline } from './services/ai-jobs/apk-analysis-pipeline';
 import { PluginManager } from './plugins/plugin-manager';
 import { computeLoadOrder } from './plugins/load-order';
 import { discoverPlugins, discoverNpmPlugins, applyPluginFilter } from './plugins/discover';
@@ -767,12 +768,9 @@ pluginSourceManager.fetchAll(true).catch(err => {
   error(`Initial plugin source fetch failed (will retry on schedule): ${err.message}`);
 });
 registerJobEndpoints(jobRegistry);
-// TODO(Task 20): uncomment once buildApkAnalysisExecutors/buildApkAnalysisExecutionCtx exist.
-// registerAiPipelineEndpoints({
-//   db,
-//   executors: buildApkAnalysisExecutors(),
-//   buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }),
-// });
+// registerAiPipelineEndpoints wiring moved below, right after `aiFactory` is constructed —
+// this call site runs before that `const aiFactory = ...` declaration executes, and referencing
+// it here would throw (temporal dead zone for a top-level `const`).
 registerInterceptRuleEndpoints(db, (msg) => broadcastToAll(msg));
 // Interactive intercept ("breakpoints") — separate from the rule-based feature above.
 registerInterceptLiveEndpoints((msg) => broadcastToAll(msg), (config) => writeHoldConfig(config));
@@ -821,6 +819,15 @@ aiFactory.registerCoreIdentity('apk-diff-engine', {
   aiScopes: ['core.apk:read', 'core.apk:manage', 'mcp'],
 });
 apkDiffEngine.setAiFactory(aiFactory);
+
+// Task 20: the Astérix pattern pipeline's REST surface. `aiFactory` must already exist (just
+// above) — this is why this call lives here rather than back at the TODO comment Task 19 left
+// near registerJobEndpoints.
+registerAiPipelineEndpoints({
+  db,
+  executors: buildApkAnalysisExecutors(),
+  buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }),
+});
 
 // Wire notification service to broadcast events not handled by direct service hooks
 onBroadcast((msg) => {
@@ -1399,6 +1406,8 @@ httpServer.listen(PORT, HOST, () => {
   }
   apkAnalyzer.resetRunningJobs();
   apkAnalyzer.start();
+  // Seed the Astérix pattern pipeline + its published version — idempotent, safe on every boot.
+  seedApkAnalysisPipeline(db);
   fridaReleaseManager.start().catch(err => error('Frida release manager failed: ' + err.message));
   fileSync.start();
   jobRegistry.start();
