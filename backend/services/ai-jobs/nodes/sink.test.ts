@@ -1,0 +1,75 @@
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { describe, it, expect } from 'vitest';
+import * as schema from '../../../db/schema';
+import { runSink } from './sink';
+import { getNote } from '../../apk-notes';
+
+function makeDb() {
+  const sqlite = new Database(':memory:');
+  sqlite.pragma('foreign_keys = ON');
+  sqlite.exec(`
+    CREATE TABLE tracked_apps (id INTEGER PRIMARY KEY, package_name TEXT NOT NULL, app_name TEXT, auto_analyse INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+    CREATE TABLE apk_versions (id INTEGER PRIMARY KEY, tracked_app_id INTEGER NOT NULL, version_code INTEGER NOT NULL, version_name TEXT, filename TEXT NOT NULL, file_size INTEGER, device_id TEXT, source TEXT DEFAULT 'device', downloaded_at INTEGER NOT NULL);
+    CREATE TABLE apk_notes (version_id INTEGER PRIMARY KEY REFERENCES apk_versions(id) ON DELETE CASCADE, content TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
+  `);
+  const db = drizzle(sqlite, { schema });
+  db.insert(schema.trackedApps).values({ id: 1, packageName: 'x', createdAt: new Date() }).run();
+  db.insert(schema.apkVersions).values({ id: 431, trackedAppId: 1, versionCode: 1, filename: 'x.apk', downloadedAt: new Date() }).run();
+  return db;
+}
+
+// Every node's input is wrapped by source-node-id, even with exactly one incoming edge —
+// Tasks 13-17 establish this for the whole executor (e.g. the linear-chain test's
+// `{ trigger: { appName: 'x', versionId: 431 } }`). The plan's first draft of this task had
+// write-full-document/write-section read `input.markdown`/`input.section` directly, which
+// would read `undefined` through the real executor and write the literal string "undefined"
+// into the note on every run — caught in the SDD pre-flight scan before this task was
+// dispatched. config.from names which predecessor's output to unwrap first, same convention
+// as Report's sections[].from; these tests use the real wrapped shape throughout.
+describe('runSink', () => {
+  it('apk-analysis/write-full-document writes the whole assembled document in one call', async () => {
+    const db = makeDb();
+    await runSink(
+      { writeFn: 'apk-analysis/write-full-document', from: 'report' },
+      { report: { markdown: '## Overview\nHello.\n' } },
+      { db, versionId: 431 },
+    );
+    expect(getNote(db, 431)).toBe('## Overview\nHello.\n');
+  });
+
+  it('apk-analysis/write-section patches just one section, leaving others untouched', async () => {
+    const db = makeDb();
+    await runSink(
+      { writeFn: 'apk-analysis/write-full-document', from: 'report' },
+      { report: { markdown: '## Overview\nOld.\n\n## Diff Summary\nOld diff.\n' } },
+      { db, versionId: 431 },
+    );
+    await runSink(
+      { writeFn: 'apk-analysis/write-section', from: 'agent-diff', section: 'Diff Summary' },
+      { 'agent-diff': { text: 'New diff.' } },
+      { db, versionId: 431 },
+    );
+    const note = getNote(db, 431);
+    expect(note).toContain('## Overview\nOld.');
+    expect(note).toContain('## Diff Summary\nNew diff.');
+  });
+
+  it('throws (not an unhandled rejection) when the target version does not exist', async () => {
+    const db = makeDb();
+    await expect(
+      runSink({ writeFn: 'apk-analysis/write-full-document', from: 'report' }, { report: { markdown: 'x' } }, { db, versionId: 999999 }),
+    ).rejects.toThrow();
+  });
+
+  it('throws on an unregistered writeFn name', async () => {
+    const db = makeDb();
+    await expect(runSink({ writeFn: 'nope' }, {}, { db, versionId: 431 })).rejects.toThrow(/Unknown sink/);
+  });
+
+  it('write-full-document writes an empty string when "from" is omitted or its source produced nothing, never the literal text "undefined"', async () => {
+    const db = makeDb();
+    await runSink({ writeFn: 'apk-analysis/write-full-document' }, {}, { db, versionId: 431 });
+    expect(getNote(db, 431)).toBe('');
+  });
+});
