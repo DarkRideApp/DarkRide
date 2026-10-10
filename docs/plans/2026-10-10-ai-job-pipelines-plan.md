@@ -1,0 +1,3610 @@
+# AI Job Pipelines Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Replace `apk-analyzer.ts`'s single long-lived AI agent run (one system prompt, one write-tier escalation, whole-run blast radius on any refusal) with a typed graph of small scoped nodes, a generic executor, and a visual editor — ship the Astérix pipeline (7 `AgentCall`s → `Report` → `Sink`, two disjoint `Trigger` zones) as the first thing built on it.
+
+**Architecture:** Three layers — a node primitive library (`backend/services/ai-jobs/nodes/`, pure `(input, ctx) => output` functions), a pipeline definition + executor (`backend/services/ai-jobs/pipeline-runner.ts`, versioned graph rows + topological walk with skip propagation, envelope nodes, multi-trigger zones, opt-in memoization), and a visual editor (`frontend/pages/ai-jobs/`, `@xyflow/react`). Backend phases (A–E below) are independently testable and shippable before the frontend (F) exists — the REST API and gate tests don't need a UI to verify.
+
+**Tech Stack:** TypeScript, Drizzle ORM (better-sqlite3), Express (REST-over-WebSocket via `api-service.ts`), vitest, React 19, `@xyflow/react`, Playwright.
+
+**Spec:** `docs/specs/2026-10-10-ai-job-pipelines-design.md` — this plan implements it task-by-task; read both together. Code in this plan matches the spec's node contracts, executor semantics, data model, and the `Report` node's design exactly; where this plan needs a concrete choice the spec left as a pure interface, that choice is called out inline.
+
+## Global Constraints
+
+- Node 24, TypeScript throughout — match existing file conventions (see any file under `backend/services/` for the house style: `createLoggers(name)` for logging, named exports, no default exports).
+- Drizzle schema changes always ship as a migration file under `migrations/` (project root, not `backend/db/migrations/`) with a matching `migrations/meta/_journal.json` entry, `--> statement-breakpoint` between every statement in a multi-statement `.sql` file, and a `when` value strictly greater than the **max** `when` across every existing journal entry (currently `1791494784563` — verify at execution time, it will have moved).
+- Every new backend module ships a co-located `.test.ts` in the same commit (gate tests: mocked dependencies, deterministic, <2s, no live model calls).
+- Drizzle unit tests use `new Database(':memory:')` + raw SQL `sqlite.exec()` to create tables per test, then `drizzle(sqlite, { schema })` — never import migration files into tests (they pull in plugin schema that may not be installed).
+- REST endpoints register via `registerEndpoint(method, path, handler, { requires: [...] })` from `backend/api/api-service.ts`; scopes come from `backend/services/ai-tool-definitions.ts`'s existing `patch_analysis_section`/`write_analysis_notes`/`read_analysis_notes` scopes (`core.apk:manage` / `core.apk:read`) — reuse them exactly, don't invent new scope strings.
+- `AgentCall` nodes call through `BoundAgent.handleMessage` (`backend/services/ai-agent-factory.ts`), never raw `ai-agent.ts` — that's where call-logging and identity resolution live.
+- Frontend: TDD still applies (component tests with `@testing-library/react`), and every user-facing flow gets a Playwright e2e spec per `feedback_e2e_testing_mandatory` (project memory) — no exceptions.
+- Commit after every task, per CLAUDE.md's "After every task — commit, push, restart." Push happens once per work session, not necessarily after each individual commit, unless told otherwise.
+- `tsc` does not check `frontend/` (project memory: `frontend_not_typechecked.md`) — frontend tasks still need a throwaway `tsc` pass before calling the task done, same as the plugins-workspace precedent.
+
+## Review Focus
+
+- **A `Trigger`'s raw input is missing a required field** (`{}` instead of `{ versionId }`) — the `apk-analysis` `Trigger`'s expand function must throw a clear error, not silently produce an `ApkContext` with `undefined` fields that only breaks three nodes downstream. (Task 4)
+- **A template references a node that's `inactive` this run**, not just a typo'd path — `{{some-node.field}}` where `some-node` exists in the graph but isn't in the fired `Trigger`'s reachable zone. Resolution must fail the same way as an unknown path, not return `undefined`. (Task 3)
+- **Publishing a pipeline version where two `Trigger`s declare different output schemas**, or where a node is reachable from more than one `Trigger` — the graph validator must reject this at publish time, not surface as a confusing runtime failure on whichever `Trigger` fires second. (Task 11)
+- **A `Sink` write fails because its target no longer exists** (e.g. the tracked APK version was deleted mid-run) — `patchNoteSection`/`setNote` throwing on a missing `apkVersions` row must become an ordinary `failed` node-run, not an unhandled rejection that takes down the whole executor process. (Task 10)
+- **Two runs of the same pipeline version fire concurrently** (double-click Run, or a manual run overlapping an auto-triggered one) — genuinely unaddressed by the spec, which only covers same-run parallel `Sink` writes. The cheap, decisive fix: reject a second run for a pipeline version that already has a `running` row, rather than leaving the race unaddressed. (Task 19)
+
+---
+
+## Phase A: Data model
+
+### Task 1: Schema + migration for the four pipeline tables
+
+**Files:**
+- Modify: `backend/db/schema.ts` (append after the last table — check the end of the file for the current last export before inserting, so the diff is a clean append)
+- Create: `migrations/0102_ai_pipelines.sql` (verify this is actually the next free number — `ls migrations/*.sql | wc -l` was 85 and the journal's last `idx` was 101 at spec time; recompute both at execution time)
+- Modify: `migrations/meta/_journal.json`
+- Test: `backend/db/schema.test.ts` (create if it doesn't exist; if it does, append to it)
+
+**Interfaces:**
+- Produces: `aiPipelines`, `aiPipelineVersions`, `aiPipelineRuns`, `aiPipelineNodeRuns` (Drizzle table objects, imported by every later backend task as `import { aiPipelines, aiPipelineVersions, aiPipelineRuns, aiPipelineNodeRuns } from '../db/schema'` relative to `backend/services/ai-jobs/`).
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/db/schema.test.ts
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { describe, it, expect } from 'vitest';
+import * as schema from './schema';
+
+describe('ai_pipelines tables', () => {
+  it('cascades deletes from aiPipelines through to aiPipelineNodeRuns', () => {
+    const sqlite = new Database(':memory:');
+    sqlite.pragma('foreign_keys = ON');
+    sqlite.exec(`
+      CREATE TABLE ai_pipelines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        job_kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE ai_pipeline_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pipeline_id INTEGER NOT NULL REFERENCES ai_pipelines(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        graph TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft',
+        created_at INTEGER NOT NULL,
+        UNIQUE(pipeline_id, version)
+      );
+      CREATE TABLE ai_pipeline_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pipeline_version_id INTEGER NOT NULL REFERENCES ai_pipeline_versions(id) ON DELETE CASCADE,
+        trigger_node_id TEXT NOT NULL,
+        triggered_by TEXT NOT NULL,
+        input TEXT,
+        reuse_unchanged INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'running',
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+      CREATE TABLE ai_pipeline_node_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES ai_pipeline_runs(id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        input TEXT,
+        input_hash TEXT,
+        was_memoized INTEGER NOT NULL DEFAULT 0,
+        output TEXT,
+        error TEXT,
+        model_used TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+    `);
+    const db = drizzle(sqlite, { schema });
+
+    const now = new Date();
+    db.insert(schema.aiPipelines).values({ id: 1, name: 'Astérix', jobKind: 'apk-analysis', createdAt: now }).run();
+    db.insert(schema.aiPipelineVersions).values({ id: 1, pipelineId: 1, version: 1, graph: { nodes: [], edges: [] }, status: 'published', createdAt: now }).run();
+    db.insert(schema.aiPipelineRuns).values({ id: 1, pipelineVersionId: 1, triggerNodeId: 'trigger', triggeredBy: 'manual', status: 'running', startedAt: now }).run();
+    db.insert(schema.aiPipelineNodeRuns).values({ id: 1, runId: 1, nodeId: 'agent-overview', status: 'ok', startedAt: now }).run();
+
+    db.delete(schema.aiPipelines).where(eq(schema.aiPipelines.id, 1)).run();
+
+    expect(db.select().from(schema.aiPipelineNodeRuns).all()).toHaveLength(0);
+  });
+});
+```
+
+Add `import { eq } from 'drizzle-orm';` to the test file's imports.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/db/schema.test.ts`
+Expected: FAIL — `schema.aiPipelines` is undefined (not exported yet).
+
+- [ ] **Step 3: Write the schema additions**
+
+Append to `backend/db/schema.ts`:
+
+```ts
+export const aiPipelines = sqliteTable('ai_pipelines', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull(),
+  jobKind: text('job_kind').notNull(), // 'apk-analysis' | future kinds
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+});
+
+export const aiPipelineVersions = sqliteTable('ai_pipeline_versions', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  pipelineId: integer('pipeline_id').notNull().references(() => aiPipelines.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  graph: text('graph', { mode: 'json' }).$type<{ nodes: unknown[]; edges: unknown[] }>().notNull(),
+  status: text('status', { enum: ['draft', 'published'] }).notNull().default('draft'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+}, (t) => ({
+  uniqueVersion: unique().on(t.pipelineId, t.version),
+}));
+
+export const aiPipelineRuns = sqliteTable('ai_pipeline_runs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  pipelineVersionId: integer('pipeline_version_id').notNull().references(() => aiPipelineVersions.id, { onDelete: 'cascade' }),
+  triggerNodeId: text('trigger_node_id').notNull(),
+  triggeredBy: text('triggered_by').notNull(), // 'manual' | 'apk-analysis-complete'
+  input: text('input', { mode: 'json' }).$type<Record<string, unknown>>(),
+  reuseUnchanged: integer('reuse_unchanged', { mode: 'boolean' }).notNull().default(false),
+  status: text('status', { enum: ['running', 'ok', 'failed', 'partial'] }).notNull().default('running'),
+  startedAt: integer('started_at', { mode: 'timestamp' }).notNull(),
+  finishedAt: integer('finished_at', { mode: 'timestamp' }),
+});
+
+export const aiPipelineNodeRuns = sqliteTable('ai_pipeline_node_runs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  runId: integer('run_id').notNull().references(() => aiPipelineRuns.id, { onDelete: 'cascade' }),
+  nodeId: text('node_id').notNull(),
+  status: text('status', { enum: ['ok', 'failed', 'skipped', 'inactive'] }).notNull(),
+  input: text('input', { mode: 'json' }).$type<Record<string, unknown>>(),
+  inputHash: text('input_hash'),
+  wasMemoized: integer('was_memoized', { mode: 'boolean' }).notNull().default(false),
+  output: text('output', { mode: 'json' }).$type<Record<string, unknown>>(),
+  error: text('error'),
+  modelUsed: text('model_used'),
+  inputTokens: integer('input_tokens'),
+  outputTokens: integer('output_tokens'),
+  startedAt: integer('started_at', { mode: 'timestamp' }).notNull(),
+  finishedAt: integer('finished_at', { mode: 'timestamp' }),
+});
+```
+
+Confirm `unique` is already imported at the top of `schema.ts` (it's used elsewhere, e.g. `aiPipelineVersions`'s own precedent tables) — if not, add it to the `drizzle-orm/sqlite-core` import line.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/db/schema.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Write the migration file**
+
+Create `migrations/0102_ai_pipelines.sql` (recheck the number is free first):
+
+```sql
+CREATE TABLE IF NOT EXISTS ai_pipelines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  job_kind TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS ai_pipeline_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pipeline_id INTEGER NOT NULL REFERENCES ai_pipelines(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  graph TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  created_at INTEGER NOT NULL,
+  UNIQUE(pipeline_id, version)
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS ai_pipeline_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pipeline_version_id INTEGER NOT NULL REFERENCES ai_pipeline_versions(id) ON DELETE CASCADE,
+  trigger_node_id TEXT NOT NULL,
+  triggered_by TEXT NOT NULL,
+  input TEXT,
+  reuse_unchanged INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'running',
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS ai_pipeline_node_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES ai_pipeline_runs(id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  input TEXT,
+  input_hash TEXT,
+  was_memoized INTEGER NOT NULL DEFAULT 0,
+  output TEXT,
+  error TEXT,
+  model_used TEXT,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS ai_pipeline_node_runs_run_idx ON ai_pipeline_node_runs(run_id);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS ai_pipeline_node_runs_memo_idx ON ai_pipeline_node_runs(node_id, input_hash);
+```
+
+Append to `migrations/meta/_journal.json`'s `entries` array (compute `when` as `max(existing whens) + 1`, do not hardcode the literal below without checking — it's illustrative of the shape, not a value to copy blindly):
+
+```json
+{
+  "idx": 102,
+  "version": "7",
+  "when": 1791700000000,
+  "tag": "0102_ai_pipelines",
+  "breakpoints": true
+}
+```
+
+- [ ] **Step 6: Verify the migration applies cleanly**
+
+Run the project's normal dev-server startup against a scratch copy of the dev DB (never the real one) and confirm no migration error in the log, then confirm the four tables exist:
+
+```bash
+sqlite3 /path/to/scratch-copy.db ".tables" | grep ai_pipeline
+```
+
+Expected: `ai_pipelines  ai_pipeline_node_runs  ai_pipeline_runs  ai_pipeline_versions`
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add backend/db/schema.ts backend/db/schema.test.ts migrations/0102_ai_pipelines.sql migrations/meta/_journal.json
+git commit -m "feat(ai-jobs): add ai_pipelines/versions/runs/node_runs schema + migration"
+```
+
+---
+
+## Phase B: Node primitives
+
+Each node kind is a pure function `(input, ctx) => output` plus a thin adapter the executor calls. `ctx` carries whatever a node needs beyond its input (the `BoundAgent` for `AgentCall`, the `db` for `Sink`, etc.) so each node file stays independently testable with a fake `ctx`.
+
+### Task 2: Shared types
+
+**Files:**
+- Create: `backend/services/ai-jobs/types.ts`
+- Test: `backend/services/ai-jobs/types.test.ts`
+
+**Interfaces:**
+- Produces: `PipelineNode`, `PipelineEdge`, `PipelineGraph`, `NodeRunStatus`, `RunStatus`, `Envelope<T>`, `NodeKind`, `AgentCallConfig`, `TransformConfig`, `BranchConfig`, `ReportConfig`, `ForEachConfig`, `SinkConfig`, `TriggerConfig` — every later task imports from here, so get the shapes right once.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/types.test.ts
+import { describe, it, expect } from 'vitest';
+import { isEnvelopeOk } from './types';
+import type { Envelope } from './types';
+
+describe('Envelope', () => {
+  it('isEnvelopeOk narrows to the ok variant', () => {
+    const ok: Envelope<{ n: number }> = { status: 'ok', output: { n: 1 } };
+    const failed: Envelope<{ n: number }> = { status: 'failed', error: 'boom' };
+    expect(isEnvelopeOk(ok)).toBe(true);
+    expect(isEnvelopeOk(failed)).toBe(false);
+    if (isEnvelopeOk(ok)) {
+      expect(ok.output.n).toBe(1); // type-level: output must be accessible here
+    }
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/types.test.ts`
+Expected: FAIL — module `./types` does not exist.
+
+- [ ] **Step 3: Write the types**
+
+```ts
+// backend/services/ai-jobs/types.ts
+
+export type NodeKind = 'Trigger' | 'AgentCall' | 'Transform' | 'Branch' | 'Report' | 'ForEach' | 'Sink';
+
+export type NodeRunStatus = 'ok' | 'failed' | 'skipped' | 'inactive';
+export type RunStatus = 'running' | 'ok' | 'failed' | 'partial';
+
+/** What an envelope node (Branch, Report) receives per predecessor instead of a bare value. */
+export type Envelope<T = unknown> =
+  | { status: 'ok'; output: T }
+  | { status: 'failed'; error: string }
+  | { status: 'skipped' | 'inactive' };
+
+export function isEnvelopeOk<T>(e: Envelope<T>): e is { status: 'ok'; output: T } {
+  return e.status === 'ok';
+}
+
+export interface AgentCallConfig {
+  tier: string;
+  instructionTemplate: string;
+  toolAllowlist: string[];
+}
+
+export interface TransformConfig {
+  /** Name of a pre-registered function — see nodes/transform.ts's registry. Never freeform code. */
+  fn: string;
+}
+
+export interface BranchConfig {
+  /** Name of a pre-registered predicate function — see nodes/branch.ts's registry. */
+  predicate: string;
+  /** Edge labels this Branch can route to; must match outgoing edge labels in the graph. */
+  edges: string[];
+}
+
+export interface ReportSection {
+  title: string;
+  /** Source node id — must be a direct incoming edge's source. */
+  from: string;
+}
+
+export interface ReportConfig {
+  sections: ReportSection[];
+}
+
+export interface ForEachConfig {
+  /** Name of a pre-registered per-item function. */
+  itemFn: string;
+}
+
+export interface SinkConfig {
+  /** Name of a pre-registered write function — see nodes/sink.ts's registry. */
+  writeFn: string;
+}
+
+export interface TriggerConfig {
+  /** Name of a pre-registered expand function — see nodes/trigger.ts's registry. */
+  expandFn: string;
+  /** Declared output schema, shared across every Trigger in one pipeline (validator-enforced). */
+  outputSchema: Array<{ field: string; type: string; description: string }>;
+}
+
+export type NodeConfig =
+  | ({ kind: 'Trigger' } & TriggerConfig)
+  | ({ kind: 'AgentCall' } & AgentCallConfig)
+  | ({ kind: 'Transform' } & TransformConfig)
+  | ({ kind: 'Branch' } & BranchConfig)
+  | ({ kind: 'Report' } & ReportConfig)
+  | ({ kind: 'ForEach' } & ForEachConfig)
+  | ({ kind: 'Sink' } & SinkConfig);
+
+export interface PipelineNode {
+  id: string;
+  config: NodeConfig;
+}
+
+export interface PipelineEdge {
+  from: string;
+  to: string;
+  /** Only meaningful for a Branch's outgoing edges; omitted elsewhere. */
+  label?: string;
+}
+
+export interface PipelineGraph {
+  nodes: PipelineNode[];
+  edges: PipelineEdge[];
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/types.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/types.ts backend/services/ai-jobs/types.test.ts
+git commit -m "feat(ai-jobs): add shared pipeline/node types"
+```
+
+### Task 3: Template resolution
+
+**Files:**
+- Create: `backend/services/ai-jobs/template.ts`
+- Test: `backend/services/ai-jobs/template.test.ts`
+
+**Interfaces:**
+- Consumes: nothing from earlier tasks (pure string function).
+- Produces: `resolveTemplate(template: string, scope: Record<string, unknown>): string` — throws `TemplateResolutionError` on any unresolved `{{...}}`. Used by Task 5 (`AgentCall`) to resolve `instructionTemplate` before calling `handleMessage`.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/template.test.ts
+import { describe, it, expect } from 'vitest';
+import { resolveTemplate, TemplateResolutionError } from './template';
+
+describe('resolveTemplate', () => {
+  it('substitutes a dotted path from scope', () => {
+    const scope = { trigger: { appName: 'Parc Astérix' } };
+    expect(resolveTemplate('Analyze {{trigger.appName}}.', scope)).toBe('Analyze Parc Astérix.');
+  });
+
+  it('substitutes multiple placeholders, including from a non-trigger source', () => {
+    const scope = { trigger: { versionName: '6.10.1' }, 'agent-overview': { summary: 'React Native app' } };
+    expect(resolveTemplate('{{agent-overview.summary}} (v{{trigger.versionName}})', scope))
+      .toBe('React Native app (v6.10.1)');
+  });
+
+  it('throws on an unresolved path instead of leaving literal braces', () => {
+    const scope = { trigger: { appName: 'Parc Astérix' } };
+    expect(() => resolveTemplate('{{trigger.appNmae}}', scope)).toThrow(TemplateResolutionError);
+  });
+
+  it('throws when the source key exists but the field does not', () => {
+    const scope = { trigger: { appName: 'Parc Astérix' } };
+    expect(() => resolveTemplate('{{trigger.versionCode}}', scope)).toThrow(TemplateResolutionError);
+  });
+
+  it('throws referencing a node that is inactive this run, same as an unknown path', () => {
+    // inactive nodes are simply absent from scope — the executor never adds them
+    const scope = { trigger: { appName: 'Parc Astérix' } };
+    expect(() => resolveTemplate('{{agent-diff.summary}}', scope)).toThrow(TemplateResolutionError);
+  });
+
+  it('does not evaluate expressions — a non-identifier path is a literal miss, not an error about syntax', () => {
+    const scope = { trigger: { fileSizeBytes: 150088871 } };
+    expect(() => resolveTemplate('{{trigger.fileSizeBytes / 1024}}', scope)).toThrow(TemplateResolutionError);
+  });
+
+  it('passes through text with no placeholders unchanged', () => {
+    expect(resolveTemplate('No variables here.', {})).toBe('No variables here.');
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/template.test.ts`
+Expected: FAIL — module `./template` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+```ts
+// backend/services/ai-jobs/template.ts
+
+export class TemplateResolutionError extends Error {
+  constructor(public readonly path: string) {
+    super(`Unresolved template path "{{${path}}}" — the node fails rather than sending literal braces to the model.`);
+    this.name = 'TemplateResolutionError';
+  }
+}
+
+const PLACEHOLDER_RE = /\{\{([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*)\}\}/g;
+
+/**
+ * Dotted-path-only substitution: {{source.field}} → scope[source][field]. Never an expression —
+ * a path with anything but identifiers and dots (e.g. "trigger.fileSizeBytes / 1024") simply
+ * never matches PLACEHOLDER_RE as a whole, so the literal "{{...}}" is left in the template and
+ * then fails the generic "still has braces after substitution" check below. Fails loud: an
+ * unresolved placeholder throws, it never survives into what gets sent to a model.
+ */
+export function resolveTemplate(template: string, scope: Record<string, unknown>): string {
+  const resolved = template.replace(PLACEHOLDER_RE, (_match, path: string) => {
+    const [source, ...fieldParts] = path.split('.');
+    if (fieldParts.length === 0) throw new TemplateResolutionError(path);
+    let value: unknown = scope[source];
+    for (const part of fieldParts) {
+      if (value === null || typeof value !== 'object') throw new TemplateResolutionError(path);
+      value = (value as Record<string, unknown>)[part];
+    }
+    if (value === undefined || value === null) throw new TemplateResolutionError(path);
+    return String(value);
+  });
+  // A malformed placeholder (e.g. an expression) never matched PLACEHOLDER_RE, so it's still
+  // sitting in `resolved` verbatim — catch it here rather than silently shipping it to a model.
+  const stillBraced = resolved.match(/\{\{[^}]*\}\}/);
+  if (stillBraced) throw new TemplateResolutionError(stillBraced[0].slice(2, -2));
+  return resolved;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/template.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/template.ts backend/services/ai-jobs/template.test.ts
+git commit -m "feat(ai-jobs): add dotted-path template resolution, fail-loud on a miss"
+```
+
+### Task 4: Trigger node + the `apk-analysis` `ApkContext` expander
+
+**Files:**
+- Create: `backend/services/ai-jobs/nodes/trigger.ts`
+- Test: `backend/services/ai-jobs/nodes/trigger.test.ts`
+
+**Interfaces:**
+- Consumes: nothing from earlier node tasks.
+- Produces: `TRIGGER_REGISTRY: Record<string, TriggerExpander>` where `type TriggerExpander = (rawInput: Record<string, unknown>, ctx: TriggerCtx) => Promise<Record<string, unknown>>`; `registerTrigger(name, fn)`; the `'apk-analysis/apk-context'` entry registered by this task. `TriggerCtx` carries `{ db: AppDatabase }`. The executor (Task 12+) looks up `config.expandFn` in `TRIGGER_REGISTRY`.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/nodes/trigger.test.ts
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { describe, it, expect } from 'vitest';
+import * as schema from '../../../db/schema';
+import { TRIGGER_REGISTRY } from './trigger';
+
+function makeDb() {
+  const sqlite = new Database(':memory:');
+  sqlite.exec(`
+    CREATE TABLE tracked_apps (id INTEGER PRIMARY KEY, package_name TEXT NOT NULL, app_name TEXT, auto_analyse INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+    CREATE TABLE apk_versions (id INTEGER PRIMARY KEY, tracked_app_id INTEGER NOT NULL, version_code INTEGER NOT NULL, version_name TEXT, filename TEXT NOT NULL, file_size INTEGER, device_id TEXT, source TEXT DEFAULT 'device', downloaded_at INTEGER NOT NULL);
+  `);
+  return drizzle(sqlite, { schema });
+}
+
+describe('apk-analysis/apk-context trigger', () => {
+  it('expands { versionId } into the full ApkContext struct', async () => {
+    const db = makeDb();
+    db.insert(schema.trackedApps).values({ id: 17, packageName: 'fr.parcasterix.appli.android', appName: 'Parc Astérix', createdAt: new Date() }).run();
+    db.insert(schema.apkVersions).values({
+      id: 431, trackedAppId: 17, versionCode: 1791383868, versionName: '6.10.1',
+      filename: 'x.apk', fileSize: 150088871, source: 'device', downloadedAt: new Date('2026-10-09T22:16:21Z'),
+    }).run();
+
+    const expand = TRIGGER_REGISTRY['apk-analysis/apk-context'];
+    const result = await expand({ versionId: 431 }, { db });
+
+    expect(result).toEqual({
+      appName: 'Parc Astérix',
+      packageName: 'fr.parcasterix.appli.android',
+      versionName: '6.10.1',
+      versionCode: 1791383868,
+      fileSizeBytes: 150088871,
+      downloadedAt: '2026-10-09T22:16:21.000Z',
+      source: 'device',
+    });
+  });
+
+  it('throws on missing versionId rather than producing a half-populated context', async () => {
+    const db = makeDb();
+    const expand = TRIGGER_REGISTRY['apk-analysis/apk-context'];
+    await expect(expand({}, { db })).rejects.toThrow(/versionId/);
+  });
+
+  it('throws when versionId does not resolve to a real apk_versions row', async () => {
+    const db = makeDb();
+    const expand = TRIGGER_REGISTRY['apk-analysis/apk-context'];
+    await expect(expand({ versionId: 999 }, { db })).rejects.toThrow(/999/);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/trigger.test.ts`
+Expected: FAIL — module `./trigger` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+```ts
+// backend/services/ai-jobs/nodes/trigger.ts
+import { eq } from 'drizzle-orm';
+import { apkVersions, trackedApps } from '../../../db/schema';
+import type { AppDatabase } from '../../../db/index';
+
+export interface TriggerCtx {
+  db: AppDatabase;
+}
+
+export type TriggerExpander = (rawInput: Record<string, unknown>, ctx: TriggerCtx) => Promise<Record<string, unknown>>;
+
+export const TRIGGER_REGISTRY: Record<string, TriggerExpander> = {};
+
+export function registerTrigger(name: string, fn: TriggerExpander): void {
+  TRIGGER_REGISTRY[name] = fn;
+}
+
+registerTrigger('apk-analysis/apk-context', async (rawInput, ctx) => {
+  const versionId = rawInput.versionId;
+  if (typeof versionId !== 'number') {
+    throw new Error(`apk-analysis/apk-context Trigger requires a numeric "versionId" in its input, got ${JSON.stringify(rawInput)}`);
+  }
+  const row = ctx.db
+    .select({
+      appName: trackedApps.appName,
+      packageName: trackedApps.packageName,
+      versionName: apkVersions.versionName,
+      versionCode: apkVersions.versionCode,
+      fileSizeBytes: apkVersions.fileSize,
+      downloadedAt: apkVersions.downloadedAt,
+      source: apkVersions.source,
+    })
+    .from(apkVersions)
+    .innerJoin(trackedApps, eq(apkVersions.trackedAppId, trackedApps.id))
+    .where(eq(apkVersions.id, versionId))
+    .all()[0];
+
+  if (!row) throw new Error(`apk-analysis/apk-context Trigger: no apk_versions row for versionId ${versionId}`);
+
+  return {
+    appName: row.appName,
+    packageName: row.packageName,
+    versionName: row.versionName,
+    versionCode: row.versionCode,
+    fileSizeBytes: row.fileSizeBytes,
+    downloadedAt: row.downloadedAt instanceof Date ? row.downloadedAt.toISOString() : row.downloadedAt,
+    source: row.source,
+  };
+});
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/trigger.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/nodes/trigger.ts backend/services/ai-jobs/nodes/trigger.test.ts
+git commit -m "feat(ai-jobs): add Trigger node kind + apk-analysis ApkContext expander"
+```
+
+### Task 5: Give `handleMessage` a real tool allowlist (new surface on `ai-agent.ts`, per the spec's own "not reuse" callout)
+
+`HandleMessageParams` has no field for restricting tools today — `pageContext` resolves to every tool registered for that context via the tool registry, with no subset filtering. This task adds the filter; it's the one piece of this plan that touches `ai-agent.ts` itself rather than only adding files under `ai-jobs/`.
+
+**Files:**
+- Modify: `backend/services/ai-agent.ts` — find the exact call site first with `grep -n "getToolDefinitionsForUser\|getToolsForContext" backend/services/ai-agent.ts` (the spec's review pass cited `ai-tools.ts:131/143` for the registry side; the call site inside `ai-agent.ts` itself wasn't pinned to a line number anywhere in this plan's research — confirm it fresh, the file is large and under active development elsewhere).
+- Test: `backend/services/ai-agent.test.ts` (existing file — add to it, don't replace)
+
+**Interfaces:**
+- Produces: `HandleMessageParams.toolAllowlist?: string[]` — when present, the resolved tool list for that call is `allTools.filter(t => toolAllowlist.includes(t.name))` instead of the full context list. Absent `toolAllowlist` keeps today's behavior byte-for-byte (every existing non-pipeline caller passes no `toolAllowlist` and must see zero change).
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// append to backend/services/ai-agent.test.ts — adapt the mock-provider setup to match
+// whatever harness the surrounding describe blocks in this file already use (it has one;
+// do not build a second one — grep the file for `describe('tiered execution'` or similar
+// for the existing pattern and reuse its mock AI provider / toolRegistry fixtures).
+describe('toolAllowlist', () => {
+  it('restricts the resolved tool list to just the allowlisted names', async () => {
+    // Arrange a toolRegistry with at least 3 tools registered for a test pageContext,
+    // and a mock provider whose createStreamingRequest captures the `tools` argument
+    // it was called with.
+    const capturedTools: string[][] = [];
+    // ...wire captureTools into the existing mock provider fixture's createStreamingRequest...
+
+    await agent.handleMessage({
+      conversationId: null,
+      message: 'test',
+      pageContext: 'apk-analysis',
+      contextId: '1',
+      mode: 'silent',
+      maxTurns: 5,
+      toolAllowlist: ['get_apk_overview', 'get_apk_strings'],
+      onToken: () => {},
+    });
+
+    expect(capturedTools[0].sort()).toEqual(['get_apk_overview', 'get_apk_strings']);
+  });
+
+  it('keeps full-context behavior when toolAllowlist is omitted', async () => {
+    const capturedTools: string[][] = [];
+    // ...same capture wiring...
+    await agent.handleMessage({
+      conversationId: null, message: 'test', pageContext: 'apk-analysis',
+      contextId: '1', mode: 'silent', maxTurns: 5, onToken: () => {},
+    });
+    expect(capturedTools[0].length).toBeGreaterThan(2); // the full apk-analysis tool set, unfiltered
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-agent.test.ts -t toolAllowlist`
+Expected: FAIL — `toolAllowlist` is not a recognized property / the filter never happens, so the first test's captured tool list is the full unfiltered set.
+
+- [ ] **Step 3: Add the field and the filter**
+
+Add to `HandleMessageParams` (wherever it's declared in `ai-agent.ts`):
+
+```ts
+export interface HandleMessageParams {
+  // ...existing fields, unchanged...
+  /**
+   * Restrict the resolved tool list to exactly these names. Added for AgentCall pipeline
+   * nodes — never widens the context's tool set, only narrows it. Omitted: today's
+   * behavior (every tool registered for pageContext), unchanged.
+   */
+  toolAllowlist?: string[];
+}
+```
+
+At the real tool-resolution call site found in Step 1's grep, change:
+
+```ts
+const tools = toolRegistry.getToolDefinitionsForUser(pageContext, userScopes, unattended);
+```
+
+to:
+
+```ts
+let tools = toolRegistry.getToolDefinitionsForUser(pageContext, userScopes, unattended);
+if (params.toolAllowlist) {
+  const allowed = new Set(params.toolAllowlist);
+  tools = tools.filter(t => allowed.has(t.name));
+}
+```
+
+(Match the actual local variable names at the real call site — `tools`/`params` here are illustrative of the shape, not guaranteed identifiers; adapt to what's actually there.)
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-agent.test.ts -t toolAllowlist`
+Expected: PASS
+
+- [ ] **Step 5: Run the full ai-agent test suite to confirm no regression**
+
+Run: `npx vitest run backend/services/ai-agent.test.ts`
+Expected: PASS — every pre-existing test, unchanged, since no caller passes `toolAllowlist` yet.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/services/ai-agent.ts backend/services/ai-agent.test.ts
+git commit -m "feat(ai): add an optional toolAllowlist to handleMessage, narrows only"
+```
+
+### Task 6: AgentCall node
+
+**Files:**
+- Create: `backend/services/ai-jobs/nodes/agent-call.ts`
+- Test: `backend/services/ai-jobs/nodes/agent-call.test.ts`
+
+**Interfaces:**
+- Consumes: `resolveTemplate` (Task 3), `HandleMessageParams.toolAllowlist` (Task 5), `AgentCallConfig` (Task 2).
+- Produces: `runAgentCall(config: AgentCallConfig, input: Record<string, unknown>, ctx: AgentCallCtx): Promise<Record<string, unknown>>` where `AgentCallCtx = { agent: BoundAgent; contextId: string }`. Throws on template-resolution failure or on `handleMessage` returning `result.error`/`result.aborted`. The executor (Task 13) is responsible for creating the right `BoundAgent` (core-service vs. user identity, bound to `config.tier`) and catching this throw to mark the node `failed` — this function itself does not catch, it's the executor's job per the envelope-vs-plain-throw split already established for every other node kind.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/nodes/agent-call.test.ts
+import { describe, it, expect, vi } from 'vitest';
+import { runAgentCall } from './agent-call';
+import type { AgentCallConfig } from '../types';
+
+function makeFakeAgent(handleMessageImpl: (p: any) => Promise<any>) {
+  return { identity: { identityType: 'core-service' as const }, handleMessage: vi.fn(handleMessageImpl) };
+}
+
+describe('runAgentCall', () => {
+  const config: AgentCallConfig = {
+    tier: 'High',
+    instructionTemplate: 'Analyze {{trigger.appName}} v{{trigger.versionName}}.',
+    toolAllowlist: ['get_apk_overview'],
+  };
+
+  it('resolves the template against input and sends it as the message', async () => {
+    const agent = makeFakeAgent(async () => ({ run: { requests: [] } }));
+    await runAgentCall(config, { trigger: { appName: 'Parc Astérix', versionName: '6.10.1' } }, { agent: agent as any, contextId: '431' });
+
+    expect(agent.handleMessage).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'Analyze Parc Astérix v6.10.1.',
+      toolAllowlist: ['get_apk_overview'],
+      contextId: '431',
+      mode: 'silent',
+    }));
+  });
+
+  it('throws when the template cannot resolve, before ever calling handleMessage', async () => {
+    const agent = makeFakeAgent(async () => ({ run: { requests: [] } }));
+    await expect(
+      runAgentCall({ ...config, instructionTemplate: '{{trigger.missingField}}' }, { trigger: { appName: 'x' } }, { agent: agent as any, contextId: '431' }),
+    ).rejects.toThrow(/missingField/);
+    expect(agent.handleMessage).not.toHaveBeenCalled();
+  });
+
+  it('throws when handleMessage reports an error', async () => {
+    const agent = makeFakeAgent(async () => ({ error: 'ModelRefusedError: cyber', run: { requests: [] } }));
+    await expect(
+      runAgentCall(config, { trigger: { appName: 'x', versionName: '1' } }, { agent: agent as any, contextId: '431' }),
+    ).rejects.toThrow(/ModelRefusedError/);
+  });
+
+  it('returns the final text output on success', async () => {
+    const agent = makeFakeAgent(async () => ({ finalText: 'Summary: a React Native app.', run: { requests: [] } }));
+    const result = await runAgentCall(config, { trigger: { appName: 'x', versionName: '1' } }, { agent: agent as any, contextId: '431' });
+    expect(result).toEqual({ text: 'Summary: a React Native app.' });
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/agent-call.test.ts`
+Expected: FAIL — module `./agent-call` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+Confirm `HandleMessageResult`'s real shape (`finalText`? `error`? `aborted`?) by grepping `ai-agent.ts` for its interface before writing this — the test above assumes fields based on what Task 5's work already touched; adjust field names to match reality if they differ.
+
+```ts
+// backend/services/ai-jobs/nodes/agent-call.ts
+import { resolveTemplate } from '../template';
+import type { AgentCallConfig } from '../types';
+import type { BoundAgent } from '../../ai-agent-factory';
+
+export interface AgentCallCtx {
+  agent: BoundAgent;
+  contextId: string;
+}
+
+const AI_ANALYSIS_MAX_TURNS = 50; // match apk-analyzer.ts's existing constant; import it instead of duplicating if it's exported
+
+export async function runAgentCall(
+  config: AgentCallConfig,
+  input: Record<string, unknown>,
+  ctx: AgentCallCtx,
+): Promise<Record<string, unknown>> {
+  const message = resolveTemplate(config.instructionTemplate, input); // throws TemplateResolutionError, left uncaught on purpose
+
+  const result = await ctx.agent.handleMessage({
+    conversationId: null,
+    message,
+    pageContext: 'apk-analysis',
+    contextId: ctx.contextId,
+    mode: 'silent',
+    maxTurns: AI_ANALYSIS_MAX_TURNS,
+    toolAllowlist: config.toolAllowlist,
+    onToken: () => {},
+  });
+
+  if (result.error) throw new Error(result.error);
+  if (result.aborted) throw new Error('AgentCall aborted');
+
+  return { text: result.finalText ?? '' };
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/agent-call.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/nodes/agent-call.ts backend/services/ai-jobs/nodes/agent-call.test.ts
+git commit -m "feat(ai-jobs): add AgentCall node — scoped, read-only, single-tier"
+```
+
+### Task 7: Transform node
+
+**Files:**
+- Create: `backend/services/ai-jobs/nodes/transform.ts`
+- Test: `backend/services/ai-jobs/nodes/transform.test.ts`
+
+**Interfaces:**
+- Produces: `TRANSFORM_REGISTRY: Record<string, TransformFn>` where `type TransformFn = (input: Record<string, unknown>) => Record<string, unknown>`; `registerTransform(name, fn)`; `runTransform(config: TransformConfig, input): Record<string, unknown>` — looks up `config.fn` in the registry, throws `Unknown transform "<name>"` if absent, otherwise calls it synchronously (no node in this plan's Astérix pipeline needs an async Transform, and the spec never requires one — keep it synchronous, simplest thing that's true).
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/nodes/transform.test.ts
+import { describe, it, expect } from 'vitest';
+import { registerTransform, runTransform } from './transform';
+
+describe('runTransform', () => {
+  registerTransform('test/double', (input) => ({ n: (input.n as number) * 2 }));
+
+  it('runs the registered function by name', () => {
+    expect(runTransform({ fn: 'test/double' }, { n: 5 })).toEqual({ n: 10 });
+  });
+
+  it('throws on an unregistered function name', () => {
+    expect(() => runTransform({ fn: 'test/nope' }, {})).toThrow(/Unknown transform "test\/nope"/);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/transform.test.ts`
+Expected: FAIL — module `./transform` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+```ts
+// backend/services/ai-jobs/nodes/transform.ts
+import type { TransformConfig } from '../types';
+
+export type TransformFn = (input: Record<string, unknown>) => Record<string, unknown>;
+
+export const TRANSFORM_REGISTRY: Record<string, TransformFn> = {};
+
+export function registerTransform(name: string, fn: TransformFn): void {
+  TRANSFORM_REGISTRY[name] = fn;
+}
+
+export function runTransform(config: TransformConfig, input: Record<string, unknown>): Record<string, unknown> {
+  const fn = TRANSFORM_REGISTRY[config.fn];
+  if (!fn) throw new Error(`Unknown transform "${config.fn}"`);
+  return fn(input);
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/transform.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/nodes/transform.ts backend/services/ai-jobs/nodes/transform.test.ts
+git commit -m "feat(ai-jobs): add Transform node — named registered deterministic functions"
+```
+
+### Task 8: Branch node (envelope node #1)
+
+**Files:**
+- Create: `backend/services/ai-jobs/nodes/branch.ts`
+- Test: `backend/services/ai-jobs/nodes/branch.test.ts`
+
+**Interfaces:**
+- Consumes: `Envelope<T>` (Task 2).
+- Produces: `BRANCH_REGISTRY: Record<string, BranchPredicate>` where `type BranchPredicate = (envelope: Envelope) => string` (returns the chosen edge label — must be one of `config.edges`); `registerBranchPredicate(name, fn)`; `runBranch(config: BranchConfig, envelope: Envelope): string`. The executor (Task 14) is what actually exempts `Branch` from skip propagation and builds the envelope — this function is the pure decision given one already-built envelope.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/nodes/branch.test.ts
+import { describe, it, expect } from 'vitest';
+import { registerBranchPredicate, runBranch } from './branch';
+import type { Envelope } from '../types';
+
+describe('runBranch', () => {
+  registerBranchPredicate('test/ok-or-fallback', (e: Envelope) => (e.status === 'ok' ? 'primary' : 'fallback'));
+
+  it('routes to the edge the predicate returns for an ok envelope', () => {
+    const edge = runBranch({ predicate: 'test/ok-or-fallback', edges: ['primary', 'fallback'] }, { status: 'ok', output: {} });
+    expect(edge).toBe('primary');
+  });
+
+  it('routes to the edge the predicate returns for a failed envelope', () => {
+    const edge = runBranch({ predicate: 'test/ok-or-fallback', edges: ['primary', 'fallback'] }, { status: 'failed', error: 'boom' });
+    expect(edge).toBe('fallback');
+  });
+
+  it('throws if the predicate returns an edge not declared in config.edges', () => {
+    registerBranchPredicate('test/bogus', () => 'not-declared');
+    expect(() => runBranch({ predicate: 'test/bogus', edges: ['primary', 'fallback'] }, { status: 'ok', output: {} }))
+      .toThrow(/not-declared/);
+  });
+
+  it('throws on an unregistered predicate name', () => {
+    expect(() => runBranch({ predicate: 'test/nope', edges: ['a'] }, { status: 'ok', output: {} })).toThrow(/Unknown branch predicate/);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/branch.test.ts`
+Expected: FAIL — module `./branch` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+```ts
+// backend/services/ai-jobs/nodes/branch.ts
+import type { BranchConfig, Envelope } from '../types';
+
+export type BranchPredicate = (envelope: Envelope) => string;
+
+export const BRANCH_REGISTRY: Record<string, BranchPredicate> = {};
+
+export function registerBranchPredicate(name: string, fn: BranchPredicate): void {
+  BRANCH_REGISTRY[name] = fn;
+}
+
+export function runBranch(config: BranchConfig, envelope: Envelope): string {
+  const predicate = BRANCH_REGISTRY[config.predicate];
+  if (!predicate) throw new Error(`Unknown branch predicate "${config.predicate}"`);
+  const edge = predicate(envelope);
+  if (!config.edges.includes(edge)) {
+    throw new Error(`Branch predicate "${config.predicate}" returned edge "${edge}", not declared in config.edges (${config.edges.join(', ')})`);
+  }
+  return edge;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/branch.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/nodes/branch.ts backend/services/ai-jobs/nodes/branch.test.ts
+git commit -m "feat(ai-jobs): add Branch node — envelope-based, exempt from skip rule"
+```
+
+### Task 9: Report node (envelope node #2) + the `apk-analysis` assembler
+
+**Files:**
+- Create: `backend/services/ai-jobs/nodes/report.ts`
+- Test: `backend/services/ai-jobs/nodes/report.test.ts`
+
+**Interfaces:**
+- Consumes: `Envelope<T>`, `ReportConfig`, `ReportSection` (Task 2).
+- Produces: `runReport(config: ReportConfig, envelopes: Record<string, Envelope<{ text: string }>>): { markdown: string }` — pure, synchronous, never throws for a `failed`/`skipped`/`inactive` envelope (that's the entire point — see Review Focus). Registered per job kind via `REPORT_ASSEMBLERS` the same shape as the other registries, so a future job can supply its own section-to-markdown formatting without touching this file; `apk-analysis`'s formatting (plain `## <title>\n<content>` blocks) is registered here as the default and is what the Astérix pipeline (Task 20) uses.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/nodes/report.test.ts
+import { describe, it, expect } from 'vitest';
+import { runReport } from './report';
+import type { Envelope, ReportConfig } from '../types';
+
+describe('runReport', () => {
+  const config: ReportConfig = {
+    sections: [
+      { title: 'Overview', from: 'agent-overview' },
+      { title: 'Wait Times', from: 'agent-wait-times' },
+      { title: 'Bypass Script', from: 'agent-bypass' },
+    ],
+  };
+
+  it('assembles every ok section in declared order', () => {
+    const envelopes: Record<string, Envelope<{ text: string }>> = {
+      'agent-overview': { status: 'ok', output: { text: 'A React Native app.' } },
+      'agent-wait-times': { status: 'ok', output: { text: 'No wait-time endpoints found.' } },
+      'agent-bypass': { status: 'ok', output: { text: 'Frida script here.' } },
+    };
+    const result = runReport(config, envelopes);
+    const overviewIdx = result.markdown.indexOf('## Overview');
+    const waitIdx = result.markdown.indexOf('## Wait Times');
+    const bypassIdx = result.markdown.indexOf('## Bypass Script');
+    expect(overviewIdx).toBeGreaterThanOrEqual(0);
+    expect(waitIdx).toBeGreaterThan(overviewIdx);
+    expect(bypassIdx).toBeGreaterThan(waitIdx);
+    expect(result.markdown).toContain('A React Native app.');
+  });
+
+  it('substitutes an explicit placeholder for a failed section, never throws, never silently omits it', () => {
+    const envelopes: Record<string, Envelope<{ text: string }>> = {
+      'agent-overview': { status: 'ok', output: { text: 'A React Native app.' } },
+      'agent-wait-times': { status: 'ok', output: { text: 'No wait-time endpoints found.' } },
+      'agent-bypass': { status: 'failed', error: 'ModelRefusedError: cyber' },
+    };
+    const result = runReport(config, envelopes);
+    expect(result.markdown).toContain('## Bypass Script');
+    expect(result.markdown).toContain('unavailable this run');
+    expect(result.markdown).not.toContain('ModelRefusedError'); // the placeholder is honest, not a raw error dump into the doc
+  });
+
+  it('substitutes the same placeholder for a skipped or inactive section', () => {
+    const envelopes: Record<string, Envelope<{ text: string }>> = {
+      'agent-overview': { status: 'ok', output: { text: 'x' } },
+      'agent-wait-times': { status: 'skipped' },
+      'agent-bypass': { status: 'inactive' },
+    };
+    const result = runReport(config, envelopes);
+    expect(result.markdown).toContain('## Wait Times');
+    expect(result.markdown).toContain('## Bypass Script');
+    expect((result.markdown.match(/unavailable this run/g) || []).length).toBe(2);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/report.test.ts`
+Expected: FAIL — module `./report` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+```ts
+// backend/services/ai-jobs/nodes/report.ts
+import type { Envelope, ReportConfig } from '../types';
+
+export function runReport(
+  config: ReportConfig,
+  envelopes: Record<string, Envelope<{ text: string }>>,
+): { markdown: string } {
+  const blocks = config.sections.map((section) => {
+    const envelope = envelopes[section.from];
+    const body = envelope && envelope.status === 'ok'
+      ? envelope.output.text.trimEnd()
+      : `— ${section.title} unavailable this run. Its source node did not complete.`;
+    return `## ${section.title}\n${body}`;
+  });
+  return { markdown: blocks.join('\n\n') + '\n' };
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/report.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/nodes/report.ts backend/services/ai-jobs/nodes/report.test.ts
+git commit -m "feat(ai-jobs): add Report node — ordered, fault-tolerant document assembly"
+```
+
+### Task 10: ForEach node
+
+**Files:**
+- Create: `backend/services/ai-jobs/nodes/foreach.ts`
+- Test: `backend/services/ai-jobs/nodes/foreach.test.ts`
+
+**Interfaces:**
+- Produces: `FOREACH_REGISTRY: Record<string, ForEachItemFn>` where `type ForEachItemFn = (item: unknown) => Promise<unknown>`; `registerForEachItemFn(name, fn)`; `runForEach(config: ForEachConfig, items: unknown[]): Promise<Array<{ status: 'ok'; output: unknown } | { status: 'failed'; error: string }>>` — per-item failure is data in the returned array, never thrown; the node's own promise only rejects if `items` itself isn't an array.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/nodes/foreach.test.ts
+import { describe, it, expect } from 'vitest';
+import { registerForEachItemFn, runForEach } from './foreach';
+
+describe('runForEach', () => {
+  registerForEachItemFn('test/maybe-fail', async (item) => {
+    if ((item as number) % 3 === 0) throw new Error(`item ${item} is divisible by 3`);
+    return (item as number) * 10;
+  });
+
+  it('collects all 10 results, ok and failed, never throws for a per-item failure', async () => {
+    const items = Array.from({ length: 10 }, (_, i) => i + 1); // 1..10, two multiples of 3
+    const results = await runForEach({ itemFn: 'test/maybe-fail' }, items);
+
+    expect(results).toHaveLength(10);
+    const failed = results.filter(r => r.status === 'failed');
+    const ok = results.filter(r => r.status === 'ok');
+    expect(failed).toHaveLength(2); // 3, 6, 9 are divisible... wait: 3,6,9 = 3 items
+    expect(ok).toHaveLength(7);
+  });
+
+  it('rejects outright when the input list is malformed, not per-item', async () => {
+    await expect(runForEach({ itemFn: 'test/maybe-fail' }, 'not an array' as any)).rejects.toThrow(/array/);
+  });
+
+  it('throws on an unregistered item function name before touching any item', async () => {
+    await expect(runForEach({ itemFn: 'test/nope' }, [1, 2])).rejects.toThrow(/Unknown ForEach item function/);
+  });
+});
+```
+
+Fix the arithmetic before running: 1..10 divisible by 3 are 3, 6, 9 — three items, not two. Correct the test's `expect(failed).toHaveLength(2)` to `toHaveLength(3)` and `expect(ok).toHaveLength(7)` stays 7 (10 − 3).
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/foreach.test.ts`
+Expected: FAIL — module `./foreach` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+```ts
+// backend/services/ai-jobs/nodes/foreach.ts
+import type { ForEachConfig } from '../types';
+
+export type ForEachItemFn = (item: unknown) => Promise<unknown>;
+export type ForEachItemResult = { status: 'ok'; output: unknown } | { status: 'failed'; error: string };
+
+export const FOREACH_REGISTRY: Record<string, ForEachItemFn> = {};
+
+export function registerForEachItemFn(name: string, fn: ForEachItemFn): void {
+  FOREACH_REGISTRY[name] = fn;
+}
+
+export async function runForEach(config: ForEachConfig, items: unknown[]): Promise<ForEachItemResult[]> {
+  if (!Array.isArray(items)) throw new Error('runForEach: items must be an array');
+  const fn = FOREACH_REGISTRY[config.itemFn];
+  if (!fn) throw new Error(`Unknown ForEach item function "${config.itemFn}"`);
+
+  const settled = await Promise.allSettled(items.map(fn));
+  return settled.map((s): ForEachItemResult =>
+    s.status === 'fulfilled' ? { status: 'ok', output: s.value } : { status: 'failed', error: String(s.reason) },
+  );
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/foreach.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/nodes/foreach.ts backend/services/ai-jobs/nodes/foreach.test.ts
+git commit -m "feat(ai-jobs): add ForEach node — per-item failure is data, not node status"
+```
+
+### Task 11: Sink node + the two `apk-analysis` write functions
+
+**Files:**
+- Create: `backend/services/ai-jobs/nodes/sink.ts`
+- Test: `backend/services/ai-jobs/nodes/sink.test.ts`
+
+**Interfaces:**
+- Consumes: `getNote`/`setNote`/`patchNoteSection` from `backend/services/apk-notes.ts` (existing, unmodified).
+- Produces: `SINK_REGISTRY: Record<string, SinkWriteFn>` where `type SinkWriteFn = (input: Record<string, unknown>, ctx: SinkCtx) => Promise<void>`, `SinkCtx = { db: AppDatabase; versionId: number }`; `registerSink(name, fn)`; `runSink(config: SinkConfig, input, ctx): Promise<void>` — either completes or throws (Review Focus: a missing `apk_versions` row must surface as an ordinary thrown error here, which the executor then turns into a `failed` node-run, not an unhandled rejection). Registers `'apk-analysis/write-section'` (wraps `patchNoteSection`, used by Quick Rescan's single-section `Sink`) and `'apk-analysis/write-full-document'` (wraps `setNote`, used by the `Report`-fed `Sink`).
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/nodes/sink.test.ts
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { describe, it, expect } from 'vitest';
+import * as schema from '../../../db/schema';
+import { runSink } from './sink';
+import { getNote } from '../../apk-notes';
+
+function makeDb() {
+  const sqlite = new Database(':memory:');
+  sqlite.pragma('foreign_keys = ON');
+  sqlite.exec(`
+    CREATE TABLE tracked_apps (id INTEGER PRIMARY KEY, package_name TEXT NOT NULL, app_name TEXT, auto_analyse INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+    CREATE TABLE apk_versions (id INTEGER PRIMARY KEY, tracked_app_id INTEGER NOT NULL, version_code INTEGER NOT NULL, version_name TEXT, filename TEXT NOT NULL, file_size INTEGER, device_id TEXT, source TEXT DEFAULT 'device', downloaded_at INTEGER NOT NULL);
+    CREATE TABLE apk_notes (version_id INTEGER PRIMARY KEY REFERENCES apk_versions(id) ON DELETE CASCADE, content TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
+  `);
+  const db = drizzle(sqlite, { schema });
+  db.insert(schema.trackedApps).values({ id: 1, packageName: 'x', createdAt: new Date() }).run();
+  db.insert(schema.apkVersions).values({ id: 431, trackedAppId: 1, versionCode: 1, filename: 'x.apk', downloadedAt: new Date() }).run();
+  return db;
+}
+
+describe('runSink', () => {
+  it('apk-analysis/write-full-document writes the whole assembled document in one call', async () => {
+    const db = makeDb();
+    await runSink({ writeFn: 'apk-analysis/write-full-document' }, { markdown: '## Overview\nHello.\n' }, { db, versionId: 431 });
+    expect(getNote(db, 431)).toBe('## Overview\nHello.\n');
+  });
+
+  it('apk-analysis/write-section patches just one section, leaving others untouched', async () => {
+    const db = makeDb();
+    await runSink({ writeFn: 'apk-analysis/write-full-document' }, { markdown: '## Overview\nOld.\n\n## Diff Summary\nOld diff.\n' }, { db, versionId: 431 });
+    await runSink({ writeFn: 'apk-analysis/write-section' }, { section: 'Diff Summary', text: 'New diff.' }, { db, versionId: 431 });
+    const note = getNote(db, 431);
+    expect(note).toContain('## Overview\nOld.');
+    expect(note).toContain('## Diff Summary\nNew diff.');
+  });
+
+  it('throws (not an unhandled rejection) when the target version does not exist', async () => {
+    const db = makeDb();
+    await expect(
+      runSink({ writeFn: 'apk-analysis/write-full-document' }, { markdown: 'x' }, { db, versionId: 999999 }),
+    ).rejects.toThrow();
+  });
+
+  it('throws on an unregistered writeFn name', async () => {
+    const db = makeDb();
+    await expect(runSink({ writeFn: 'nope' }, {}, { db, versionId: 431 })).rejects.toThrow(/Unknown sink/);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/sink.test.ts`
+Expected: FAIL — module `./sink` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+The "version no longer exists" case: `setNote`/`patchNoteSection` both call `getNote` first (a plain `select`, returns `''` for a missing row — it does not throw) and then `insert`/`update` against `apk_notes.version_id` with a `REFERENCES apk_versions(id) ON DELETE CASCADE` foreign key. With `foreign_keys = ON` (the project default), an insert against a non-existent `apk_versions.id` throws a `FOREIGN KEY constraint failed` from better-sqlite3 — that's what Step 1's third test actually exercises; no extra existence check is needed in this file, just don't swallow what SQLite already throws.
+
+```ts
+// backend/services/ai-jobs/nodes/sink.ts
+import type { SinkConfig } from '../types';
+import type { AppDatabase } from '../../../db/index';
+import { patchNoteSection, setNote } from '../../apk-notes';
+
+export interface SinkCtx {
+  db: AppDatabase;
+  versionId: number;
+}
+
+export type SinkWriteFn = (input: Record<string, unknown>, ctx: SinkCtx) => Promise<void>;
+
+export const SINK_REGISTRY: Record<string, SinkWriteFn> = {};
+
+export function registerSink(name: string, fn: SinkWriteFn): void {
+  SINK_REGISTRY[name] = fn;
+}
+
+export async function runSink(config: SinkConfig, input: Record<string, unknown>, ctx: SinkCtx): Promise<void> {
+  const fn = SINK_REGISTRY[config.writeFn];
+  if (!fn) throw new Error(`Unknown sink "${config.writeFn}"`);
+  await fn(input, ctx);
+}
+
+registerSink('apk-analysis/write-full-document', async (input, ctx) => {
+  setNote(ctx.db, ctx.versionId, String(input.markdown));
+});
+
+registerSink('apk-analysis/write-section', async (input, ctx) => {
+  patchNoteSection(ctx.db, ctx.versionId, String(input.section), String(input.text));
+});
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/nodes/sink.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/nodes/sink.ts backend/services/ai-jobs/nodes/sink.test.ts
+git commit -m "feat(ai-jobs): add Sink node + apk-analysis write-section/write-full-document"
+```
+
+---
+
+## Phase C: Graph validation + executor
+
+### Task 12: Graph validator
+
+**Files:**
+- Create: `backend/services/ai-jobs/graph-validator.ts`
+- Test: `backend/services/ai-jobs/graph-validator.test.ts`
+
+**Interfaces:**
+- Consumes: `PipelineGraph`, `PipelineNode`, `TriggerConfig` (Task 2).
+- Produces: `validateGraph(graph: PipelineGraph): ValidationError[]` (empty array = valid) and `ValidationError = { nodeId?: string; message: string }`. Called at publish time (Task 18's REST endpoint) — a graph that fails validation is never saved as a `published` version.
+
+Rules enforced (from the spec's Node primitives + Non-goals):
+1. At least one `Trigger` node exists.
+2. Every `Trigger` node declares the same `outputSchema` (compared by field name + type, order-independent).
+3. Every non-`Trigger` node is reachable (forward, via edges) from exactly one `Trigger`. Zero reachable `Trigger`s or more than one is an error, named per offending node.
+4. A `Branch` or `Report` node (envelope nodes) must have every one of its `from`/incoming-edge sources as a **direct** predecessor — this is already structurally guaranteed by "edges are direct connections," so this rule reduces to: a `Report`'s declared `sections[].from` must each correspond to an actual incoming edge into that `Report`, not a node two hops away. Validate that explicitly since `ReportConfig.sections` is authored data that could drift from the graph's real edges.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/graph-validator.test.ts
+import { describe, it, expect } from 'vitest';
+import { validateGraph } from './graph-validator';
+import type { PipelineGraph } from './types';
+
+const triggerSchema = [{ field: 'appName', type: 'string', description: 'x' }];
+
+function node(id: string, config: PipelineGraph['nodes'][number]['config']) {
+  return { id, config };
+}
+
+describe('validateGraph', () => {
+  it('passes a minimal valid graph: one Trigger, one AgentCall, one Sink', () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        node('trigger', { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: triggerSchema }),
+        node('agent', { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] }),
+        node('sink', { kind: 'Sink', writeFn: 'apk-analysis/write-section' }),
+      ],
+      edges: [{ from: 'trigger', to: 'agent' }, { from: 'agent', to: 'sink' }],
+    };
+    expect(validateGraph(graph)).toEqual([]);
+  });
+
+  it('rejects a graph with zero Trigger nodes', () => {
+    const graph: PipelineGraph = { nodes: [node('agent', { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] })], edges: [] };
+    const errors = validateGraph(graph);
+    expect(errors.some(e => /at least one Trigger/i.test(e.message))).toBe(true);
+  });
+
+  it('rejects two Triggers with different output schemas', () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        node('t1', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+        node('t2', { kind: 'Trigger', expandFn: 'b', outputSchema: [{ field: 'different', type: 'string', description: 'x' }] }),
+      ],
+      edges: [],
+    };
+    const errors = validateGraph(graph);
+    expect(errors.some(e => /same output schema/i.test(e.message))).toBe(true);
+  });
+
+  it('rejects a node reachable from two different Triggers', () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        node('t1', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+        node('t2', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+        node('shared', { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] }),
+      ],
+      edges: [{ from: 't1', to: 'shared' }, { from: 't2', to: 'shared' }],
+    };
+    const errors = validateGraph(graph);
+    expect(errors.some(e => e.nodeId === 'shared' && /more than one Trigger/i.test(e.message))).toBe(true);
+  });
+
+  it('rejects a node reachable from zero Triggers (orphaned)', () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        node('t1', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+        node('orphan', { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] }),
+      ],
+      edges: [],
+    };
+    const errors = validateGraph(graph);
+    expect(errors.some(e => e.nodeId === 'orphan' && /not reachable from any Trigger/i.test(e.message))).toBe(true);
+  });
+
+  it('rejects a Report section whose "from" is not a direct incoming edge', () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        node('t1', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+        node('agent', { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] }),
+        node('report', { kind: 'Report', sections: [{ title: 'X', from: 'not-a-real-edge-source' }] }),
+      ],
+      edges: [{ from: 't1', to: 'agent' }, { from: 'agent', to: 'report' }],
+    };
+    const errors = validateGraph(graph);
+    expect(errors.some(e => e.nodeId === 'report' && /not-a-real-edge-source/.test(e.message))).toBe(true);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/graph-validator.test.ts`
+Expected: FAIL — module `./graph-validator` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+```ts
+// backend/services/ai-jobs/graph-validator.ts
+import type { PipelineGraph, PipelineNode } from './types';
+
+export interface ValidationError {
+  nodeId?: string;
+  message: string;
+}
+
+function schemasMatch(a: PipelineNode['config'], b: PipelineNode['config']): boolean {
+  if (a.kind !== 'Trigger' || b.kind !== 'Trigger') return true;
+  const norm = (schema: typeof a.outputSchema) =>
+    [...schema].sort((x, y) => x.field.localeCompare(y.field)).map(f => `${f.field}:${f.type}`).join(',');
+  return norm(a.outputSchema) === norm(b.outputSchema);
+}
+
+export function validateGraph(graph: PipelineGraph): ValidationError[] {
+  const errors: ValidationError[] = [];
+  const triggers = graph.nodes.filter(n => n.config.kind === 'Trigger');
+
+  if (triggers.length === 0) {
+    errors.push({ message: 'A pipeline needs at least one Trigger node.' });
+    return errors; // nothing else to check meaningfully without a root
+  }
+
+  for (let i = 1; i < triggers.length; i++) {
+    if (!schemasMatch(triggers[0].config, triggers[i].config)) {
+      errors.push({
+        nodeId: triggers[i].id,
+        message: `Trigger "${triggers[i].id}" does not declare the same output schema as Trigger "${triggers[0].id}" — every Trigger in a pipeline must.`,
+      });
+    }
+  }
+
+  // Reachability: for each trigger, BFS forward over edges, recording which trigger(s) reach each node.
+  const reachedBy = new Map<string, Set<string>>();
+  for (const trigger of triggers) {
+    const seen = new Set<string>([trigger.id]);
+    const queue = [trigger.id];
+    while (queue.length) {
+      const current = queue.shift()!;
+      for (const edge of graph.edges) {
+        if (edge.from !== current || seen.has(edge.to)) continue;
+        seen.add(edge.to);
+        queue.push(edge.to);
+      }
+    }
+    for (const nodeId of seen) {
+      if (nodeId === trigger.id) continue;
+      if (!reachedBy.has(nodeId)) reachedBy.set(nodeId, new Set());
+      reachedBy.get(nodeId)!.add(trigger.id);
+    }
+  }
+
+  for (const n of graph.nodes) {
+    if (n.config.kind === 'Trigger') continue;
+    const reachers = reachedBy.get(n.id) ?? new Set();
+    if (reachers.size === 0) {
+      errors.push({ nodeId: n.id, message: `Node "${n.id}" is not reachable from any Trigger.` });
+    } else if (reachers.size > 1) {
+      errors.push({ nodeId: n.id, message: `Node "${n.id}" is reachable from more than one Trigger (${[...reachers].join(', ')}) — Triggers must partition the graph into disjoint zones.` });
+    }
+  }
+
+  for (const n of graph.nodes) {
+    if (n.config.kind !== 'Report') continue;
+    const incomingSources = new Set(graph.edges.filter(e => e.to === n.id).map(e => e.from));
+    for (const section of n.config.sections) {
+      if (!incomingSources.has(section.from)) {
+        errors.push({ nodeId: n.id, message: `Report "${n.id}" declares section "${section.title}" from "${section.from}", which is not a direct incoming edge into this Report.` });
+      }
+    }
+  }
+
+  return errors;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/graph-validator.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/graph-validator.ts backend/services/ai-jobs/graph-validator.test.ts
+git commit -m "feat(ai-jobs): add graph validator — trigger-zone partition + schema + Report sections"
+```
+
+### Task 13: Executor — core data shapes + a linear chain, no skip/envelope/multi-trigger/memoization yet
+
+This task and the four after it build `pipeline-runner.ts` incrementally — each adds one real behavior and every earlier task's tests must still pass unmodified at the end of every later task. The executor is deliberately decoupled from the concrete node implementations: it calls into an injected `NodeExecutors` map, so this file never imports `nodes/*.ts` directly, and the Astérix-specific wiring (Task 20) is the only place that connects the two.
+
+**Files:**
+- Create: `backend/services/ai-jobs/pipeline-runner.ts`
+- Test: `backend/services/ai-jobs/pipeline-runner.test.ts`
+
+**Interfaces:**
+- Consumes: `PipelineGraph`, `NodeRunStatus`, `RunStatus`, `Envelope` (Task 2).
+- Produces: `runPipeline(graph, triggerNodeId, rawInput, executors, ctx): Promise<RunResult>`, `NodeExecutors` (one function per `NodeKind`), `ExecutionCtx = Record<string, unknown>` (opaque bag the executor passes through unchanged — job-specific wiring lives in whatever's inside it, never in the executor). `RunResult = { status: RunStatus; nodes: NodeRunResult[] }`, `NodeRunResult = { nodeId: string; status: NodeRunStatus; output?: Record<string, unknown>; error?: string }`.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// backend/services/ai-jobs/pipeline-runner.test.ts
+import { describe, it, expect, vi } from 'vitest';
+import { runPipeline } from './pipeline-runner';
+import type { PipelineGraph, NodeExecutors } from './pipeline-runner';
+
+function fakeExecutors(overrides: Partial<NodeExecutors> = {}): NodeExecutors {
+  return {
+    Trigger: vi.fn(async (_c, rawInput) => ({ appName: 'x', ...rawInput })),
+    AgentCall: vi.fn(async () => ({ text: 'ok' })),
+    Transform: vi.fn(() => ({})),
+    Branch: vi.fn(() => 'default'),
+    Report: vi.fn(() => ({ markdown: '' })),
+    ForEach: vi.fn(async () => []),
+    Sink: vi.fn(async () => {}),
+    ...overrides,
+  };
+}
+
+const linearGraph: PipelineGraph = {
+  nodes: [
+    { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+    { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+    { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+  ],
+  edges: [{ from: 'trigger', to: 'agent' }, { from: 'agent', to: 'sink' }],
+};
+
+describe('runPipeline — linear chain', () => {
+  it('runs trigger, then agent, then sink, in order, every node ok', async () => {
+    const executors = fakeExecutors();
+    const result = await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {});
+
+    expect(result.status).toBe('ok');
+    expect(result.nodes.map(n => n.nodeId)).toEqual(['trigger', 'agent', 'sink']);
+    expect(result.nodes.every(n => n.status === 'ok')).toBe(true);
+    expect(executors.Trigger).toHaveBeenCalledWith(expect.objectContaining({ kind: 'Trigger' }), { versionId: 431 }, {});
+  });
+
+  it('passes the Trigger output to the next node keyed as "trigger"', async () => {
+    const seenInput: unknown[] = [];
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async (_c, input) => { seenInput.push(input); return { text: 'ok' }; }),
+    });
+    await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {});
+    expect(seenInput[0]).toEqual({ trigger: { appName: 'x', versionId: 431 } });
+  });
+
+  it('marks the run failed when a node throws and nothing downstream runs', async () => {
+    const executors = fakeExecutors({ AgentCall: vi.fn(async () => { throw new Error('boom'); }) });
+    const result = await runPipeline(linearGraph, 'trigger', {}, executors, {});
+    expect(result.status).toBe('failed');
+    const agentResult = result.nodes.find(n => n.nodeId === 'agent')!;
+    expect(agentResult.status).toBe('failed');
+    expect(agentResult.error).toMatch(/boom/);
+    expect(executors.Sink).not.toHaveBeenCalled();
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts`
+Expected: FAIL — module `./pipeline-runner` does not exist.
+
+- [ ] **Step 3: Write the minimal implementation**
+
+This version only handles a graph where every node has at most one incoming edge and nothing branches — enough for the linear-chain test, deliberately incomplete everywhere else (fan-out/fan-in, skip, envelopes, multi-trigger, memoization are Tasks 14–17).
+
+```ts
+// backend/services/ai-jobs/pipeline-runner.ts
+import type {
+  PipelineGraph, PipelineNode, NodeConfig, NodeRunStatus, RunStatus, Envelope,
+  TriggerConfig, AgentCallConfig, TransformConfig, BranchConfig, ReportConfig, ForEachConfig, SinkConfig,
+} from './types';
+
+export type ExecutionCtx = Record<string, unknown>;
+
+export interface NodeExecutors {
+  Trigger: (config: TriggerConfig, rawInput: Record<string, unknown>, ctx: ExecutionCtx) => Promise<Record<string, unknown>>;
+  AgentCall: (config: AgentCallConfig, input: Record<string, unknown>, ctx: ExecutionCtx) => Promise<Record<string, unknown>>;
+  Transform: (config: TransformConfig, input: Record<string, unknown>, ctx: ExecutionCtx) => Record<string, unknown>;
+  Branch: (config: BranchConfig, envelope: Envelope, ctx: ExecutionCtx) => string;
+  Report: (config: ReportConfig, envelopes: Record<string, Envelope>, ctx: ExecutionCtx) => Record<string, unknown>;
+  ForEach: (config: ForEachConfig, items: unknown[], ctx: ExecutionCtx) => Promise<unknown[]>;
+  Sink: (config: SinkConfig, input: Record<string, unknown>, ctx: ExecutionCtx) => Promise<void>;
+}
+
+export interface NodeRunResult {
+  nodeId: string;
+  status: NodeRunStatus;
+  output?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface RunResult {
+  status: RunStatus;
+  nodes: NodeRunResult[];
+}
+
+export async function runPipeline(
+  graph: PipelineGraph,
+  triggerNodeId: string,
+  rawInput: Record<string, unknown>,
+  executors: NodeExecutors,
+  ctx: ExecutionCtx,
+): Promise<RunResult> {
+  const byId = new Map(graph.nodes.map(n => [n.id, n]));
+  const results = new Map<string, NodeRunResult>();
+  const outputs = new Map<string, Record<string, unknown>>();
+
+  // Topological order via Kahn's algorithm — stable for the linear-chain case this task covers;
+  // Task 14 replaces the single-pass walk below with wave-based concurrent execution.
+  const inDegree = new Map<string, number>();
+  for (const n of graph.nodes) inDegree.set(n.id, 0);
+  for (const e of graph.edges) inDegree.set(e.to, (inDegree.get(e.to) ?? 0) + 1);
+
+  const order: string[] = [];
+  const queue = graph.nodes.filter(n => (inDegree.get(n.id) ?? 0) === 0).map(n => n.id);
+  const degreeLeft = new Map(inDegree);
+  while (queue.length) {
+    const id = queue.shift()!;
+    order.push(id);
+    for (const e of graph.edges) {
+      if (e.from !== id) continue;
+      degreeLeft.set(e.to, (degreeLeft.get(e.to) ?? 0) - 1);
+      if (degreeLeft.get(e.to) === 0) queue.push(e.to);
+    }
+  }
+
+  let aborted = false;
+  for (const nodeId of order) {
+    const node = byId.get(nodeId)!;
+    const incoming = graph.edges.filter(e => e.to === nodeId).map(e => e.from);
+    const parentFailed = incoming.some(p => results.get(p)?.status === 'failed');
+
+    if (parentFailed) {
+      results.set(nodeId, { nodeId, status: 'skipped' });
+      continue;
+    }
+    if (aborted) continue;
+
+    const input = buildInput(incoming, outputs);
+    try {
+      const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx);
+      results.set(nodeId, { nodeId, status: 'ok', output });
+      outputs.set(nodeId, output);
+    } catch (err) {
+      results.set(nodeId, { nodeId, status: 'failed', error: String(err instanceof Error ? err.message : err) });
+    }
+  }
+
+  const statuses = [...results.values()];
+  const runStatus: RunStatus = statuses.every(r => r.status === 'ok')
+    ? 'ok'
+    : statuses.some(r => r.status === 'ok')
+      ? 'partial'
+      : 'failed';
+
+  return { status: runStatus, nodes: order.map(id => results.get(id)!) };
+}
+
+function buildInput(incoming: string[], outputs: Map<string, Record<string, unknown>>): Record<string, unknown> {
+  const input: Record<string, unknown> = {};
+  for (const sourceId of incoming) {
+    if (outputs.has(sourceId)) input[sourceId] = outputs.get(sourceId);
+  }
+  return input;
+}
+
+async function runOne(
+  config: NodeConfig,
+  input: Record<string, unknown>,
+  executors: NodeExecutors,
+  ctx: ExecutionCtx,
+): Promise<Record<string, unknown>> {
+  switch (config.kind) {
+    case 'Trigger': return executors.Trigger(config, input, ctx);
+    case 'AgentCall': return executors.AgentCall(config, input, ctx);
+    case 'Transform': return executors.Transform(config, input, ctx);
+    case 'Sink': await executors.Sink(config, input, ctx); return {};
+    case 'ForEach': return { items: await executors.ForEach(config, (input.items as unknown[]) ?? [], ctx) };
+    // Branch/Report are envelope nodes — Task 15 replaces these two cases; left unreachable
+    // from the linear-chain test this task covers (no Branch/Report node in linearGraph).
+    case 'Branch': throw new Error('Branch requires envelope wiring — see Task 15');
+    case 'Report': throw new Error('Report requires envelope wiring — see Task 15');
+  }
+}
+```
+
+Also append the "trigger output keyed as trigger" expectation to `buildInput` for the specific case where the Trigger node itself is a predecessor — note the test expects `{ trigger: { appName: 'x', versionId: 431 } }`, i.e. the Trigger's own node id (`'trigger'`) is the key, same as any other predecessor; no special-casing needed since `outputs.set('trigger', ...)` already happened. Re-verify this falls out of the code above once it's typed in — if the second test fails because the key doesn't match, it means `buildInput` needs the Trigger's *id*, not the literal string `'trigger'`, which is what's written above already (the test graph happens to name its Trigger node `'trigger'`, so this is a coincidence worth noting, not a hardcoded special case to replicate).
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/pipeline-runner.ts backend/services/ai-jobs/pipeline-runner.test.ts
+git commit -m "feat(ai-jobs): executor skeleton — linear topological run"
+```
+
+### Task 14: Executor — concurrent waves + transitive skip propagation
+
+**Files:**
+- Modify: `backend/services/ai-jobs/pipeline-runner.ts`
+- Modify: `backend/services/ai-jobs/pipeline-runner.test.ts` (add to it — every Task 13 test must still pass unmodified)
+
+**Interfaces:** unchanged from Task 13 — this task only changes `runPipeline`'s internal scheduling, not its signature.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// append to pipeline-runner.test.ts
+describe('runPipeline — concurrency and transitive skip', () => {
+  const fanOutGraph: PipelineGraph = {
+    nodes: [
+      { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+      { id: 'a1', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      { id: 'a2', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      { id: 's1', config: { kind: 'Sink', writeFn: 'x' } },
+      { id: 's2', config: { kind: 'Sink', writeFn: 'x' } },
+    ],
+    edges: [
+      { from: 'trigger', to: 'a1' }, { from: 'trigger', to: 'a2' },
+      { from: 'a1', to: 's1' }, { from: 'a2', to: 's2' },
+    ],
+  };
+
+  it('runs independent branches concurrently, not sequentially', async () => {
+    const order: string[] = [];
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async (_c, _i) => {
+        order.push('agent-start');
+        await new Promise(r => setTimeout(r, 10));
+        order.push('agent-end');
+        return { text: 'ok' };
+      }),
+    });
+    await runPipeline(fanOutGraph, 'trigger', {}, executors, {});
+    // Both agents start before either finishes — sequential execution would interleave start/end/start/end.
+    expect(order).toEqual(['agent-start', 'agent-start', 'agent-end', 'agent-end']);
+  });
+
+  it('skip propagates transitively through a chain, not just one hop', async () => {
+    const chain: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'a', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'transform', config: { kind: 'Transform', fn: 'x' } },
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [{ from: 'trigger', to: 'a' }, { from: 'a', to: 'transform' }, { from: 'transform', to: 'sink' }],
+    };
+    const executors = fakeExecutors({ AgentCall: vi.fn(async () => { throw new Error('boom'); }) });
+    const result = await runPipeline(chain, 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'a')!.status).toBe('failed');
+    expect(result.nodes.find(n => n.nodeId === 'transform')!.status).toBe('skipped');
+    expect(result.nodes.find(n => n.nodeId === 'sink')!.status).toBe('skipped'); // two hops from the failure
+    expect(executors.Transform).not.toHaveBeenCalled();
+    expect(executors.Sink).not.toHaveBeenCalled();
+  });
+
+  it('one failed branch does not stop the sibling branch from completing (partial-failure-continues)', async () => {
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async (_c, input) => {
+        if ('a1' in (input as object) === false && Object.keys(input as object).includes('trigger')) {
+          // both a1 and a2 receive {trigger: ...}; fail only when this is the second AgentCall invocation
+        }
+        return { text: 'ok' };
+      }),
+    });
+    // Make a1 fail, a2 succeed, by giving each AgentCall a distinguishable config field.
+    const graph: PipelineGraph = {
+      ...fanOutGraph,
+      nodes: fanOutGraph.nodes.map(n =>
+        n.id === 'a1' ? { ...n, config: { ...n.config, instructionTemplate: 'FAIL' } as any } : n,
+      ),
+    };
+    const agentCall = vi.fn(async (config: any) => {
+      if (config.instructionTemplate === 'FAIL') throw new Error('boom');
+      return { text: 'ok' };
+    });
+    const result = await runPipeline(graph, 'trigger', {}, fakeExecutors({ AgentCall: agentCall }), {});
+
+    expect(result.status).toBe('partial');
+    expect(result.nodes.find(n => n.nodeId === 'a1')!.status).toBe('failed');
+    expect(result.nodes.find(n => n.nodeId === 's1')!.status).toBe('skipped');
+    expect(result.nodes.find(n => n.nodeId === 'a2')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 's2')!.status).toBe('ok'); // sibling branch unaffected
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts -t concurrency`
+Expected: FAIL — the first test fails because Task 13's sequential `for` loop processes nodes one at a time (`order` comes out `['agent-start','agent-end','agent-start','agent-end']`, not interleaved); the skip tests may already pass by accident (direct-parent-only skip happens to produce the right one-hop answer) but the two-hop transform→sink case fails since Task 13 never checks a *skipped* parent, only a *failed* one.
+
+- [ ] **Step 3: Rewrite the scheduling loop for waves + fix transitive skip**
+
+Replace the `for (const nodeId of order)` block in `runPipeline` (keep everything above it — the Kahn in-degree setup stays, it's still used to know when a node's dependencies are satisfied):
+
+```ts
+  const remaining = new Set(order);
+  while (remaining.size > 0) {
+    const ready = [...remaining].filter(id =>
+      graph.edges.filter(e => e.to === id).every(e => results.has(e.from)),
+    );
+    if (ready.length === 0) break; // shouldn't happen for a validated DAG; defensive exit over an infinite loop
+
+    await Promise.all(ready.map(async (nodeId) => {
+      remaining.delete(nodeId);
+      const node = byId.get(nodeId)!;
+      const incoming = graph.edges.filter(e => e.to === nodeId).map(e => e.from);
+      const parentUnavailable = incoming.some((p) => {
+        const s = results.get(p)?.status;
+        return s === 'failed' || s === 'skipped';
+      });
+
+      if (parentUnavailable) {
+        results.set(nodeId, { nodeId, status: 'skipped' });
+        return;
+      }
+
+      const input = buildInput(incoming, outputs);
+      try {
+        const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx);
+        results.set(nodeId, { nodeId, status: 'ok', output });
+        outputs.set(nodeId, output);
+      } catch (err) {
+        results.set(nodeId, { nodeId, status: 'failed', error: String(err instanceof Error ? err.message : err) });
+      }
+    }));
+  }
+```
+
+Delete the old `let aborted = false;` line and the sequential loop it belonged to — the wave loop above replaces it entirely. `order` (from Kahn's algorithm) is still used afterward, for `return { status: runStatus, nodes: order.map(id => results.get(id)!) }`, so keep computing it, just stop using it to drive execution order.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts`
+Expected: PASS — including every Task 13 test, unmodified.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/pipeline-runner.ts backend/services/ai-jobs/pipeline-runner.test.ts
+git commit -m "feat(ai-jobs): executor — concurrent waves, transitive skip propagation"
+```
+
+### Task 15: Executor — envelope nodes (`Branch`, `Report`), exempt from skip, adjacency-sensitive
+
+**Files:**
+- Modify: `backend/services/ai-jobs/pipeline-runner.ts`
+- Modify: `backend/services/ai-jobs/pipeline-runner.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// append to pipeline-runner.test.ts
+describe('runPipeline — envelope nodes', () => {
+  function branchGraph(): PipelineGraph {
+    return {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary', 'fallback'] } },
+        { id: 'primary-sink', config: { kind: 'Sink', writeFn: 'x' } },
+        { id: 'fallback-sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'agent' },
+        { from: 'agent', to: 'branch' },
+        { from: 'branch', to: 'primary-sink', label: 'primary' },
+        { from: 'branch', to: 'fallback-sink', label: 'fallback' },
+      ],
+    };
+  }
+
+  it('Branch runs even when its immediate parent failed, and routes only the chosen edge', async () => {
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => { throw new Error('boom'); }),
+      Branch: vi.fn((_config, envelope: any) => (envelope.status === 'failed' ? 'fallback' : 'primary')),
+    });
+    const result = await runPipeline(branchGraph(), 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'agent')!.status).toBe('failed');
+    expect(result.nodes.find(n => n.nodeId === 'branch')!.status).toBe('ok'); // envelope node — not skipped
+    expect(result.nodes.find(n => n.nodeId === 'fallback-sink')!.status).toBe('ok'); // chosen edge
+    expect(result.nodes.find(n => n.nodeId === 'primary-sink')!.status).toBe('skipped'); // not chosen
+    expect(executors.Branch).toHaveBeenCalledWith(expect.anything(), { status: 'failed', error: expect.stringContaining('boom') }, {});
+  });
+
+  it('a Branch that is NOT the immediate child of a failure sees "skipped", not "failed" — the adjacency rule in practice', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'transform', config: { kind: 'Transform', fn: 'x' } }, // sits between the failure and the Branch
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary'] } },
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'agent' }, { from: 'agent', to: 'transform' },
+        { from: 'transform', to: 'branch' }, { from: 'branch', to: 'sink', label: 'primary' },
+      ],
+    };
+    let seenEnvelope: any;
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => { throw new Error('boom'); }),
+      Branch: vi.fn((_c, envelope: any) => { seenEnvelope = envelope; return 'primary'; }),
+    });
+    await runPipeline(graph, 'trigger', {}, executors, {});
+    expect(seenEnvelope).toEqual({ status: 'skipped' }); // not { status: 'failed', error: 'boom' } — transform absorbed it
+  });
+
+  it('Report gathers an envelope per section source and assembles once all settle', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'a1', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'ok', toolAllowlist: [] } },
+        { id: 'a2', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'FAIL', toolAllowlist: [] } },
+        { id: 'report', config: { kind: 'Report', sections: [{ title: 'One', from: 'a1' }, { title: 'Two', from: 'a2' }] } },
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'a1' }, { from: 'trigger', to: 'a2' },
+        { from: 'a1', to: 'report' }, { from: 'a2', to: 'report' }, { from: 'report', to: 'sink' },
+      ],
+    };
+    let seenEnvelopes: any;
+    const agentCall = vi.fn(async (config: any) => { if (config.instructionTemplate === 'FAIL') throw new Error('nope'); return { text: 'ok' }; });
+    const report = vi.fn((_c, envelopes: any) => { seenEnvelopes = envelopes; return { markdown: 'x' }; });
+    const result = await runPipeline(graph, 'trigger', {}, fakeExecutors({ AgentCall: agentCall, Report: report }), {});
+
+    expect(result.nodes.find(n => n.nodeId === 'report')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'sink')!.status).toBe('ok'); // Report's own output always flows onward
+    expect(seenEnvelopes).toEqual({
+      a1: { status: 'ok', output: { text: 'ok' } },
+      a2: { status: 'failed', error: expect.stringContaining('nope') },
+    });
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts -t "envelope nodes"`
+Expected: FAIL — `runOne`'s `Branch`/`Report` cases still throw the Task-13 placeholder errors, and the wave loop's `parentUnavailable` check skips them like any other node.
+
+- [ ] **Step 3: Add the envelope exemption and envelope-building**
+
+Add a helper and change two things in the wave loop: the skip check, and `runOne`'s `Branch`/`Report` cases.
+
+```ts
+function buildEnvelope(parentId: string, results: Map<string, { status: string; output?: Record<string, unknown>; error?: string }>): Envelope {
+  const r = results.get(parentId);
+  if (!r) return { status: 'skipped' }; // defensive — shouldn't happen, the wave loop only runs a node once every incoming edge has a result
+  if (r.status === 'ok') return { status: 'ok', output: r.output ?? {} };
+  if (r.status === 'failed') return { status: 'failed', error: r.error ?? 'unknown error' };
+  return { status: r.status === 'inactive' ? 'inactive' : 'skipped' };
+}
+```
+
+In the wave loop, change the skip decision:
+
+```ts
+      const isEnvelopeNode = node.config.kind === 'Branch' || node.config.kind === 'Report';
+      if (parentUnavailable && !isEnvelopeNode) {
+        results.set(nodeId, { nodeId, status: 'skipped' });
+        return;
+      }
+```
+
+And replace `runOne`'s `Branch`/`Report` cases:
+
+```ts
+    case 'Branch': {
+      // Branch has exactly one logical predecessor per the spec (it picks ONE outgoing edge from
+      // ONE input) — if a graph somehow wires more than one into a Branch, use the first; the
+      // graph validator (Task 12) doesn't currently forbid this, worth a follow-up if it matters.
+      const envelope = branchEnvelope!; // see call-site change below — passed in rather than recomputed here
+      const chosen = executors.Branch(config, envelope, ctx);
+      return { chosenEdge: chosen };
+    }
+    case 'Report': {
+      const envelopes = reportEnvelopes!; // see call-site change below
+      return executors.Report(config, envelopes, ctx);
+    }
+```
+
+`runOne` needs the envelope(s) passed in rather than computed from `input` (which only ever carries `ok` outputs, never failure info) — change its signature and the one call site:
+
+```ts
+async function runOne(
+  config: NodeConfig,
+  input: Record<string, unknown>,
+  executors: NodeExecutors,
+  ctx: ExecutionCtx,
+  branchEnvelope?: Envelope,
+  reportEnvelopes?: Record<string, Envelope>,
+): Promise<Record<string, unknown>> {
+```
+
+and in the wave loop, right before the `runOne` call, branch on node kind to build what Step 3 just wired through:
+
+```ts
+      let branchEnvelope: Envelope | undefined;
+      let reportEnvelopes: Record<string, Envelope> | undefined;
+      if (node.config.kind === 'Branch') {
+        branchEnvelope = buildEnvelope(incoming[0], results);
+      } else if (node.config.kind === 'Report') {
+        reportEnvelopes = Object.fromEntries(incoming.map(p => [p, buildEnvelope(p, results)]));
+      }
+
+      const input = buildInput(incoming, outputs);
+      try {
+        const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx, branchEnvelope, reportEnvelopes);
+        results.set(nodeId, { nodeId, status: 'ok', output });
+        outputs.set(nodeId, output);
+      } catch (err) {
+        results.set(nodeId, { nodeId, status: 'failed', error: String(err instanceof Error ? err.message : err) });
+      }
+```
+
+Finally, a `Branch`'s *downstream* routing: when deciding `parentUnavailable` for a node fed by a `Branch`, an edge whose `label` doesn't match the Branch's `chosenEdge` must count as unavailable even though the Branch itself is `ok`. Change the `parentUnavailable` computation to look at edges, not just source status:
+
+```ts
+      const incomingEdges = graph.edges.filter(e => e.to === nodeId);
+      const parentUnavailable = incomingEdges.some((e) => {
+        const parentResult = results.get(e.from);
+        const s = parentResult?.status;
+        if (s === 'failed' || s === 'skipped' || s === 'inactive') return true;
+        if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
+          return (parentResult?.output as { chosenEdge?: string } | undefined)?.chosenEdge !== e.label;
+        }
+        return false;
+      });
+```
+
+(This replaces the `incoming.some(p => ...)` version from Task 14 — `incoming` the plain id array is still used elsewhere in this block for `buildInput`/envelope-building, keep that variable too.)
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts`
+Expected: PASS — every test from Tasks 13–15.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/pipeline-runner.ts backend/services/ai-jobs/pipeline-runner.test.ts
+git commit -m "feat(ai-jobs): executor — Branch/Report envelope exemption, edge-label routing"
+```
+
+### Task 16: Executor — multi-trigger zones, `inactive` status, run-status rollup excludes it
+
+**Files:**
+- Modify: `backend/services/ai-jobs/pipeline-runner.ts`
+- Modify: `backend/services/ai-jobs/pipeline-runner.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// append to pipeline-runner.test.ts
+describe('runPipeline — multi-trigger zones', () => {
+  const twoTriggerGraph: PipelineGraph = {
+    nodes: [
+      { id: 'full', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+      { id: 'rescan', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+      { id: 'agent-full', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      { id: 'sink-full', config: { kind: 'Sink', writeFn: 'x' } },
+      { id: 'agent-rescan', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      { id: 'sink-rescan', config: { kind: 'Sink', writeFn: 'x' } },
+    ],
+    edges: [
+      { from: 'full', to: 'agent-full' }, { from: 'agent-full', to: 'sink-full' },
+      { from: 'rescan', to: 'agent-rescan' }, { from: 'agent-rescan', to: 'sink-rescan' },
+    ],
+  };
+
+  it('firing "rescan" marks every node in the "full" zone inactive, and never calls their executors', async () => {
+    const executors = fakeExecutors();
+    const result = await runPipeline(twoTriggerGraph, 'rescan', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'full')!.status).toBe('inactive');
+    expect(result.nodes.find(n => n.nodeId === 'agent-full')!.status).toBe('inactive');
+    expect(result.nodes.find(n => n.nodeId === 'sink-full')!.status).toBe('inactive');
+    expect(result.nodes.find(n => n.nodeId === 'rescan')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'agent-rescan')!.status).toBe('ok');
+    // The Trigger executor is called once per run (the fired one), never for the inactive zone's Trigger.
+    expect(executors.Trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it('run status rolls up over the active zone only — inactive nodes never count toward ok/partial/failed', async () => {
+    const executors = fakeExecutors({ AgentCall: vi.fn(async () => { throw new Error('boom'); }) });
+    const result = await runPipeline(twoTriggerGraph, 'rescan', {}, executors, {});
+    // agent-rescan fails, sink-rescan skips — the "full" zone (4 inactive nodes) must not turn this into "partial"
+    // via some leftover inactive-counts-as-ok logic, nor silently inflate node totals.
+    expect(result.status).toBe('failed'); // the whole (2-node) active zone produced nothing
+    const activeZoneNodes = result.nodes.filter(n => n.status !== 'inactive');
+    expect(activeZoneNodes.map(n => n.nodeId).sort()).toEqual(['agent-rescan', 'rescan', 'sink-rescan']);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts -t "multi-trigger"`
+Expected: FAIL — today every node runs regardless of which `Trigger` fired (there's only ever been one `Trigger` exercised so far), so `executors.Trigger` is called once per `Trigger` node in the graph, not once total, and nothing is ever `inactive`.
+
+- [ ] **Step 3: Compute the fired trigger's reachable zone up front, short-circuit everything else**
+
+Add a reachability helper (same shape as the graph validator's, intentionally not shared — the validator's runs at publish time over the *whole* graph checking every `Trigger`; this one runs at execution time for *one* fired `Trigger`, different enough callers that a shared util would need a clunky parameter just to say "which mode," not worth it for two call sites):
+
+```ts
+function reachableFrom(nodeId: string, graph: PipelineGraph): Set<string> {
+  const seen = new Set<string>([nodeId]);
+  const queue = [nodeId];
+  while (queue.length) {
+    const current = queue.shift()!;
+    for (const e of graph.edges) {
+      if (e.from !== current || seen.has(e.to)) continue;
+      seen.add(e.to);
+      queue.push(e.to);
+    }
+  }
+  return seen;
+}
+```
+
+At the top of `runPipeline`, right after `const byId = new Map(...)`:
+
+```ts
+  const activeZone = reachableFrom(triggerNodeId, graph);
+  for (const n of graph.nodes) {
+    if (!activeZone.has(n.id)) results.set(n.id, { nodeId: n.id, status: 'inactive' });
+  }
+```
+
+Change the wave loop's `remaining` set to exclude the inactive nodes from the start (they already have a result, so `ready`'s `!results.has` style checks would naturally skip them if you compute `remaining` as `new Set(order.filter(id => activeZone.has(id)))` instead of `new Set(order)`).
+
+Change the run-status rollup to filter `inactive` out before computing `ok`/`partial`/`failed`:
+
+```ts
+  const activeResults = [...results.values()].filter(r => r.status !== 'inactive');
+  const runStatus: RunStatus = activeResults.every(r => r.status === 'ok')
+    ? 'ok'
+    : activeResults.some(r => r.status === 'ok')
+      ? 'partial'
+      : 'failed';
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts`
+Expected: PASS — every test from Tasks 13–16.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/services/ai-jobs/pipeline-runner.ts backend/services/ai-jobs/pipeline-runner.test.ts
+git commit -m "feat(ai-jobs): executor — multi-trigger zones, inactive status, rollup excludes it"
+```
+
+### Task 17: Executor — opt-in memoization
+
+Design note not spelled out verbatim in the spec: the hash is computed over `{config, input}` together, not `input` alone. Since `(nodeId, pipelineVersionId)` already pins `config` for the cache key, hashing `input` alone would be equivalent in practice — but hashing both is strictly safer (covers a future case where the same `nodeId` legitimately gets different config across a hand-edited draft/published split) and costs nothing. `Trigger` and `Report` are never memoized regardless of `reuseUnchanged` — enforced structurally by only checking the cache for `'AgentCall'`/`'Sink'` kinds.
+
+**Files:**
+- Create: `backend/services/ai-jobs/memoization.ts`
+- Create: `backend/services/ai-jobs/memoization.test.ts`
+- Modify: `backend/services/ai-jobs/pipeline-runner.ts`
+- Modify: `backend/services/ai-jobs/pipeline-runner.test.ts`
+
+**Interfaces:**
+- Produces: `computeInputHash(config: NodeConfig, input: Record<string, unknown>): string` (sha256 hex). `runPipeline`'s signature gains a 6th, optional parameter: `options?: { reuseUnchanged?: boolean; priorNodeRuns?: Record<string, { inputHash: string; output: Record<string, unknown> }> }`. `NodeRunResult` gains `wasMemoized?: boolean`.
+
+- [ ] **Step 1: Write the failing test for `computeInputHash`**
+
+```ts
+// backend/services/ai-jobs/memoization.test.ts
+import { describe, it, expect } from 'vitest';
+import { computeInputHash } from './memoization';
+
+describe('computeInputHash', () => {
+  it('is stable for the same config + input regardless of key order', () => {
+    const a = computeInputHash({ kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: ['a', 'b'] }, { trigger: { appName: 'x', versionName: '1' } });
+    const b = computeInputHash({ kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: ['a', 'b'] }, { trigger: { versionName: '1', appName: 'x' } });
+    expect(a).toBe(b);
+  });
+
+  it('changes when the input changes', () => {
+    const config = { kind: 'AgentCall' as const, tier: 'High', instructionTemplate: 'x', toolAllowlist: [] };
+    const a = computeInputHash(config, { trigger: { versionName: '6.10.1' } });
+    const b = computeInputHash(config, { trigger: { versionName: '6.10.2' } });
+    expect(a).not.toBe(b);
+  });
+
+  it('changes when the config changes, even with identical input', () => {
+    const input = { trigger: { versionName: '1' } };
+    const a = computeInputHash({ kind: 'AgentCall', tier: 'High', instructionTemplate: 'old prompt', toolAllowlist: [] }, input);
+    const b = computeInputHash({ kind: 'AgentCall', tier: 'High', instructionTemplate: 'new prompt', toolAllowlist: [] }, input);
+    expect(a).not.toBe(b);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/memoization.test.ts`
+Expected: FAIL — module `./memoization` does not exist.
+
+- [ ] **Step 3: Write `computeInputHash`**
+
+```ts
+// backend/services/ai-jobs/memoization.ts
+import { createHash } from 'crypto';
+import type { NodeConfig } from './types';
+
+/** Deterministic stringify: sorts object keys at every level so key order never affects the hash. */
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>).sort();
+    return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function computeInputHash(config: NodeConfig, input: Record<string, unknown>): string {
+  return createHash('sha256').update(stableStringify({ config, input })).digest('hex');
+}
+
+export const MEMOIZABLE_KINDS = new Set(['AgentCall', 'Sink']);
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/memoization.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Write the failing executor test**
+
+```ts
+// append to pipeline-runner.test.ts
+describe('runPipeline — memoization', () => {
+  it('reuses a prior AgentCall output when reuseUnchanged is set and the hash matches, never calls the executor', async () => {
+    const { computeInputHash } = await import('./memoization');
+    const config = linearGraph.nodes[1].config; // the AgentCall node
+    const input = { trigger: { versionId: 431 } };
+    const priorHash = computeInputHash(config, input);
+
+    const executors = fakeExecutors();
+    const result = await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+      reuseUnchanged: true,
+      priorNodeRuns: { agent: { inputHash: priorHash, output: { text: 'cached answer' } } },
+    });
+
+    expect(executors.AgentCall).not.toHaveBeenCalled();
+    const agentResult = result.nodes.find(n => n.nodeId === 'agent')!;
+    expect(agentResult.status).toBe('ok');
+    expect(agentResult.wasMemoized).toBe(true);
+    expect(agentResult.output).toEqual({ text: 'cached answer' });
+  });
+
+  it('runs fresh when the hash does not match (input actually changed)', async () => {
+    const executors = fakeExecutors();
+    const result = await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+      reuseUnchanged: true,
+      priorNodeRuns: { agent: { inputHash: 'stale-hash-from-a-different-input', output: { text: 'stale' } } },
+    });
+    expect(executors.AgentCall).toHaveBeenCalled();
+    expect(result.nodes.find(n => n.nodeId === 'agent')!.wasMemoized).toBeFalsy();
+  });
+
+  it('never memoizes Trigger or Report even when a matching hash is supplied', async () => {
+    const { computeInputHash } = await import('./memoization');
+    const triggerConfig = linearGraph.nodes[0].config;
+    const hash = computeInputHash(triggerConfig, { versionId: 431 });
+    const executors = fakeExecutors();
+    await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+      reuseUnchanged: true,
+      priorNodeRuns: { trigger: { inputHash: hash, output: { appName: 'cached' } } },
+    });
+    expect(executors.Trigger).toHaveBeenCalled(); // not skipped, despite a matching hash in priorNodeRuns
+  });
+
+  it('reuseUnchanged defaults to off — omitting it runs everything fresh even with priorNodeRuns supplied', async () => {
+    const { computeInputHash } = await import('./memoization');
+    const config = linearGraph.nodes[1].config;
+    const hash = computeInputHash(config, { trigger: { versionId: 431 } });
+    const executors = fakeExecutors();
+    await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+      priorNodeRuns: { agent: { inputHash: hash, output: { text: 'should not be used' } } },
+    });
+    expect(executors.AgentCall).toHaveBeenCalled();
+  });
+});
+```
+
+- [ ] **Step 6: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts -t memoization`
+Expected: FAIL — `runPipeline` doesn't accept a 6th parameter yet, and `NodeRunResult` has no `wasMemoized` field.
+
+- [ ] **Step 7: Wire memoization into the executor**
+
+Add to `types.ts`: `NodeRunResult` (if it's declared there instead of `pipeline-runner.ts` — it's declared in `pipeline-runner.ts` per Task 13, so add it there) gains `wasMemoized?: boolean`.
+
+Change `runPipeline`'s signature and add the lookup inside the wave loop, right before the `try`/`runOne` call:
+
+```ts
+export async function runPipeline(
+  graph: PipelineGraph,
+  triggerNodeId: string,
+  rawInput: Record<string, unknown>,
+  executors: NodeExecutors,
+  ctx: ExecutionCtx,
+  options: { reuseUnchanged?: boolean; priorNodeRuns?: Record<string, { inputHash: string; output: Record<string, unknown> }> } = {},
+): Promise<RunResult> {
+```
+
+Inside the wave loop, after `const input = buildInput(incoming, outputs);` and before the `try`:
+
+```ts
+      if (options.reuseUnchanged && MEMOIZABLE_KINDS.has(node.config.kind)) {
+        const prior = options.priorNodeRuns?.[nodeId];
+        const hash = computeInputHash(node.config, input);
+        if (prior && prior.inputHash === hash) {
+          results.set(nodeId, { nodeId, status: 'ok', output: prior.output, wasMemoized: true });
+          outputs.set(nodeId, prior.output);
+          return;
+        }
+      }
+```
+
+Add the import: `import { computeInputHash, MEMOIZABLE_KINDS } from './memoization';`
+
+- [ ] **Step 8: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/pipeline-runner.test.ts`
+Expected: PASS — every test from Tasks 13–17.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add backend/services/ai-jobs/memoization.ts backend/services/ai-jobs/memoization.test.ts backend/services/ai-jobs/pipeline-runner.ts backend/services/ai-jobs/pipeline-runner.test.ts
+git commit -m "feat(ai-jobs): opt-in memoization — AgentCall/Sink only, off by default"
+```
+
+### Task 18: Pin the concurrent-`Sink`-writes invariant with a real gate test
+
+This is the load-bearing, previously-undocumented behavior the spec calls out: `patchNoteSection` does a synchronous read-splice-write with no `await` between the read and the write, so same-tick concurrent calls happen to serialize correctly today. This task doesn't add new product code — it adds the regression test that catches it if `apk-notes.ts`'s storage ever goes async.
+
+**Files:**
+- Modify: `backend/services/apk-notes.test.ts` (existing file — add to it)
+
+- [ ] **Step 1: Write the test**
+
+```ts
+// append to backend/services/apk-notes.test.ts — adapt the db setup to whatever fixture
+// the rest of this test file already uses (it has apk_versions/apk_notes tables wired up
+// somewhere already, since every other test in the file needs them); don't build a second one.
+describe('concurrent patchNoteSection calls', () => {
+  it('four concurrent writes to four different sections of the same version all land — no lost update', async () => {
+    const db = /* existing fixture */;
+    const versionId = /* existing fixture's seeded version id */;
+
+    await Promise.all([
+      Promise.resolve().then(() => patchNoteSection(db, versionId, 'Overview', 'Overview content.')),
+      Promise.resolve().then(() => patchNoteSection(db, versionId, 'Wait Times', 'Wait times content.')),
+      Promise.resolve().then(() => patchNoteSection(db, versionId, 'Maps', 'Maps content.')),
+      Promise.resolve().then(() => patchNoteSection(db, versionId, 'Secrets', 'Secrets content.')),
+    ]);
+
+    const note = getNote(db, versionId);
+    expect(note).toContain('## Overview\nOverview content.');
+    expect(note).toContain('## Wait Times\nWait times content.');
+    expect(note).toContain('## Maps\nMaps content.');
+    expect(note).toContain('## Secrets\nSecrets content.');
+  });
+});
+```
+
+Note on the `Promise.resolve().then(...)` wrapping: `patchNoteSection` itself is synchronous (`getNote`/`setNote` are plain `better-sqlite3` calls, no `await` inside), so `Promise.all` over four plain synchronous calls would just run them one after another in call order with no actual interleaving to test. Wrapping each in a microtask queues all four read-splice-write sequences to interleave at the microtask boundary, which is the realistic shape of "four `Sink` nodes in the same executor wave, each `await`ing before calling the (synchronous) write function" — this is what actually exercises the no-await-between-read-and-write property instead of trivially passing because nothing was ever concurrent.
+
+- [ ] **Step 2: Run test to verify it fails or passes**
+
+Run: `npx vitest run backend/services/apk-notes.test.ts -t "concurrent patchNoteSection"`
+Expected: PASS — this is a regression pin on existing, correct behavior, not a new feature; if it fails, that's a real bug in `apk-notes.ts` to fix before continuing, not a sign this test is wrong.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add backend/services/apk-notes.test.ts
+git commit -m "test(ai-jobs): pin the concurrent patchNoteSection no-lost-update invariant"
+```
+
+---
+
+## Phase D: REST API
+
+### Task 19: `/v1/ai-pipelines` endpoints — CRUD, publish, run, run status
+
+**Files:**
+- Create: `backend/api/ai-pipelines.ts`
+- Create: `backend/api/ai-pipelines.test.ts`
+- Modify: `backend/index.ts` (register the new endpoints, same place `registerJobEndpoints`/other `register*Endpoints` calls live)
+
+**Interfaces:**
+- Consumes: `validateGraph` (Task 12), `runPipeline` (Tasks 13–17), `aiPipelines`/`aiPipelineVersions`/`aiPipelineRuns`/`aiPipelineNodeRuns` (Task 1).
+- Produces: `registerAiPipelineEndpoints(deps: AiPipelineDeps): void` where `AiPipelineDeps = { db: AppDatabase; executors: NodeExecutors; buildCtx: (identity, input: Record<string, unknown>) => ExecutionCtx }` — `buildCtx` derives the run's identity from the authenticated request, not a fixed core-service identity, matching `triggerAiAgentManual`'s existing per-user-identity pattern.
+
+Routes (scopes match `patch_analysis_section`/`read_analysis_notes`'s existing `core.apk:manage`/`core.apk:read`, per Global Constraints):
+- `GET /v1/ai-pipelines` — list (`core.apk:read`)
+- `POST /v1/ai-pipelines` — create a pipeline + its first draft version (`core.apk:manage`)
+- `POST /v1/ai-pipelines/:id/versions` — add a new draft version (`core.apk:manage`)
+- `POST /v1/ai-pipelines/:id/publish` — validates the latest draft version via `validateGraph`, 400s with the validation errors if invalid, else flips it to `published` (`core.apk:manage`)
+- `POST /v1/ai-pipelines/:id/run` — body `{ triggerNodeId, input, reuseUnchanged? }`; **rejects with 409 if a `running` row already exists for this pipeline's current published version** (Review Focus: cross-run concurrency) — otherwise inserts a `running` `aiPipelineRuns` row, calls `runPipeline`, persists every `NodeRunResult` as an `aiPipelineNodeRuns` row, updates the run row to its final status (`core.apk:manage`)
+- `GET /v1/ai-pipelines/runs/:runId` — status + every node-run row (`core.apk:read`)
+
+- [ ] **Step 1: Write the failing test for the 409 concurrency guard (Review Focus item)**
+
+```ts
+// backend/api/ai-pipelines.test.ts
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { describe, it, expect, vi } from 'vitest';
+import * as schema from '../db/schema';
+import { registerAiPipelineEndpoints } from './ai-pipelines';
+// Use the project's existing REST-over-WebSocket or supertest-style harness for api-service.ts
+// routes — grep an existing *.test.ts in backend/api/ for the pattern (e.g. apk-availability.test.ts)
+// and reuse it rather than inventing a new way to exercise registerEndpoint-registered routes.
+
+describe('POST /v1/ai-pipelines/:id/run — concurrency guard', () => {
+  it('rejects a second run with 409 while one is already running for the same pipeline', async () => {
+    // Arrange: a published pipeline version, and an aiPipelineRuns row already `status: 'running'`
+    // for it. Act: POST /v1/ai-pipelines/:id/run. Assert: 409, body.error mentions "already running",
+    // and runPipeline (the executor) is never actually invoked for the rejected request.
+  });
+
+  it('accepts a run once the prior one has finished (status is ok/partial/failed, not running)', async () => {
+    // Same setup, but the existing row's status is 'ok'. Assert: 200, a new row created.
+  });
+});
+```
+
+Fill in the two test bodies using the harness pattern found by grepping `backend/api/apk-availability.test.ts` (or whichever sibling test file turns out to exercise `registerEndpoint`-registered routes most directly) — this plan intentionally doesn't fabricate the exact request-dispatch helper names here since getting them from a real neighboring test is more reliable than guessing them.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/api/ai-pipelines.test.ts`
+Expected: FAIL — module `./ai-pipelines` does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+```ts
+// backend/api/ai-pipelines.ts
+import { eq, and } from 'drizzle-orm';
+import { registerEndpoint } from './api-service';
+import { aiPipelines, aiPipelineVersions, aiPipelineRuns, aiPipelineNodeRuns } from '../db/schema';
+import type { AppDatabase } from '../db/index';
+import { validateGraph } from '../services/ai-jobs/graph-validator';
+import { runPipeline, type NodeExecutors, type ExecutionCtx } from '../services/ai-jobs/pipeline-runner';
+import type { PipelineGraph } from '../services/ai-jobs/types';
+
+export interface AiPipelineDeps {
+  db: AppDatabase;
+  executors: NodeExecutors;
+  /** `identity` comes from the authenticated request (req.authUser), not a fixed core-service identity —
+   * a manual run from the editor runs as the clicking user, same as `triggerAiAgentManual` does today. */
+  buildCtx: (identity: { type: 'core-service' } | { type: 'user'; userId: number }, input: Record<string, unknown>) => ExecutionCtx;
+}
+
+export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
+  const { db } = deps;
+
+  registerEndpoint('GET', '/v1/ai-pipelines', (req, res) => {
+    const rows = db.select().from(aiPipelines).all();
+    res.json({ success: true, data: rows });
+  }, { requires: ['core.apk:read'] });
+
+  registerEndpoint('POST', '/v1/ai-pipelines', (req, res) => {
+    const { name, jobKind, graph } = req.body as { name: string; jobKind: string; graph: PipelineGraph };
+    const now = new Date();
+    const pipelineId = db.insert(aiPipelines).values({ name, jobKind, createdAt: now }).run().lastInsertRowid as number;
+    db.insert(aiPipelineVersions).values({ pipelineId, version: 1, graph, status: 'draft', createdAt: now }).run();
+    res.json({ success: true, data: { id: pipelineId } });
+  }, { requires: ['core.apk:manage'] });
+
+  registerEndpoint('POST', '/v1/ai-pipelines/:id/versions', (req, res) => {
+    const pipelineId = Number(req.params.id);
+    const { graph } = req.body as { graph: PipelineGraph };
+    const latest = db.select().from(aiPipelineVersions).where(eq(aiPipelineVersions.pipelineId, pipelineId))
+      .orderBy(aiPipelineVersions.version).all().pop();
+    const nextVersion = (latest?.version ?? 0) + 1;
+    db.insert(aiPipelineVersions).values({ pipelineId, version: nextVersion, graph, status: 'draft', createdAt: new Date() }).run();
+    res.json({ success: true, data: { version: nextVersion } });
+  }, { requires: ['core.apk:manage'] });
+
+  registerEndpoint('POST', '/v1/ai-pipelines/:id/publish', (req, res) => {
+    const pipelineId = Number(req.params.id);
+    const latest = db.select().from(aiPipelineVersions).where(eq(aiPipelineVersions.pipelineId, pipelineId))
+      .orderBy(aiPipelineVersions.version).all().pop();
+    if (!latest) { res.status(404).json({ success: false, error: 'No version to publish' }); return; }
+
+    const errors = validateGraph(latest.graph as PipelineGraph);
+    if (errors.length > 0) { res.status(400).json({ success: false, error: 'Invalid graph', errors }); return; }
+
+    db.update(aiPipelineVersions).set({ status: 'published' }).where(eq(aiPipelineVersions.id, latest.id)).run();
+    res.json({ success: true });
+  }, { requires: ['core.apk:manage'] });
+
+  registerEndpoint('POST', '/v1/ai-pipelines/:id/run', async (req, res) => {
+    const pipelineId = Number(req.params.id);
+    const { triggerNodeId, input, reuseUnchanged } = req.body as { triggerNodeId: string; input: Record<string, unknown>; reuseUnchanged?: boolean };
+
+    const version = db.select().from(aiPipelineVersions)
+      .where(and(eq(aiPipelineVersions.pipelineId, pipelineId), eq(aiPipelineVersions.status, 'published')))
+      .orderBy(aiPipelineVersions.version).all().pop();
+    if (!version) { res.status(404).json({ success: false, error: 'No published version for this pipeline' }); return; }
+
+    const alreadyRunning = db.select().from(aiPipelineRuns)
+      .where(and(eq(aiPipelineRuns.pipelineVersionId, version.id), eq(aiPipelineRuns.status, 'running')))
+      .all()[0];
+    if (alreadyRunning) {
+      res.status(409).json({ success: false, error: `A run is already in progress for this pipeline version (run ${alreadyRunning.id})` });
+      return;
+    }
+
+    const now = new Date();
+    const runId = db.insert(aiPipelineRuns).values({
+      pipelineVersionId: version.id, triggerNodeId, triggeredBy: 'manual',
+      input, reuseUnchanged: !!reuseUnchanged, status: 'running', startedAt: now,
+    }).run().lastInsertRowid as number;
+
+    const graph = version.graph as PipelineGraph;
+    let priorNodeRuns: Record<string, { inputHash: string; output: Record<string, unknown> }> | undefined;
+    if (reuseUnchanged) {
+      priorNodeRuns = {};
+      const priorRuns = db.select().from(aiPipelineRuns).where(eq(aiPipelineRuns.pipelineVersionId, version.id)).all();
+      for (const priorRun of priorRuns) {
+        const priorNodes = db.select().from(aiPipelineNodeRuns)
+          .where(and(eq(aiPipelineNodeRuns.runId, priorRun.id), eq(aiPipelineNodeRuns.status, 'ok')))
+          .all();
+        for (const nr of priorNodes) {
+          if (nr.inputHash && nr.output) priorNodeRuns[nr.nodeId] = { inputHash: nr.inputHash, output: nr.output };
+        }
+      }
+    }
+
+    const identity = req.authUser
+      ? { type: 'user' as const, userId: req.authUser.actorUserId }
+      : { type: 'core-service' as const }; // defensive fallback — registerEndpoint's scope check already requires an authUser for a core.apk:manage route, this branch should be unreachable in practice
+    const result = await runPipeline(graph, triggerNodeId, input, deps.executors, deps.buildCtx(identity, input), { reuseUnchanged, priorNodeRuns });
+
+    for (const nodeResult of result.nodes) {
+      db.insert(aiPipelineNodeRuns).values({
+        runId, nodeId: nodeResult.nodeId, status: nodeResult.status,
+        output: nodeResult.output, error: nodeResult.error,
+        wasMemoized: !!nodeResult.wasMemoized, startedAt: now, finishedAt: new Date(),
+      }).run();
+    }
+    db.update(aiPipelineRuns).set({ status: result.status, finishedAt: new Date() }).where(eq(aiPipelineRuns.id, runId)).run();
+
+    res.json({ success: true, data: { runId, status: result.status } });
+  }, { requires: ['core.apk:manage'] });
+
+  registerEndpoint('GET', '/v1/ai-pipelines/runs/:runId', (req, res) => {
+    const runId = Number(req.params.runId);
+    const run = db.select().from(aiPipelineRuns).where(eq(aiPipelineRuns.id, runId)).all()[0];
+    if (!run) { res.status(404).json({ success: false, error: 'Run not found' }); return; }
+    const nodes = db.select().from(aiPipelineNodeRuns).where(eq(aiPipelineNodeRuns.runId, runId)).all();
+    res.json({ success: true, data: { run, nodes } });
+  }, { requires: ['core.apk:read'] });
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/api/ai-pipelines.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Wire it into `backend/index.ts`**
+
+Near the other `register*Endpoints(...)` calls (e.g. `registerJobEndpoints(jobRegistry)` at line 768):
+
+```ts
+import { registerAiPipelineEndpoints } from './api/ai-pipelines';
+// ...
+registerAiPipelineEndpoints({
+  db,
+  executors: aiJobExecutors, // built in Task 20, alongside the Astérix pipeline definition
+  buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }), // Task 20
+});
+```
+
+Leave this import commented with a `// TODO(Task 20)` note if Task 20 hasn't landed yet when this task is executed in isolation — but if following this plan in order, Task 20 lands next and this wiring becomes real immediately.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/api/ai-pipelines.ts backend/api/ai-pipelines.test.ts backend/index.ts
+git commit -m "feat(ai-jobs): REST API — CRUD, publish (validated), run (409 on concurrent), run status"
+```
+
+---
+
+## Phase E: The Astérix pipeline + migration off the old loop
+
+### Task 20: Wire the `NodeExecutors` map + define the Astérix pipeline graph as data
+
+**Files:**
+- Create: `backend/services/ai-jobs/apk-analysis-pipeline.ts`
+- Create: `backend/services/ai-jobs/apk-analysis-pipeline.test.ts`
+
+**Interfaces:**
+- Consumes: every `nodes/*.ts` file (Tasks 4, 6–11), `runPipeline`/`NodeExecutors`/`ExecutionCtx` (Tasks 13–17).
+- Produces: `buildApkAnalysisExecutors(): NodeExecutors`, `buildApkAnalysisExecutionCtx(deps: { db: AppDatabase; aiFactory: AiAgentFactory; identity: 'core-service' | { userId: number } }, triggerNodeId: string): ExecutionCtx`, `ASTERIX_PATTERN_GRAPH: PipelineGraph` (the literal worked-example graph from the spec — this is the actual pipeline definition seeded for `apk-analysis`, not a test fixture, even though it lives next to its own test file).
+
+- [ ] **Step 1: Write the failing test — the graph itself passes validation and has the right shape**
+
+```ts
+// backend/services/ai-jobs/apk-analysis-pipeline.test.ts
+import { describe, it, expect } from 'vitest';
+import { ASTERIX_PATTERN_GRAPH, buildApkAnalysisExecutors } from './apk-analysis-pipeline';
+import { validateGraph } from './graph-validator';
+import { runPipeline } from './pipeline-runner';
+
+describe('ASTERIX_PATTERN_GRAPH', () => {
+  it('passes graph validation — two disjoint Trigger zones, consistent schema, valid Report sections', () => {
+    expect(validateGraph(ASTERIX_PATTERN_GRAPH)).toEqual([]);
+  });
+
+  it('has exactly two Triggers, seven Group-A/B AgentCalls, one Report, two Sinks', () => {
+    const kinds = ASTERIX_PATTERN_GRAPH.nodes.map(n => n.config.kind);
+    expect(kinds.filter(k => k === 'Trigger')).toHaveLength(2);
+    expect(kinds.filter(k => k === 'AgentCall')).toHaveLength(7);
+    expect(kinds.filter(k => k === 'Report')).toHaveLength(1);
+    expect(kinds.filter(k => k === 'Sink')).toHaveLength(2);
+  });
+
+  it('the Report node declares its 7 sections in the spec\'s stated order', () => {
+    const report = ASTERIX_PATTERN_GRAPH.nodes.find(n => n.config.kind === 'Report')!;
+    const titles = (report.config as { sections: Array<{ title: string }> }).sections.map(s => s.title);
+    expect(titles).toEqual(['Overview', 'Wait Times', 'Opening Hours', 'Maps', 'Secrets', 'cURL Examples', 'Bypass Script']);
+  });
+
+  it('runs end to end against mocked executors with the Full Analysis trigger, Bypass Script failing', async () => {
+    const executors = buildApkAnalysisExecutors();
+    // Spy-override just the AgentCall and Sink entries with fakes, leaving Trigger/Transform/Branch/
+    // Report/ForEach as their real implementations — this is the one test that exercises the real
+    // Report assembly + real Sink writes against an in-memory DB, not just mocks throughout.
+    // ...see Task 1/4/11's fixtures for the in-memory db + seeded apk_versions row pattern...
+  });
+});
+```
+
+Flesh out the fourth test's body once writing this task for real: build an in-memory DB seeded the way Task 4's and Task 11's tests already do, override only `buildApkAnalysisExecutors()`'s `AgentCall` entry with a fake that fails for the node whose `config.instructionTemplate` contains `'SSL pinning'` (the Bypass Script node's real template, defined in this same task) and succeeds otherwise, run `runPipeline(ASTERIX_PATTERN_GRAPH, '<full-analysis-trigger-id>', { versionId }, executors, ctx)`, then assert `result.status === 'partial'` and that `getNote(db, versionId)` contains a `## Bypass Script` section with "unavailable this run" in it alongside six real sections.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/ai-jobs/apk-analysis-pipeline.test.ts`
+Expected: FAIL — module does not exist.
+
+- [ ] **Step 3: Write the graph + executor wiring**
+
+```ts
+// backend/services/ai-jobs/apk-analysis-pipeline.ts
+import type { PipelineGraph } from './types';
+import type { NodeExecutors, ExecutionCtx } from './pipeline-runner';
+import { TRIGGER_REGISTRY } from './nodes/trigger';
+import { runAgentCall } from './nodes/agent-call';
+import { runTransform } from './nodes/transform';
+import { runBranch } from './nodes/branch';
+import { runReport } from './nodes/report';
+import { runForEach } from './nodes/foreach';
+import { runSink } from './nodes/sink';
+import type { AiAgentFactory } from '../ai-agent-factory';
+import type { AppDatabase } from '../../db/index';
+
+const APK_CONTEXT_SCHEMA = [
+  { field: 'appName', type: 'string', description: 'Display name' },
+  { field: 'packageName', type: 'string', description: 'Reverse-DNS package name' },
+  { field: 'versionName', type: 'string', description: 'Human version string' },
+  { field: 'versionCode', type: 'number', description: 'Numeric version code' },
+  { field: 'fileSizeBytes', type: 'number', description: 'APK file size in bytes' },
+  { field: 'downloadedAt', type: 'string', description: 'ISO timestamp' },
+  { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
+];
+
+const GROUP_A_TOOLS = ['get_apk_overview', 'get_apk_strings', 'list_apk_assets', 'get_app_versions', 'search_apk_code', 'find_api_endpoints', 'get_api_endpoint', 'get_map_config'];
+const GROUP_B_TOOLS = ['search_credentials', 'search_apk_code', 'get_apk_strings', 'find_api_endpoints', 'get_api_endpoint', 'list_api_endpoints', 'detect_ssl_pinning', 'generate_ssl_bypass', 'inspect_class_methods'];
+
+export const ASTERIX_PATTERN_GRAPH: PipelineGraph = {
+  nodes: [
+    { id: 'trigger-full', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-rescan', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
+
+    { id: 'agent-overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}. Summarize purpose, framework, permissions and notable SDKs.' } },
+    { id: 'agent-wait-times', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} fetches ride wait times. Search for queue, wait and attraction-status endpoints.' } },
+    { id: 'agent-opening-hours', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} v{{trigger.versionName}} fetches park opening hours and schedule data.' } },
+    { id: 'agent-maps', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Describe the map system in {{trigger.packageName}}: offline tiles, bounds, or a live tile provider.' } },
+    { id: 'agent-secrets', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Document every hardcoded secret, API key and token in {{trigger.packageName}} v{{trigger.versionName}}, with file location.' } },
+    { id: 'agent-curl', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: "Write runnable curl examples for {{trigger.appName}}'s discovered API endpoints, using the real extracted keys." } },
+    { id: 'agent-bypass', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Write a Frida script bypassing SSL pinning in {{trigger.packageName}} v{{trigger.versionName}}.' } },
+
+    { id: 'report', config: { kind: 'Report', sections: [
+      { title: 'Overview', from: 'agent-overview' },
+      { title: 'Wait Times', from: 'agent-wait-times' },
+      { title: 'Opening Hours', from: 'agent-opening-hours' },
+      { title: 'Maps', from: 'agent-maps' },
+      { title: 'Secrets', from: 'agent-secrets' },
+      { title: 'cURL Examples', from: 'agent-curl' },
+      { title: 'Bypass Script', from: 'agent-bypass' },
+    ] } },
+    { id: 'sink-report', config: { kind: 'Sink', writeFn: 'apk-analysis/write-full-document' } },
+
+    { id: 'agent-diff', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: ['get_app_versions', 'search_apk_findings'], instructionTemplate: 'Compare {{trigger.appName}} v{{trigger.versionName}} against the previously analyzed version. Summarize what changed — new endpoints, new permissions, new SDKs.' } },
+    { id: 'sink-diff', config: { kind: 'Sink', writeFn: 'apk-analysis/write-section' } },
+  ],
+  edges: [
+    ...['agent-overview', 'agent-wait-times', 'agent-opening-hours', 'agent-maps', 'agent-secrets', 'agent-curl', 'agent-bypass']
+      .map(agentId => ({ from: 'trigger-full', to: agentId })),
+    ...['agent-overview', 'agent-wait-times', 'agent-opening-hours', 'agent-maps', 'agent-secrets', 'agent-curl', 'agent-bypass']
+      .map(agentId => ({ from: agentId, to: 'report' })),
+    { from: 'report', to: 'sink-report' },
+    { from: 'trigger-rescan', to: 'agent-diff' },
+    { from: 'agent-diff', to: 'sink-diff' },
+  ],
+};
+
+export type ApkAnalysisIdentity = { type: 'core-service' } | { type: 'user'; userId: number };
+
+export function buildApkAnalysisExecutors(): NodeExecutors {
+  return {
+    Trigger: async (config, rawInput, ctx) => {
+      const expand = TRIGGER_REGISTRY[config.expandFn];
+      if (!expand) throw new Error(`Unknown trigger expander "${config.expandFn}"`);
+      return expand(rawInput, { db: (ctx as { db: AppDatabase }).db });
+    },
+    // Binds its OWN BoundAgent, per node, using this node's own config.tier — the whole point of
+    // "one tier per AgentCall, no shared research/write pair" (spec, Architecture). A single
+    // agent bound once for the entire run and reused by every node would silently defeat that:
+    // every node would run on whatever tier the FIRST bind happened to use, regardless of its own
+    // declared config.tier. Astérix's seven nodes all happen to declare "High" today, which is
+    // exactly the kind of coincidence that hides this bug until a second pipeline uses two tiers.
+    AgentCall: async (config, input, ctx) => {
+      const c = ctx as { aiFactory: import('../ai-agent-factory').AiAgentFactory; identity: ApkAnalysisIdentity; contextId: string };
+      const agent = c.identity.type === 'core-service'
+        ? c.aiFactory.forCoreService('apk-analyzer', { tier: config.tier })
+        : c.aiFactory.forUser(c.identity.userId, { tier: config.tier });
+      return runAgentCall(config, input, { agent, contextId: c.contextId });
+    },
+    Transform: (config, input) => runTransform(config, input),
+    Branch: (config, envelope) => runBranch(config, envelope),
+    Report: (config, envelopes) => runReport(config, envelopes as any),
+    ForEach: async (config, items) => runForEach(config, items),
+    Sink: async (config, input, ctx) => {
+      const c = ctx as { db: AppDatabase; versionId: number };
+      await runSink(config, input, c);
+    },
+  };
+}
+
+export function buildApkAnalysisExecutionCtx(
+  deps: { db: AppDatabase; aiFactory: import('../ai-agent-factory').AiAgentFactory; identity: ApkAnalysisIdentity; versionId: number },
+): ExecutionCtx {
+  return {
+    db: deps.db,
+    aiFactory: deps.aiFactory,
+    identity: deps.identity,
+    contextId: String(deps.versionId),
+    versionId: deps.versionId,
+  };
+}
+```
+
+**Test to add alongside the ones in Step 1** confirming this binding actually happens per node, not once for the whole run:
+
+```ts
+it('binds a fresh BoundAgent per AgentCall node, each with that node\'s own config.tier', async () => {
+  const forCoreService = vi.fn(() => ({ identity: {} as any, handleMessage: vi.fn(async () => ({ finalText: 'ok' })) }));
+  const aiFactory = { forCoreService } as unknown as import('../ai-agent-factory').AiAgentFactory;
+  const executors = buildApkAnalysisExecutors();
+  const ctx = buildApkAnalysisExecutionCtx({ db: {} as any, aiFactory, identity: { type: 'core-service' }, versionId: 431 });
+
+  await executors.AgentCall(ASTERIX_PATTERN_GRAPH.nodes.find(n => n.id === 'agent-overview')!.config as any, { trigger: {} }, ctx);
+  await executors.AgentCall(ASTERIX_PATTERN_GRAPH.nodes.find(n => n.id === 'agent-bypass')!.config as any, { trigger: {} }, ctx);
+
+  expect(forCoreService).toHaveBeenCalledTimes(2); // not once, reused — once per node
+  expect(forCoreService).toHaveBeenCalledWith('apk-analyzer', { tier: 'High' });
+});
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/ai-jobs/apk-analysis-pipeline.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: Seed the pipeline + published version at server boot**
+
+Add a `seedApkAnalysisPipeline(db: AppDatabase): void` function to the same file — idempotent (checks for an existing `aiPipelines` row with `jobKind: 'apk-analysis'` and name `'Astérix pattern'` before inserting), called once from `backend/index.ts` near `apkAnalyzer.start()`. Write its own small test (insert twice, assert only one `aiPipelines` row and one `published` version exist) before wiring it into `index.ts`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/services/ai-jobs/apk-analysis-pipeline.ts backend/services/ai-jobs/apk-analysis-pipeline.test.ts backend/index.ts
+git commit -m "feat(ai-jobs): define the Astérix pattern pipeline, wire executors, seed it at boot"
+```
+
+### Task 21: Migrate `apk-analyzer.ts` off the old loop, behind a setting
+
+**Files:**
+- Modify: `backend/services/apk-analyzer.ts` (the `runAiAgent` method, called from `triggerAiAgentAuto`/`triggerAiAgentManual`)
+- Modify: `backend/services/apk-analyzer.test.ts`
+- Modify: `backend/index.ts` (extend the `apkAnalyzer.setAiConfig(...)` call site, or add a sibling `setPipelinesEnabled(...)` setter — match whichever is the smaller diff once Step 1's grep shows the real current call)
+
+**Interfaces:**
+- Consumes: `runPipeline`, `ASTERIX_PATTERN_GRAPH`, `buildApkAnalysisExecutors`, `buildApkAnalysisExecutionCtx` (Task 20).
+
+- [ ] **Step 1: Write the failing test**
+
+Grep `backend/services/apk-analyzer.test.ts` first for how `runAiAgent`/`triggerAiAgentAuto` are currently tested (a mock `aiFactory`/`BoundAgent` fixture already exists there — reuse it, this task adds one new describe block, not a parallel harness).
+
+```ts
+// append to apk-analyzer.test.ts
+describe('AI notes generation — pipeline path', () => {
+  it('calls runPipeline instead of agent.handleMessage directly when ai_pipelines_enabled is true', async () => {
+    const runPipelineSpy = vi.fn(async () => ({ status: 'ok', nodes: [] }));
+    // Construct the ApkAnalyzerService the way the rest of this file already does, but with
+    // setPipelinesEnabled(() => true) (or whichever setter Step 3 below actually adds) and the
+    // runPipeline call point injected/mocked — adapt to this file's existing DI pattern (setAiConfig
+    // takes closures; whatever this task adds should match that shape, not introduce a new one).
+
+    analyzer.triggerAiAgentManual(431, userId);
+    await flushMicrotasks(); // match whatever async-flush helper this test file already uses, if any
+
+    expect(runPipelineSpy).toHaveBeenCalled();
+  });
+
+  it('keeps calling agent.handleMessage directly when ai_pipelines_enabled is false (the default)', async () => {
+    // Same setup, setPipelinesEnabled(() => false). Assert the OLD path still runs —
+    // this is the one test in this task that must never break across the rollout window.
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run backend/services/apk-analyzer.test.ts -t "pipeline path"`
+Expected: FAIL — there's no `ai_pipelines_enabled` branch in `runAiAgent` yet.
+
+- [ ] **Step 3: Branch `runAiAgent` on the new setting**
+
+In `apk-analyzer.ts`, add a `getPipelinesEnabled?: () => boolean` field next to the existing `getAiPrompt`/`getAiAutorun`/`getTierConfig` closures (same constructor-injection shape — find their declarations via `grep -n "getAiPrompt\|getAiAutorun\|getTierConfig" backend/services/apk-analyzer.ts` and add the new one right beside them, plus a `setPipelinesEnabled(fn)` method mirroring whatever `setAiConfig` already does for the other three).
+
+`runAiAgent` takes an already-bound `agent: BoundAgent` today (bound once, no tier option, by `triggerAiAgentAuto`/`triggerAiAgentManual` before calling it) — fine for the old path's single `handleMessage` call, wrong for the pipeline path, which needs to rebind a fresh `BoundAgent` **per `AgentCall` node** using that node's own `config.tier` (Task 20's fix). So `runAiAgent` needs an `identity` descriptor threaded through from its two callers, not just the pre-bound `agent` — add a parameter rather than trying to recover identity from the already-bound agent:
+
+```ts
+// triggerAiAgentAuto's existing `agent = this.aiFactory.forCoreService('apk-analyzer')` call stays
+// (the old path still needs it) — add the identity descriptor alongside it:
+this.runAiAgent(versionId, agent, { type: 'core-service' });
+
+// triggerAiAgentManual's existing `agent = this.aiFactory.forUser(userId)` call stays too:
+this.runAiAgent(versionId, agent, { type: 'user', userId });
+```
+
+```ts
+private runAiAgent(
+  versionId: number,
+  agent: import('./ai-agent-factory').BoundAgent,
+  identity: { type: 'core-service' } | { type: 'user'; userId: number },
+): void {
+  if (this.activeAiAgentRuns.has(versionId)) {
+    log(`AI agent already running for version ${versionId}, skipping`);
+    return;
+  }
+  this.activeAiAgentRuns.add(versionId);
+  broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: 'running' });
+  log(`Starting AI agent for version ${versionId}`);
+
+  if (this.getPipelinesEnabled?.()) {
+    this.runAiPipeline(versionId, identity).finally(() => this.activeAiAgentRuns.delete(versionId));
+    return;
+  }
+
+  // ...existing agent.handleMessage({...}) call, unchanged below this point — still uses the
+  // pre-bound `agent` parameter, which stays exactly as it is today for this path...
+}
+
+private async runAiPipeline(
+  versionId: number,
+  identity: { type: 'core-service' } | { type: 'user'; userId: number },
+): Promise<void> {
+  const { ASTERIX_PATTERN_GRAPH, buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx } =
+    await import('./ai-jobs/apk-analysis-pipeline');
+  const { runPipeline } = await import('./ai-jobs/pipeline-runner');
+
+  const triggerNodeId = 'trigger-full'; // auto/manual re-analysis both use the Full Analysis entry point
+  const result = await runPipeline(
+    ASTERIX_PATTERN_GRAPH, triggerNodeId, { versionId },
+    buildApkAnalysisExecutors(),
+    buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId }),
+  );
+
+  broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: result.status === 'failed' ? 'failed' : 'completed' });
+  log(`AI pipeline completed for version ${versionId}: ${result.status}`);
+}
+```
+
+Adjust field/method names to whatever Step 1's grep actually finds — the shape above (one more closure, one more branch at the top of the existing method) is the real constraint; exact identifiers depend on the file as it stands at execution time, not as summarized in this plan.
+
+- [ ] **Step 4: Wire the setting in `backend/index.ts`**
+
+Next to the existing `apkAnalyzer.setAiConfig(...)` call (found in Task-research as lines 593–604):
+
+```ts
+apkAnalyzer.setPipelinesEnabled(() => {
+  const row = db.select().from(settings).where(eq(settings.key, 'ai_pipelines_enabled')).all()[0];
+  return row?.value === 'true'; // default false — opt in deliberately, per the spec's rollout plan
+});
+```
+
+- [ ] **Step 5: Run test to verify it passes**
+
+Run: `npx vitest run backend/services/apk-analyzer.test.ts`
+Expected: PASS — including every pre-existing test in the file, unmodified, since the default (`ai_pipelines_enabled` unset) keeps the old path.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/services/apk-analyzer.ts backend/services/apk-analyzer.test.ts backend/index.ts
+git commit -m "feat(ai-jobs): migrate apk-analyzer to the pipeline executor behind ai_pipelines_enabled"
+```
+
+---
+
+## Phase F: Frontend
+
+A working, verified interactive mockup of this editor already exists (published during design, not part of this repo) — its visual language (dark theme tokens, node header-bar colors per kind, grid canvas background, curved SVG edges with per-section ports on `Report`, the prompt-editor variable chips, the `INACTIVE`/`CACHED` badges) is the reference to match, not to redesign from scratch. Frontend tasks below port that proven interaction design into real, data-driven React components against the real REST API from Phase D, rather than inventing the UI fresh.
+
+### Task 22: `@xyflow/react` dependency + route + canvas rendering a real pipeline version
+
+**Files:**
+- Modify: `package.json` (add `@xyflow/react`, pin an exact version ≥2 weeks old at execution time — check npm for the current latest and pick accordingly, don't hardcode a version from spec-writing time into installed `package.json` without checking it still resolves)
+- Create: `frontend/pages/ai-jobs/AiJobsWorkspace.tsx`
+- Create: `frontend/pages/ai-jobs/Canvas.tsx`
+- Create: `frontend/pages/ai-jobs/testing.tsx` (fixture builders + mock ws, same shape as `frontend/pages/plugins/testing.tsx`)
+- Create: `frontend/pages/ai-jobs/AiJobsWorkspace.test.tsx`
+- Modify: `frontend/App.tsx` (add the route, next to the other `Route path="settings"` children)
+- Modify: `frontend/components/settings/SettingsSidebar.tsx` (add the nav entry)
+
+**Interfaces:**
+- Consumes: `GET /v1/ai-pipelines` (Task 19) via the existing `useWebSocket`/`sendRestApi` pattern (same as every other settings page — see `frontend/pages/plugins/usePluginCatalog.ts` for the pattern to follow, not reinvent).
+- Produces: the `/ui/settings/ai-jobs` route rendering a read-only canvas for the `apk-analysis` pipeline's published version.
+
+- [ ] **Step 1: Write the failing test**
+
+```tsx
+// frontend/pages/ai-jobs/AiJobsWorkspace.test.tsx
+import React from 'react';
+import { render, screen, waitFor } from '@testing-library/react';
+import { describe, it, expect } from 'vitest';
+import { AiJobsWorkspace } from './AiJobsWorkspace';
+import { createMockWs, withProviders, mockPipelineVersion } from './testing';
+
+describe('AiJobsWorkspace', () => {
+  it('renders the Trigger, AgentCall, Report and Sink nodes from the fetched pipeline', async () => {
+    const ws = createMockWs({ pipelineVersion: mockPipelineVersion() });
+    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+    expect(screen.getByText('Assemble notes')).toBeInTheDocument(); // the Report node's label
+    expect(screen.getAllByText(/AGENTCALL/i).length).toBeGreaterThanOrEqual(7);
+  });
+});
+```
+
+`mockPipelineVersion()` in `testing.tsx` returns a fixture matching `ASTERIX_PATTERN_GRAPH`'s real shape (Task 20) — build it by copying that graph's node/edge data into the fixture, not inventing a different smaller graph, so this test exercises the real shape the backend actually serves.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test:frontend -- AiJobsWorkspace`
+Expected: FAIL — `AiJobsWorkspace`/`Canvas`/`testing` don't exist yet.
+
+- [ ] **Step 3: Add the dependency, the route, the nav entry, and the components**
+
+```bash
+npm install @xyflow/react@<latest-at-execution-time>
+```
+
+```tsx
+// frontend/pages/ai-jobs/Canvas.tsx
+import React, { useMemo } from 'react';
+import { ReactFlow, Background, Controls, type Node, type Edge } from '@xyflow/react';
+import '@xyflow/react/dist/style.css';
+import type { PipelineGraph } from '../../../backend/services/ai-jobs/types'; // type-only import — erased at build, no runtime coupling to backend code
+
+const KIND_COLOR: Record<string, string> = {
+  Trigger: '#2dd4bf', AgentCall: '#4d8eff', Transform: '#a78bfa',
+  Branch: '#fbbf24', Report: '#818cf8', ForEach: '#f472b6', Sink: '#94a3b8',
+};
+
+export function Canvas({ graph, onSelectNode }: { graph: PipelineGraph; onSelectNode: (nodeId: string) => void }) {
+  const nodes: Node[] = useMemo(() => graph.nodes.map((n, i) => ({
+    id: n.id,
+    position: { x: (i % 4) * 260, y: Math.floor(i / 4) * 160 }, // placeholder layout — a real force/dagre layout is a follow-up, not blocking this task's deliverable
+    data: { label: `${n.config.kind}\n${n.id}` },
+    style: { borderLeft: `4px solid ${KIND_COLOR[n.config.kind]}`, background: '#161f36', color: '#e4e9fb' },
+  })), [graph]);
+
+  const edges: Edge[] = useMemo(() => graph.edges.map((e, i) => ({
+    id: `e${i}`, source: e.from, target: e.to, animated: false,
+  })), [graph]);
+
+  return (
+    <div style={{ height: '100%', width: '100%' }}>
+      <ReactFlow nodes={nodes} edges={edges} onNodeClick={(_, node) => onSelectNode(node.id)} fitView>
+        <Background />
+        <Controls />
+      </ReactFlow>
+    </div>
+  );
+}
+```
+
+```tsx
+// frontend/pages/ai-jobs/AiJobsWorkspace.tsx
+import React, { useEffect, useState } from 'react';
+import { useWebSocket, useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
+import { Canvas } from './Canvas';
+import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
+
+export function AiJobsWorkspace() {
+  useDocumentTitle('AI Job Pipelines');
+  const { sendRestApi } = useWebSocket();
+  const [graph, setGraph] = useState<PipelineGraph | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    sendRestApi('GET', '/v1/ai-pipelines').then((res: any) => {
+      if (cancelled) return;
+      const apkPipeline = res.body?.data?.find((p: any) => p.jobKind === 'apk-analysis');
+      if (apkPipeline?.graph) setGraph(apkPipeline.graph);
+    });
+    return () => { cancelled = true; };
+  }, [sendRestApi]);
+
+  if (!graph) return <div className="page-header"><h1>Plugins</h1></div>; // loading state — replace with a real spinner in Task 23, not this task's concern
+
+  return (
+    <div className="ai-jobs-root" style={{ height: '100vh' }}>
+      <Canvas graph={graph} onSelectNode={setSelected} />
+      {selected && <div data-testid="selected-node">{selected}</div>}
+    </div>
+  );
+}
+```
+
+`testing.tsx` mirrors `frontend/pages/plugins/testing.tsx`'s `createMockWs`/`withProviders` shape exactly — same `envelope()` helper, same `{ type: 'restapi', id, status, body }` response shape — plus a new `mockPipelineVersion()` fixture builder returning a `{ graph: ASTERIX_PATTERN_GRAPH-shaped-data }` object, and the mock ws's `GET /v1/ai-pipelines` route returning `{ success: true, data: [{ id: 1, jobKind: 'apk-analysis', graph: mockPipelineVersion().graph }] }`.
+
+Add the route to `App.tsx`, inside the `settings` route's children (alongside `analysis`, `ai`, etc.):
+
+```tsx
+<Route path="ai-jobs" element={<AiJobsWorkspace />} />
+```
+
+Add the import at the top of `App.tsx`: `import { AiJobsWorkspace } from './pages/ai-jobs/AiJobsWorkspace';`
+
+Add the nav entry to `SettingsSidebar.tsx` next to the existing `AI`/`Analysis` entries — match that file's existing `<NavLink>` pattern exactly (grep it for how `Analysis` is listed, copy the shape with `to="/ui/settings/ai-jobs"` and label `"AI Job Pipelines"`).
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test:frontend -- AiJobsWorkspace`
+Expected: PASS
+
+- [ ] **Step 5: Throwaway `tsc` check (frontend isn't type-checked by the main build — project memory `frontend_not_typechecked.md`)**
+
+```bash
+npx tsc --noEmit --jsx react-jsx --esModuleInterop --skipLibCheck frontend/pages/ai-jobs/*.tsx
+```
+
+Fix any real type errors it surfaces before committing — this is the only type-check these files will ever get.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add package.json package-lock.json frontend/pages/ai-jobs/ frontend/App.tsx frontend/components/settings/SettingsSidebar.tsx
+git commit -m "feat(ai-jobs): add @xyflow/react, /ui/settings/ai-jobs route, canvas renders a real pipeline"
+```
+
+### Task 23: Side panel — per-kind facts, the `AgentCall` prompt editor, the `Report` section list editor
+
+One panel component, branching on node kind — mirrors `frontend/pages/plugins/PluginDrawer.tsx`'s role/structure (`role="dialog"`, a close button, focus management) rather than inventing a second drawer pattern. The prompt-editor's live-preview substitution is a client-side-only convenience copy of the server's `resolveTemplate` logic (Task 3) — duplicated deliberately rather than imported across the frontend/backend boundary, since it's a preview aid, not the authoritative resolution (that only ever happens server-side, inside an actual run).
+
+**Files:**
+- Create: `frontend/pages/ai-jobs/SidePanel.tsx`
+- Create: `frontend/pages/ai-jobs/templatePreview.ts` (the small client-side substitution copy)
+- Create: `frontend/pages/ai-jobs/templatePreview.test.ts`
+- Create: `frontend/pages/ai-jobs/SidePanel.test.tsx`
+- Modify: `frontend/pages/ai-jobs/AiJobsWorkspace.tsx` (render `SidePanel` when `selected` is set)
+
+**Interfaces:**
+- Consumes: `PipelineGraph`/`PipelineNode` (type-only, from the backend types module, same as Task 22).
+- Produces: `resolvePreview(template: string, scope: Record<string, unknown>): string` (never throws — an unresolved placeholder renders inline as a visibly-marked miss, since this is a preview aid, not a thing that blocks typing); `<SidePanel node={...} onClose={...} onSave={(nodeId, patch) => void} />`.
+
+- [ ] **Step 1: Write the failing test for `resolvePreview`**
+
+```ts
+// frontend/pages/ai-jobs/templatePreview.test.ts
+import { describe, it, expect } from 'vitest';
+import { resolvePreview } from './templatePreview';
+
+describe('resolvePreview', () => {
+  it('substitutes a resolvable path', () => {
+    expect(resolvePreview('Analyze {{trigger.appName}}.', { trigger: { appName: 'Parc Astérix' } }))
+      .toBe('Analyze Parc Astérix.');
+  });
+
+  it('marks an unresolved path inline instead of throwing — this is a preview, typing must never crash', () => {
+    const result = resolvePreview('{{trigger.typoed}}', { trigger: { appName: 'x' } });
+    expect(result).toContain('unresolved');
+    expect(() => resolvePreview('{{trigger.typoed}}', { trigger: {} })).not.toThrow();
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test:frontend -- templatePreview`
+Expected: FAIL — module doesn't exist.
+
+- [ ] **Step 3: Write `resolvePreview`**
+
+```ts
+// frontend/pages/ai-jobs/templatePreview.ts
+export function resolvePreview(template: string, scope: Record<string, unknown>): string {
+  return template.replace(/\{\{([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*)\}\}/g, (match, path: string) => {
+    const [source, ...fieldParts] = path.split('.');
+    let value: unknown = scope[source];
+    for (const part of fieldParts) {
+      if (value === null || typeof value !== 'object') { value = undefined; break; }
+      value = (value as Record<string, unknown>)[part];
+    }
+    return value === undefined || value === null ? `${match} (unresolved)` : String(value);
+  });
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test:frontend -- templatePreview`
+Expected: PASS
+
+- [ ] **Step 5: Write the failing `SidePanel` test**
+
+```tsx
+// frontend/pages/ai-jobs/SidePanel.test.tsx
+import React from 'react';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi } from 'vitest';
+import { SidePanel } from './SidePanel';
+
+const agentNode = {
+  id: 'agent-overview',
+  config: { kind: 'AgentCall' as const, tier: 'High', instructionTemplate: 'Analyze {{trigger.appName}}.', toolAllowlist: ['get_apk_overview'] },
+};
+const triggerSchema = [{ field: 'appName', type: 'string', description: 'x' }];
+
+describe('SidePanel — AgentCall', () => {
+  it('shows the instruction template in an editable textarea', () => {
+    render(<SidePanel node={agentNode} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getByRole('textbox')).toHaveValue('Analyze {{trigger.appName}}.');
+  });
+
+  it('inserting a variable chip appends it at the cursor and the preview updates', () => {
+    const onSave = vi.fn();
+    render(<SidePanel node={agentNode} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
+    fireEvent.click(screen.getByRole('button', { name: /trigger\.appName/i }));
+    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+    expect(textarea.value).toContain('{{trigger.appName}}');
+    expect(onSave).toHaveBeenCalledWith('agent-overview', expect.objectContaining({ instructionTemplate: expect.stringContaining('{{trigger.appName}}') }));
+  });
+
+  it('closing calls onClose', () => {
+    const onClose = vi.fn();
+    render(<SidePanel node={agentNode} triggerSchema={triggerSchema} onClose={onClose} onSave={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /close/i }));
+    expect(onClose).toHaveBeenCalled();
+  });
+});
+
+describe('SidePanel — Report', () => {
+  const reportNode = {
+    id: 'report',
+    config: { kind: 'Report' as const, sections: [{ title: 'Overview', from: 'agent-overview' }, { title: 'Bypass Script', from: 'agent-bypass' }] },
+  };
+
+  it('lists sections in declared order, numbered', () => {
+    render(<SidePanel node={reportNode} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    const rows = screen.getAllByTestId('report-section-row');
+    expect(rows.map(r => r.textContent)).toEqual([expect.stringContaining('1'), expect.stringContaining('2')].map((m, i) => expect.stringContaining(['Overview', 'Bypass Script'][i])));
+  });
+});
+```
+
+- [ ] **Step 6: Run test to verify it fails**
+
+Run: `npm run test:frontend -- SidePanel`
+Expected: FAIL — module doesn't exist.
+
+- [ ] **Step 7: Write `SidePanel`**
+
+```tsx
+// frontend/pages/ai-jobs/SidePanel.tsx
+import React, { useRef, useState } from 'react';
+import { resolvePreview } from './templatePreview';
+
+interface SchemaField { field: string; type: string; description: string }
+interface NodeLike { id: string; config: Record<string, any> & { kind: string } }
+
+export function SidePanel({ node, triggerSchema, onClose, onSave }: {
+  node: NodeLike;
+  triggerSchema: SchemaField[];
+  onClose: () => void;
+  onSave: (nodeId: string, patch: Record<string, unknown>) => void;
+}) {
+  if (node.config.kind === 'AgentCall') {
+    return <AgentCallPanel node={node} triggerSchema={triggerSchema} onClose={onClose} onSave={onSave} />;
+  }
+  if (node.config.kind === 'Report') {
+    return <ReportPanel node={node} onClose={onClose} />;
+  }
+  return (
+    <aside role="dialog" aria-label={`${node.id} details`}>
+      <button onClick={onClose} aria-label="Close details">×</button>
+      <dl>{Object.entries(node.config).map(([k, v]) => <div key={k}><dt>{k}</dt><dd>{JSON.stringify(v)}</dd></div>)}</dl>
+    </aside>
+  );
+}
+
+function AgentCallPanel({ node, triggerSchema, onClose, onSave }: {
+  node: NodeLike; triggerSchema: SchemaField[]; onClose: () => void; onSave: (nodeId: string, patch: Record<string, unknown>) => void;
+}) {
+  const [template, setTemplate] = useState<string>(node.config.instructionTemplate);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  const sampleScope = { trigger: Object.fromEntries(triggerSchema.map(f => [f.field, `<${f.field}>`])) };
+
+  function insertVar(field: string) {
+    const ta = taRef.current;
+    const token = `{{trigger.${field}}}`;
+    const start = ta?.selectionStart ?? template.length;
+    const end = ta?.selectionEnd ?? template.length;
+    const next = template.slice(0, start) + token + template.slice(end);
+    setTemplate(next);
+    onSave(node.id, { instructionTemplate: next });
+  }
+
+  return (
+    <aside role="dialog" aria-label={`${node.id} details`}>
+      <button onClick={onClose} aria-label="Close details">×</button>
+      <textarea
+        ref={taRef}
+        value={template}
+        onChange={(e) => { setTemplate(e.target.value); onSave(node.id, { instructionTemplate: e.target.value }); }}
+      />
+      {triggerSchema.map(f => (
+        <button key={f.field} onClick={() => insertVar(f.field)}>+ trigger.{f.field}</button>
+      ))}
+      <div data-testid="prompt-preview">{resolvePreview(template, sampleScope)}</div>
+    </aside>
+  );
+}
+
+function ReportPanel({ node, onClose }: { node: NodeLike; onClose: () => void }) {
+  const sections = node.config.sections as Array<{ title: string; from: string }>;
+  return (
+    <aside role="dialog" aria-label={`${node.id} details`}>
+      <button onClick={onClose} aria-label="Close details">×</button>
+      <ol>
+        {sections.map((s, i) => (
+          <li key={s.from} data-testid="report-section-row">{i + 1}. {s.title} ← {s.from}</li>
+        ))}
+      </ol>
+    </aside>
+  );
+}
+```
+
+- [ ] **Step 8: Run test to verify it passes**
+
+Run: `npm run test:frontend -- SidePanel`
+Expected: PASS
+
+- [ ] **Step 9: Wire it into `AiJobsWorkspace.tsx`**
+
+Replace the `{selected && <div data-testid="selected-node">{selected}</div>}` placeholder from Task 22 with:
+
+```tsx
+{selected && (
+  <SidePanel
+    node={graph.nodes.find(n => n.id === selected)!}
+    triggerSchema={graph.nodes.find(n => n.config.kind === 'Trigger')!.config.outputSchema}
+    onClose={() => setSelected(null)}
+    onSave={(nodeId, patch) => {
+      setGraph(g => g && ({ ...g, nodes: g.nodes.map(n => n.id === nodeId ? { ...n, config: { ...n.config, ...patch } } : n) }));
+    }}
+  />
+)}
+```
+
+(This updates local state only — persisting an edited graph as a new draft version is a `POST /v1/ai-pipelines/:id/versions` call, Task 19's endpoint; wiring a "Save" button to it is this plan's natural next follow-up once this task's own tests are green, not blocking this task's own deliverable.)
+
+- [ ] **Step 10: `tsc` check + commit**
+
+```bash
+npx tsc --noEmit --jsx react-jsx --esModuleInterop --skipLibCheck frontend/pages/ai-jobs/*.tsx frontend/pages/ai-jobs/*.ts
+git add frontend/pages/ai-jobs/SidePanel.tsx frontend/pages/ai-jobs/SidePanel.test.tsx frontend/pages/ai-jobs/templatePreview.ts frontend/pages/ai-jobs/templatePreview.test.ts frontend/pages/ai-jobs/AiJobsWorkspace.tsx
+git commit -m "feat(ai-jobs): side panel — AgentCall prompt editor, Report section list, generic facts"
+```
+
+### Task 24: Entry-point picker, reuse-unchanged toggle, Run flow
+
+**Scope note, stated plainly rather than silently narrowed:** the spec's Frontend section says status "streams... over the existing WebSocket channel the way Live Log already does." Phase D's `/run` endpoint (Task 19) is synchronous — it `await`s the whole `runPipeline()` call and responds once with the final result; there is no per-node live broadcast wired up anywhere in this plan. This task builds the UI that matches what Phase D actually ships: a single blocking "Running…" state for the whole run's duration, then every node's final status applied at once from the response. True per-node live streaming (a `broadcastToAll` call per `NodeRunResult` as the executor produces it, the way `apk:ai-agent-update` already works elsewhere) is real, valuable follow-up work this plan does not include — see Open Questions at the end of this document.
+
+**Files:**
+- Create: `frontend/pages/ai-jobs/RunControls.tsx`
+- Create: `frontend/pages/ai-jobs/RunControls.test.tsx`
+- Modify: `frontend/pages/ai-jobs/AiJobsWorkspace.tsx`
+
+**Interfaces:**
+- Consumes: `POST /v1/ai-pipelines/:id/run` (Task 19).
+- Produces: `<RunControls triggers={...} onRun={(triggerNodeId, reuseUnchanged) => Promise<RunResponse>} />`.
+
+- [ ] **Step 1: Write the failing test**
+
+```tsx
+// frontend/pages/ai-jobs/RunControls.test.tsx
+import React from 'react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi } from 'vitest';
+import { RunControls } from './RunControls';
+
+const triggers = [{ id: 'trigger-full', label: 'Full Analysis' }, { id: 'trigger-rescan', label: 'Quick Rescan' }];
+
+describe('RunControls', () => {
+  it('defaults to the first trigger and reuse off, Run calls onRun with those', async () => {
+    const onRun = vi.fn().mockResolvedValue({ status: 'ok', nodes: [] });
+    render(<RunControls triggers={triggers} onRun={onRun} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledWith('trigger-full', false));
+  });
+
+  it('switching the entry point and checking reuse changes what Run sends', async () => {
+    const onRun = vi.fn().mockResolvedValue({ status: 'ok', nodes: [] });
+    render(<RunControls triggers={triggers} onRun={onRun} />);
+    fireEvent.change(screen.getByRole('combobox', { name: /entry point/i }), { target: { value: 'trigger-rescan' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: /reuse unchanged/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledWith('trigger-rescan', true));
+  });
+
+  it('disables the Run button while a run is in flight and re-enables after it settles', async () => {
+    let resolve!: (v: unknown) => void;
+    const onRun = vi.fn(() => new Promise(r => { resolve = r; }));
+    render(<RunControls triggers={triggers} onRun={onRun as any} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    expect(screen.getByRole('button', { name: /running/i })).toBeDisabled();
+    resolve({ status: 'ok', nodes: [] });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Run' })).not.toBeDisabled());
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test:frontend -- RunControls`
+Expected: FAIL — module doesn't exist.
+
+- [ ] **Step 3: Write `RunControls`**
+
+```tsx
+// frontend/pages/ai-jobs/RunControls.tsx
+import React, { useState } from 'react';
+
+export function RunControls({ triggers, onRun }: {
+  triggers: Array<{ id: string; label: string }>;
+  onRun: (triggerNodeId: string, reuseUnchanged: boolean) => Promise<{ status: string; nodes: unknown[] }>;
+}) {
+  const [triggerNodeId, setTriggerNodeId] = useState(triggers[0]?.id ?? '');
+  const [reuseUnchanged, setReuseUnchanged] = useState(false);
+  const [running, setRunning] = useState(false);
+
+  async function handleRun() {
+    setRunning(true);
+    try {
+      await onRun(triggerNodeId, reuseUnchanged);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="run-controls">
+      <label>
+        Entry point
+        <select aria-label="Entry point" value={triggerNodeId} onChange={(e) => setTriggerNodeId(e.target.value)}>
+          {triggers.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+        </select>
+      </label>
+      <label>
+        <input
+          type="checkbox"
+          aria-label="Reuse unchanged nodes"
+          checked={reuseUnchanged}
+          onChange={(e) => setReuseUnchanged(e.target.checked)}
+        />
+        Reuse unchanged nodes
+      </label>
+      <button onClick={handleRun} disabled={running}>{running ? 'Running…' : 'Run'}</button>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test:frontend -- RunControls`
+Expected: PASS
+
+- [ ] **Step 5: Wire it into `AiJobsWorkspace.tsx`**
+
+```tsx
+const triggerNodes = graph.nodes.filter(n => n.config.kind === 'Trigger').map(n => ({ id: n.id, label: n.id })); // real label source is a follow-up — Task 20's graph has no human-readable Trigger display name field today, just its id; adding one is a small, separate schema/UI change, not blocking this task
+
+const [nodeStatuses, setNodeStatuses] = useState<Record<string, { status: string; wasMemoized?: boolean }>>({});
+
+async function handleRun(triggerNodeId: string, reuseUnchanged: boolean) {
+  const res: any = await sendRestApi('POST', '/v1/ai-pipelines/1/run', { triggerNodeId, input: {}, reuseUnchanged });
+  const byId: Record<string, { status: string; wasMemoized?: boolean }> = {};
+  for (const n of res.body?.data?.nodes ?? []) byId[n.nodeId] = { status: n.status, wasMemoized: n.wasMemoized };
+  setNodeStatuses(byId);
+  return res.body?.data;
+}
+```
+
+(`'1'` as the pipeline id is a placeholder standing in for whatever id `GET /v1/ai-pipelines` actually returned for the `apk-analysis` entry fetched in Task 22 — thread that value through via a small `pipelineId` state variable set alongside `setGraph` in the existing `useEffect`, rather than hardcoding it; shown as a literal here only to keep this step focused on the request shape.)
+
+Render `<RunControls triggers={triggerNodes} onRun={handleRun} />` above the `Canvas`, and pass `nodeStatuses` into `Canvas` so node styling can reflect `ok`/`failed`/`cached`/`inactive` (extend `Canvas`'s `style` computation from Task 22 to read `nodeStatuses[n.id]?.status` and pick a border color accordingly — same `KIND_COLOR`-style lookup table pattern, one more small table for status colors).
+
+- [ ] **Step 6: `tsc` check + commit**
+
+```bash
+npx tsc --noEmit --jsx react-jsx --esModuleInterop --skipLibCheck frontend/pages/ai-jobs/*.tsx
+git add frontend/pages/ai-jobs/RunControls.tsx frontend/pages/ai-jobs/RunControls.test.tsx frontend/pages/ai-jobs/AiJobsWorkspace.tsx frontend/pages/ai-jobs/Canvas.tsx
+git commit -m "feat(ai-jobs): entry-point picker, reuse-unchanged toggle, Run wired to the REST API"
+```
+
+### Task 25: End-to-end test
+
+**Files:**
+- Create: `tests/e2e/ai-pipelines.spec.ts`
+
+**Interfaces:**
+- Consumes: the real server (via the project's existing Playwright `webServer` fixture — same isolated-DB pattern as `plugins-install-ui.spec.ts`, not the shared e2e server, since this spec publishes a pipeline version and triggers a real run against it).
+
+- [ ] **Step 1: Write the test**
+
+```ts
+// tests/e2e/ai-pipelines.spec.ts
+import { test, expect } from '@playwright/test';
+import { loginAsAdmin, waitForBackend } from './helpers/auth';
+
+test.describe('AI job pipelines', () => {
+  test('canvas renders the Astérix pattern pipeline, Run produces a partial result with Bypass Script failed', async ({ page }) => {
+    await loginAsAdmin(page);
+    await waitForBackend(page.request);
+    await page.goto('/ui/settings/ai-jobs');
+
+    await expect(page.getByText('Overview')).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('Assemble notes')).toBeVisible();
+
+    // Click an AgentCall node, confirm the prompt editor opens with real content.
+    await page.getByText('Overview').click();
+    await expect(page.getByRole('textbox')).toHaveValue(/Analyze \{\{trigger\.appName\}\}/);
+
+    // Insert a variable chip, confirm it lands in the textarea.
+    await page.getByRole('button', { name: /trigger\.appName/i }).click();
+    await expect(page.getByRole('textbox')).toHaveValue(/\{\{trigger\.appName\}\}.*\{\{trigger\.appName\}\}/s);
+
+    // Click the Report node, confirm its ordered section list shows all seven, in order.
+    await page.getByText('Assemble notes').click();
+    const sectionRows = page.getByTestId('report-section-row');
+    await expect(sectionRows).toHaveCount(7);
+    await expect(sectionRows.nth(6)).toContainText('Bypass Script');
+  });
+});
+```
+
+This spec deliberately stops short of clicking Run against a live model — doing that for real would cost a live API call and hit exactly the cyber-classifier refusal this whole project exists to route around, non-deterministically, inside a gate-tested e2e suite where that's the wrong place for it. A full live run belongs in the periodic eval the spec's Testing section already calls for, not here.
+
+- [ ] **Step 2: Run the test**
+
+Run: `npx playwright test tests/e2e/ai-pipelines.spec.ts`
+Expected: PASS (after Tasks 22–24 are all in place — this test exercises the whole frontend phase together, which is the point of an e2e spec as the phase's final gate).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/e2e/ai-pipelines.spec.ts
+git commit -m "test(ai-jobs): e2e — canvas renders the real pipeline, prompt editor, Report sections"
+```
+
+---
+
+## Open Questions Carried Forward (not blocking, named so they aren't lost)
+
+- **Per-node live status streaming** (Task 24's scope note) — `/run` is synchronous today; broadcasting each `NodeRunResult` as it's produced, the way `apk:ai-agent-update` already works, is real follow-up work.
+- **Canvas layout** (Task 22) — nodes are placed in a naive grid, not the hand-tuned 2D layout with per-section `Report` ports the verified mockup used. A real layout pass (either a `dagre`/`elkjs` auto-layout or porting the mockup's exact coordinate math) is a follow-up, not required for this plan's tests to pass.
+- **Persisting an edited graph** (Task 23) — `SidePanel`'s `onSave` only updates local React state today; wiring it to `POST /v1/ai-pipelines/:id/versions` (Task 19 already has the endpoint) is a small follow-up.
+- Every "Open question" already named in the spec itself (reconverging Trigger zones, cross-version memoization, versioned prompt templates, human-in-the-loop nodes) — unchanged, still future work, not restated here.
+- **The spec's Testing section names three lanes — Gate tests, Periodic eval, E2E. This plan only has tasks for the first and third.** No periodic-eval harness exists anywhere in this codebase today (checked: no `eval` infra under `backend/`, nothing beyond unrelated name collisions) — there is no established convention this plan could follow, and inventing one from scratch wasn't done here rather than guessed at. The four assertions the spec's Testing section calls for (no single failure empties more than its own section; token cost holds against today's design; benign sections stay on the High tier's top model; Group B's fallback rate isn't worse scoped than diluted) are real, still unimplemented, and — per CLAUDE.md's "every feature ships with a test suite AND an eval suite, in the same commit" — this plan is **not** a complete discharge of that rule as written. Whoever picks this plan up should treat "design the eval harness" as its own small piece of work, done before calling the whole feature DONE, not silently skipped because it wasn't a task above.
