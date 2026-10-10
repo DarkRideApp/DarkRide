@@ -639,6 +639,25 @@ describe('runPipeline — memoization', () => {
     );
   });
 
+  it("a non-serializable value in a memoizable node's input (BigInt) never crashes the run — computeInputHash's failure is swallowed, the node still runs fresh, inputHash is left undefined", async () => {
+    // BigInt reaches the AgentCall node's real input via the Trigger's raw input, exactly the
+    // way any other field does — fakeExecutors' Trigger returns { appName: 'x', ...rawInput },
+    // which becomes every downstream node's input.trigger. JSON.stringify (inside
+    // computeInputHash's normalization step) throws a TypeError on a BigInt, and since the hash
+    // is now computed unconditionally for every AgentCall/Sink node (not just when
+    // reuseUnchanged is on), a DEFAULT run with no memoization options at all must still not
+    // reject just because this one node's input happens to be unhashable.
+    const executors = fakeExecutors();
+    const result = await runPipeline(linearGraph, 'trigger', { versionId: 431n }, executors, {});
+
+    expect(result.status).toBe('ok'); // the run completes normally, not rejected
+    const agentResult = result.nodes.find(n => n.nodeId === 'agent')!;
+    expect(agentResult.status).toBe('ok'); // ran fresh
+    expect(agentResult.wasMemoized).toBeFalsy();
+    expect(agentResult.inputHash).toBeUndefined(); // hash couldn't be computed — left undefined, not thrown
+    expect(executors.AgentCall).toHaveBeenCalled();
+  });
+
   it('reuses a prior AgentCall output when reuseUnchanged is set and the hash matches, never calls the executor', async () => {
     const { computeInputHash } = await import('./memoization');
     const config = linearGraph.nodes[1].config; // the AgentCall node

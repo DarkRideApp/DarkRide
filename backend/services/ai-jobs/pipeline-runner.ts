@@ -220,8 +220,19 @@ export async function runPipeline(
       // *lookup* (did a PRIOR run's hash match this one) is gated on `reuseUnchanged`.
       let inputHash: string | undefined;
       if (MEMOIZABLE_KINDS.has(node.config.kind)) {
-        inputHash = computeInputHash(node.config, input);
-        if (options.reuseUnchanged) {
+        try {
+          inputHash = computeInputHash(node.config, input);
+        } catch {
+          // computeInputHash's JSON round-trip throws on a BigInt or a circular reference
+          // anywhere in config/input. That must never crash the whole run just because
+          // memoization can't hash this one node's input — it's an orthogonal, opt-in feature,
+          // and this hash is now computed unconditionally (see above), so even a plain default
+          // run (reuseUnchanged never even mentioned) would otherwise reach this and reject.
+          // Leave inputHash undefined: the node below still runs fresh, exactly as if it weren't
+          // memoizable at all; it just can't be looked up or recorded for a later run.
+          inputHash = undefined;
+        }
+        if (options.reuseUnchanged && inputHash !== undefined) {
           const prior = options.priorNodeRuns?.[nodeId];
           if (prior && prior.inputHash === inputHash) {
             // Clone rather than hand out the cached object by reference: no current node
