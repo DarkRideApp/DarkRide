@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useWebSocket, useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Canvas } from './Canvas';
 import { SidePanel } from './SidePanel';
-import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
+import type { PipelineGraph, PipelineNode, TriggerConfig } from '../../../backend/services/ai-jobs/types';
 
 /**
  * Forward-reachability BFS defining a Trigger's zone — duplicated client-side rather than
@@ -24,15 +24,19 @@ export function reachableFrom(nodeId: string, graph: PipelineGraph): Set<string>
   return seen;
 }
 
+function isTriggerNode(n: PipelineNode): n is PipelineNode & { config: TriggerConfig & { kind: 'Trigger' } } {
+  return n.config.kind === 'Trigger';
+}
+
 /** The Trigger whose zone actually contains `nodeId` — never just "the first Trigger in the
  * graph." A valid published graph (graph-validator, Task 16) guarantees every non-Trigger node
  * is reachable from some Trigger, so the fallback below is defensive, not a real path. */
 export function findOwningTriggerSchema(graph: PipelineGraph, nodeId: string): Array<{ field: string; type: string; description: string }> {
-  const triggers = graph.nodes.filter(n => n.config.kind === 'Trigger');
+  const triggers = graph.nodes.filter(isTriggerNode);
   for (const trigger of triggers) {
-    if (reachableFrom(trigger.id, graph).has(nodeId)) return (trigger.config as any).outputSchema;
+    if (reachableFrom(trigger.id, graph).has(nodeId)) return trigger.config.outputSchema;
   }
-  return (triggers[0]?.config as any)?.outputSchema ?? [];
+  return triggers[0]?.config.outputSchema ?? [];
 }
 
 export function AiJobsWorkspace() {

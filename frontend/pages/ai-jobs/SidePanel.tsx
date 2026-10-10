@@ -56,8 +56,12 @@ function AgentCallBody({ node, triggerSchema, onSave }: {
   function insertVar(field: string) {
     const ta = taRef.current;
     const token = `{{trigger.${field}}}`;
-    const start = ta?.selectionStart ?? template.length;
-    const end = ta?.selectionEnd ?? template.length;
+    // An unfocused <textarea>'s selectionStart/End is 0, not null/undefined — `??` alone does
+    // not detect "no real cursor position." Only trust the selection when the textarea actually
+    // has focus; otherwise append at the end.
+    const hasFocus = ta !== null && document.activeElement === ta;
+    const start = hasFocus ? ta.selectionStart ?? template.length : template.length;
+    const end = hasFocus ? ta.selectionEnd ?? template.length : template.length;
     const next = template.slice(0, start) + token + template.slice(end);
     setTemplate(next);
     onSave(node.id, { instructionTemplate: next });
