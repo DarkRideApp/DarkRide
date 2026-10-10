@@ -53,4 +53,48 @@ describe('runPipeline — linear chain', () => {
     expect(agentResult.error).toMatch(/boom/);
     expect(executors.Sink).not.toHaveBeenCalled();
   });
+
+  // Regression guard: Task 14 adds wave-based concurrency and a
+  // "partial-failure-continues" test over a fan-out graph — one branch failing must not sink
+  // a sibling branch that completed. The run-status rollup must exclude the Trigger's own
+  // 'ok' status from the vote: including it would let the Trigger's success rescue a
+  // single-chain total failure (this file's own previous test, above) into 'partial' instead
+  // of 'failed'. This test pins the correct three-way split (ok / partial / failed) using only
+  // non-Trigger nodes, before Task 14 exists to test it structurally.
+  it('treats one failed branch as "partial", not "failed", when a sibling branch completes', async () => {
+    const twoBranchGraph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agentA', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'sinkA', config: { kind: 'Sink', writeFn: 'x' } },
+        { id: 'agentB', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'sinkB', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'agentA' }, { from: 'agentA', to: 'sinkA' },
+        { from: 'trigger', to: 'agentB' }, { from: 'agentB', to: 'sinkB' },
+      ],
+    };
+
+    // Exactly one of the two AgentCall invocations fails — which node it lands on doesn't
+    // matter for this assertion, only that one branch fails while the other completes.
+    let calls = 0;
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) throw new Error('branch A boom');
+        return { text: 'ok' };
+      }),
+    });
+
+    const result = await runPipeline(twoBranchGraph, 'trigger', {}, executors, {});
+
+    expect(result.status).toBe('partial');
+    const failedBranchNodes = result.nodes.filter(n => n.status === 'failed');
+    const skippedBranchNodes = result.nodes.filter(n => n.status === 'skipped');
+    const okOutcomeNodes = result.nodes.filter(n => n.status === 'ok' && n.nodeId !== 'trigger');
+    expect(failedBranchNodes).toHaveLength(1);
+    expect(skippedBranchNodes).toHaveLength(1);
+    expect(okOutcomeNodes).toHaveLength(2); // the surviving branch's AgentCall + Sink
+  });
 });
