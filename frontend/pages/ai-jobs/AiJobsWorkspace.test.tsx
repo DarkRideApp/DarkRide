@@ -1,8 +1,8 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { AiJobsWorkspace, findOwningTriggerSchema } from './AiJobsWorkspace';
-import { createMockWs, withProviders, mockPipelineVersion } from './testing';
+import { createMockWs, withProviders, mockPipelineVersion, calledPaths } from './testing';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
 // @xyflow/react's <ReactFlow> observes its pane with a ResizeObserver, which jsdom does not
@@ -34,6 +34,46 @@ describe('AiJobsWorkspace', () => {
     // Overview/Wait Times/Opening Hours/Maps/Secrets/cURL Examples/Bypass Script).
     expect(screen.getByText('Wait Times')).toBeInTheDocument();
     expect(screen.getAllByText(/AGENTCALL/i).length).toBeGreaterThanOrEqual(7);
+  });
+
+  it('Run calls POST .../run then GET .../runs/:runId in order, and applies node status styling', async () => {
+    // POST .../run (backend/api/ai-pipelines.ts:154) never carries per-node results — only
+    // { runId, status } — so the workspace must follow up with a GET on the returned runId
+    // (ai-pipelines.ts:166-172, shape { run, nodes }) to actually populate node styling.
+    const ws = createMockWs({
+      pipelineVersion: mockPipelineVersion(),
+      routes: {
+        'POST /v1/ai-pipelines/1/run': () => ({ success: true, data: { runId: 7, status: 'ok' } }),
+        'GET /v1/ai-pipelines/runs/7': () => ({
+          success: true,
+          data: {
+            run: { id: 7, status: 'ok' },
+            nodes: [
+              { runId: 7, nodeId: 'agent-overview', status: 'ok', wasMemoized: false },
+              { runId: 7, nodeId: 'agent-wait-times', status: 'failed', wasMemoized: false },
+            ],
+          },
+        }),
+      },
+    });
+    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    await waitFor(() => expect(calledPaths(ws)).toEqual(
+      expect.arrayContaining(['GET /v1/ai-pipelines', 'POST /v1/ai-pipelines/1/run', 'GET /v1/ai-pipelines/runs/7']),
+    ));
+    // Order matters: the run-detail GET must follow the run POST, never precede or replace it.
+    const paths = calledPaths(ws);
+    expect(paths.indexOf('POST /v1/ai-pipelines/1/run')).toBeLessThan(paths.indexOf('GET /v1/ai-pipelines/runs/7'));
+
+    await waitFor(() => {
+      const overviewNode = screen.getByText('agent-overview').closest('.react-flow__node') as HTMLElement;
+      expect(overviewNode.style.outline).toContain('#22c55e'); // STATUS_COLOR.ok
+      const waitTimesNode = screen.getByText('agent-wait-times').closest('.react-flow__node') as HTMLElement;
+      expect(waitTimesNode.style.outline).toContain('#ef4444'); // STATUS_COLOR.failed
+    });
   });
 });
 
