@@ -11,7 +11,7 @@ import type { TierConfig } from './ai-agent';
 import { AI_ANALYSIS_MAX_TURNS } from './ai-agent';
 import type { AiAgentFactory } from './ai-agent-factory';
 import { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, type ApkAnalysisIdentity } from './ai-jobs/apk-analysis-pipeline';
-import { runPipeline } from './ai-jobs/pipeline-runner';
+import { startPipelineRun } from './ai-jobs/run-executor';
 import type { PipelineGraph } from './ai-jobs/types';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
@@ -1007,6 +1007,12 @@ export class ApkAnalyzerService {
    * editor takes effect on the next real auto/manual-triggered run without a server restart.
    * `seedApkAnalysisPipeline` (Task 20) is what puts that constant into the DB at boot; this
    * method only ever reads it back.
+   *
+   * Goes through the SAME `startPipelineRun` the REST `/run` endpoint uses (found in the final
+   * whole-branch review: before this, this path had no DB run record at all and no way to notice
+   * it was racing a REST-triggered run against the same APK version's note). The returned promise
+   * resolves once the run settles, so `runAiAgent`'s `activeAiAgentRuns` bookkeeping still spans
+   * the whole run.
    */
   private async runAiPipeline(versionId: number, identity: ApkAnalysisIdentity): Promise<void> {
     const pipeline = this.db.select().from(aiPipelines)
@@ -1026,31 +1032,45 @@ export class ApkAnalyzerService {
     }
 
     const triggerNodeId = 'trigger-full'; // auto/manual re-analysis both use the Full Analysis entry point
-    const result = await runPipeline(
-      version.graph as PipelineGraph,
-      triggerNodeId,
-      { versionId },
-      buildApkAnalysisExecutors(),
-      buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId }),
-    );
 
-    if (result.status === 'failed') {
-      const failedNodes = result.nodes.filter(n => n.status === 'failed').map(n => `${n.nodeId}: ${n.error}`).join('; ');
-      this.recordAiFailure(versionId, failedNodes || 'Pipeline run failed');
-      return;
-    }
-
-    this.clearAiFailure(versionId);
-
-    // Scope gap, stated plainly rather than silently absorbed: `frontend/pages/ApkAnalysis.tsx`
-    // types `msg.status` as the literal union 'running' | 'completed' | 'failed' — there is no
-    // 'partial' value this event can carry without widening that union and updating the page to
-    // render it distinctly, and this task doesn't do either. A `partial` run (say, Bypass Script
-    // failed but the other six sections landed with Report's placeholder) broadcasts as plain
-    // "completed" on the one surface an analyst actually watches during a run. Real, valuable
-    // follow-up work; out of scope for this task.
-    broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: 'completed' });
-    log(`AI pipeline completed for version ${versionId}: ${result.status}`);
+    return new Promise<void>((resolve) => {
+      const started = startPipelineRun({
+        db: this.db,
+        pipelineVersionId: version.id,
+        graph: version.graph as PipelineGraph,
+        triggerNodeId,
+        input: { versionId },
+        triggeredBy: 'apk-analysis-complete',
+        executors: buildApkAnalysisExecutors(),
+        buildCtx: () => buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId }),
+        onSettled: (result, crashError) => {
+          // try/finally: a throw from any side effect below must never leave this promise
+          // pending, or runAiAgent's `.finally` never clears activeAiAgentRuns and this APK
+          // version can never be AI-analysed again until a restart.
+          try {
+            if (result.status === 'failed') {
+              const failedNodes = result.nodes.filter(n => n.status === 'failed').map(n => `${n.nodeId}: ${n.error}`).join('; ');
+              this.recordAiFailure(versionId, failedNodes || crashError || 'Pipeline run failed');
+            } else {
+              this.clearAiFailure(versionId);
+              // Scope gap, stated plainly rather than silently absorbed: `frontend/pages/ApkAnalysis.tsx`
+              // types `msg.status` as the literal union 'running' | 'completed' | 'failed' — a `partial`
+              // run (say, Bypass Script failed but the other six sections landed) broadcasts as plain
+              // "completed" on the one surface an analyst actually watches during a run. Real, valuable
+              // follow-up work; out of scope here.
+              broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: 'completed' });
+              log(`AI pipeline completed for version ${versionId}: ${result.status}`);
+            }
+          } finally {
+            resolve();
+          }
+        },
+      });
+      if (!started.ok) {
+        this.recordAiFailure(versionId, started.error);
+        resolve();
+      }
+    });
   }
 
   /** An AI run failed: tell the open page and leave a note, so the reason is visible where the analysis should be. */

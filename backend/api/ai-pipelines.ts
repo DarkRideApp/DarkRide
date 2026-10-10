@@ -3,7 +3,8 @@ import { registerEndpoint } from './api-service';
 import { aiPipelines, aiPipelineVersions, aiPipelineRuns, aiPipelineNodeRuns } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import { validateGraph } from '../services/ai-jobs/graph-validator';
-import { runPipeline, type NodeExecutors, type ExecutionCtx } from '../services/ai-jobs/pipeline-runner';
+import type { NodeExecutors, ExecutionCtx } from '../services/ai-jobs/pipeline-runner';
+import { startPipelineRun, type StartPipelineRunResult } from '../services/ai-jobs/run-executor';
 import type { PipelineGraph } from '../services/ai-jobs/types';
 
 export interface AiPipelineDeps {
@@ -12,6 +13,10 @@ export interface AiPipelineDeps {
   /** `identity` comes from the authenticated request (req.authUser), not a fixed core-service identity —
    * a manual run from the editor runs as the clicking user, same as `triggerAiAgentManual` does today. */
   buildCtx: (identity: { type: 'core-service' } | { type: 'user'; userId: number }, input: Record<string, unknown>) => ExecutionCtx;
+  /** Reads the `ai_pipelines_enabled` flag (production passes `isPipelinesEnabled` from
+   * run-executor.ts). Optional: omitted means enabled, so test harnesses that don't care about
+   * the flag keep working. When provided and it returns false, `/run` answers 403. */
+  getPipelinesEnabled?: (db: AppDatabase) => boolean;
 }
 
 export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
@@ -70,10 +75,28 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
     res.json({ success: true });
   }, { requires: ['core.apk:manage'] });
 
-  registerEndpoint('POST', '/v1/ai-pipelines/:id/run', async (req, res) => {
+  registerEndpoint('POST', '/v1/ai-pipelines/:id/run', (req, res) => {
     const pipelineId = Number(req.params.id);
     const { input, reuseUnchanged } = req.body as { triggerNodeId?: string; input: Record<string, unknown>; reuseUnchanged?: boolean };
     let { triggerNodeId } = req.body as { triggerNodeId?: string };
+
+    // Same flag that gates the production auto-trigger path (apk-analyzer.ts). Found in the final
+    // review: without this, the REST endpoint ran pipelines (real AgentCalls, real note writes)
+    // even with the feature switched off.
+    if (deps.getPipelinesEnabled && !deps.getPipelinesEnabled(db)) {
+      res.status(403).json({ success: false, error: 'AI job pipelines are disabled (the ai_pipelines_enabled setting is off)' });
+      return;
+    }
+
+    // Fail closed. registerEndpoint's scope check should already have rejected an unauthenticated
+    // request to this core.apk:manage route, but if that ever changes, the answer must be 401 —
+    // never a silent fallback to a more privileged core-service identity. AuthUser
+    // (backend/auth/middleware.ts) has `userId`, not `actorUserId`.
+    if (!req.authUser) {
+      res.status(401).json({ success: false, error: 'Authentication required' });
+      return;
+    }
+    const identity = { type: 'user' as const, userId: req.authUser.userId };
 
     const version = db.select().from(aiPipelineVersions)
       .where(and(eq(aiPipelineVersions.pipelineId, pipelineId), eq(aiPipelineVersions.status, 'published')))
@@ -82,8 +105,8 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
 
     // Spec: triggerNodeId is required once a version has more than one Trigger, optional and
     // inferred when it has exactly one.
-    const graphForTriggerCheck = version.graph as PipelineGraph;
-    const triggerNodes = graphForTriggerCheck.nodes.filter(n => n.config.kind === 'Trigger');
+    const graph = version.graph as PipelineGraph;
+    const triggerNodes = graph.nodes.filter(n => n.config.kind === 'Trigger');
     if (!triggerNodeId) {
       if (triggerNodes.length !== 1) {
         res.status(400).json({ success: false, error: `triggerNodeId is required — this pipeline version has ${triggerNodes.length} Trigger nodes, not exactly one` });
@@ -95,72 +118,34 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
       return;
     }
 
-    const alreadyRunning = db.select().from(aiPipelineRuns)
-      .where(and(eq(aiPipelineRuns.pipelineVersionId, version.id), eq(aiPipelineRuns.status, 'running')))
-      .all()[0];
-    if (alreadyRunning) {
-      res.status(409).json({ success: false, error: `A run is already running for this pipeline version (run ${alreadyRunning.id})` });
+    // The 409 guard, run-row insert, priorNodeRuns loader and crash handling all live in
+    // startPipelineRun, shared with apk-analyzer.ts's production trigger path. It returns as soon
+    // as the run is recorded; the client polls GET /v1/ai-pipelines/runs/:runId for the outcome
+    // (a real multi-AgentCall run takes minutes, far past the client's 30s REST timeout).
+    let started: StartPipelineRunResult;
+    try {
+      started = startPipelineRun({
+        db,
+        pipelineVersionId: version.id,
+        graph,
+        triggerNodeId,
+        input: input ?? {},
+        reuseUnchanged,
+        triggeredBy: 'manual',
+        executors: deps.executors,
+        buildCtx: () => deps.buildCtx(identity, input ?? {}),
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
       return;
     }
 
-    const now = new Date();
-    const runId = db.insert(aiPipelineRuns).values({
-      pipelineVersionId: version.id, triggerNodeId, triggeredBy: 'manual',
-      input, reuseUnchanged: !!reuseUnchanged, status: 'running', startedAt: now,
-    }).run().lastInsertRowid as number;
-
-    const graph = version.graph as PipelineGraph;
-    let priorNodeRuns: Record<string, { inputHash: string; output: Record<string, unknown> }> | undefined;
-    if (reuseUnchanged) {
-      priorNodeRuns = {};
-      // Ascending by id, so a later (more recent) run's node output always overwrites an earlier
-      // one's in the loop below — relying on unordered default row-scan order isn't a guaranteed
-      // contract, so order explicitly.
-      const priorRuns = db.select().from(aiPipelineRuns).where(eq(aiPipelineRuns.pipelineVersionId, version.id)).orderBy(aiPipelineRuns.id).all();
-      for (const priorRun of priorRuns) {
-        const priorNodes = db.select().from(aiPipelineNodeRuns)
-          .where(and(eq(aiPipelineNodeRuns.runId, priorRun.id), eq(aiPipelineNodeRuns.status, 'ok')))
-          .all();
-        for (const nr of priorNodes) {
-          if (nr.inputHash && nr.output) priorNodeRuns[nr.nodeId] = { inputHash: nr.inputHash, output: nr.output };
-        }
-      }
+    if (!started.ok) {
+      res.status(409).json({ success: false, error: started.error });
+      return;
     }
 
-    // AuthUser (backend/auth/middleware.ts) has `userId`, not `actorUserId` — that field belongs
-    // to the unrelated AgentIdentity type. The defensive core-service fallback below should be
-    // unreachable in practice: registerEndpoint's scope check already requires an authUser for a
-    // core.apk:manage route.
-    const identity = req.authUser
-      ? { type: 'user' as const, userId: req.authUser.userId }
-      : { type: 'core-service' as const };
-
-    try {
-      const result = await runPipeline(graph, triggerNodeId, input, deps.executors, deps.buildCtx(identity, input), { reuseUnchanged, priorNodeRuns });
-
-      for (const nodeResult of result.nodes) {
-        db.insert(aiPipelineNodeRuns).values({
-          runId, nodeId: nodeResult.nodeId, status: nodeResult.status,
-          output: nodeResult.output, error: nodeResult.error,
-          // inputHash must be persisted here, not just wasMemoized: the loader just above filters
-          // on `nr.inputHash && nr.output`, so without writing it here, priorNodeRuns is always
-          // empty on every later run and memoization can never fire in production.
-          inputHash: nodeResult.inputHash,
-          wasMemoized: !!nodeResult.wasMemoized, startedAt: now, finishedAt: new Date(),
-        }).run();
-      }
-      db.update(aiPipelineRuns).set({ status: result.status, finishedAt: new Date() }).where(eq(aiPipelineRuns.id, runId)).run();
-
-      res.json({ success: true, data: { runId, status: result.status } });
-    } catch (err) {
-      // Found during review: without this, any throw between inserting the 'running' row and
-      // finalizing it (buildCtx, runPipeline itself, or a node-run insert) leaves the row stuck
-      // in 'running' forever, and every future /run for this version 409s permanently with no
-      // way to clear it short of a direct DB edit. Mark it failed so the 409 guard only ever
-      // blocks a genuine concurrent run, never a crashed one.
-      db.update(aiPipelineRuns).set({ status: 'failed', finishedAt: new Date() }).where(eq(aiPipelineRuns.id, runId)).run();
-      res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
-    }
+    res.json({ success: true, data: { runId: started.runId, status: 'running' } });
   }, { requires: ['core.apk:manage'] });
 
   registerEndpoint('GET', '/v1/ai-pipelines/runs/:runId', (req, res) => {

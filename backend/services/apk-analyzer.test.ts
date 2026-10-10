@@ -1379,6 +1379,81 @@ describe('ApkAnalyzerService', () => {
       expect(service.isAiAgentRunning(versionId)).toBe(false);
     });
 
+    it('persists the production run: an ai_pipeline_runs row plus one ai_pipeline_node_runs row per node (I4)', async () => {
+      // Before the final-review fix this path called runPipeline directly and wrote nothing to
+      // the DB — no run history, and nothing for the shared concurrency guard to see.
+      seedPublishedPipeline();
+      runPipelineMock.mockResolvedValue({
+        status: 'ok',
+        nodes: [
+          { nodeId: 'trigger-full', status: 'ok', output: { appName: 'x' } },
+          { nodeId: 'agent-overview', status: 'ok', output: { text: 'overview' }, inputHash: 'h1' },
+        ],
+      });
+      configureAiFactory();
+      (service as any).setPipelinesEnabled(() => true);
+
+      service.triggerAiAgentManual(versionId, 42);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      const runs = db.select().from(schema.aiPipelineRuns).all();
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({
+        status: 'ok', triggerNodeId: 'trigger-full', triggeredBy: 'apk-analysis-complete', input: { versionId },
+      });
+      const published = db.select().from(schema.aiPipelineVersions).all().find(v => v.status === 'published')!;
+      expect(runs[0].pipelineVersionId).toBe(published.id);
+      const nodeRuns = db.select().from(schema.aiPipelineNodeRuns).all();
+      expect(nodeRuns.map(n => n.nodeId).sort()).toEqual(['agent-overview', 'trigger-full']);
+      expect(nodeRuns.every(n => n.runId === runs[0].id)).toBe(true);
+      expect(nodeRuns.find(n => n.nodeId === 'agent-overview')).toMatchObject({ output: { text: 'overview' }, inputHash: 'h1' });
+      expect(service.isAiAgentRunning(versionId)).toBe(false);
+    });
+
+    it('is refused by the shared concurrency guard when a run of the same pipeline version is already running (I5)', async () => {
+      seedPublishedPipeline();
+      const published = db.select().from(schema.aiPipelineVersions).all().find(v => v.status === 'published')!;
+      // Simulates a REST-triggered run already in flight against this pipeline version.
+      const existingRunId = db.insert(schema.aiPipelineRuns).values({
+        pipelineVersionId: published.id, triggerNodeId: 'trigger-full', triggeredBy: 'manual',
+        input: { versionId }, reuseUnchanged: false, status: 'running', startedAt: new Date(),
+      }).run().lastInsertRowid as number;
+      runPipelineMock.mockResolvedValue({ status: 'ok', nodes: [] });
+      configureAiFactory();
+      (service as any).setPipelinesEnabled(() => true);
+
+      (broadcastToAll as any).mockClear();
+      service.triggerAiAgentManual(versionId, 42);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(runPipelineMock).not.toHaveBeenCalled();
+      const updates = (broadcastToAll as any).mock.calls.map((c: any) => c[0]).filter((m: any) => m.type === 'apk:ai-agent-update');
+      expect(updates.map((u: any) => u.status)).toEqual(['running', 'failed']);
+      expect(updates[1].error).toMatch(new RegExp(`already running.*run ${existingRunId}`, 'i'));
+      expect(getNote(db, versionId)).toContain('## AI Analysis Failed');
+      // No second run row was inserted, and this version is not left wedged.
+      expect(db.select().from(schema.aiPipelineRuns).all()).toHaveLength(1);
+      expect(service.isAiAgentRunning(versionId)).toBe(false);
+    });
+
+    it('a throw from a settle side effect still releases activeAiAgentRuns', async () => {
+      seedPublishedPipeline();
+      runPipelineMock.mockResolvedValue({ status: 'ok', nodes: [] });
+      configureAiFactory();
+      (service as any).setPipelinesEnabled(() => true);
+      const clearSpy = vi.spyOn(service as any, 'clearAiFailure').mockImplementation(() => { throw new Error('note store down'); });
+
+      service.triggerAiAgentManual(versionId, 42);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(clearSpy).toHaveBeenCalled();
+      expect(service.isAiAgentRunning(versionId)).toBe(false);
+      clearSpy.mockRestore();
+    });
+
     it('a throw from getAiPrompt on the default (non-pipeline) path propagates synchronously and never registers the run as active', () => {
       // Regression guard for Finding 2: settings reads must happen BEFORE
       // activeAiAgentRuns.add()/the 'running' broadcast, or a throwing getter wedges the
