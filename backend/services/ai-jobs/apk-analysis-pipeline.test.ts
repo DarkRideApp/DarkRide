@@ -5,7 +5,10 @@ import * as schema from '../../db/schema';
 import { getNote } from '../apk-notes';
 import { validateGraph } from './graph-validator';
 import { runPipeline } from './pipeline-runner';
+import { AiToolRegistry } from '../ai-tools';
+import { registerAllTools } from '../ai-tool-definitions';
 import {
+  APK_ANALYZER_AI_SCOPES,
   ASTERIX_PATTERN_GRAPH,
   buildApkAnalysisExecutors,
   buildApkAnalysisExecutionCtx,
@@ -126,6 +129,47 @@ describe('ASTERIX_PATTERN_GRAPH', () => {
 
     expect(forCoreService).toHaveBeenCalledTimes(2); // not once, reused — once per node
     expect(forCoreService).toHaveBeenCalledWith('apk-analyzer', { tier: 'High' });
+  });
+});
+
+describe('ASTERIX_PATTERN_GRAPH tool allowlists', () => {
+  // Regression guard for the final review's I3: about half the declared tool names could never
+  // reach the model — one wasn't a registered AI tool at all, the rest needed a context or scope
+  // the apk-analyzer identity doesn't have. Resolves through the SAME registry call the agent loop
+  // uses (pageContext 'apk-analysis', unattended because AgentCall runs in 'silent' mode), as the
+  // auto-trigger identity, so a dead name fails here instead of silently shrinking the agent.
+  const agentCalls = ASTERIX_PATTERN_GRAPH.nodes.filter(n => n.config.kind === 'AgentCall');
+
+  function reachableToolNames(): Set<string> {
+    const registry = new AiToolRegistry();
+    registerAllTools(registry, makeDb() as any);
+    const defs = registry.getToolDefinitionsForUser('apk-analysis', new Set(APK_ANALYZER_AI_SCOPES), true);
+    return new Set(defs.map(d => d.name));
+  }
+
+  it('every allowlisted tool on every AgentCall resolves for the apk-analyzer identity under apk-analysis', () => {
+    const reachable = reachableToolNames();
+    const dead = agentCalls.flatMap(n =>
+      (n.config as { toolAllowlist: string[] }).toolAllowlist
+        .filter(name => !reachable.has(name))
+        .map(name => `${n.id}: ${name}`),
+    );
+    expect(dead).toEqual([]);
+  });
+
+  it('every allowlisted tool is a registered apk-analysis tool needing only core.apk:read or core.apk:manage', () => {
+    const registry = new AiToolRegistry();
+    registerAllTools(registry, makeDb() as any);
+    const names = new Set(agentCalls.flatMap(n => (n.config as { toolAllowlist: string[] }).toolAllowlist));
+    for (const name of names) {
+      const tool = registry.getToolsForContext('apk-analysis').find(t => t.name === name);
+      expect(tool, `${name} is not a registered apk-analysis tool`).toBeDefined();
+      expect(['core.apk:read', 'core.apk:manage']).toContain(tool!.requiredScope);
+    }
+  });
+
+  it('does not widen the apk-analyzer identity beyond apk scopes', () => {
+    expect(APK_ANALYZER_AI_SCOPES).toEqual(['core.apk:read', 'core.apk:manage', 'mcp']);
   });
 });
 

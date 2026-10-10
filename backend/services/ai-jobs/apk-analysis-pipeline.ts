@@ -25,8 +25,28 @@ const APK_CONTEXT_SCHEMA = [
   { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
 ];
 
-const GROUP_A_TOOLS = ['get_apk_overview', 'get_apk_strings', 'list_apk_assets', 'get_app_versions', 'search_apk_code', 'find_api_endpoints', 'get_api_endpoint', 'get_map_config'];
-const GROUP_B_TOOLS = ['search_credentials', 'search_apk_code', 'get_apk_strings', 'find_api_endpoints', 'get_api_endpoint', 'list_api_endpoints', 'detect_ssl_pinning', 'generate_ssl_bypass', 'inspect_class_methods'];
+/**
+ * The AI scopes the `apk-analyzer` core-service identity is registered with (backend/index.ts) —
+ * the identity every auto-triggered run of this pipeline's AgentCalls executes as. Exported so
+ * index.ts registers exactly this list and the tool-reachability test checks against the same
+ * one. Widening it is a security decision (this agent reads attacker-controlled APK content),
+ * not a way to make a tool "work".
+ */
+export const APK_ANALYZER_AI_SCOPES = ['core.apk:read', 'core.apk:manage', 'mcp'];
+
+const GROUP_A_TOOLS = ['get_apk_overview', 'get_apk_strings', 'list_apk_assets', 'get_app_versions', 'search_apk_code', 'find_api_endpoints'];
+// get_api_endpoint and get_map_config removed — found during the final review: neither ever
+// resolved for this identity (get_api_endpoint needs core.traffic:read and a different context;
+// get_map_config isn't a registered AI tool at all, only a Claude-Code-only MCP tool with the
+// same name). Declaring a tool that can never run is worse than not declaring it — it tells the
+// model (and anyone reading this list) it has a capability it never actually has.
+const GROUP_B_TOOLS = ['search_apk_code', 'get_apk_strings', 'find_api_endpoints', 'detect_ssl_pinning'];
+// search_credentials, list_api_endpoints, generate_ssl_bypass, inspect_class_methods removed for
+// the same reason — each needs a scope (core.credentials:read / core.traffic:read /
+// core.frida:manage) the apk-analyzer core identity does not have. Granting those scopes to an
+// AUTOMATED, UNATTENDED identity that processes untrusted APK content would be a real security
+// decision (letting a prompt-injectable agent autonomously read stored credentials or run Frida
+// instrumentation) — deliberately NOT made here.
 
 /**
  * The literal, real pipeline graph for the `apk-analysis` job kind — not a test fixture. Two
