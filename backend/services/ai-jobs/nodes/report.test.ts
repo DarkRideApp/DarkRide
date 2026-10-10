@@ -1,0 +1,62 @@
+import { describe, it, expect } from 'vitest';
+import { runReport } from './report';
+import type { Envelope, ReportConfig } from '../types';
+
+describe('runReport', () => {
+  const config: ReportConfig = {
+    sections: [
+      { title: 'Overview', from: 'agent-overview' },
+      { title: 'Wait Times', from: 'agent-wait-times' },
+      { title: 'Bypass Script', from: 'agent-bypass' },
+    ],
+  };
+
+  it('assembles every ok section in declared order', () => {
+    const envelopes: Record<string, Envelope<{ text: string }>> = {
+      'agent-overview': { status: 'ok', output: { text: 'A React Native app.' } },
+      'agent-wait-times': { status: 'ok', output: { text: 'No wait-time endpoints found.' } },
+      'agent-bypass': { status: 'ok', output: { text: 'Frida script here.' } },
+    };
+    const result = runReport(config, envelopes);
+    const overviewIdx = result.markdown.indexOf('## Overview');
+    const waitIdx = result.markdown.indexOf('## Wait Times');
+    const bypassIdx = result.markdown.indexOf('## Bypass Script');
+    expect(overviewIdx).toBeGreaterThanOrEqual(0);
+    expect(waitIdx).toBeGreaterThan(overviewIdx);
+    expect(bypassIdx).toBeGreaterThan(waitIdx);
+    expect(result.markdown).toContain('A React Native app.');
+  });
+
+  it('substitutes an explicit placeholder for a failed section, never throws, never silently omits it', () => {
+    const envelopes: Record<string, Envelope<{ text: string }>> = {
+      'agent-overview': { status: 'ok', output: { text: 'A React Native app.' } },
+      'agent-wait-times': { status: 'ok', output: { text: 'No wait-time endpoints found.' } },
+      'agent-bypass': { status: 'failed', error: 'ModelRefusedError: cyber' },
+    };
+    const result = runReport(config, envelopes);
+    expect(result.markdown).toContain('## Bypass Script');
+    expect(result.markdown).toContain('unavailable this run');
+    expect(result.markdown).not.toContain('ModelRefusedError'); // the placeholder is honest, not a raw error dump into the doc
+  });
+
+  it('substitutes the same placeholder for a skipped or inactive section', () => {
+    const envelopes: Record<string, Envelope<{ text: string }>> = {
+      'agent-overview': { status: 'ok', output: { text: 'x' } },
+      'agent-wait-times': { status: 'skipped' },
+      'agent-bypass': { status: 'inactive' },
+    };
+    const result = runReport(config, envelopes);
+    expect(result.markdown).toContain('## Wait Times');
+    expect(result.markdown).toContain('## Bypass Script');
+    expect((result.markdown.match(/unavailable this run/g) || []).length).toBe(2);
+  });
+
+  it('substitutes the placeholder when a source envelope is absent from the map entirely', () => {
+    const envelopes: Record<string, Envelope<{ text: string }>> = {
+      'agent-overview': { status: 'ok', output: { text: 'x' } },
+    };
+    const result = runReport(config, envelopes);
+    expect(result.markdown).toContain('## Wait Times');
+    expect((result.markdown.match(/unavailable this run/g) || []).length).toBe(2);
+  });
+});
