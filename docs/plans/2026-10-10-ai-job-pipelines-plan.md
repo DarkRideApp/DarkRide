@@ -4038,13 +4038,53 @@ Expected: PASS
 
 - [ ] **Step 9: Wire it into `AiJobsWorkspace.tsx`**
 
+**Correction made before this task was dispatched:** the draft below picked `graph.nodes.find(n =>
+n.config.kind === 'Trigger')` — the FIRST Trigger node in array order, unconditionally. The real
+Astérix graph (Task 20) has two disjoint Trigger zones, `trigger-full` and `trigger-rescan`; today
+both happen to share `APK_CONTEXT_SCHEMA`, which is why this wouldn't have failed any test written
+against that one pipeline, but this tool's whole purpose (per spec) is to be reused for pipelines
+this plan never sees. The first pipeline anyone builds with two Triggers of genuinely different
+shape would show every AgentCall downstream of the second Trigger the WRONG variable chips. Find
+the Trigger that actually reaches the selected node instead, using the same forward-reachability
+BFS the executor itself uses to define a Trigger's zone (Task 16's `reachableFrom` in
+`backend/services/ai-jobs/pipeline-runner.ts` — duplicated here client-side rather than imported,
+for the same frontend/backend-boundary reason `templatePreview.ts` duplicates `resolveTemplate`):
+
+```tsx
+// in AiJobsWorkspace.tsx, alongside the other module-level helpers
+function reachableFrom(nodeId: string, graph: PipelineGraph): Set<string> {
+  const seen = new Set<string>([nodeId]);
+  const queue = [nodeId];
+  while (queue.length) {
+    const current = queue.shift()!;
+    for (const e of graph.edges) {
+      if (e.from !== current || seen.has(e.to)) continue;
+      seen.add(e.to);
+      queue.push(e.to);
+    }
+  }
+  return seen;
+}
+
+/** The Trigger whose zone actually contains `nodeId` — never just "the first Trigger in the
+ * graph." A valid published graph (graph-validator, Task 16) guarantees every non-Trigger node
+ * is reachable from some Trigger, so the fallback below is defensive, not a real path. */
+function findOwningTriggerSchema(graph: PipelineGraph, nodeId: string): Array<{ field: string; type: string; description: string }> {
+  const triggers = graph.nodes.filter(n => n.config.kind === 'Trigger');
+  for (const trigger of triggers) {
+    if (reachableFrom(trigger.id, graph).has(nodeId)) return trigger.config.outputSchema;
+  }
+  return triggers[0]?.config.outputSchema ?? [];
+}
+```
+
 Replace the `{selected && <div data-testid="selected-node">{selected}</div>}` placeholder from Task 22 with:
 
 ```tsx
 {selected && (
   <SidePanel
     node={graph.nodes.find(n => n.id === selected)!}
-    triggerSchema={graph.nodes.find(n => n.config.kind === 'Trigger')!.config.outputSchema}
+    triggerSchema={findOwningTriggerSchema(graph, selected)}
     onClose={() => setSelected(null)}
     onSave={(nodeId, patch) => {
       setGraph(g => g && ({ ...g, nodes: g.nodes.map(n => n.id === nodeId ? { ...n, config: { ...n.config, ...patch } } : n) }));
@@ -4054,6 +4094,8 @@ Replace the `{selected && <div data-testid="selected-node">{selected}</div>}` pl
 ```
 
 (This updates local state only — persisting an edited graph as a new draft version is a `POST /v1/ai-pipelines/:id/versions` call, Task 19's endpoint; wiring a "Save" button to it is this plan's natural next follow-up once this task's own tests are green, not blocking this task's own deliverable.)
+
+Add a test to `AiJobsWorkspace.test.tsx` (or a dedicated `findOwningTriggerSchema`-only unit, implementer's choice) proving this with a fixture that has two Trigger zones with *different* `outputSchema`s, asserting the AgentCall belonging to the second zone gets the second zone's schema, not the first's.
 
 - [ ] **Step 10: `tsc` check + commit**
 
