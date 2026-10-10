@@ -89,10 +89,21 @@ export async function runPipeline(
   // that completed — Task 14's wave-based concurrency depends on this); none ok -> 'failed'
   // (a single-chain failure, e.g. this task's own third test, where the only "ok" left after
   // excluding the Trigger disappears, so it can't rescue the run into 'partial').
+  //
+  // 'inactive' is excluded from the same filter alongside Trigger-kind nodes: nothing produces
+  // it yet (Task 15's Branch routing and Task 16's multi-trigger zones are the first to), but
+  // it's cheaper to fold the correct exclusion into this line now than to have two later tasks
+  // each reopen this block — it's a no-op today since no current test ever produces 'inactive'.
+  //
+  // Degenerate case: a graph with only a Trigger node (outcomeStatuses is empty) must report the
+  // Trigger's own status, not a hardcoded 'ok' — if the sole Trigger node itself threw, the run
+  // did nothing and failed, and reporting 'ok' would be a straight-up lie about what happened.
   const statuses = [...results.values()];
-  const outcomeStatuses = statuses.filter(r => byId.get(r.nodeId)?.config.kind !== 'Trigger');
+  const outcomeStatuses = statuses.filter(
+    r => r.status !== 'inactive' && byId.get(r.nodeId)?.config.kind !== 'Trigger',
+  );
   const runStatus: RunStatus =
-    outcomeStatuses.length === 0 ? 'ok' // degenerate: a graph with only a Trigger node
+    outcomeStatuses.length === 0 ? (results.get(triggerNodeId)?.status === 'ok' ? 'ok' : 'failed')
     : outcomeStatuses.every(r => r.status === 'ok') ? 'ok'
     : outcomeStatuses.some(r => r.status === 'ok') ? 'partial'
     : 'failed';
