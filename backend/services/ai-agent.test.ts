@@ -2795,5 +2795,58 @@ describe('AiAgent', () => {
       // allowlist — not tool_b, not the newly-reachable tool_x.
       expect(capturedToolCalls[1].map((t) => t.name).sort()).toEqual(['request_tools', 'tool_a']);
     });
+
+    it('refuses to execute a tool_use for a name outside the allowlist, even when scopes would allow it', async () => {
+      // The allowlist used to filter only what was DECLARED to the model; a tool_use naming any
+      // other in-scope tool (e.g. injected by untrusted APK content) still executed.
+      const executeA = vi.fn().mockResolvedValue('a ran');
+      const executeB = vi.fn().mockResolvedValue('b ran');
+      const registry = makeRegistry([
+        { name: 'tool_a', context: ['devices'], execute: executeA },
+        { name: 'tool_b', context: ['devices'], execute: executeB },
+      ]);
+      const sentMessages: AiMessage[][] = [];
+      let callCount = 0;
+      const provider = makeMockProvider(vi.fn((messages: AiMessage[]) => {
+        sentMessages.push(structuredClone(messages));
+        callCount++;
+        if (callCount === 1) {
+          return (async function* () {
+            yield { type: 'tool_use' as const, id: 'tb1', name: 'tool_b', input: {} };
+            yield { type: 'tool_use' as const, id: 'ta1', name: 'tool_a', input: {} };
+            yield { type: 'usage' as const, inputTokens: 10, outputTokens: 5 };
+          })();
+        }
+        return textOnlyStream('Done');
+      }));
+      const agent = new AiAgent(db, registry, provider);
+      const onToolStart = vi.fn();
+      const onToolResult = vi.fn();
+
+      const result = await agent.handleMessageWithIdentity(identity, {
+        conversationId: null,
+        message: 'test',
+        pageContext: 'devices',
+        contextId: '1',
+        onToken: vi.fn(),
+        onToolStart,
+        onToolResult,
+        mode: 'silent',
+        maxTurns: 5,
+        toolAllowlist: ['tool_a'],
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(executeB).not.toHaveBeenCalled();
+      expect(executeA).toHaveBeenCalledTimes(1);
+      expect(onToolStart.mock.calls.map((c) => c[1])).toEqual(['tool_a']);
+      expect(onToolResult).toHaveBeenCalledWith('tb1', 'tool_b', 'Tool "tool_b" is not in this call\'s allowed tool list.', 0);
+      // The denial goes back to the model as tool_b's tool_result on the next turn.
+      const secondTurn = sentMessages[1];
+      const denial = secondTurn.find((m: any) => m.role === 'tool_result' && m.toolUseId === 'tb1') as any;
+      expect(denial.content).toBe('Tool "tool_b" is not in this call\'s allowed tool list.');
+      const allowed = secondTurn.find((m: any) => m.role === 'tool_result' && m.toolUseId === 'ta1') as any;
+      expect(allowed.content).toBe('a ran');
+    });
   });
 });
