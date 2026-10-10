@@ -23,6 +23,23 @@ test.describe('AI job pipelines', () => {
     await expect(page.getByText('agent-overview', { exact: true })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText('report', { exact: true })).toBeVisible();
 
+    // RunControls: entry-point picker and reuse toggle are present and interactable, without
+    // ever clicking Run — a real run costs a live model call and risks the cyber-classifier
+    // refusal this project exists to route around, which belongs in a periodic eval, not this
+    // gate-tested spec (see the note after the Run-flow code block above).
+    const entryPoint = page.getByRole('combobox', { name: 'Entry point' });
+    await expect(entryPoint).toHaveValue('trigger-full');
+    await entryPoint.selectOption('trigger-rescan');
+    await expect(entryPoint).toHaveValue('trigger-rescan');
+    await entryPoint.selectOption('trigger-full');
+
+    const reuseToggle = page.getByRole('checkbox', { name: 'Reuse unchanged nodes' });
+    await expect(reuseToggle).not.toBeChecked();
+    await reuseToggle.check();
+    await expect(reuseToggle).toBeChecked();
+    await reuseToggle.uncheck();
+    await expect(reuseToggle).not.toBeChecked();
+
     // Click the agent-overview AgentCall node, confirm the prompt editor opens with real content.
     await page.getByText('agent-overview', { exact: true }).click();
     await expect(page.getByRole('textbox')).toHaveValue(/Analyze \{\{trigger\.appName\}\}/);
