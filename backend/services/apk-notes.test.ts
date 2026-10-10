@@ -37,3 +37,30 @@ describe('removeNoteSection', () => {
     expect(getNote(db as any, 1)).toBe('');
   });
 });
+
+// Pins an undocumented invariant: patchNoteSection reads, splices and writes with no
+// `await` in between, so same-tick callers never lose each other's sections today.
+// If storage ever goes async (await between getNote and setNote), these interleave
+// and the last writer wins, dropping the other sections. That is a real bug, not a
+// flaky test.
+describe('concurrent patchNoteSection calls', () => {
+  let db: ReturnType<typeof createTestDb>;
+  beforeEach(() => { db = createTestDb(); });
+
+  it('four concurrent writes to four different sections of the same version all land, no lost update', async () => {
+    const versionId = 1;
+
+    await Promise.all([
+      Promise.resolve().then(() => patchNoteSection(db as any, versionId, 'Overview', 'Overview content.')),
+      Promise.resolve().then(() => patchNoteSection(db as any, versionId, 'Wait Times', 'Wait times content.')),
+      Promise.resolve().then(() => patchNoteSection(db as any, versionId, 'Maps', 'Maps content.')),
+      Promise.resolve().then(() => patchNoteSection(db as any, versionId, 'Secrets', 'Secrets content.')),
+    ]);
+
+    const note = getNote(db as any, versionId);
+    expect(note).toContain('## Overview\nOverview content.');
+    expect(note).toContain('## Wait Times\nWait times content.');
+    expect(note).toContain('## Maps\nMaps content.');
+    expect(note).toContain('## Secrets\nSecrets content.');
+  });
+});
