@@ -32,22 +32,26 @@ export interface RunResult {
 /**
  * Runs a pipeline graph to completion against an injected NodeExecutors map.
  *
- * THIS TASK (13) only handles graphs where every node has at most one incoming edge and
- * nothing branches — a straight topological walk in a single pass, no concurrency, no skip
- * propagation beyond "a failed parent skips its child", no envelope wiring for Branch/Report,
- * no multi-trigger zones, no memoization. Tasks 14-17 extend this same function in place:
- *   - Task 14: wave-based concurrent execution + real skip propagation
- *   - Task 15: envelope nodes (Branch/Report) get their Envelope-shaped inputs
+ * Runs the graph in waves: each round executes every node whose dependencies are already
+ * satisfied, concurrently via Promise.all, then recomputes the next round's ready set. A
+ * failed or skipped predecessor marks its successor 'skipped' too, and because a node only
+ * becomes ready once every incoming edge's source already has a recorded result, that skip
+ * status propagates transitively across however many hops separate it from the failure —
+ * not just to the immediate child.
+ *
+ * Still outstanding, for Tasks 15-17 to add to this same function in place:
+ *   - Task 15: envelope wiring for Branch/Report (they currently throw — see runOne below)
  *   - Task 16: multi-trigger zone partitioning (graph-validator.ts already enforces this
  *     statically; the executor still needs to run each zone from its own trigger)
  *   - Task 17: opt-in memoization
  *
  * `triggerNodeId` names which node in `graph.nodes` is the Trigger to seed with `rawInput` —
  * this is the real parameter driving the special-case "seed this node with rawInput instead of
- * its upstream outputs" behavior. It must never be replaced with a literal string: the test
- * fixture's Trigger node happens to be named 'trigger', but that is a coincidence of the fixture,
- * not a contract. A later task adds a fixture with a Trigger node named something else entirely
- * to catch exactly this shortcut.
+ * its upstream outputs" behavior, and it is also what every other node's input gets keyed
+ * under as `trigger` (see `input.trigger = outputs.get(triggerNodeId)` below). It must never
+ * be replaced with a literal string: one test fixture's Trigger node happens to be named
+ * 'trigger', but that's a coincidence of that fixture, not a contract — another fixture names
+ * its Trigger 'trigger-full' specifically to catch a hardcoded-literal shortcut here.
  */
 export async function runPipeline(
   graph: PipelineGraph,
@@ -106,9 +110,9 @@ export async function runPipeline(
   // which isn't a business outcome, and counting it as "ok" tips the vote the wrong way at
   // both ends. Over just the non-Trigger ("outcome") nodes: every ok -> 'ok'; some ok (mixed
   // with failed/skipped) -> 'partial' (one branch's failure doesn't sink a sibling branch
-  // that completed — Task 14's wave-based concurrency depends on this); none ok -> 'failed'
-  // (a single-chain failure, e.g. this task's own third test, where the only "ok" left after
-  // excluding the Trigger disappears, so it can't rescue the run into 'partial').
+  // that completed concurrently in the same or a later wave); none ok -> 'failed' (a
+  // single-chain failure, where the only "ok" left after excluding the Trigger disappears,
+  // so it can't rescue the run into 'partial').
   //
   // 'inactive' is excluded from the same filter alongside Trigger-kind nodes: nothing produces
   // it yet (Task 15's Branch routing and Task 16's multi-trigger zones are the first to), but
@@ -132,9 +136,10 @@ export async function runPipeline(
 }
 
 /**
- * Kahn's algorithm — stable ordering for the linear-chain graphs this task handles.
- * Task 14 replaces this single-pass walk with wave-based concurrent execution, but the
- * ordering contract (a node never runs before any of its direct predecessors) carries over.
+ * Kahn's algorithm — produces a stable ordering used only for the `nodes` array in the
+ * returned RunResult (callers get results in a deterministic, dependency-respecting order).
+ * It no longer drives execution order: `runPipeline`'s wave loop above recomputes its own
+ * ready set each round from `results`, independently of this ordering.
  */
 function topologicalOrder(graph: PipelineGraph): string[] {
   const degreeLeft = new Map<string, number>();
