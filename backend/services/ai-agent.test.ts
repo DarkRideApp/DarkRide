@@ -17,6 +17,7 @@ import { ModelRefusedError, OverloadedError } from './ai/errors';
 import type {
   AiStreamEvent,
   AiMessage,
+  AiToolDefinition,
 } from '../../shared/types/ai-chat';
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -2670,6 +2671,81 @@ describe('AiAgent', () => {
       expect(usage?.requests.map((r) => r.inputTokens)).toEqual([40, 60]);
       expect(usage?.turns).toBe(2);
       expect(usage?.toolCalls).toBe(1);
+    });
+  });
+
+  describe('toolAllowlist', () => {
+    const identity: AgentIdentity = {
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: ['devices:read', 'devices:write'],
+      onBehalfOfService: 'test',
+    };
+
+    function makeCapturingProvider(): { provider: AiStreamingProvider; capturedTools: () => AiToolDefinition[] } {
+      let capturedTools: AiToolDefinition[] = [];
+      const createStreamingRequest = vi.fn(
+        (_messages: AiMessage[], _systemPrompt: string, tools: AiToolDefinition[]) => {
+          capturedTools = tools;
+          return textOnlyStream('ok');
+        },
+      );
+      return { provider: makeMockProvider(createStreamingRequest), capturedTools: () => capturedTools };
+    }
+
+    it('restricts the resolved tool list to just the allowlisted names', async () => {
+      const { provider, capturedTools } = makeCapturingProvider();
+      const registry = makeRegistry([
+        { name: 'tool_a' },
+        { name: 'tool_b' },
+        { name: 'tool_c' },
+      ]);
+      const agent = new AiAgent(db, registry, provider);
+
+      const result = await agent.handleMessageWithIdentity(identity, {
+        conversationId: null,
+        message: 'test',
+        pageContext: 'devices',
+        contextId: '1',
+        onToken: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolResult: vi.fn(),
+        mode: 'silent',
+        maxTurns: 5,
+        toolAllowlist: ['tool_a', 'tool_b'],
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(capturedTools().map((t) => t.name).sort()).toEqual(['tool_a', 'tool_b']);
+    });
+
+    it('keeps full-context behavior when toolAllowlist is omitted', async () => {
+      const { provider, capturedTools } = makeCapturingProvider();
+      const registry = makeRegistry([
+        { name: 'tool_a' },
+        { name: 'tool_b' },
+        { name: 'tool_c' },
+      ]);
+      const agent = new AiAgent(db, registry, provider);
+
+      const result = await agent.handleMessageWithIdentity(identity, {
+        conversationId: null,
+        message: 'test',
+        pageContext: 'devices',
+        contextId: '1',
+        onToken: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolResult: vi.fn(),
+        mode: 'silent',
+        maxTurns: 5,
+      });
+
+      expect(result.error).toBeUndefined();
+      // Full set: the 3 registered tools plus the request_tools meta-tool, unfiltered.
+      expect(capturedTools().length).toBeGreaterThan(2);
+      expect(capturedTools().map((t) => t.name).sort()).toEqual(
+        ['request_tools', 'tool_a', 'tool_b', 'tool_c'],
+      );
     });
   });
 });

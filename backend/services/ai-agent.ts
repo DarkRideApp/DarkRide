@@ -63,6 +63,12 @@ export interface HandleMessageParams {
    * In silent mode, only tools with `allowUnattended !== false` are available.
    */
   mode: 'silent' | 'streaming';
+  /**
+   * Restrict the resolved tool list to exactly these names. Added for AgentCall pipeline
+   * nodes — never widens the context's tool set, only narrows it. Omitted: today's
+   * behavior (every tool registered for pageContext), unchanged.
+   */
+  toolAllowlist?: string[];
 }
 
 /**
@@ -437,6 +443,10 @@ export class AiAgent implements AiAgentInterface {
     // 3. Get tool definitions for the page context (filtered by user scopes + unattended mode)
     const activeContexts = new Set<string>([pageContext]);
     let tools = this.toolRegistry.getToolDefinitionsForUser(pageContext, userScopes, unattended);
+    if (params.toolAllowlist) {
+      const allowed = new Set(params.toolAllowlist);
+      tools = tools.filter(t => allowed.has(t.name));
+    }
 
     // 4. Build system prompt
     const systemPrompt = buildSystemPrompt(pageContext, contextId, tools, maxTurns);
