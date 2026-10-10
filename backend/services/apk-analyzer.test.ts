@@ -51,10 +51,17 @@ vi.mock('../logs', () => ({
   createLoggers: () => ({ log: vi.fn(), error: vi.fn() }),
 }));
 
+const { runPipelineMock } = vi.hoisted(() => ({ runPipelineMock: vi.fn() }));
+vi.mock('./ai-jobs/pipeline-runner', async (importOriginal) => {
+  const original = await importOriginal<typeof import('./ai-jobs/pipeline-runner')>();
+  return { ...original, runPipeline: runPipelineMock };
+});
+
 import { ApkAnalyzerService } from './apk-analyzer';
 import { broadcastToAll } from '../websocket/index';
 import { getNote, patchNoteSection } from './apk-notes';
 import { createTestDb } from '../test-utils/create-test-db';
+import { ASTERIX_PATTERN_GRAPH } from './ai-jobs/apk-analysis-pipeline';
 
 function insertTrackedApp(db: BetterSQLite3Database<typeof schema>, packageName: string): number {
   const result = db.insert(schema.trackedApps).values({
@@ -1189,6 +1196,104 @@ describe('ApkAnalyzerService', () => {
 
       expect(forCoreService).not.toHaveBeenCalled();
       expect(handleMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('AI notes generation — pipeline path', () => {
+    let versionId: number;
+
+    const SEEDED_GRAPH = {
+      nodes: [{ id: 'trigger-full', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: [] } }],
+      edges: [],
+    };
+
+    function seedPublishedPipeline() {
+      const now = new Date();
+      const pipelineId = db.insert(schema.aiPipelines).values({
+        name: 'Astérix pattern', jobKind: 'apk-analysis', createdAt: now,
+      }).run().lastInsertRowid as number;
+      // An older draft version — must never be the one a run picks up.
+      db.insert(schema.aiPipelineVersions).values({
+        pipelineId, version: 1, graph: { nodes: [], edges: [] } as any, status: 'draft', createdAt: now,
+      }).run();
+      // The current published version, with a graph distinguishable from ASTERIX_PATTERN_GRAPH.
+      db.insert(schema.aiPipelineVersions).values({
+        pipelineId, version: 2, graph: SEEDED_GRAPH as any, status: 'published', createdAt: now,
+      }).run();
+    }
+
+    beforeEach(() => {
+      const appId = insertTrackedApp(db, 'com.example.pipeline-path');
+      versionId = insertApkVersion(db, appId);
+      runPipelineMock.mockReset();
+    });
+
+    function configureAiFactory() {
+      const forUser = vi.fn().mockReturnValue({
+        identity: { identityType: 'user', actorUserId: 42, effectiveScopes: ['core.apk:read'] },
+        handleMessage: vi.fn().mockResolvedValue({ usage: {}, conversationId: 1 }),
+      });
+      service.setAiConfig(() => 'test prompt', () => true);
+      service.setAiFactory({ forUser, forCoreService: vi.fn() } as any);
+      return { forUser };
+    }
+
+    it("calls runPipeline with the DB's published apk-analysis graph, not a hardcoded constant, when ai_pipelines_enabled is true", async () => {
+      seedPublishedPipeline();
+      runPipelineMock.mockResolvedValue({ status: 'ok', nodes: [] });
+      configureAiFactory();
+      (service as any).setPipelinesEnabled(() => true);
+
+      const result = service.triggerAiAgentManual(versionId, 42);
+      expect(result.started).toBe(true);
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(runPipelineMock).toHaveBeenCalled();
+      const graphArg = runPipelineMock.mock.calls[0][0];
+      expect(graphArg).toEqual(SEEDED_GRAPH);
+      expect(graphArg).not.toBe(ASTERIX_PATTERN_GRAPH);
+      expect(graphArg).not.toEqual(ASTERIX_PATTERN_GRAPH);
+      expect(runPipelineMock.mock.calls[0][1]).toBe('trigger-full');
+      expect(runPipelineMock.mock.calls[0][2]).toEqual({ versionId });
+    });
+
+    it('keeps calling agent.handleMessage directly when ai_pipelines_enabled is false (the default)', async () => {
+      seedPublishedPipeline();
+      const { forUser } = configureAiFactory();
+      (service as any).setPipelinesEnabled(() => false);
+
+      const result = service.triggerAiAgentManual(versionId, 42);
+      expect(result.started).toBe(true);
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(runPipelineMock).not.toHaveBeenCalled();
+      const boundAgent = forUser.mock.results[0].value;
+      expect(boundAgent.handleMessage).toHaveBeenCalledOnce();
+    });
+
+    it('logs and does not throw out of the request handler when no published apk-analysis pipeline row exists', async () => {
+      // Deliberately not seeding any aiPipelines/aiPipelineVersions row.
+      configureAiFactory();
+      (service as any).setPipelinesEnabled(() => true);
+
+      (broadcastToAll as any).mockClear();
+      let result: { started: boolean; reason?: string } | undefined;
+      expect(() => {
+        result = service.triggerAiAgentManual(versionId, 42);
+      }).not.toThrow();
+      expect(result?.started).toBe(true);
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(runPipelineMock).not.toHaveBeenCalled();
+      const updates = (broadcastToAll as any).mock.calls.map((c: any) => c[0]).filter((m: any) => m.type === 'apk:ai-agent-update');
+      expect(updates.map((u: any) => u.status)).toEqual(['running', 'failed']);
+      expect(service.isAiAgentRunning(versionId)).toBe(false);
     });
   });
 });
