@@ -2199,6 +2199,14 @@ describe('runPipeline — envelope nodes', () => {
   // executors.Branch; (3) same for a Report on a fully dead path — its Sink must never fire.
   // Each of these reproduces a real bug the review proved by probing the live executor, not a
   // hypothetical — write them as real regression tests, not a TODO.
+  //
+  // A fourth case, found on the SAME review's re-pass over its own fix: a Report fed by several
+  // sources where most are genuinely live and ok, and exactly one is on a dead (non-chosen)
+  // Branch edge — assert the Report's executor IS called (unlike case 3 above, where every
+  // source is dead), its Sink runs with the real assembled content from the live sections, and
+  // the overall run is 'ok'. This is the scenario that proved the naive "any dead edge -> Report
+  // inactive" rule wrong — six good sections must never be silently dropped because a seventh,
+  // optional one wasn't chosen.
 
   it('a Branch that is NOT the immediate child of a failure sees "skipped", not "failed" — the adjacency rule in practice', async () => {
     const graph: PipelineGraph = {
@@ -2271,21 +2279,34 @@ function buildEnvelope(parentId: string, results: Map<string, { status: string; 
 }
 ```
 
-In the wave loop, change the skip decision — note this anticipates the `unavailabilityStatus` helper Step 3 below replaces `parentUnavailable` with, so write them together rather than one then the other. **The envelope-node exemption applies only to a genuine ancestor failure (`'skipped'`), never to a dead/non-chosen path (`'inactive'`)** — a Branch or Report sitting entirely on an edge that was never chosen has nothing to decide or assemble, and must not run (this was a real bug caught in this task's own review: the first draft of this block exempted envelope nodes from `'inactive'` too, which let a second Branch — or a Report — sitting on a non-chosen edge still execute, including any Sink beneath it actually writing in production):
+In the wave loop, change the skip decision — note this anticipates the `unavailabilityStatus` helper Step 3 below replaces `parentUnavailable` with, so write them together rather than one then the other. **The envelope-node exemption applies only to a genuine ancestor failure (`'skipped'`), never to a dead/non-chosen path (`'inactive'`)** — a `Branch` or `Report` sitting entirely on an edge that was never chosen has nothing to decide or assemble, and must not run (this was a real bug caught in this task's own review: the first draft of this block exempted envelope nodes from `'inactive'` too, which let a second `Branch` — or a `Report` — sitting on a non-chosen edge still execute, including any `Sink` beneath it actually writing in production).
+
+**`Report` needs its own, more lenient eligibility rule, not the generic `unavailabilityStatus` check** — this is the spec's own explicit requirement (`docs/specs/2026-10-10-ai-job-pipelines-design.md`'s Node primitives table: "it always runs once every `from` node settles... rather than requiring all-`ok`"), and a second real bug this task's own review caught when the fix above was first drafted: `unavailabilityStatus` returns `'inactive'` the moment even ONE incoming edge is a pure branch-mismatch and none are real failures — correct for `Branch` (exactly one logical predecessor, so "any dead input" and "all dead inputs" are the same thing), wrong for `Report` (many declared sections, where the entire point is tolerating a mix of outcomes). Applying the generic rule to `Report` made a `Report` with, say, six live `ok` sections and a seventh behind a `Branch` that didn't choose that path go entirely `'inactive'` and never run — silently dropping six good sections and reporting the run `'ok'`, the exact "silent gap reported as success" failure mode this whole project exists to eliminate. `Report` must instead go `'inactive'` only when **every** incoming edge is dead; if even one is live (whether `ok`, `failed`, or `skipped` — anything that isn't `'inactive'`), `Report` runs and gets its usual per-section envelopes (Task 9's `runReport` already placeholders a non-`ok` section identically for `failed`/`skipped`/`inactive`, so no change needed there):
 
 ```ts
       const isEnvelopeNode = node.config.kind === 'Branch' || node.config.kind === 'Report';
-      if (unavailability === 'inactive') {
-        results.set(nodeId, { nodeId, status: 'inactive' });
-        return; // applies to EVERY node kind, including Branch/Report — a dead path is dead regardless of kind
-      }
-      if (unavailability === 'skipped' && !isEnvelopeNode) {
-        results.set(nodeId, { nodeId, status: 'skipped' });
-        return; // the envelope-node exemption, now scoped to genuine failures only
+
+      if (node.config.kind === 'Report') {
+        const incomingEdges = graph.edges.filter(e => e.to === nodeId);
+        const allIncomingInactive = incomingEdges.length > 0
+          && incomingEdges.every(e => results.get(e.from)?.status === 'inactive');
+        if (allIncomingInactive) {
+          results.set(nodeId, { nodeId, status: 'inactive' });
+          return;
+        }
+        // otherwise fall through and run Report normally — it's already exempt from 'skipped'
+        // below, and is now also exempt from a partial-'inactive' mix via the check just above
+      } else {
+        if (unavailability === 'inactive') {
+          results.set(nodeId, { nodeId, status: 'inactive' });
+          return; // every node kind except Report (handled above) — a dead path is dead regardless of kind
+        }
+        if (unavailability === 'skipped' && !isEnvelopeNode) {
+          results.set(nodeId, { nodeId, status: 'skipped' });
+          return; // the envelope-node exemption, now scoped to genuine failures only
+        }
       }
 ```
-
-(Deliberately not handled here: a `Report` fed by several sources where only SOME are on a dead branch while others are genuinely live — under this logic, the whole `Report` becomes `'inactive'` only if EVERY incoming edge is a pure branch-mismatch; if even one source is a real failure/skip, `branchMismatchOnly` flips and `Report` still runs. A `Report` with a mix of live-and-ok sources alongside branch-dead ones isn't specially handled and isn't exercised by the Astérix pipeline, which never uses `Branch` — flagged as an Open Question rather than solved speculatively.)
 
 And replace `runOne`'s `Branch`/`Report` cases:
 
@@ -2339,7 +2360,7 @@ and in the wave loop, right before the `runOne` call, branch on node kind to bui
       }
 ```
 
-Finally, a `Branch`'s *downstream* routing: when deciding whether a node fed by a `Branch` is unavailable, an edge whose `label` doesn't match the Branch's `chosenEdge` must count as unavailable even though the Branch itself is `ok`. But this needs to produce a status distinct from a genuine ancestor failure: a non-chosen edge was never going to run regardless of whether anything upstream failed, so it gets `'inactive'` (the same "structurally outside this run" concept Task 16 uses for a whole non-fired Trigger zone), while a real failed/skipped/inactive ancestor still produces `'skipped'`. Getting this wrong (marking a non-chosen edge `'skipped'`) makes a perfectly healthy Branch-routed run report `'partial'` overall purely because one edge was never taken — caught during Task 13's review, fixed here before this task's code was ever written.
+Finally, a `Branch`'s *downstream* routing: when deciding whether a node fed by a `Branch` is unavailable, an edge whose `label` doesn't match the Branch's `chosenEdge` must count as unavailable even though the Branch itself is `ok`. But this needs to produce a status distinct from a genuine ancestor failure: a non-chosen edge was never going to run regardless of whether anything upstream failed, so it gets `'inactive'` (the same "structurally outside this run" concept Task 16 uses for a whole non-fired Trigger zone). **Only a real `failed`/`skipped` ancestor produces `'skipped'` — `'inactive'` never does, at any depth.** (An earlier draft of this paragraph said "a real failed/skipped/inactive ancestor still produces skipped" — that's the exact bug this task's own review caught and fixed below: grouping `'inactive'` with the two real-failure statuses made an inactive ancestor degrade into `'skipped'` one hop downstream, which makes a perfectly healthy Branch-routed run report `'partial'` overall purely because one edge was never taken.)
 
 Replace the `incoming.some(p => ...)` boolean from Task 14 with a function that returns the right status instead of a bare boolean. Add `PipelineNode` to this file's existing `import type { PipelineGraph, NodeConfig, ... } from './types';` line — it's used here as an explicit parameter annotation for the first time in this file (everywhere else it was only ever inferred):
 
@@ -4069,6 +4090,6 @@ git commit -m "test(ai-jobs): e2e — canvas renders the real pipeline, prompt e
 - Every "Open question" already named in the spec itself (reconverging Trigger zones, cross-version memoization, versioned prompt templates, human-in-the-loop nodes) — unchanged, still future work, not restated here.
 - **Wave-based scheduling blocks a wave's faster nodes on its slowest node** (Task 14, found in that task's review) — `runPipeline`'s executor runs each wave's ready nodes concurrently via `Promise.all`, but waits for every one of them before computing the next wave, even across independent branches. For the shipped Astérix pipeline this costs nothing (its 7 parallel `AgentCall`s all sit in one wave, and `Report` genuinely needs all 7 to finish before it can run regardless), but a future pipeline with asymmetric independent branches off one `Trigger` would have its faster branch's downstream nodes wait on the slower branch's node to finish first. Fixing this properly means a true dataflow scheduler (start each node the instant its own predecessors settle, not wave-by-wave) — a real rewrite of the executor's scheduling loop, not a patch, and three more tasks (15-17) build directly on the current wave shape. Deliberately not done now; a future pipeline with real throughput needs should prompt revisiting this.
 - **What an ordinary (non-envelope) node that merges both of a Branch's arms should do is undefined** (Task 15, found in that task's review) — if a plain node (not a `Report`) has two incoming edges, one from the chosen arm and one from the non-chosen arm, `unavailabilityStatus` currently makes it `'inactive'` (since the non-chosen arm's edge is never resolved to a real failure), even though its OTHER input is perfectly live. Under the executor's existing strict-AND-join semantics (every input must be available for a node to run — unchanged since Task 14), this is arguably correct: a node genuinely can't do its job with one of its two declared inputs permanently absent. But the spec never states that a `Report` is the *only* valid way to rejoin a Branch's arms, and the graph validator doesn't enforce it. Not fixed — deliberately left as a named design question rather than guessed at; either the validator should reject a non-`Report` merge downstream of a `Branch`, or the spec should explicitly bless it with these "inactive wins" semantics.
-- **A `Report` fed by a mix of live-and-ok sources and sources on a dead (non-chosen) branch isn't specially handled** (Task 15, found in that task's review) — the fix for the two bugs above makes a `Report` become `'inactive'` only if EVERY one of its incoming edges is a pure branch-mismatch; if even one source is a genuine failure/skip, the `Report` still runs (fault-tolerant, as designed). But a `Report` with, say, 6 always-live sections plus a 7th section fed from behind a `Branch` that didn't choose that path isn't exercised by any test, and isn't reachable by the shipped Astérix pipeline (which never uses `Branch`). Revisit if a future pipeline needs a `Report` to gracefully fold in an optional, branch-gated section.
+- ~~A `Report` fed by a mix of live-and-ok sources and sources on a dead (non-chosen) branch isn't specially handled~~ — **this was wrong and has been fixed, not deferred.** The generic `unavailabilityStatus` rule goes `'inactive'` the moment even one incoming edge is a pure branch-mismatch, which is correct for `Branch` (one logical predecessor) but was being applied to `Report` too — and a second pass of Task 15's own review (re-verified against the spec's explicit text: "`Report`... always runs once every `from` node settles... rather than requiring all-`ok`") caught that this made a `Report` with, say, 6 live `ok` sections plus a 7th behind a non-chosen `Branch` edge go entirely `'inactive'` and never run — silently dropping 6 good sections while reporting the run `'ok'`. `Report` now has its own eligibility rule: `'inactive'` only when **every** incoming edge is dead, never merely because some are. See the code block above.
 - **The special `trigger` input key can collide with a real node literally named `"trigger"`** (Task 14, found in that task's review) — `input.trigger = outputs.get(triggerNodeId)` (every node's input always carries the fired Trigger's output under the literal key `'trigger'`) would silently overwrite a legitimate predecessor's output if some OTHER node in the graph is also named `trigger` and happens to be a direct predecessor of the same node. Narrow (requires a graph author to pick that exact id for a non-Trigger node) and not reachable in the shipped Astérix pipeline (whose Trigger nodes are named `trigger-full`/`trigger-rescan`, never bare `trigger`). A cheap fix exists (reserve `'trigger'` as a disallowed node id in `graph-validator.ts`) but wasn't added — Task 12 is already shipped and reviewed, and this is narrow enough not to justify reopening it. Worth a one-line addition to the validator whenever that file is next touched.
 - **The spec's Testing section names three lanes — Gate tests, Periodic eval, E2E. This plan only has tasks for the first and third.** No periodic-eval harness exists anywhere in this codebase today (checked: no `eval` infra under `backend/`, nothing beyond unrelated name collisions) — there is no established convention this plan could follow, and inventing one from scratch wasn't done here rather than guessed at. The four assertions the spec's Testing section calls for (no single failure empties more than its own section; token cost holds against today's design; benign sections stay on the High tier's top model; Group B's fallback rate isn't worse scoped than diluted) are real, still unimplemented, and — per CLAUDE.md's "every feature ships with a test suite AND an eval suite, in the same commit" — this plan is **not** a complete discharge of that rule as written. Whoever picks this plan up should treat "design the eval harness" as its own small piece of work, done before calling the whole feature DONE, not silently skipped because it wasn't a task above.
