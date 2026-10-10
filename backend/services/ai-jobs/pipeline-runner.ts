@@ -1,5 +1,5 @@
 import type {
-  PipelineGraph, PipelineNode, NodeConfig, NodeRunStatus, RunStatus, Envelope,
+  PipelineGraph, PipelineNode, PipelineEdge, NodeConfig, NodeRunStatus, RunStatus, Envelope,
   TriggerConfig, AgentCallConfig, TransformConfig, BranchConfig, ReportConfig, ForEachConfig, SinkConfig,
 } from './types';
 
@@ -84,24 +84,54 @@ export async function runPipeline(
       const unavailability = unavailabilityStatus(nodeId, graph, byId, results);
       const isEnvelopeNode = node.config.kind === 'Branch' || node.config.kind === 'Report';
 
-      // 'inactive' means this node sits on a path that was structurally never going to run —
-      // a dead Branch edge, not a real failure anywhere upstream. That applies to EVERY node
-      // kind, including Branch/Report: the envelope-node exemption below exists so a Branch or
-      // Report can still make a decision or assemble a report after a REAL ancestor failure,
-      // not so it can run code (including a Branch choosing yet another edge, or a Report's own
-      // Sink) on a path that was never chosen in the first place. Checked before the envelope
-      // exemption, not folded into it.
-      if (unavailability === 'inactive') {
-        results.set(nodeId, { nodeId, status: 'inactive' });
-        return;
-      }
+      // Report gets its OWN eligibility check, separate from the generic unavailabilityStatus
+      // used by every other node kind (Branch included). Branch has exactly one logical
+      // predecessor, so "any dead input" and "all dead inputs" are the same thing for it —
+      // unavailabilityStatus's all-or-nothing answer is correct there. Report is different by
+      // design: it's built to assemble a mix of outcomes across many declared sections (the spec
+      // is explicit — "it always runs once every `from` node settles... receiving an envelope...
+      // per section rather than requiring all-`ok`"). If Report used the generic check, ONE
+      // section behind a non-chosen Branch edge among several other genuinely live sections
+      // would mark the whole Report 'inactive' and skip it entirely — silently dropping every
+      // other section's real output and reporting the run 'ok' regardless, which is exactly the
+      // silent-data-loss failure Report exists to prevent. So Report goes 'inactive' only when
+      // EVERY incoming edge is dead; if even one is live (ok/failed/skipped all count as live —
+      // only 'inactive' counts as dead), Report runs normally and gets its usual per-section
+      // envelopes (buildEnvelope already turns a dead section into {status:'inactive'}, which
+      // runReport's placeholder logic treats the same as failed/skipped for that one section).
+      if (node.config.kind === 'Report') {
+        const incomingEdges = graph.edges.filter(e => e.to === nodeId);
+        // Per-EDGE liveness, not per-parent: a Report fed directly off a Branch's non-chosen
+        // labeled edge has a parent (the Branch) that resolved 'ok' — checking the parent's own
+        // collapsed status would miss that this specific edge was never the chosen one. isEdgeDead
+        // already accounts for both a dead ('inactive') parent and a Branch-label mismatch on
+        // this exact edge, which is what correctly marks that case dead too.
+        const allIncomingDead = incomingEdges.length > 0
+          && incomingEdges.every(e => isEdgeDead(e, byId, results));
+        if (allIncomingDead) {
+          results.set(nodeId, { nodeId, status: 'inactive' });
+          return;
+        }
+        // Otherwise fall through and run Report normally, below.
+      } else {
+        // 'inactive' means this node sits on a path that was structurally never going to run —
+        // a dead Branch edge, not a real failure anywhere upstream. That applies to every other
+        // node kind (including Branch, per the comment above): the envelope-node exemption below
+        // exists so a Branch can still make a decision after a REAL ancestor failure, not so it
+        // can run code (including choosing yet another edge) on a path that was never chosen in
+        // the first place. Checked before the envelope exemption, not folded into it.
+        if (unavailability === 'inactive') {
+          results.set(nodeId, { nodeId, status: 'inactive' });
+          return;
+        }
 
-      // Branch/Report are envelope nodes: they run even when their immediate parent genuinely
-      // failed (they receive an Envelope describing what happened instead of being skipped) —
-      // but only for a real failure, never for the dead-path case handled above.
-      if (unavailability === 'skipped' && !isEnvelopeNode) {
-        results.set(nodeId, { nodeId, status: 'skipped' });
-        return;
+        // Branch is an envelope node: it runs even when its immediate parent genuinely failed
+        // (it receives an Envelope describing what happened instead of being skipped) — but only
+        // for a real failure, never for the dead-path case handled above.
+        if (unavailability === 'skipped' && !isEnvelopeNode) {
+          results.set(nodeId, { nodeId, status: 'skipped' });
+          return;
+        }
       }
 
       let branchEnvelope: Envelope | undefined;
@@ -239,6 +269,32 @@ function buildEnvelope(parentId: string, results: Map<string, NodeRunResult>): E
 }
 
 /**
+ * Whether a single incoming edge is "dead" this run — its source never actually fed this edge,
+ * either because the source itself is already 'inactive' (a dead path, recursively), or because
+ * the source is a Branch and THIS edge's label isn't the one it chose (the source itself may
+ * well have resolved 'ok' — a Branch always does when it runs — so checking the source's own
+ * collapsed status is not enough; the per-edge label match is what actually decides whether this
+ * particular edge carried anything).
+ *
+ * A 'failed' or 'skipped' source is deliberately NOT "dead" by this definition: those are real,
+ * reportable outcomes (Report's whole job is surfacing them, not treating them as absence), only
+ * 'inactive' and a lost Branch-label match mean "this edge never had a chance to carry anything."
+ *
+ * Shared by `unavailabilityStatus` (every node kind's "any dead edge counts" rule) and the
+ * `Report`-specific "only ALL-dead counts" rule below — same notion of edge death, two different
+ * aggregations over it.
+ */
+function isEdgeDead(e: PipelineEdge, byId: Map<string, PipelineNode>, results: Map<string, NodeRunResult>): boolean {
+  const parentResult = results.get(e.from);
+  if (parentResult?.status === 'inactive') return true;
+  if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
+    const chosenEdge = (parentResult?.output as { chosenEdge?: string } | undefined)?.chosenEdge;
+    return chosenEdge !== e.label;
+  }
+  return false;
+}
+
+/**
  * Decides whether a node is unavailable this run, and if so, which of the two distinct
  * negative statuses applies:
  *   - 'skipped' — a REAL ancestor failure/skip fed this node (at least one incoming edge's
@@ -278,24 +334,18 @@ function unavailabilityStatus(
   let anyUnavailable = false;
   let branchMismatchOnly = true; // flips to false the moment a REAL ancestor failure/skip is found
   for (const e of incomingEdges) {
-    const parentResult = results.get(e.from);
-    const s = parentResult?.status;
+    const s = results.get(e.from)?.status;
     if (s === 'failed' || s === 'skipped') {
       anyUnavailable = true;
       branchMismatchOnly = false;
       continue;
     }
-    // An 'inactive' parent is a dead path, not a real failure — it must propagate as 'inactive',
-    // never degrade to 'skipped' just because it crossed a hop boundary. Does NOT flip
-    // branchMismatchOnly: an inactive ancestor is itself only ever caused by a branch mismatch
-    // (or another inactive ancestor, recursively) further up the chain.
-    if (s === 'inactive') {
+    // A dead edge (source already 'inactive', or a Branch's non-chosen label) must propagate as
+    // 'inactive', never degrade to 'skipped' just because it crossed a hop boundary — it does NOT
+    // flip branchMismatchOnly: a dead edge is itself only ever caused by a branch mismatch (or
+    // another dead edge, recursively) further up the chain, never a real failure.
+    if (isEdgeDead(e, byId, results)) {
       anyUnavailable = true;
-      continue;
-    }
-    if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
-      const chosenEdge = (parentResult?.output as { chosenEdge?: string } | undefined)?.chosenEdge;
-      if (chosenEdge !== e.label) anyUnavailable = true; // branchMismatchOnly stays true unless another edge says otherwise
     }
   }
   if (!anyUnavailable) return null;
