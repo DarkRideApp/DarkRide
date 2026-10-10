@@ -63,6 +63,12 @@ export interface HandleMessageParams {
    * In silent mode, only tools with `allowUnattended !== false` are available.
    */
   mode: 'silent' | 'streaming';
+  /**
+   * Restrict the resolved tool list to exactly these names. Added for AgentCall pipeline
+   * nodes — never widens the context's tool set, only narrows it. Omitted: today's
+   * behavior (every tool registered for pageContext), unchanged.
+   */
+  toolAllowlist?: string[];
 }
 
 /**
@@ -437,6 +443,10 @@ export class AiAgent implements AiAgentInterface {
     // 3. Get tool definitions for the page context (filtered by user scopes + unattended mode)
     const activeContexts = new Set<string>([pageContext]);
     let tools = this.toolRegistry.getToolDefinitionsForUser(pageContext, userScopes, unattended);
+    if (params.toolAllowlist) {
+      const allowed = new Set(params.toolAllowlist);
+      tools = tools.filter(t => allowed.has(t.name));
+    }
 
     // 4. Build system prompt
     const systemPrompt = buildSystemPrompt(pageContext, contextId, tools, maxTurns);
@@ -594,6 +604,10 @@ export class AiAgent implements AiAgentInterface {
             }
           }
           tools = this.toolRegistry.getToolDefinitionsForContextsForUser([...activeContexts], userScopes, unattended);
+          if (params.toolAllowlist) {
+            const allowed = new Set(params.toolAllowlist);
+            tools = tools.filter(t => allowed.has(t.name));
+          }
 
           // Add tool result for request_tools
           const contextList = [...activeContexts].join(', ');
@@ -603,6 +617,22 @@ export class AiAgent implements AiAgentInterface {
             content: `Tools loaded for contexts: ${contextList}`,
           });
         } else {
+          // Enforce toolAllowlist at execution time, not just when declaring tools. Found in the
+          // final pipeline review: the filters above only decide what the model is TOLD it has; a
+          // tool_use for any other name (prompt injection from untrusted content such as a
+          // decompiled APK, a stale tool list from an earlier turn, or a hallucinated name) still
+          // ran as long as the identity's scopes allowed it.
+          if (params.toolAllowlist && !params.toolAllowlist.includes(toolCall.name)) {
+            const deniedMsg = `Tool "${toolCall.name}" is not in this call's allowed tool list.`;
+            messages.push({
+              role: 'tool_result',
+              toolUseId: toolCall.id,
+              content: deniedMsg,
+            });
+            onToolResult(toolCall.id, toolCall.name, deniedMsg, 0);
+            continue;
+          }
+
           // Check if tool requires user confirmation
           if (onToolConfirm && this.toolRegistry.requiresConfirmation(toolCall.name)) {
             const allowed = await onToolConfirm(toolCall.id, toolCall.name, toolCall.input);

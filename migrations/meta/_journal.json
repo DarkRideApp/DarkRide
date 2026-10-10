@@ -596,6 +596,13 @@
       "when": 1791494784563,
       "tag": "0101_ai_call_request",
       "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1791494784564,
+      "tag": "0102_ai_pipelines",
+      "breakpoints": true
     }
   ]
 }

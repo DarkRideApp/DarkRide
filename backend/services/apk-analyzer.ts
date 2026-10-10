@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { eq, and, desc } from 'drizzle-orm';
-import { analysisJobs, apkVersions, trackedApps } from '../db/schema';
+import { analysisJobs, apkVersions, trackedApps, aiPipelines, aiPipelineVersions } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import type { AnalysisJob } from '../../shared/types/api';
 import type { ToolManager, ToolPaths } from './tool-manager';
@@ -10,6 +10,9 @@ import type { FileStorageService } from './file-storage';
 import type { TierConfig } from './ai-agent';
 import { AI_ANALYSIS_MAX_TURNS } from './ai-agent';
 import type { AiAgentFactory } from './ai-agent-factory';
+import { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, type ApkAnalysisIdentity } from './ai-jobs/apk-analysis-pipeline';
+import { startPipelineRun } from './ai-jobs/run-executor';
+import type { PipelineGraph } from './ai-jobs/types';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
 import { APK_DIR, apkFilePath, resolveApkLocal, apkCloudKey, ensureApkLocal, analysisDir as getAnalysisDir } from '../utils/apk-paths';
@@ -59,6 +62,7 @@ export class ApkAnalyzerService {
   private getAiPrompt: (() => string) | null = null;
   private getAiAutorun: (() => boolean) | undefined = undefined;
   private getTierConfig: (() => TierConfig | null) | null = null;
+  private getPipelinesEnabled?: () => boolean;
   private activeAiAgentRuns = new Set<number>();
   private diffEngine: import('./apk-diff-engine').ApkDiffEngine | null = null;
   private hookBus: import('@darkrideapp/plugin-sdk').HookBus | null = null;
@@ -77,6 +81,11 @@ export class ApkAnalyzerService {
     this.getAiPrompt = getPrompt;
     this.getAiAutorun = getAutorun;
     this.getTierConfig = getTierConfig ?? null;
+  }
+
+  /** Gate for the new pipeline-engine path (Task 21). Unset/false keeps the old single-agent loop. */
+  setPipelinesEnabled(getEnabled: () => boolean): void {
+    this.getPipelinesEnabled = getEnabled;
   }
 
   /**
@@ -872,7 +881,7 @@ export class ApkAnalyzerService {
       return;
     }
 
-    this.runAiAgent(versionId, agent);
+    this.runAiAgent(versionId, agent, { type: 'core-service' });
   }
 
   /** Manual trigger: a user clicks "AI Analysis" — runs under that user's identity. */
@@ -892,18 +901,29 @@ export class ApkAnalyzerService {
       return { started: false, reason: 'AI agent already running for this version' };
     }
 
-    this.runAiAgent(versionId, agent);
+    this.runAiAgent(versionId, agent, { type: 'user', userId });
     return { started: true };
   }
 
-  private runAiAgent(versionId: number, agent: import('./ai-agent-factory').BoundAgent): void {
+  private runAiAgent(
+    versionId: number,
+    agent: import('./ai-agent-factory').BoundAgent,
+    identity: ApkAnalysisIdentity,
+  ): void {
     if (this.activeAiAgentRuns.has(versionId)) {
       log(`AI agent already running for version ${versionId}, skipping`);
       return;
     }
 
-    const prompt = this.getAiPrompt!();
-    const tierConfig = this.getTierConfig?.() ?? undefined;
+    // Read every setting up front, before registering the run as active or broadcasting
+    // 'running' — found during this task's review: a throw from getAiPrompt/getTierConfig
+    // (both DB reads) after activeAiAgentRuns.add() left versionId wedged forever, with a
+    // 'running' broadcast already sent and nothing to clear it. Reading getPipelinesEnabled
+    // up front for the same reason — it's also a DB read.
+    const usePipeline = this.getPipelinesEnabled?.() ?? false;
+    const prompt = usePipeline ? undefined : this.getAiPrompt!();
+    const tierConfig = usePipeline ? undefined : (this.getTierConfig?.() ?? undefined);
+
     this.activeAiAgentRuns.add(versionId);
 
     broadcastToAll({
@@ -914,10 +934,21 @@ export class ApkAnalyzerService {
 
     log(`Starting AI agent for version ${versionId}`);
 
+    if (usePipeline) {
+      this.runAiPipeline(versionId, identity)
+        .catch((err: any) => {
+          this.recordAiFailure(versionId, err.message || String(err));
+        })
+        .finally(() => {
+          this.activeAiAgentRuns.delete(versionId);
+        });
+      return;
+    }
+
     agent
       .handleMessage({
         conversationId: null,
-        message: prompt,
+        message: prompt!,
         pageContext: 'apk-analysis',
         contextId: String(versionId),
         mode: 'silent',
@@ -967,6 +998,79 @@ export class ApkAnalyzerService {
       .finally(() => {
         this.activeAiAgentRuns.delete(versionId);
       });
+  }
+
+  /**
+   * Pipeline-engine path (Task 21), gated by `getPipelinesEnabled`. The graph always comes from
+   * the DB's current *published* `aiPipelineVersions` row for the `apk-analysis` job kind — never
+   * the `ASTERIX_PATTERN_GRAPH` constant directly — so an edit published through the pipeline
+   * editor takes effect on the next real auto/manual-triggered run without a server restart.
+   * `seedApkAnalysisPipeline` (Task 20) is what puts that constant into the DB at boot; this
+   * method only ever reads it back.
+   *
+   * Goes through the SAME `startPipelineRun` the REST `/run` endpoint uses (found in the final
+   * whole-branch review: before this, this path had no DB run record at all and no way to notice
+   * it was racing a REST-triggered run against the same APK version's note). The returned promise
+   * resolves once the run settles, so `runAiAgent`'s `activeAiAgentRuns` bookkeeping still spans
+   * the whole run.
+   */
+  private async runAiPipeline(versionId: number, identity: ApkAnalysisIdentity): Promise<void> {
+    const pipeline = this.db.select().from(aiPipelines)
+      .where(eq(aiPipelines.jobKind, 'apk-analysis'))
+      .orderBy(aiPipelines.id) // deterministic if more than one apk-analysis row ever exists — found during review
+      .all()[0];
+    if (!pipeline) {
+      this.recordAiFailure(versionId, 'No apk-analysis pipeline row found — did seedApkAnalysisPipeline run at boot?');
+      return;
+    }
+    const version = this.db.select().from(aiPipelineVersions)
+      .where(and(eq(aiPipelineVersions.pipelineId, pipeline.id), eq(aiPipelineVersions.status, 'published')))
+      .orderBy(desc(aiPipelineVersions.version)).all()[0];
+    if (!version) {
+      this.recordAiFailure(versionId, `Pipeline "${pipeline.name}" (id ${pipeline.id}) has no published version`);
+      return;
+    }
+
+    const triggerNodeId = 'trigger-full'; // auto/manual re-analysis both use the Full Analysis entry point
+
+    return new Promise<void>((resolve) => {
+      const started = startPipelineRun({
+        db: this.db,
+        pipelineVersionId: version.id,
+        graph: version.graph as PipelineGraph,
+        triggerNodeId,
+        input: { versionId },
+        triggeredBy: 'apk-analysis-complete',
+        executors: buildApkAnalysisExecutors(),
+        buildCtx: () => buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId }),
+        onSettled: (result, crashError) => {
+          // try/finally: a throw from any side effect below must never leave this promise
+          // pending, or runAiAgent's `.finally` never clears activeAiAgentRuns and this APK
+          // version can never be AI-analysed again until a restart.
+          try {
+            if (result.status === 'failed') {
+              const failedNodes = result.nodes.filter(n => n.status === 'failed').map(n => `${n.nodeId}: ${n.error}`).join('; ');
+              this.recordAiFailure(versionId, failedNodes || crashError || 'Pipeline run failed');
+            } else {
+              this.clearAiFailure(versionId);
+              // Scope gap, stated plainly rather than silently absorbed: `frontend/pages/ApkAnalysis.tsx`
+              // types `msg.status` as the literal union 'running' | 'completed' | 'failed' — a `partial`
+              // run (say, Bypass Script failed but the other six sections landed) broadcasts as plain
+              // "completed" on the one surface an analyst actually watches during a run. Real, valuable
+              // follow-up work; out of scope here.
+              broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: 'completed' });
+              log(`AI pipeline completed for version ${versionId}: ${result.status}`);
+            }
+          } finally {
+            resolve();
+          }
+        },
+      });
+      if (!started.ok) {
+        this.recordAiFailure(versionId, started.error);
+        resolve();
+      }
+    });
   }
 
   /** An AI run failed: tell the open page and leave a note, so the reason is visible where the analysis should be. */

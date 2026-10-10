@@ -103,6 +103,9 @@ import { NotificationService } from './services/notification-service';
 import { registerNotificationEndpoints } from './api/notifications';
 import { JobRegistry } from './services/job-registry';
 import { registerJobEndpoints } from './api/jobs';
+import { registerAiPipelineEndpoints } from './api/ai-pipelines';
+import { APK_ANALYZER_AI_SCOPES, buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, seedApkAnalysisPipeline } from './services/ai-jobs/apk-analysis-pipeline';
+import { isPipelinesEnabled, resetRunningPipelineRuns } from './services/ai-jobs/run-executor';
 import { PluginManager } from './plugins/plugin-manager';
 import { computeLoadOrder } from './plugins/load-order';
 import { discoverPlugins, discoverNpmPlugins, applyPluginFilter } from './plugins/discover';
@@ -604,6 +607,9 @@ apkAnalyzer.setAiConfig(
 );
 // Note: apkAnalyzer.setAiFactory(aiFactory) is called after aiFactory is constructed below.
 
+// Gate for the new pipeline-engine path (Task 21). Defaults to false — opt in deliberately.
+apkAnalyzer.setPipelinesEnabled(() => isPipelinesEnabled(db));
+
 // Wire up APK diff engine
 const apkDiffEngine = new ApkDiffEngine(db);
 apkDiffEngine.setFileSync(fileSync);
@@ -766,6 +772,9 @@ pluginSourceManager.fetchAll(true).catch(err => {
   error(`Initial plugin source fetch failed (will retry on schedule): ${err.message}`);
 });
 registerJobEndpoints(jobRegistry);
+// registerAiPipelineEndpoints wiring moved below, right after `aiFactory` is constructed —
+// this call site runs before that `const aiFactory = ...` declaration executes, and referencing
+// it here would throw (temporal dead zone for a top-level `const`).
 registerInterceptRuleEndpoints(db, (msg) => broadcastToAll(msg));
 // Interactive intercept ("breakpoints") — separate from the rule-based feature above.
 registerInterceptLiveEndpoints((msg) => broadcastToAll(msg), (config) => writeHoldConfig(config));
@@ -806,7 +815,7 @@ registerAiChatEndpoints({
 // registerCoreIdentity MUST happen before setAiFactory so the first auto-trigger
 // doesn't race ahead before the identity is provisioned.
 aiFactory.registerCoreIdentity('apk-analyzer', {
-  aiScopes: ['core.apk:read', 'core.apk:manage', 'mcp'],
+  aiScopes: APK_ANALYZER_AI_SCOPES,
 });
 apkAnalyzer.setAiFactory(aiFactory);
 
@@ -814,6 +823,17 @@ aiFactory.registerCoreIdentity('apk-diff-engine', {
   aiScopes: ['core.apk:read', 'core.apk:manage', 'mcp'],
 });
 apkDiffEngine.setAiFactory(aiFactory);
+
+// Task 20: the Astérix pattern pipeline's REST surface. `aiFactory` must already exist (just
+// above) — this is why this call lives here rather than back at the TODO comment Task 19 left
+// near registerJobEndpoints.
+registerAiPipelineEndpoints({
+  db,
+  executors: buildApkAnalysisExecutors(),
+  buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }),
+  // Same flag as apkAnalyzer.setPipelinesEnabled above: with it off, /run answers 403.
+  getPipelinesEnabled: (db) => isPipelinesEnabled(db),
+});
 
 // Wire notification service to broadcast events not handled by direct service hooks
 onBroadcast((msg) => {
@@ -1391,7 +1411,13 @@ httpServer.listen(PORT, HOST, () => {
     log('APK tracker skipped (job disabled)');
   }
   apkAnalyzer.resetRunningJobs();
+  // Same idea for pipeline runs: a restart mid-run would otherwise leave the row 'running' and
+  // 409 every later run of that pipeline version forever. Before apkAnalyzer.start(), so a run
+  // it kicks off on boot can never be caught by this reset.
+  resetRunningPipelineRuns(db);
   apkAnalyzer.start();
+  // Seed the Astérix pattern pipeline + its published version — idempotent, safe on every boot.
+  seedApkAnalysisPipeline(db);
   fridaReleaseManager.start().catch(err => error('Frida release manager failed: ' + err.message));
   fileSync.start();
   jobRegistry.start();
