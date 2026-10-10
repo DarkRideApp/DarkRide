@@ -139,7 +139,20 @@ export async function runPipeline(
       if (node.config.kind === 'Branch') {
         branchEnvelope = buildEnvelope(incoming[0], results);
       } else if (node.config.kind === 'Report') {
-        reportEnvelopes = Object.fromEntries(incoming.map(p => [p, buildEnvelope(p, results)]));
+        // Edge-aware, not parent-status-based: a section sourced directly from a Branch's
+        // non-chosen edge has a parent (the Branch) that resolved 'ok' (it successfully routed),
+        // so buildEnvelope(e.from, results) would return {status:'ok', output:{chosenEdge}} —
+        // which has no real section content and crashes runReport's assembly, taking every OTHER
+        // live section down with it. isEdgeDead already knows this edge specifically was never
+        // the chosen one; when it says dead, the section gets an honest {status:'inactive'}
+        // placeholder instead of the Branch's raw routing output.
+        const reportIncomingEdges = graph.edges.filter(e => e.to === nodeId);
+        reportEnvelopes = Object.fromEntries(
+          reportIncomingEdges.map(e => [
+            e.from,
+            isEdgeDead(e, byId, results) ? { status: 'inactive' as const } : buildEnvelope(e.from, results),
+          ]),
+        );
       }
 
       const input = buildInput(incoming, outputs);
@@ -286,6 +299,11 @@ function buildEnvelope(parentId: string, results: Map<string, NodeRunResult>): E
  */
 function isEdgeDead(e: PipelineEdge, byId: Map<string, PipelineNode>, results: Map<string, NodeRunResult>): boolean {
   const parentResult = results.get(e.from);
+  // A failed/skipped Branch has no output.chosenEdge at all, so every one of its outgoing edges
+  // would otherwise look "dead" via the label-mismatch check below (chosenEdge !== e.label is
+  // true when chosenEdge is undefined) — that's wrong, this is a genuine failure, not a routing
+  // decision that went the other way. Must be checked before the Branch-label check, not after.
+  if (parentResult?.status === 'failed' || parentResult?.status === 'skipped') return false;
   if (parentResult?.status === 'inactive') return true;
   if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
     const chosenEdge = (parentResult?.output as { chosenEdge?: string } | undefined)?.chosenEdge;

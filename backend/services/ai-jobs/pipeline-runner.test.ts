@@ -469,4 +469,100 @@ describe('runPipeline — dead (non-chosen) Branch paths', () => {
     });
     expect(result.status).toBe('ok');
   });
+
+  it('a Report fed only by a Branch whose predicate throws still runs, with an honest "failed" envelope — not "inactive"', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary'] } },
+        { id: 'report', config: { kind: 'Report', sections: [{ title: 'X', from: 'branch' }] } },
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'agent' },
+        { from: 'agent', to: 'branch' },
+        { from: 'branch', to: 'report', label: 'primary' },
+        { from: 'report', to: 'sink' },
+      ],
+    };
+    let seenEnvelopes: any;
+    const report = vi.fn((_c, envelopes: any) => {
+      seenEnvelopes = envelopes;
+      const markdown = Object.entries(envelopes)
+        .map(([title, env]: [string, any]) =>
+          env.status === 'ok' ? `${title}: ${env.output.text}` : `${title}: unavailable this run (${env.status}${env.error ? ' — ' + env.error : ''})`)
+        .join('\n');
+      return { markdown };
+    });
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => ({ text: 'ok' })),
+      Branch: vi.fn(() => { throw new Error('predicate boom'); }), // the Branch's own logic throws
+      Report: report,
+    });
+    const result = await runPipeline(graph, 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'branch')!.status).toBe('failed');
+    // Report must still run — a failed Branch is a real, reportable outcome, not a dead edge.
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(result.nodes.find(n => n.nodeId === 'report')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'sink')!.status).toBe('ok'); // Report's Sink still fires
+    expect(seenEnvelopes).toEqual({ branch: { status: 'failed', error: expect.stringContaining('predicate boom') } });
+    // An honest failure placeholder reached the assembled output — not a crash, not a silent drop.
+    expect(report.mock.results[0].value.markdown).toContain('unavailable this run (failed');
+    expect(report.mock.results[0].value.markdown).toContain('predicate boom');
+    expect(result.status).toBe('partial'); // the Branch's genuine failure still counts against the run
+  });
+
+  it('a Report mixing one live AgentCall section with a DIRECT non-chosen-Branch-edge section runs correctly, with an inactive placeholder (not the Branch\'s raw output) for the gated one', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'liveAgent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'live', toolAllowlist: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary', 'fallback'] } },
+        { id: 'primarySink', config: { kind: 'Sink', writeFn: 'x' } },
+        { id: 'report', config: { kind: 'Report', sections: [{ title: 'Live', from: 'liveAgent' }, { title: 'Gated', from: 'branch' }] } },
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'liveAgent' }, { from: 'trigger', to: 'agent' },
+        { from: 'agent', to: 'branch' },
+        { from: 'branch', to: 'primarySink', label: 'primary' },
+        { from: 'branch', to: 'report', label: 'fallback' }, // Report sourced DIRECTLY off the non-chosen edge, no intermediate node
+        { from: 'liveAgent', to: 'report' },
+        { from: 'report', to: 'sink' },
+      ],
+    };
+    let seenEnvelopes: any;
+    const agentCall = vi.fn(async (config: any) => ({ text: config.instructionTemplate }));
+    const report = vi.fn((_c, envelopes: any) => {
+      seenEnvelopes = envelopes;
+      const markdown = Object.entries(envelopes)
+        .map(([title, env]: [string, any]) =>
+          env.status === 'ok' ? `${title}: ${env.output.text}` : `${title}: unavailable this run (${env.status})`)
+        .join('\n');
+      return { markdown };
+    });
+    const executors = fakeExecutors({
+      AgentCall: agentCall,
+      Branch: vi.fn(() => 'primary'), // never chooses 'fallback' — report's direct 'fallback' edge is dead
+      Report: report,
+    });
+    const result = await runPipeline(graph, 'trigger', {}, executors, {});
+
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(result.nodes.find(n => n.nodeId === 'report')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'sink')!.status).toBe('ok');
+    // The critical assertion: the gated section's envelope must be an honest {status:'inactive'}
+    // placeholder, NOT the Branch's own raw {status:'ok', output:{chosenEdge}} — that raw shape
+    // has no .text field and crashes a real assembly function expecting section content.
+    expect(seenEnvelopes).toEqual({
+      liveAgent: { status: 'ok', output: { text: 'live' } },
+      branch: { status: 'inactive' },
+    });
+    expect(report.mock.results[0].value.markdown).toContain('live');
+    expect(report.mock.results[0].value.markdown).toContain('unavailable this run (inactive)');
+    expect(result.status).toBe('ok'); // nothing failed — the gated edge is inactive, not a negative outcome
+  });
 });
