@@ -2164,8 +2164,31 @@ describe('runPipeline — envelope nodes', () => {
     expect(result.nodes.find(n => n.nodeId === 'agent')!.status).toBe('failed');
     expect(result.nodes.find(n => n.nodeId === 'branch')!.status).toBe('ok'); // envelope node — not skipped
     expect(result.nodes.find(n => n.nodeId === 'fallback-sink')!.status).toBe('ok'); // chosen edge
-    expect(result.nodes.find(n => n.nodeId === 'primary-sink')!.status).toBe('skipped'); // not chosen
+    // 'inactive', not 'skipped' — a Branch's non-chosen edge was never going to run regardless of
+    // whether anything upstream failed; it is structurally outside this run's chosen path, the same
+    // concept Task 16 uses for a whole non-fired Trigger zone. This matters for the rollup (see the
+    // new test below): if this were 'skipped', a perfectly healthy Branch-routed run would report
+    // 'partial' overall purely because one edge was never taken, which is wrong. Caught in Task 13's
+    // review, fixed here before this task's code was ever written, not as a later patch.
+    expect(result.nodes.find(n => n.nodeId === 'primary-sink')!.status).toBe('inactive'); // not chosen
     expect(executors.Branch).toHaveBeenCalledWith(expect.anything(), { status: 'failed', error: expect.stringContaining('boom') }, {});
+  });
+
+  it('a healthy Branch-routed run reports "ok" overall, not "partial" — the non-chosen edge is inactive, not a negative outcome', async () => {
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => ({ text: 'ok' })), // succeeds this time, unlike the test above
+      Branch: vi.fn(() => 'primary'),
+    });
+    const result = await runPipeline(branchGraph(), 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'agent')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'branch')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'primary-sink')!.status).toBe('ok'); // chosen edge
+    expect(result.nodes.find(n => n.nodeId === 'fallback-sink')!.status).toBe('inactive'); // not chosen, not a failure
+    // The whole point of this test: an untaken branch must never drag a fully healthy run down to
+    // 'partial'. Relies on the rollup already excluding 'inactive' from its ok/some-ok/none-ok vote
+    // (added as a forward-compatible no-op during Task 13's own fix round, for exactly this case).
+    expect(result.status).toBe('ok');
   });
 
   it('a Branch that is NOT the immediate child of a failure sees "skipped", not "failed" — the adjacency rule in practice', async () => {
@@ -2239,12 +2262,12 @@ function buildEnvelope(parentId: string, results: Map<string, { status: string; 
 }
 ```
 
-In the wave loop, change the skip decision:
+In the wave loop, change the skip decision — note this anticipates the `unavailabilityStatus` helper Step 3 below replaces `parentUnavailable` with, so write them together rather than one then the other:
 
 ```ts
       const isEnvelopeNode = node.config.kind === 'Branch' || node.config.kind === 'Report';
-      if (parentUnavailable && !isEnvelopeNode) {
-        results.set(nodeId, { nodeId, status: 'skipped' });
+      if (unavailability && !isEnvelopeNode) {
+        results.set(nodeId, { nodeId, status: unavailability });
         return;
       }
 ```
@@ -2301,22 +2324,45 @@ and in the wave loop, right before the `runOne` call, branch on node kind to bui
       }
 ```
 
-Finally, a `Branch`'s *downstream* routing: when deciding `parentUnavailable` for a node fed by a `Branch`, an edge whose `label` doesn't match the Branch's `chosenEdge` must count as unavailable even though the Branch itself is `ok`. Change the `parentUnavailable` computation to look at edges, not just source status:
+Finally, a `Branch`'s *downstream* routing: when deciding whether a node fed by a `Branch` is unavailable, an edge whose `label` doesn't match the Branch's `chosenEdge` must count as unavailable even though the Branch itself is `ok`. But this needs to produce a status distinct from a genuine ancestor failure: a non-chosen edge was never going to run regardless of whether anything upstream failed, so it gets `'inactive'` (the same "structurally outside this run" concept Task 16 uses for a whole non-fired Trigger zone), while a real failed/skipped/inactive ancestor still produces `'skipped'`. Getting this wrong (marking a non-chosen edge `'skipped'`) makes a perfectly healthy Branch-routed run report `'partial'` overall purely because one edge was never taken — caught during Task 13's review, fixed here before this task's code was ever written.
+
+Replace the `incoming.some(p => ...)` boolean from Task 14 with a function that returns the right status instead of a bare boolean. Add `PipelineNode` to this file's existing `import type { PipelineGraph, NodeConfig, ... } from './types';` line — it's used here as an explicit parameter annotation for the first time in this file (everywhere else it was only ever inferred):
 
 ```ts
-      const incomingEdges = graph.edges.filter(e => e.to === nodeId);
-      const parentUnavailable = incomingEdges.some((e) => {
-        const parentResult = results.get(e.from);
-        const s = parentResult?.status;
-        if (s === 'failed' || s === 'skipped' || s === 'inactive') return true;
-        if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
-          return (parentResult?.output as { chosenEdge?: string } | undefined)?.chosenEdge !== e.label;
-        }
-        return false;
-      });
+function unavailabilityStatus(
+  nodeId: string,
+  graph: PipelineGraph,
+  byId: Map<string, PipelineNode>,
+  results: Map<string, NodeRunResult>,
+): 'skipped' | 'inactive' | null {
+  const incomingEdges = graph.edges.filter(e => e.to === nodeId);
+  let anyUnavailable = false;
+  let branchMismatchOnly = true; // flips to false the moment a REAL ancestor failure/skip/inactive is found
+  for (const e of incomingEdges) {
+    const parentResult = results.get(e.from);
+    const s = parentResult?.status;
+    if (s === 'failed' || s === 'skipped' || s === 'inactive') {
+      anyUnavailable = true;
+      branchMismatchOnly = false;
+      continue;
+    }
+    if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
+      const chosenEdge = (parentResult?.output as { chosenEdge?: string } | undefined)?.chosenEdge;
+      if (chosenEdge !== e.label) anyUnavailable = true; // branchMismatchOnly stays true unless another edge says otherwise
+    }
+  }
+  if (!anyUnavailable) return null;
+  return branchMismatchOnly ? 'inactive' : 'skipped';
+}
 ```
 
-(This replaces the `incoming.some(p => ...)` version from Task 14 — `incoming` the plain id array is still used elsewhere in this block for `buildInput`/envelope-building, keep that variable too.)
+And in the wave loop, right before the skip-decision block above:
+
+```ts
+      const unavailability = unavailabilityStatus(nodeId, graph, byId, results);
+```
+
+(`incoming`, the plain id array, is still used elsewhere in this block for `buildInput`/envelope-building — keep that variable too; this function is additional, not a replacement for it.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -2433,22 +2479,28 @@ At the top of `runPipeline`, right after `const byId = new Map(...)`:
 
 Change the wave loop's `remaining` set to exclude the inactive nodes from the start (they already have a result, so `ready`'s `!results.has` style checks would naturally skip them if you compute `remaining` as `new Set(order.filter(id => activeZone.has(id)))` instead of `new Set(order)`).
 
-Change the run-status rollup to filter `inactive` out before computing `ok`/`partial`/`failed` —
-**this combines with, rather than replaces, the Trigger-exclusion fix Task 13 already applied
-to this same block** (its own first draft counted the fired Trigger's own `'ok'` status in the
-rollup, which made a single downstream failure alongside an otherwise-healthy Trigger
-incorrectly report `'partial'` instead of `'failed'` — fixed during that task's own review, and
-Task 14's "partial-failure-continues" test depends on the fix holding here too, since neither
-Task 14 nor this task replaces the whole block, only adds another filter to it):
+**No change needed to the run-status rollup block itself** — by this point in the plan it
+already excludes both Trigger-kind nodes and `'inactive'` status from its vote. Both exclusions
+were added during Task 13's own review (not as something this task introduces): that task's
+first draft counted the fired Trigger's own `'ok'` status in the rollup, which made a single
+downstream failure alongside an otherwise-healthy Trigger incorrectly report `'partial'`
+instead of `'failed'`; the `'inactive'` exclusion was added at the same time, as a forward-
+compatible no-op, specifically so neither this task nor Task 15 (which started actually
+producing `'inactive'` statuses, for a Branch's non-chosen edge) would need to touch this block
+again. It also already handles the empty-outcome-set edge case correctly (falls back to the
+fired Trigger's own status rather than hardcoding `'ok'`) — a gap this task's own multi-trigger
+work would otherwise have reintroduced for a Trigger-only active zone whose Trigger throws.
+Confirm by reading the current state of the block rather than re-deriving it:
 
 ```ts
-  const activeResults = [...results.values()].filter(r => r.status !== 'inactive');
-  const outcomeResults = activeResults.filter(r => byId.get(r.nodeId)?.config.kind !== 'Trigger');
-  const runStatus: RunStatus =
-    outcomeResults.length === 0 ? 'ok' : // degenerate: no non-Trigger node in the active zone
-    outcomeResults.every(r => r.status === 'ok')
+  const outcomeStatuses = statuses.filter(r =>
+    r.status !== 'inactive' && byId.get(r.nodeId)?.config.kind !== 'Trigger'
+  );
+  const runStatus: RunStatus = outcomeStatuses.length === 0
+    ? (results.get(triggerNodeId)?.status === 'ok' ? 'ok' : 'failed')
+    : outcomeStatuses.every(r => r.status === 'ok')
       ? 'ok'
-      : outcomeResults.some(r => r.status === 'ok')
+      : outcomeStatuses.some(r => r.status === 'ok')
         ? 'partial'
         : 'failed';
 ```
