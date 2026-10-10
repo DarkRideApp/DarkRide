@@ -3,7 +3,7 @@ import type { ForEachConfig } from '../types';
 export type ForEachItemFn = (item: unknown) => Promise<unknown>;
 export type ForEachItemResult = { status: 'ok'; output: unknown } | { status: 'failed'; error: string };
 
-export const FOREACH_REGISTRY: Record<string, ForEachItemFn> = {};
+export const FOREACH_REGISTRY: Record<string, ForEachItemFn> = Object.create(null);
 
 export function registerForEachItemFn(name: string, fn: ForEachItemFn): void {
   FOREACH_REGISTRY[name] = fn;

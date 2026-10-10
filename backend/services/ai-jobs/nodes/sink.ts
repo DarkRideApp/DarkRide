@@ -14,7 +14,7 @@ export interface SinkCtx {
 // same convention Report's sections[].from uses.
 export type SinkWriteFn = (config: SinkConfig, input: Record<string, unknown>, ctx: SinkCtx) => Promise<void>;
 
-export const SINK_REGISTRY: Record<string, SinkWriteFn> = {};
+export const SINK_REGISTRY: Record<string, SinkWriteFn> = Object.create(null);
 
 export function registerSink(name: string, fn: SinkWriteFn): void {
   SINK_REGISTRY[name] = fn;

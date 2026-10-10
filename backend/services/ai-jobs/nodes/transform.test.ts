@@ -11,4 +11,8 @@ describe('runTransform', () => {
   it('throws on an unregistered function name', () => {
     expect(() => runTransform({ fn: 'test/nope' }, {})).toThrow(/Unknown transform "test\/nope"/);
   });
+
+  it('treats an inherited Object.prototype key as unregistered rather than resolving it', () => {
+    expect(() => runTransform({ fn: 'constructor' }, {})).toThrow(/Unknown transform "constructor"/);
+  });
 });

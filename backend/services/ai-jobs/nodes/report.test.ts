@@ -59,4 +59,11 @@ describe('runReport', () => {
     expect(result.markdown).toContain('## Wait Times');
     expect((result.markdown.match(/unavailable this run/g) || []).length).toBe(2);
   });
+
+  it('treats an inherited Object.prototype key as an unregistered assembler rather than resolving it', () => {
+    const envelopes: Record<string, Envelope<{ text: string }>> = {
+      'agent-overview': { status: 'ok', output: { text: 'x' } },
+    };
+    expect(() => runReport(config, envelopes, 'constructor')).toThrow(/Unknown report assembler "constructor"/);
+  });
 });

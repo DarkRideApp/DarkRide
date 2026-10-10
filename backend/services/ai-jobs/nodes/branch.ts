@@ -2,7 +2,7 @@ import type { BranchConfig, Envelope } from '../types';
 
 export type BranchPredicate = (envelope: Envelope) => string;
 
-export const BRANCH_REGISTRY: Record<string, BranchPredicate> = {};
+export const BRANCH_REGISTRY: Record<string, BranchPredicate> = Object.create(null);
 
 export function registerBranchPredicate(name: string, fn: BranchPredicate): void {
   BRANCH_REGISTRY[name] = fn;

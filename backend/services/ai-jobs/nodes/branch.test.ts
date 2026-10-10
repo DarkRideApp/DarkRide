@@ -24,4 +24,8 @@ describe('runBranch', () => {
   it('throws on an unregistered predicate name', () => {
     expect(() => runBranch({ predicate: 'test/nope', edges: ['a'] }, { status: 'ok', output: {} })).toThrow(/Unknown branch predicate/);
   });
+
+  it('treats an inherited Object.prototype key as unregistered rather than resolving it', () => {
+    expect(() => runBranch({ predicate: 'constructor', edges: ['a'] }, { status: 'ok', output: {} })).toThrow(/Unknown branch predicate "constructor"/);
+  });
 });

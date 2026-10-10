@@ -67,6 +67,11 @@ describe('runSink', () => {
     await expect(runSink({ writeFn: 'nope' }, {}, { db, versionId: 431 })).rejects.toThrow(/Unknown sink/);
   });
 
+  it('treats an inherited Object.prototype key as unregistered rather than resolving it', async () => {
+    const db = makeDb();
+    await expect(runSink({ writeFn: 'constructor' }, {}, { db, versionId: 431 })).rejects.toThrow(/Unknown sink "constructor"/);
+  });
+
   it('write-full-document writes an empty string when "from" is omitted or its source produced nothing, never the literal text "undefined"', async () => {
     const db = makeDb();
     await runSink({ writeFn: 'apk-analysis/write-full-document' }, {}, { db, versionId: 431 });
