@@ -33,14 +33,17 @@ export function SidePanel({ node, triggerSchema, onClose, onSave }: {
   }, [onClose]);
 
   return (
-    <aside role="dialog" aria-label={`${node.id} details`}>
-      <button ref={closeRef} type="button" aria-label="Close details" onClick={onClose}>×</button>
+    <aside className="ai-jobs-side-panel" role="dialog" aria-label={`${node.id} details`}>
+      <div className="ai-jobs-side-panel-header">
+        <span className="ai-jobs-side-panel-title">{node.config.kind}: {node.id}</span>
+        <button ref={closeRef} type="button" className="btn btn-ghost btn-sm" aria-label="Close details" onClick={onClose}>×</button>
+      </div>
       {node.config.kind === 'AgentCall' ? (
         <AgentCallBody node={node} triggerSchema={triggerSchema} onSave={onSave} />
       ) : node.config.kind === 'Report' ? (
         <ReportBody node={node} />
       ) : (
-        <dl>{Object.entries(node.config).map(([k, v]) => <div key={k}><dt>{k}</dt><dd>{JSON.stringify(v)}</dd></div>)}</dl>
+        <dl className="ai-jobs-facts">{Object.entries(node.config).map(([k, v]) => <div key={k}><dt>{k}</dt><dd>{JSON.stringify(v)}</dd></div>)}</dl>
       )}
     </aside>
   );
@@ -71,13 +74,16 @@ function AgentCallBody({ node, triggerSchema, onSave }: {
     <>
       <textarea
         ref={taRef}
+        className="form-textarea"
         value={template}
         onChange={(e) => { setTemplate(e.target.value); onSave(node.id, { instructionTemplate: e.target.value }); }}
       />
-      {triggerSchema.map(f => (
-        <button key={f.field} onClick={() => insertVar(f.field)}>+ trigger.{f.field}</button>
-      ))}
-      <div data-testid="prompt-preview">{resolvePreview(template, sampleScope)}</div>
+      <div className="ai-jobs-chip-row">
+        {triggerSchema.map(f => (
+          <button key={f.field} type="button" className="btn btn-ghost btn-sm" onClick={() => insertVar(f.field)}>+ trigger.{f.field}</button>
+        ))}
+      </div>
+      <div className="ai-jobs-preview" data-testid="prompt-preview">{resolvePreview(template, sampleScope)}</div>
     </>
   );
 }
@@ -85,7 +91,7 @@ function AgentCallBody({ node, triggerSchema, onSave }: {
 function ReportBody({ node }: { node: NodeLike }) {
   const sections = node.config.sections as Array<{ title: string; from: string }>;
   return (
-    <ol>
+    <ol className="ai-jobs-report-sections">
       {sections.map((s, i) => (
         <li key={s.from} data-testid="report-section-row">{i + 1}. {s.title} ← {s.from}</li>
       ))}
