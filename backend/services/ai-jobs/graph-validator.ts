@@ -30,6 +30,21 @@ export function validateGraph(graph: PipelineGraph): ValidationError[] {
     }
   }
 
+  // A Trigger is an independent root (spec: zero incoming edges). An edge into one breaks the
+  // executor's "exactly one Trigger fires per run" invariant: the downstream Trigger gets run
+  // when its upstream one fires, and when it is the one fired its own incoming edge is 'inactive',
+  // so the whole run fails silently. Caught here at publish time, before the BFS below would
+  // treat it as just another reachable node.
+  for (const e of graph.edges) {
+    const target = graph.nodes.find(n => n.id === e.to);
+    if (target?.config.kind === 'Trigger') {
+      errors.push({
+        nodeId: target.id,
+        message: `Trigger "${target.id}" has an incoming edge from "${e.from}" — a Trigger must be an independent root with zero incoming edges.`,
+      });
+    }
+  }
+
   // Reachability: for each trigger, BFS forward over edges, recording which trigger(s) reach each node.
   const reachedBy = new Map<string, Set<string>>();
   for (const trigger of triggers) {
