@@ -2709,10 +2709,11 @@ function stableStringify(value: unknown): string {
 
 export function computeInputHash(config: NodeConfig, input: Record<string, unknown>): string {
   // Round-trip through JSON first — found during Task 17's review. Two gaps in stableStringify
-  // alone: (1) a Date hashes as '{}' (JSON.stringify never visits a Date's own fields, so two
-  // different Dates collide into a false "unchanged" hit — not reachable today since every real
-  // Date this hashes touches is already stringified to ISO text before it gets here, e.g. the
-  // Trigger's own expander, but fragile to rely on silently); (2) a key explicitly set to
+  // alone: (1) a Date hashes as '{}' (stableStringify's object branch walks a value's own keys,
+  // and a Date has none of its time data as an own enumerable key, so two different Dates
+  // collide into a false "unchanged" hit — not reachable today since every real Date this hashes
+  // touches is already stringified to ISO text before it gets here, e.g. the Trigger's own
+  // expander, but fragile to rely on silently); (2) a key explicitly set to
   // `undefined` hashes differently from that key being entirely absent, which matters once a
   // hash computed in-memory during one run has to match the SAME hash after a round-trip through
   // the DB's JSON column in a later run (undefined keys don't survive that round-trip, so an
@@ -2845,8 +2846,20 @@ Inside the wave loop, after `const input = buildInput(incoming, outputs);` and b
 ```ts
       let inputHash: string | undefined;
       if (MEMOIZABLE_KINDS.has(node.config.kind)) {
-        inputHash = computeInputHash(node.config, input);
-        if (options.reuseUnchanged) {
+        // try/catch: found in Task 17's final review round. Making the hash unconditional (see
+        // above) means a default run — reuseUnchanged never even mentioned — now always reaches
+        // computeInputHash too; before this task's fix round it only ran inside the
+        // reuseUnchanged-gated block, so a default run never touched it. A BigInt or circular
+        // reference anywhere in a memoizable node's input (JSON.stringify throws on both) would
+        // otherwise reject the WHOLE runPipeline call over a cosmetic hash failure, even with
+        // memoization never in use. Leaving inputHash undefined and continuing is strictly safer
+        // than crashing the run for a feature that isn't even active.
+        try {
+          inputHash = computeInputHash(node.config, input);
+        } catch {
+          inputHash = undefined;
+        }
+        if (options.reuseUnchanged && inputHash !== undefined) {
           const prior = options.priorNodeRuns?.[nodeId];
           if (prior && prior.inputHash === inputHash) {
             const output = structuredClone(prior.output);
