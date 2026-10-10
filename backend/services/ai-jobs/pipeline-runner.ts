@@ -82,13 +82,25 @@ export async function runPipeline(
       const node = byId.get(nodeId)!;
       const incoming = graph.edges.filter(e => e.to === nodeId).map(e => e.from);
       const unavailability = unavailabilityStatus(nodeId, graph, byId, results);
-
-      // Branch/Report are envelope nodes: they run even when their immediate parent failed
-      // (they receive an Envelope describing what happened instead of being skipped), so this
-      // exemption must be checked before the skip decision below, not after.
       const isEnvelopeNode = node.config.kind === 'Branch' || node.config.kind === 'Report';
-      if (unavailability && !isEnvelopeNode) {
-        results.set(nodeId, { nodeId, status: unavailability });
+
+      // 'inactive' means this node sits on a path that was structurally never going to run —
+      // a dead Branch edge, not a real failure anywhere upstream. That applies to EVERY node
+      // kind, including Branch/Report: the envelope-node exemption below exists so a Branch or
+      // Report can still make a decision or assemble a report after a REAL ancestor failure,
+      // not so it can run code (including a Branch choosing yet another edge, or a Report's own
+      // Sink) on a path that was never chosen in the first place. Checked before the envelope
+      // exemption, not folded into it.
+      if (unavailability === 'inactive') {
+        results.set(nodeId, { nodeId, status: 'inactive' });
+        return;
+      }
+
+      // Branch/Report are envelope nodes: they run even when their immediate parent genuinely
+      // failed (they receive an Envelope describing what happened instead of being skipped) —
+      // but only for a real failure, never for the dead-path case handled above.
+      if (unavailability === 'skipped' && !isEnvelopeNode) {
+        results.set(nodeId, { nodeId, status: 'skipped' });
         return;
       }
 
@@ -229,18 +241,32 @@ function buildEnvelope(parentId: string, results: Map<string, NodeRunResult>): E
 /**
  * Decides whether a node is unavailable this run, and if so, which of the two distinct
  * negative statuses applies:
- *   - 'skipped' — a real ancestor failure/skip/inactive fed this node. A genuine negative
+ *   - 'skipped' — a REAL ancestor failure/skip fed this node (at least one incoming edge's
+ *     source actually threw, or was itself 'skipped' for the same reason). A genuine negative
  *     outcome; counts against the run in the ok/partial/failed rollup.
- *   - 'inactive' — EVERY contributing reason is a Branch choosing a different edge, nothing
- *     about this node's own incoming edges reflects an actual failure anywhere upstream. This
- *     node was never going to run regardless of whether anything failed — structurally outside
- *     this run's chosen path (the same concept Task 16 uses for a whole non-fired Trigger zone).
- *     Excluded from the rollup entirely.
+ *   - 'inactive' — every contributing reason is either a Branch choosing a different edge, or
+ *     an already-'inactive' ancestor (which itself traces back to nothing but branch mismatches,
+ *     recursively) — nothing about this node's own incoming edges reflects an actual failure
+ *     anywhere upstream. This node was never going to run regardless of whether anything
+ *     failed — structurally outside this run's chosen path (the same concept Task 16 uses for a
+ *     whole non-fired Trigger zone). Excluded from the rollup entirely, and the caller must
+ *     treat it as unavailable for EVERY node kind, including Branch/Report (see the wave loop:
+ *     'inactive' is checked and applied before the envelope-node exemption, not folded into it —
+ *     a Branch/Report sitting on a dead edge must never itself run, nor leak into its own
+ *     descendants, just because its kind is normally exempt from skip on a real failure).
  *
- * Mixing the two is the bug this function exists to prevent: if a Branch-mismatch ever produced
- * 'skipped', a perfectly healthy Branch-routed run (nothing failed, Branch just chose one of its
- * valid edges) would incorrectly report 'partial' overall, purely because the other edge was
- * never taken. Caught during Task 13's review, fixed here before this task's code was written.
+ * Mixing the two is the bug this function exists to prevent, in two different ways:
+ *   1. If a Branch-mismatch ever produced 'skipped' instead of 'inactive', a perfectly healthy
+ *      Branch-routed run (nothing failed, Branch just chose one of its valid edges) would
+ *      incorrectly report 'partial' overall, purely because the other edge was never taken.
+ *   2. If an 'inactive' ancestor ever produced 'skipped' one hop downstream (treating it the
+ *      same as a real failure instead of propagating 'inactive'), the same false-'partial' bug
+ *      reappears two-plus hops deep on a dead Branch path, and an envelope node (Branch/Report)
+ *      sitting entirely on that dead path would wrongly qualify for the real-failure exemption
+ *      and run anyway — a Branch making a second, phantom routing decision, or a Report
+ *      assembling and a Sink writing on a path that was never live.
+ * Both were caught during Task 15's review, after the first version of this function only
+ * handled case 1.
  */
 function unavailabilityStatus(
   nodeId: string,
@@ -250,13 +276,21 @@ function unavailabilityStatus(
 ): 'skipped' | 'inactive' | null {
   const incomingEdges = graph.edges.filter(e => e.to === nodeId);
   let anyUnavailable = false;
-  let branchMismatchOnly = true; // flips to false the moment a REAL ancestor failure/skip/inactive is found
+  let branchMismatchOnly = true; // flips to false the moment a REAL ancestor failure/skip is found
   for (const e of incomingEdges) {
     const parentResult = results.get(e.from);
     const s = parentResult?.status;
-    if (s === 'failed' || s === 'skipped' || s === 'inactive') {
+    if (s === 'failed' || s === 'skipped') {
       anyUnavailable = true;
       branchMismatchOnly = false;
+      continue;
+    }
+    // An 'inactive' parent is a dead path, not a real failure — it must propagate as 'inactive',
+    // never degrade to 'skipped' just because it crossed a hop boundary. Does NOT flip
+    // branchMismatchOnly: an inactive ancestor is itself only ever caused by a branch mismatch
+    // (or another inactive ancestor, recursively) further up the chain.
+    if (s === 'inactive') {
+      anyUnavailable = true;
       continue;
     }
     if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
