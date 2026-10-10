@@ -44,9 +44,13 @@ export interface RunResult {
  * info). A `Branch`'s non-chosen outgoing edge marks its target `'inactive'` rather than
  * `'skipped'` — see `unavailabilityStatus` below for why the two must never be conflated.
  *
- * Still outstanding, for Tasks 16-17 to add to this same function in place:
- *   - Task 16: multi-trigger zone partitioning (graph-validator.ts already enforces this
- *     statically; the executor still needs to run each zone from its own trigger)
+ * Multi-trigger graphs (more than one `Trigger` node, e.g. a "Full Analysis" vs "Quick Rescan"
+ * entry point) are partitioned up front: `reachableFrom(triggerNodeId, graph)` computes the
+ * fired Trigger's zone, and every node outside it is marked `'inactive'` before the wave loop
+ * even starts — their executors are never called, and the run-status rollup already excludes
+ * `'inactive'` (see below), so another zone's nodes never count toward this run's outcome.
+ *
+ * Still outstanding, for Task 17 to add to this same function in place:
  *   - Task 17: opt-in memoization
  *
  * `triggerNodeId` names which node in `graph.nodes` is the Trigger to seed with `rawInput` —
@@ -68,9 +72,24 @@ export async function runPipeline(
   const results = new Map<string, NodeRunResult>();
   const outputs = new Map<string, Record<string, unknown>>();
 
+  const firedTrigger = byId.get(triggerNodeId);
+  if (!firedTrigger || firedTrigger.config.kind !== 'Trigger') {
+    // Without this, a typo'd or missing triggerNodeId makes activeZone = {triggerNodeId} only
+    // (reachableFrom still "succeeds" — it just finds one unknown node with no edges), every
+    // real node ends up `inactive`, activeResults is empty, and the ok/partial/failed rollup
+    // below is vacuously `true` on an empty array — the run reports 'ok' having executed and
+    // written nothing. Caught in plan review. Fail loud instead.
+    throw new Error(`runPipeline: "${triggerNodeId}" is not a Trigger node in this graph`);
+  }
+
+  const activeZone = reachableFrom(triggerNodeId, graph);
+  for (const n of graph.nodes) {
+    if (!activeZone.has(n.id)) results.set(n.id, { nodeId: n.id, status: 'inactive' });
+  }
+
   const order = topologicalOrder(graph);
 
-  const remaining = new Set(order);
+  const remaining = new Set(order.filter(id => activeZone.has(id)));
   while (remaining.size > 0) {
     const ready = [...remaining].filter(id =>
       graph.edges.filter(e => e.to === id).every(e => results.has(e.from)),
@@ -201,6 +220,28 @@ export async function runPipeline(
     : 'failed';
 
   return { status: runStatus, nodes: order.map(id => results.get(id)!) };
+}
+
+/**
+ * BFS reachability from the fired Trigger — the set of nodes in its zone, which get to run this
+ * execution. Same shape as the graph validator's reachability check (which runs at publish time
+ * over the *whole* graph, checking every `Trigger`), intentionally not shared with it: that one
+ * answers "is every node reachable from SOME Trigger," this one answers "is this node reachable
+ * from the ONE Trigger that fired" — different enough callers that a shared util would need a
+ * clunky mode parameter just to say which question to ask, not worth it for two call sites.
+ */
+function reachableFrom(nodeId: string, graph: PipelineGraph): Set<string> {
+  const seen = new Set<string>([nodeId]);
+  const queue = [nodeId];
+  while (queue.length) {
+    const current = queue.shift()!;
+    for (const e of graph.edges) {
+      if (e.from !== current || seen.has(e.to)) continue;
+      seen.add(e.to);
+      queue.push(e.to);
+    }
+  }
+  return seen;
 }
 
 /**
