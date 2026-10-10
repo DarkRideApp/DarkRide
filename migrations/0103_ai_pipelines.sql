@@ -43,3 +43,7 @@ CREATE TABLE IF NOT EXISTS ai_pipeline_node_runs (
   started_at INTEGER NOT NULL,
   finished_at INTEGER
 );
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS ai_pipeline_node_runs_run_idx ON ai_pipeline_node_runs(run_id);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS ai_pipeline_node_runs_memo_idx ON ai_pipeline_node_runs(node_id, input_hash);
