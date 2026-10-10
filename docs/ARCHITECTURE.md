@@ -180,7 +180,7 @@ React SPA built with Vite. Key pages:
 - **Frida IDE** -- script editor, app selector, gadget mode for non-rooted devices
 - **Apps** -- tracked app versions, APK pull/install, gadget injection, Play Store fetcher
 - **APK Analysis** -- static analysis findings, React Native bundle viewer, version diffs, AI review
-- **Marketplace** -- browse, install, update, and uninstall plugins; signature + content verification on install
+- **Plugins** -- one workspace (Installed and Discover tabs) to browse the marketplace, install, update, enable, and uninstall plugins; signature + content verification on install
 
 Communication with backend uses both REST (fetch) and WebSocket (for real-time updates and REST-over-WS).
 

@@ -17,10 +17,10 @@ const GENERAL: SidebarItem[] = [
   { label: 'Traffic', path: '/ui/settings/traffic' },
 ];
 
+// Installing, updating and enabling plugins happens in the Plugins workspace
+// (top-level nav). Settings keeps each plugin's own settings page, plus a way back.
 const PLUGINS_STATIC: SidebarItem[] = [
-  { label: 'Installed', path: '/ui/settings/plugins' },
-  // Marketplace moved to the top-level Tools nav on 2026-05-14 — it's a
-  // first-run / frequent action, not a config screen. Per fresh review §2a.
+  { label: 'Manage plugins', path: '/ui/plugins' },
 ];
 
 const ADVANCED: SidebarItem[] = [
@@ -48,7 +48,6 @@ function Group({ label, items }: { label: string; items: SidebarItem[] }) {
           key={item.path}
           to={item.path}
           className={({ isActive }) => `settings-sidebar-link${isActive ? ' active' : ''}`}
-          end={item.path === '/ui/settings/plugins'}
         >
           {item.label}
         </NavLink>

@@ -26,8 +26,10 @@ const PAGES = [
   { path: '/ui/apks', name: 'APKs' },
   { path: '/ui/frida', name: 'Frida' },
   { path: '/ui/settings', name: 'Settings' },
-  { path: '/ui/settings/plugins', name: 'Plugins' },
-  { path: '/ui/settings/marketplace', name: 'Marketplace' },
+  { path: '/ui/plugins', name: 'Plugins' },
+  // Old URLs redirect into the Plugins workspace; they must keep loading cleanly.
+  { path: '/ui/settings/plugins', name: 'Plugins (old Settings URL)' },
+  { path: '/ui/settings/marketplace', name: 'Marketplace (old URL)' },
   { path: '/ui/settings/proxies', name: 'Proxies' },
   { path: '/ui/settings/credentials', name: 'Credentials' },
   { path: '/ui/settings/jobs', name: 'Jobs' },

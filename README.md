@@ -127,7 +127,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full breakdown, and [do
 
 - [Development Guide](docs/development.md) — local dev workflow, multi-repo plugin setup, env vars
 - [Environment Variables](docs/environment.md) — every `DARKRIDE_*` / runtime knob with defaults
-- [Installing Plugins](docs/installing-plugins.md) — Marketplace UI, CLI, signing model
+- [Installing Plugins](docs/installing-plugins.md) — the Plugins page, CLI, signing model
 - [Troubleshooting](docs/troubleshooting.md) — common errors and what fixes them
 - [Container Deployment](Dockerfile) — Dockerfile for running DarkRide containerised
 

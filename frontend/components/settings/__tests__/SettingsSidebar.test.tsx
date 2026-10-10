@@ -28,9 +28,10 @@ describe('SettingsSidebar', () => {
     renderSidebar();
     expect(screen.getByRole('link', { name: /Notifications/ })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Integrations/ })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /Installed/ })).toBeInTheDocument();
-    // Marketplace promoted to top-level nav on 2026-05-14 (AppLayout Tools group);
-    // not in the Settings sidebar any more.
+    // Installing, updating and enabling plugins moved to the Plugins workspace;
+    // Settings only links out to it and lists each plugin's own settings page.
+    expect(screen.getByRole('link', { name: 'Manage plugins' })).toHaveAttribute('href', '/ui/plugins');
+    expect(screen.queryByRole('link', { name: /^Installed$/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Marketplace/ })).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Proxies/ })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Changelog/ })).toBeInTheDocument();

@@ -13,8 +13,8 @@ import { loginAsAdmin, waitForBackend } from './helpers/auth';
 // The admin user has all scopes, so every tab should be visible.
 const SETTINGS_TABS = [
   { label: 'Settings', path: '/ui/settings' },
-  { label: 'Plugins', path: '/ui/settings/plugins' },
-  { label: 'Marketplace', path: '/ui/settings/marketplace' },
+  // Plugins and Marketplace are no longer Settings tabs: both live in the Plugins
+  // workspace (/ui/plugins), and the old URLs redirect there. See plugin-management.spec.ts.
   { label: 'Proxies', path: '/ui/settings/proxies' },
   { label: 'Credentials', path: '/ui/settings/credentials' },
   { label: 'Jobs', path: '/ui/settings/jobs' },

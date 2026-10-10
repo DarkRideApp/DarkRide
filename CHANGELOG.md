@@ -6,6 +6,7 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 
 ### Added
 
+- **Plugins page.** Installed and Discover are now two tabs of one page, `/ui/plugins`, instead of a Marketplace page and a Plugin Manager in Settings. An update, an install, an enable switch and uninstall work the same on both tabs; a detail drawer shows author, license, source, signature, dependencies, what the plugin provides, the AI permissions it asks for and its full error. Search and filters (updates, disabled, errors, category) and the open plugin are kept in the URL, so every view is linkable and Back closes the drawer. A marketplace outage no longer hides the plugins you have installed. `/ui/marketplace`, `/ui/settings/marketplace` and `/ui/settings/plugins` redirect to the matching tab. See `docs/installing-plugins.md`.
 - **Plugin SDK 1.5.0** — `ctx.documentStore` (`DocStoreApi`: `putDoc`/`getDoc`) is now available to plugins as a typed handle over the host Document Store. Accessible from `start()` — throws if accessed during `register()`. Includes an in-memory test fixture `createInMemoryDocStore` exported from `@darkrideapp/plugin-sdk/test-utils`. Non-breaking minor bump (1.4.0 → 1.5.0).
 - **AI providers** are now defined by a catalog and four wire dialects. New provider types: `openai`, `mistral`, and `openai-compatible` (any OpenAI-style server, for example LM Studio, vLLM, or a gateway). See `docs/ai-providers.md`.
 - **Fallback to the next model on more failures.** Within a tier, the router tries the next model when a call fails with a rate limit, exhausted credits or spend limit, provider overload, a rejected key (401; for Gemini also a 403 `PERMISSION_DENIED`), or a connection error (including a connection that drops while the reply is streaming), and only before any output has been produced. A 403 from any other provider also falls back to the next model but starts no cooldown, because it usually means a blocked request or a model the key may not use. A caller cancel is never treated as a provider failure. Exhausted credits and a rejected key put every model on the same provider into cooldown. A rate limit or connection error cools down only that model, and overload starts no cooldown. Saving a provider clears the cooldowns of its models.
@@ -33,6 +34,17 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 - **A model that declines a request no longer ends the run.** When Anthropic stops a response with a refusal (for example its cyber safeguard), Gemini blocks a prompt or response for safety, or an OpenAI-style server answers `content_filter`, and nothing has been produced yet, the next model in the tier is tried, and the model that declined is not put on cooldown. If every model declines, the first one's message is shown; for Anthropic it names the category, and for the `cyber` category the Cyber Verification Program. A refusal after the model has started answering keeps the partial answer and adds the message, as before. Within one run a model that refused is not asked again.
 - APK analysis and APK diff runs now fall back across the models of a tier the way chat does. They used to be pinned to the first model of each tier, so one rate limit or refusal ended the run. They also respect model cooldowns now.
 - Inline completion no longer inserts a model's refusal message as the completion. Every model refusing returns the refusal as an error.
+
+### Fixed
+
+- Adding, editing, removing or toggling a plugin source no longer closes the Sources dialog, and now refreshes the marketplace straight away. Before, a newly added source showed nothing until you pressed Refresh, because the server caches the marketplace for an hour.
+- The Plugin Manager showed two restart prompts at once (the Settings banner and its own button). There is now one.
+- A marketplace plugin whose registry name differs from its runtime name (for example a git source) is matched to its installed copy by npm package, so it is no longer listed twice.
+- Buttons styled `btn-warning` (Review permissions, Restart) had no style. The class now exists.
+
+### Removed
+
+- The separate **Marketplace** sidebar entry and the **Installed** entry in Settings, replaced by **Plugins** (Settings now has a *Manage plugins* link).
 
 ### Deprecated
 

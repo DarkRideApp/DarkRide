@@ -91,12 +91,9 @@ const CORE_NAV_GROUPS: NavGroup[] = [
       { to: '/ui/selector-debugger', label: 'Selector Debugger', icon: Crosshair },
       { to: '/ui/apks', label: 'APKs', icon: Download, requiredScope: 'core.apk:read' },
       { to: '/ui/frida', label: 'Frida', icon: Bug, requiredScope: 'core.frida:read' },
-      // Marketplace is a top-level entry point — promoted out of Settings
-      // because browsing/installing plugins is a frequent first-run action
-      // and Settings is the wrong shelf for "browse apps". Old paths
-      // /ui/settings/marketplace and /ui/settings/plugins/marketplace still
-      // redirect here for back-compat. See ROADMAP §Plugin Ecosystem Polish.
-      { to: '/ui/marketplace', label: 'Marketplace', icon: Package, requiredScope: 'core.plugins:manage' },
+      // One home for plugins: Installed and Discover tabs in a single workspace.
+      // The old /ui/marketplace and /ui/settings/plugins routes redirect here.
+      { to: '/ui/plugins', label: 'Plugins', icon: Package, requiredScope: 'core.plugins:manage' },
     ],
   },
   {
@@ -121,14 +118,14 @@ function buildNavGroups(
     return { label: g.label, items: [...g.items] };
   });
 
-  // Badge the Marketplace nav item with the available-update count so users
+  // Badge the Plugins nav item with the available-update count so users
   // notice updates without having to open the page.
   if (pluginUpdateCount > 0) {
     for (const group of groups) {
-      const marketplace = group.items.find(i => i.to === '/ui/marketplace');
-      if (marketplace) {
+      const plugins = group.items.find(i => i.to === '/ui/plugins');
+      if (plugins) {
         group.items = group.items.map(i =>
-          i.to === '/ui/marketplace' ? { ...i, badge: pluginUpdateCount } : i,
+          i.to === '/ui/plugins' ? { ...i, badge: pluginUpdateCount } : i,
         );
         break;
       }

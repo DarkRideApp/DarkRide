@@ -7,8 +7,11 @@
  * Run: npx playwright test tests/e2e/settings-restart-redesign.spec.ts
  */
 
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { loginAsAdmin, waitForBackend } from './helpers/auth';
+
+// A pending-restart banner elsewhere on the page has a "Restart Server" button too, so scope to the Settings sidebar.
+const sidebar = (page: Page) => page.getByRole('complementary');
 
 test.describe('Settings redesign + restart UX', () => {
   test.beforeAll(async ({ browser }) => {
@@ -24,10 +27,10 @@ test.describe('Settings redesign + restart UX', () => {
     await expect(page).toHaveURL(/\/ui\/settings\/notifications$/);
   });
 
-  test('legacy /ui/settings/marketplace redirects to nested path', async ({ page }) => {
+  test('legacy /ui/settings/marketplace redirects into the Plugins workspace', async ({ page }) => {
     await loginAsAdmin(page);
     await page.goto('/ui/settings/marketplace');
-    await expect(page).toHaveURL(/\/ui\/settings\/plugins\/marketplace$/);
+    await expect(page).toHaveURL(/\/ui\/plugins\?tab=discover$/);
   });
 
   test('legacy /ui/settings/cloud redirects to cloud-storage', async ({ page }) => {
@@ -46,16 +49,15 @@ test.describe('Settings redesign + restart UX', () => {
     await loginAsAdmin(page);
     await page.goto('/ui/settings/notifications');
     await expect(page.getByRole('link', { name: 'Notifications' })).toBeVisible();
-    await expect(page.getByRole('link', { name: 'Installed' })).toBeVisible();
-    await expect(page.getByRole('link', { name: 'Marketplace' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Manage plugins' })).toBeVisible();
     await expect(page.getByRole('link', { name: 'Changelog' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Restart Server' })).toBeVisible();
+    await expect(sidebar(page).getByRole('button', { name: 'Restart Server' })).toBeVisible();
   });
 
   test('Restart Server button opens confirmation modal', async ({ page }) => {
     await loginAsAdmin(page);
     await page.goto('/ui/settings/notifications');
-    await page.getByRole('button', { name: 'Restart Server' }).click();
+    await sidebar(page).getByRole('button', { name: 'Restart Server' }).click();
     await expect(page.getByText('Restart Server?')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible();
   });
@@ -63,7 +65,7 @@ test.describe('Settings redesign + restart UX', () => {
   test('Cancel closes the modal without restarting', async ({ page }) => {
     await loginAsAdmin(page);
     await page.goto('/ui/settings/notifications');
-    await page.getByRole('button', { name: 'Restart Server' }).click();
+    await sidebar(page).getByRole('button', { name: 'Restart Server' }).click();
     await page.getByRole('button', { name: 'Cancel' }).click();
     await expect(page.getByText('Restart Server?')).not.toBeVisible();
     await expect(page).toHaveURL(/\/ui\/settings\/notifications$/);
