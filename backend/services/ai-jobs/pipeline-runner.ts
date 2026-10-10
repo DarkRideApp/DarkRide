@@ -82,14 +82,20 @@ export async function runPipeline(
     }
   }
 
-  // A single failed node fails the whole run, even if some nodes upstream of it (e.g. the
-  // Trigger) succeeded — 'partial' is reserved for "some nodes skipped but none failed"
-  // (meaningful once multi-trigger zones land in Task 16), not "some nodes ran ok before a
-  // later failure." Any('failed') must dominate before checking for an all-ok run.
+  // The Trigger's own status is excluded from this rollup: it merely expanded the raw input,
+  // which isn't a business outcome, and counting it as "ok" tips the vote the wrong way at
+  // both ends. Over just the non-Trigger ("outcome") nodes: every ok -> 'ok'; some ok (mixed
+  // with failed/skipped) -> 'partial' (one branch's failure doesn't sink a sibling branch
+  // that completed — Task 14's wave-based concurrency depends on this); none ok -> 'failed'
+  // (a single-chain failure, e.g. this task's own third test, where the only "ok" left after
+  // excluding the Trigger disappears, so it can't rescue the run into 'partial').
   const statuses = [...results.values()];
-  const anyFailed = statuses.some(r => r.status === 'failed');
-  const allOk = statuses.every(r => r.status === 'ok');
-  const runStatus: RunStatus = anyFailed ? 'failed' : allOk ? 'ok' : 'partial';
+  const outcomeStatuses = statuses.filter(r => byId.get(r.nodeId)?.config.kind !== 'Trigger');
+  const runStatus: RunStatus =
+    outcomeStatuses.length === 0 ? 'ok' // degenerate: a graph with only a Trigger node
+    : outcomeStatuses.every(r => r.status === 'ok') ? 'ok'
+    : outcomeStatuses.some(r => r.status === 'ok') ? 'partial'
+    : 'failed';
 
   return { status: runStatus, nodes: order.map(id => results.get(id)!) };
 }
