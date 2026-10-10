@@ -1,7 +1,39 @@
 import React, { useEffect, useState } from 'react';
 import { useWebSocket, useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Canvas } from './Canvas';
+import { SidePanel } from './SidePanel';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
+
+/**
+ * Forward-reachability BFS defining a Trigger's zone — duplicated client-side rather than
+ * imported, for the same frontend/backend-boundary reason `templatePreview.ts` duplicates
+ * `resolveTemplate`. Verbatim copy of Task 16's `reachableFrom` in
+ * backend/services/ai-jobs/pipeline-runner.ts.
+ */
+export function reachableFrom(nodeId: string, graph: PipelineGraph): Set<string> {
+  const seen = new Set<string>([nodeId]);
+  const queue = [nodeId];
+  while (queue.length) {
+    const current = queue.shift()!;
+    for (const e of graph.edges) {
+      if (e.from !== current || seen.has(e.to)) continue;
+      seen.add(e.to);
+      queue.push(e.to);
+    }
+  }
+  return seen;
+}
+
+/** The Trigger whose zone actually contains `nodeId` — never just "the first Trigger in the
+ * graph." A valid published graph (graph-validator, Task 16) guarantees every non-Trigger node
+ * is reachable from some Trigger, so the fallback below is defensive, not a real path. */
+export function findOwningTriggerSchema(graph: PipelineGraph, nodeId: string): Array<{ field: string; type: string; description: string }> {
+  const triggers = graph.nodes.filter(n => n.config.kind === 'Trigger');
+  for (const trigger of triggers) {
+    if (reachableFrom(trigger.id, graph).has(nodeId)) return (trigger.config as any).outputSchema;
+  }
+  return (triggers[0]?.config as any)?.outputSchema ?? [];
+}
 
 export function AiJobsWorkspace() {
   useDocumentTitle('AI Job Pipelines');
@@ -25,7 +57,16 @@ export function AiJobsWorkspace() {
   return (
     <div className="ai-jobs-root" style={{ height: '100vh' }}>
       <Canvas graph={graph} onSelectNode={setSelected} />
-      {selected && <div data-testid="selected-node">{selected}</div>}
+      {selected && (
+        <SidePanel
+          node={graph.nodes.find(n => n.id === selected)!}
+          triggerSchema={findOwningTriggerSchema(graph, selected)}
+          onClose={() => setSelected(null)}
+          onSave={(nodeId, patch) => {
+            setGraph(g => g && ({ ...g, nodes: g.nodes.map(n => n.id === nodeId ? { ...n, config: { ...n.config, ...patch } } : n) }));
+          }}
+        />
+      )}
     </div>
   );
 }
