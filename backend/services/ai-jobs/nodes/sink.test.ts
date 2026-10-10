@@ -3,7 +3,7 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { describe, it, expect } from 'vitest';
 import * as schema from '../../../db/schema';
 import { runSink } from './sink';
-import { getNote } from '../../apk-notes';
+import { getNote, setNote } from '../../apk-notes';
 
 function makeDb() {
   const sqlite = new Database(':memory:');
@@ -28,21 +28,45 @@ function makeDb() {
 // dispatched. config.from names which predecessor's output to unwrap first, same convention
 // as Report's sections[].from; these tests use the real wrapped shape throughout.
 describe('runSink', () => {
-  it('apk-analysis/write-full-document writes the whole assembled document in one call', async () => {
+  it('apk-analysis/write-full-document writes each Report section into the note', async () => {
     const db = makeDb();
     await runSink(
       { writeFn: 'apk-analysis/write-full-document', from: 'report' },
-      { report: { markdown: '## Overview\nHello.\n' } },
+      { report: { markdown: '## Overview\nHello.\n\n## Maps\nTiles.\n', sections: [
+        { title: 'Overview', body: 'Hello.' },
+        { title: 'Maps', body: 'Tiles.' },
+      ] } },
       { db, versionId: 431 },
     );
-    expect(getNote(db, 431)).toBe('## Overview\nHello.\n');
+    expect(getNote(db, 431)).toBe('## Overview\nHello.\n## Maps\nTiles.\n');
+  });
+
+  it('write-full-document keeps sections it does not own, e.g. a prior Quick Rescan Diff Summary (I1)', async () => {
+    // Regression guard: this sink used to setNote() the whole Report markdown, wiping the Quick
+    // Rescan zone's Diff Summary and any hand-written section every time Full Analysis ran.
+    const db = makeDb();
+    setNote(db, 431, '## Diff Summary\nNew endpoint /v2/waits.\n\n## My Notes\nChecked by hand.\n\n## Overview\nStale overview.\n');
+    await runSink(
+      { writeFn: 'apk-analysis/write-full-document', from: 'report' },
+      { report: { markdown: 'ignored', sections: [
+        { title: 'Overview', body: 'Fresh overview.' },
+        { title: 'Wait Times', body: 'Polls /waits.' },
+      ] } },
+      { db, versionId: 431 },
+    );
+    const note = getNote(db, 431);
+    expect(note).toContain('## Diff Summary\nNew endpoint /v2/waits.');
+    expect(note).toContain('## My Notes\nChecked by hand.');
+    expect(note).toContain('## Overview\nFresh overview.');
+    expect(note).not.toContain('Stale overview.');
+    expect(note).toContain('## Wait Times\nPolls /waits.');
   });
 
   it('apk-analysis/write-section patches just one section, leaving others untouched', async () => {
     const db = makeDb();
     await runSink(
       { writeFn: 'apk-analysis/write-full-document', from: 'report' },
-      { report: { markdown: '## Overview\nOld.\n\n## Diff Summary\nOld diff.\n' } },
+      { report: { sections: [{ title: 'Overview', body: 'Old.' }, { title: 'Diff Summary', body: 'Old diff.' }] } },
       { db, versionId: 431 },
     );
     await runSink(
@@ -58,7 +82,7 @@ describe('runSink', () => {
   it('throws (not an unhandled rejection) when the target version does not exist', async () => {
     const db = makeDb();
     await expect(
-      runSink({ writeFn: 'apk-analysis/write-full-document', from: 'report' }, { report: { markdown: 'x' } }, { db, versionId: 999999 }),
+      runSink({ writeFn: 'apk-analysis/write-full-document', from: 'report' }, { report: { sections: [{ title: 'x', body: 'y' }] } }, { db, versionId: 999999 }),
     ).rejects.toThrow();
   });
 
@@ -72,9 +96,11 @@ describe('runSink', () => {
     await expect(runSink({ writeFn: 'constructor' }, {}, { db, versionId: 431 })).rejects.toThrow(/Unknown sink "constructor"/);
   });
 
-  it('write-full-document writes an empty string when "from" is omitted or its source produced nothing, never the literal text "undefined"', async () => {
+  it('write-full-document writes nothing (and never the literal text "undefined") when "from" is omitted or its source has no sections', async () => {
     const db = makeDb();
+    setNote(db, 431, '## Diff Summary\nKeep me.\n');
     await runSink({ writeFn: 'apk-analysis/write-full-document' }, {}, { db, versionId: 431 });
-    expect(getNote(db, 431)).toBe('');
+    await runSink({ writeFn: 'apk-analysis/write-full-document', from: 'report' }, { report: { markdown: 'x' } }, { db, versionId: 431 });
+    expect(getNote(db, 431)).toBe('## Diff Summary\nKeep me.\n');
   });
 });

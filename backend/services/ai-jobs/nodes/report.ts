@@ -27,7 +27,7 @@ export function runReport(
   config: ReportConfig,
   envelopes: Record<string, Envelope<{ text: string }>>,
   jobKind = 'apk-analysis',
-): { markdown: string } {
+): { markdown: string; sections: AssembledSection[] } {
   const assembler = REPORT_ASSEMBLERS[jobKind];
   if (!assembler) throw new Error(`Unknown report assembler "${jobKind}"`);
   const sections = config.sections.map((section) => {
@@ -37,5 +37,7 @@ export function runReport(
       : `— ${section.title} unavailable this run. Its source node did not complete.`;
     return { title: section.title, body };
   });
-  return { markdown: assembler(sections) };
+  // `sections` is returned alongside the assembled markdown so a Sink can write each section in
+  // place instead of replacing the whole note (see sink.ts's write-full-document).
+  return { markdown: assembler(sections), sections };
 }
