@@ -2653,7 +2653,7 @@ Design note not spelled out verbatim in the spec: the hash is computed over `{co
 - Modify: `backend/services/ai-jobs/pipeline-runner.test.ts`
 
 **Interfaces:**
-- Produces: `computeInputHash(config: NodeConfig, input: Record<string, unknown>): string` (sha256 hex). `runPipeline`'s signature gains a 6th, optional parameter: `options?: { reuseUnchanged?: boolean; priorNodeRuns?: Record<string, { inputHash: string; output: Record<string, unknown> }> }`. `NodeRunResult` gains `wasMemoized?: boolean`.
+- Produces: `computeInputHash(config: NodeConfig, input: Record<string, unknown>): string` (sha256 hex, normalized through a JSON round-trip first — see Step 3 below for why). `runPipeline`'s signature gains a 6th, optional parameter: `options?: { reuseUnchanged?: boolean; priorNodeRuns?: Record<string, { inputHash: string; output: Record<string, unknown> }> }`. `NodeRunResult` gains `wasMemoized?: boolean` AND `inputHash?: string` — the hash is computed and attached for every `MEMOIZABLE_KINDS` node **regardless of whether `reuseUnchanged` is set**, not only on a cache hit; otherwise a run with reuse off can never seed a hash for a later run to reuse, and Task 19's REST handler (which persists this column so it can reload it next time) would have nothing real to write. Caught in this task's own review.
 
 - [ ] **Step 1: Write the failing test for `computeInputHash`**
 
@@ -2708,10 +2708,22 @@ function stableStringify(value: unknown): string {
 }
 
 export function computeInputHash(config: NodeConfig, input: Record<string, unknown>): string {
-  return createHash('sha256').update(stableStringify({ config, input })).digest('hex');
+  // Round-trip through JSON first — found during Task 17's review. Two gaps in stableStringify
+  // alone: (1) a Date hashes as '{}' (JSON.stringify never visits a Date's own fields, so two
+  // different Dates collide into a false "unchanged" hit — not reachable today since every real
+  // Date this hashes touches is already stringified to ISO text before it gets here, e.g. the
+  // Trigger's own expander, but fragile to rely on silently); (2) a key explicitly set to
+  // `undefined` hashes differently from that key being entirely absent, which matters once a
+  // hash computed in-memory during one run has to match the SAME hash after a round-trip through
+  // the DB's JSON column in a later run (undefined keys don't survive that round-trip, so an
+  // in-memory hash computed before storage would never match one computed after reload). A
+  // JSON.parse(JSON.stringify(...)) pass first gives the hash the exact same normalization the
+  // DB round-trip already imposes, so a hash computed now matches one computed after storage.
+  const normalized = JSON.parse(JSON.stringify({ config, input }));
+  return createHash('sha256').update(stableStringify(normalized)).digest('hex');
 }
 
-export const MEMOIZABLE_KINDS = new Set(['AgentCall', 'Sink']);
+export const MEMOIZABLE_KINDS: ReadonlySet<string> = new Set(['AgentCall', 'Sink']);
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -2761,14 +2773,36 @@ describe('runPipeline — memoization', () => {
 
   it('never memoizes Trigger or Report even when a matching hash is supplied', async () => {
     const { computeInputHash } = await import('./memoization');
+    // Hash against the REAL runtime input shape, not a guess — found during this task's own
+    // review via mutation testing (temporarily adding 'Trigger' to MEMOIZABLE_KINDS and
+    // re-running): the earlier draft of this test hashed `{ versionId: 431 }`, which never
+    // matches what the executor actually computes for the Trigger node (`{ trigger: undefined }`
+    // — the Trigger hasn't produced its own output into `outputs` yet when it itself is the one
+    // about to run), so a broken exclusion gate would have passed this test anyway. Confirming
+    // the gate is real requires a hash that WOULD match if the gate were ever removed.
     const triggerConfig = linearGraph.nodes[0].config;
-    const hash = computeInputHash(triggerConfig, { versionId: 431 });
+    const triggerHash = computeInputHash(triggerConfig, { trigger: undefined });
+    const reportConfig: NodeConfig = { kind: 'Report', sections: [{ title: 'X', from: 'agent' }] };
+    const reportInput = { agent: { text: 'fresh' }, trigger: { appName: 'x', versionId: 431 } };
+    const reportHash = computeInputHash(reportConfig, reportInput);
+
     const executors = fakeExecutors();
     await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
       reuseUnchanged: true,
-      priorNodeRuns: { trigger: { inputHash: hash, output: { appName: 'cached' } } },
+      priorNodeRuns: {
+        trigger: { inputHash: triggerHash, output: { appName: 'cached' } },
+        agent: { inputHash: reportHash, output: { markdown: 'cached report' } }, // only matters if 'agent' were a Report; see note below
+      },
     });
     expect(executors.Trigger).toHaveBeenCalled(); // not skipped, despite a matching hash in priorNodeRuns
+
+    // Separately confirm the Report exclusion on a graph that actually has one — `linearGraph`'s
+    // own 'agent' node is an AgentCall, not a Report, so reuse the envelope-nodes `branchGraph`-
+    // style fixture (or any graph with a Report node already defined earlier in this file) rather
+    // than fabricate a second graph inline here: run it with `reuseUnchanged: true` and a
+    // `priorNodeRuns` entry for the Report node using `reportHash`/`reportInput` above (adjust
+    // `reportInput` to that graph's real section sources), and assert `executors.Report` was
+    // still called despite the "matching" hash.
   });
 
   it('reuseUnchanged defaults to off — omitting it runs everything fresh even with priorNodeRuns supplied', async () => {
@@ -2791,7 +2825,7 @@ Expected: FAIL — `runPipeline` doesn't accept a 6th parameter yet, and `NodeRu
 
 - [ ] **Step 7: Wire memoization into the executor**
 
-Add to `types.ts`: `NodeRunResult` (if it's declared there instead of `pipeline-runner.ts` — it's declared in `pipeline-runner.ts` per Task 13, so add it there) gains `wasMemoized?: boolean`.
+Add to `types.ts`: `NodeRunResult` (if it's declared there instead of `pipeline-runner.ts` — it's declared in `pipeline-runner.ts` per Task 13, so add it there) gains `wasMemoized?: boolean` and `inputHash?: string`.
 
 Change `runPipeline`'s signature and add the lookup inside the wave loop, right before the `try`/`runOne` call:
 
@@ -2806,17 +2840,33 @@ export async function runPipeline(
 ): Promise<RunResult> {
 ```
 
-Inside the wave loop, after `const input = buildInput(incoming, outputs);` and before the `try`:
+Inside the wave loop, after `const input = buildInput(incoming, outputs);` and before the `try`. The hash is computed unconditionally for a `MEMOIZABLE_KINDS` node — not gated on `options.reuseUnchanged` — specifically so a run with reuse OFF still produces a real `inputHash` for `NodeRunResult`, which Task 19's REST handler persists so a LATER run (possibly the first one with `reuseUnchanged: true`) has something to compare against. Found in this task's own review: an earlier draft gated the hash computation itself on `reuseUnchanged`, which meant `inputHash` was only ever populated during a cache-hit check, never recorded for Task 19 to persist — the feature could never fire even once in production. Also clones the reused output (`structuredClone`) rather than handing back a shared reference, so nothing downstream can mutate the cached entry in place:
 
 ```ts
-      if (options.reuseUnchanged && MEMOIZABLE_KINDS.has(node.config.kind)) {
-        const prior = options.priorNodeRuns?.[nodeId];
-        const hash = computeInputHash(node.config, input);
-        if (prior && prior.inputHash === hash) {
-          results.set(nodeId, { nodeId, status: 'ok', output: prior.output, wasMemoized: true });
-          outputs.set(nodeId, prior.output);
-          return;
+      let inputHash: string | undefined;
+      if (MEMOIZABLE_KINDS.has(node.config.kind)) {
+        inputHash = computeInputHash(node.config, input);
+        if (options.reuseUnchanged) {
+          const prior = options.priorNodeRuns?.[nodeId];
+          if (prior && prior.inputHash === inputHash) {
+            const output = structuredClone(prior.output);
+            results.set(nodeId, { nodeId, status: 'ok', output, wasMemoized: true, inputHash });
+            outputs.set(nodeId, output);
+            return;
+          }
         }
+      }
+```
+
+And the existing fresh-execution path, right below, needs `inputHash` attached too (so a run with reuse off still records it):
+
+```ts
+      try {
+        const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx, branchEnvelope, reportEnvelopes);
+        results.set(nodeId, { nodeId, status: 'ok', output, ...(inputHash !== undefined ? { inputHash } : {}) });
+        outputs.set(nodeId, output);
+      } catch (err) {
+        results.set(nodeId, { nodeId, status: 'failed', error: String(err instanceof Error ? err.message : err) });
       }
 ```
 
@@ -3101,6 +3151,15 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
       db.insert(aiPipelineNodeRuns).values({
         runId, nodeId: nodeResult.nodeId, status: nodeResult.status,
         output: nodeResult.output, error: nodeResult.error,
+        // inputHash must be persisted here, not just wasMemoized — found during Task 17's review:
+        // the loader just above (priorNodeRuns[nr.nodeId] = {inputHash: nr.inputHash, ...}) filters
+        // on `nr.inputHash && nr.output`, so without writing it here, priorNodeRuns is ALWAYS empty
+        // on every later run and the whole memoization feature can never fire even once in
+        // production, regardless of whether reuseUnchanged is set. Task 17's executor now computes
+        // and returns inputHash for every memoizable-kind node unconditionally (not only when
+        // reuseUnchanged is true), specifically so a run with reuse OFF still seeds the cache for
+        // a later run that turns it on.
+        inputHash: nodeResult.inputHash,
         wasMemoized: !!nodeResult.wasMemoized, startedAt: now, finishedAt: new Date(),
       }).run();
     }
