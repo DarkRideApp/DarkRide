@@ -612,3 +612,63 @@ describe('runPipeline — multi-trigger zones', () => {
     await expect(runPipeline(twoTriggerGraph, 'agent-full', {}, executors, {})).rejects.toThrow(/not a Trigger node/); // a real node, but not a Trigger
   });
 });
+
+describe('runPipeline — memoization', () => {
+  it('reuses a prior AgentCall output when reuseUnchanged is set and the hash matches, never calls the executor', async () => {
+    const { computeInputHash } = await import('./memoization');
+    const config = linearGraph.nodes[1].config; // the AgentCall node
+    // Must match what the executor actually builds, not a guess — fakeExecutors' Trigger returns
+    // { appName: 'x', ...rawInput }, and every node's input.trigger is that output (Task 14's fix).
+    // The first draft of this test hashed { trigger: { versionId: 431 } } (missing appName),
+    // which never matched the runtime hash — the memoization lookup missed, AgentCall WAS
+    // called, and the test failed for a hash mismatch, not the behavior it claims to test.
+    // Caught in plan review.
+    const input = { trigger: { appName: 'x', versionId: 431 } };
+    const priorHash = computeInputHash(config, input);
+
+    const executors = fakeExecutors();
+    const result = await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+      reuseUnchanged: true,
+      priorNodeRuns: { agent: { inputHash: priorHash, output: { text: 'cached answer' } } },
+    });
+
+    expect(executors.AgentCall).not.toHaveBeenCalled();
+    const agentResult = result.nodes.find(n => n.nodeId === 'agent')!;
+    expect(agentResult.status).toBe('ok');
+    expect(agentResult.wasMemoized).toBe(true);
+    expect(agentResult.output).toEqual({ text: 'cached answer' });
+  });
+
+  it('runs fresh when the hash does not match (input actually changed)', async () => {
+    const executors = fakeExecutors();
+    const result = await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+      reuseUnchanged: true,
+      priorNodeRuns: { agent: { inputHash: 'stale-hash-from-a-different-input', output: { text: 'stale' } } },
+    });
+    expect(executors.AgentCall).toHaveBeenCalled();
+    expect(result.nodes.find(n => n.nodeId === 'agent')!.wasMemoized).toBeFalsy();
+  });
+
+  it('never memoizes Trigger or Report even when a matching hash is supplied', async () => {
+    const { computeInputHash } = await import('./memoization');
+    const triggerConfig = linearGraph.nodes[0].config;
+    const hash = computeInputHash(triggerConfig, { versionId: 431 });
+    const executors = fakeExecutors();
+    await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+      reuseUnchanged: true,
+      priorNodeRuns: { trigger: { inputHash: hash, output: { appName: 'cached' } } },
+    });
+    expect(executors.Trigger).toHaveBeenCalled(); // not skipped, despite a matching hash in priorNodeRuns
+  });
+
+  it('reuseUnchanged defaults to off — omitting it runs everything fresh even with priorNodeRuns supplied', async () => {
+    const { computeInputHash } = await import('./memoization');
+    const config = linearGraph.nodes[1].config;
+    const hash = computeInputHash(config, { trigger: { appName: 'x', versionId: 431 } }); // the real resolved shape, same correction as the first test
+    const executors = fakeExecutors();
+    await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+      priorNodeRuns: { agent: { inputHash: hash, output: { text: 'should not be used' } } },
+    });
+    expect(executors.AgentCall).toHaveBeenCalled();
+  });
+});

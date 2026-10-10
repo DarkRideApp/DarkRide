@@ -2,6 +2,7 @@ import type {
   PipelineGraph, PipelineNode, PipelineEdge, NodeConfig, NodeRunStatus, RunStatus, Envelope,
   TriggerConfig, AgentCallConfig, TransformConfig, BranchConfig, ReportConfig, ForEachConfig, SinkConfig,
 } from './types';
+import { computeInputHash, MEMOIZABLE_KINDS } from './memoization';
 
 export type { PipelineGraph };
 
@@ -22,6 +23,13 @@ export interface NodeRunResult {
   status: NodeRunStatus;
   output?: Record<string, unknown>;
   error?: string;
+  wasMemoized?: boolean;
+}
+
+/** Options accepted by `runPipeline`'s optional 6th parameter — see "opt-in memoization" below. */
+export interface RunPipelineOptions {
+  reuseUnchanged?: boolean;
+  priorNodeRuns?: Record<string, { inputHash: string; output: Record<string, unknown> }>;
 }
 
 export interface RunResult {
@@ -50,8 +58,15 @@ export interface RunResult {
  * even starts — their executors are never called, and the run-status rollup already excludes
  * `'inactive'` (see below), so another zone's nodes never count toward this run's outcome.
  *
- * Still outstanding, for Task 17 to add to this same function in place:
- *   - Task 17: opt-in memoization
+ * Opt-in memoization (Task 17): when `options.reuseUnchanged` is true, an `AgentCall`/`Sink`
+ * node whose `(config, input)` hash matches a prior run's recorded hash for that exact node
+ * (keyed by `nodeId` in `options.priorNodeRuns`) reuses the prior output instead of
+ * re-executing — the executor is never called, `wasMemoized` is set on its `NodeRunResult`, and
+ * its output flows downstream exactly as if it had just run. Never applied to `Trigger`
+ * (hashing a Trigger's raw input isn't meaningful — it's the thing that produces the canonical
+ * shape everything else hashes against) or `Report`/`ForEach` (their own fault-tolerance/
+ * per-item semantics would complicate memoization) — enforced structurally via
+ * `MEMOIZABLE_KINDS`, not by convention. Off by default.
  *
  * `triggerNodeId` names which node in `graph.nodes` is the Trigger to seed with `rawInput` —
  * this is the real parameter driving the special-case "seed this node with rawInput instead of
@@ -67,6 +82,7 @@ export async function runPipeline(
   rawInput: Record<string, unknown>,
   executors: NodeExecutors,
   ctx: ExecutionCtx,
+  options: RunPipelineOptions = {},
 ): Promise<RunResult> {
   const byId = new Map(graph.nodes.map(n => [n.id, n]));
   const results = new Map<string, NodeRunResult>();
@@ -183,6 +199,22 @@ export async function runPipeline(
       // the Trigger itself always completes in the first wave, so outputs.get(triggerNodeId) is
       // populated before any other node runs.
       input.trigger = outputs.get(triggerNodeId);
+
+      // Opt-in memoization — only ever checked for AgentCall/Sink (see MEMOIZABLE_KINDS), never
+      // for Trigger/Branch/Report/ForEach/Transform. A hash match means this exact node, with
+      // this exact (config, input), already ran and produced `prior.output` in some earlier run
+      // — reuse it instead of calling the executor, and record `wasMemoized` so callers can tell
+      // a cache hit apart from a fresh 'ok'.
+      if (options.reuseUnchanged && MEMOIZABLE_KINDS.has(node.config.kind)) {
+        const prior = options.priorNodeRuns?.[nodeId];
+        const hash = computeInputHash(node.config, input);
+        if (prior && prior.inputHash === hash) {
+          results.set(nodeId, { nodeId, status: 'ok', output: prior.output, wasMemoized: true });
+          outputs.set(nodeId, prior.output);
+          return;
+        }
+      }
+
       try {
         const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx, branchEnvelope, reportEnvelopes);
         results.set(nodeId, { nodeId, status: 'ok', output });
