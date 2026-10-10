@@ -367,4 +367,17 @@ describe('migration 0102_ai_pipelines.sql', () => {
     ins.run();
     expect(() => ins.run()).toThrow(/UNIQUE/);
   });
+
+  it('creates the node_runs run_id and memo (node_id, input_hash) indexes', () => {
+    const sqlite = new Database(':memory:');
+    sqlite.pragma('foreign_keys = ON');
+    applyMigration(sqlite);
+
+    const indexes = (sqlite.prepare(`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='ai_pipeline_node_runs' AND name LIKE 'ai_pipeline_node_runs_%' ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
+    expect(indexes).toEqual(['ai_pipeline_node_runs_memo_idx', 'ai_pipeline_node_runs_run_idx']);
+
+    const cols = (name: string) => (sqlite.prepare(`PRAGMA index_info('${name}')`).all() as { name: string }[]).map((r) => r.name);
+    expect(cols('ai_pipeline_node_runs_run_idx')).toEqual(['run_id']);
+    expect(cols('ai_pipeline_node_runs_memo_idx')).toEqual(['node_id', 'input_hash']);
+  });
 });
