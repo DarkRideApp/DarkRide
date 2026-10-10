@@ -29,8 +29,8 @@ const APK_CONTEXT_SCHEMA = [
   { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
 ];
 
-const GROUP_A_TOOLS = ['get_apk_overview', 'get_apk_strings', 'list_apk_assets', 'get_app_versions', 'search_apk_code', 'find_api_endpoints', 'get_api_endpoint', 'get_map_config'];
-const GROUP_B_TOOLS = ['search_credentials', 'search_apk_code', 'get_apk_strings', 'find_api_endpoints', 'get_api_endpoint', 'list_api_endpoints', 'detect_ssl_pinning', 'generate_ssl_bypass', 'inspect_class_methods'];
+const GROUP_A_TOOLS = ['get_apk_overview', 'get_apk_strings', 'list_apk_assets', 'get_app_versions', 'search_apk_code', 'find_api_endpoints'];
+const GROUP_B_TOOLS = ['search_apk_code', 'get_apk_strings', 'find_api_endpoints', 'detect_ssl_pinning'];
 
 const ASTERIX_PATTERN_GRAPH_FIXTURE: PipelineGraph = {
   nodes: [

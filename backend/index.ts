@@ -104,7 +104,7 @@ import { registerNotificationEndpoints } from './api/notifications';
 import { JobRegistry } from './services/job-registry';
 import { registerJobEndpoints } from './api/jobs';
 import { registerAiPipelineEndpoints } from './api/ai-pipelines';
-import { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, seedApkAnalysisPipeline } from './services/ai-jobs/apk-analysis-pipeline';
+import { APK_ANALYZER_AI_SCOPES, buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, seedApkAnalysisPipeline } from './services/ai-jobs/apk-analysis-pipeline';
 import { isPipelinesEnabled, resetRunningPipelineRuns } from './services/ai-jobs/run-executor';
 import { PluginManager } from './plugins/plugin-manager';
 import { computeLoadOrder } from './plugins/load-order';
@@ -815,7 +815,7 @@ registerAiChatEndpoints({
 // registerCoreIdentity MUST happen before setAiFactory so the first auto-trigger
 // doesn't race ahead before the identity is provisioned.
 aiFactory.registerCoreIdentity('apk-analyzer', {
-  aiScopes: ['core.apk:read', 'core.apk:manage', 'mcp'],
+  aiScopes: APK_ANALYZER_AI_SCOPES,
 });
 apkAnalyzer.setAiFactory(aiFactory);
 
