@@ -103,6 +103,7 @@ import { NotificationService } from './services/notification-service';
 import { registerNotificationEndpoints } from './api/notifications';
 import { JobRegistry } from './services/job-registry';
 import { registerJobEndpoints } from './api/jobs';
+import { registerAiPipelineEndpoints } from './api/ai-pipelines';
 import { PluginManager } from './plugins/plugin-manager';
 import { computeLoadOrder } from './plugins/load-order';
 import { discoverPlugins, discoverNpmPlugins, applyPluginFilter } from './plugins/discover';
@@ -766,6 +767,12 @@ pluginSourceManager.fetchAll(true).catch(err => {
   error(`Initial plugin source fetch failed (will retry on schedule): ${err.message}`);
 });
 registerJobEndpoints(jobRegistry);
+// TODO(Task 20): uncomment once buildApkAnalysisExecutors/buildApkAnalysisExecutionCtx exist.
+// registerAiPipelineEndpoints({
+//   db,
+//   executors: buildApkAnalysisExecutors(),
+//   buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }),
+// });
 registerInterceptRuleEndpoints(db, (msg) => broadcastToAll(msg));
 // Interactive intercept ("breakpoints") — separate from the rule-based feature above.
 registerInterceptLiveEndpoints((msg) => broadcastToAll(msg), (config) => writeHoldConfig(config));
