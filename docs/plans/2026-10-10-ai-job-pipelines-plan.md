@@ -3092,6 +3092,14 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
     const errors = validateGraph(latest.graph as PipelineGraph);
     if (errors.length > 0) { res.status(400).json({ success: false, error: 'Invalid graph', errors }); return; }
 
+    // Demote every other version back to draft first, so "published" is a true singleton per
+    // pipeline — found during this task's review: without this, GET (picks the OLDEST published
+    // version after an ascending sort) and /run (picks the NEWEST) disagreed about which version
+    // was current the moment a second version was ever published, breaking the exact contract
+    // Task 22's frontend depends on (the canvas loading one version while Run executes another).
+    db.update(aiPipelineVersions).set({ status: 'draft' })
+      .where(and(eq(aiPipelineVersions.pipelineId, pipelineId), eq(aiPipelineVersions.status, 'published')))
+      .run();
     db.update(aiPipelineVersions).set({ status: 'published' }).where(eq(aiPipelineVersions.id, latest.id)).run();
     res.json({ success: true });
   }, { requires: ['core.apk:manage'] });
@@ -3158,27 +3166,38 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
     const identity = req.authUser
       ? { type: 'user' as const, userId: req.authUser.userId } // AuthUser (backend/auth/middleware.ts:9-18) has userId, not actorUserId — that field belongs to the unrelated AgentIdentity type; plan review caught this, as-written every manual run threw "forUser: user undefined not found"
       : { type: 'core-service' as const }; // defensive fallback — registerEndpoint's scope check already requires an authUser for a core.apk:manage route, this branch should be unreachable in practice
-    const result = await runPipeline(graph, triggerNodeId, input, deps.executors, deps.buildCtx(identity, input), { reuseUnchanged, priorNodeRuns });
+    // Wrapped in try/catch — found during this task's review: without this, any throw between
+    // inserting the 'running' row above and finalizing it (buildCtx, runPipeline itself, or a
+    // node-run insert) left the row stuck in 'running' forever, and the 409 guard above then
+    // permanently blocked every future /run for this version, with no way to clear it short of a
+    // direct DB edit. Task 20's real buildCtx does a DB lookup by versionId that could plausibly
+    // throw, so this isn't theoretical.
+    try {
+      const result = await runPipeline(graph, triggerNodeId, input, deps.executors, deps.buildCtx(identity, input), { reuseUnchanged, priorNodeRuns });
 
-    for (const nodeResult of result.nodes) {
-      db.insert(aiPipelineNodeRuns).values({
-        runId, nodeId: nodeResult.nodeId, status: nodeResult.status,
-        output: nodeResult.output, error: nodeResult.error,
-        // inputHash must be persisted here, not just wasMemoized — found during Task 17's review:
-        // the loader just above (priorNodeRuns[nr.nodeId] = {inputHash: nr.inputHash, ...}) filters
-        // on `nr.inputHash && nr.output`, so without writing it here, priorNodeRuns is ALWAYS empty
-        // on every later run and the whole memoization feature can never fire even once in
-        // production, regardless of whether reuseUnchanged is set. Task 17's executor now computes
-        // and returns inputHash for every memoizable-kind node unconditionally (not only when
-        // reuseUnchanged is true), specifically so a run with reuse OFF still seeds the cache for
-        // a later run that turns it on.
-        inputHash: nodeResult.inputHash,
-        wasMemoized: !!nodeResult.wasMemoized, startedAt: now, finishedAt: new Date(),
-      }).run();
+      for (const nodeResult of result.nodes) {
+        db.insert(aiPipelineNodeRuns).values({
+          runId, nodeId: nodeResult.nodeId, status: nodeResult.status,
+          output: nodeResult.output, error: nodeResult.error,
+          // inputHash must be persisted here, not just wasMemoized — found during Task 17's review:
+          // the loader just above (priorNodeRuns[nr.nodeId] = {inputHash: nr.inputHash, ...}) filters
+          // on `nr.inputHash && nr.output`, so without writing it here, priorNodeRuns is ALWAYS empty
+          // on every later run and the whole memoization feature can never fire even once in
+          // production, regardless of whether reuseUnchanged is set. Task 17's executor now computes
+          // and returns inputHash for every memoizable-kind node unconditionally (not only when
+          // reuseUnchanged is true), specifically so a run with reuse OFF still seeds the cache for
+          // a later run that turns it on.
+          inputHash: nodeResult.inputHash,
+          wasMemoized: !!nodeResult.wasMemoized, startedAt: now, finishedAt: new Date(),
+        }).run();
+      }
+      db.update(aiPipelineRuns).set({ status: result.status, finishedAt: new Date() }).where(eq(aiPipelineRuns.id, runId)).run();
+
+      res.json({ success: true, data: { runId, status: result.status } });
+    } catch (err) {
+      db.update(aiPipelineRuns).set({ status: 'failed', finishedAt: new Date() }).where(eq(aiPipelineRuns.id, runId)).run();
+      res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
     }
-    db.update(aiPipelineRuns).set({ status: result.status, finishedAt: new Date() }).where(eq(aiPipelineRuns.id, runId)).run();
-
-    res.json({ success: true, data: { runId, status: result.status } });
   }, { requires: ['core.apk:manage'] });
 
   registerEndpoint('GET', '/v1/ai-pipelines/runs/:runId', (req, res) => {
