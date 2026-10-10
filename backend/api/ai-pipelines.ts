@@ -59,6 +59,13 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
     const errors = validateGraph(latest.graph as PipelineGraph);
     if (errors.length > 0) { res.status(400).json({ success: false, error: 'Invalid graph', errors }); return; }
 
+    // Demote every other version back to draft first, so "published" is a true singleton per
+    // pipeline — found during review: without this, GET (picks the oldest published version)
+    // and /run (picks the newest) disagreed about which version was current the moment a second
+    // version was ever published.
+    db.update(aiPipelineVersions).set({ status: 'draft' })
+      .where(and(eq(aiPipelineVersions.pipelineId, pipelineId), eq(aiPipelineVersions.status, 'published')))
+      .run();
     db.update(aiPipelineVersions).set({ status: 'published' }).where(eq(aiPipelineVersions.id, latest.id)).run();
     res.json({ success: true });
   }, { requires: ['core.apk:manage'] });
@@ -127,22 +134,33 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
     const identity = req.authUser
       ? { type: 'user' as const, userId: req.authUser.userId }
       : { type: 'core-service' as const };
-    const result = await runPipeline(graph, triggerNodeId, input, deps.executors, deps.buildCtx(identity, input), { reuseUnchanged, priorNodeRuns });
 
-    for (const nodeResult of result.nodes) {
-      db.insert(aiPipelineNodeRuns).values({
-        runId, nodeId: nodeResult.nodeId, status: nodeResult.status,
-        output: nodeResult.output, error: nodeResult.error,
-        // inputHash must be persisted here, not just wasMemoized: the loader just above filters
-        // on `nr.inputHash && nr.output`, so without writing it here, priorNodeRuns is always
-        // empty on every later run and memoization can never fire in production.
-        inputHash: nodeResult.inputHash,
-        wasMemoized: !!nodeResult.wasMemoized, startedAt: now, finishedAt: new Date(),
-      }).run();
+    try {
+      const result = await runPipeline(graph, triggerNodeId, input, deps.executors, deps.buildCtx(identity, input), { reuseUnchanged, priorNodeRuns });
+
+      for (const nodeResult of result.nodes) {
+        db.insert(aiPipelineNodeRuns).values({
+          runId, nodeId: nodeResult.nodeId, status: nodeResult.status,
+          output: nodeResult.output, error: nodeResult.error,
+          // inputHash must be persisted here, not just wasMemoized: the loader just above filters
+          // on `nr.inputHash && nr.output`, so without writing it here, priorNodeRuns is always
+          // empty on every later run and memoization can never fire in production.
+          inputHash: nodeResult.inputHash,
+          wasMemoized: !!nodeResult.wasMemoized, startedAt: now, finishedAt: new Date(),
+        }).run();
+      }
+      db.update(aiPipelineRuns).set({ status: result.status, finishedAt: new Date() }).where(eq(aiPipelineRuns.id, runId)).run();
+
+      res.json({ success: true, data: { runId, status: result.status } });
+    } catch (err) {
+      // Found during review: without this, any throw between inserting the 'running' row and
+      // finalizing it (buildCtx, runPipeline itself, or a node-run insert) leaves the row stuck
+      // in 'running' forever, and every future /run for this version 409s permanently with no
+      // way to clear it short of a direct DB edit. Mark it failed so the 409 guard only ever
+      // blocks a genuine concurrent run, never a crashed one.
+      db.update(aiPipelineRuns).set({ status: 'failed', finishedAt: new Date() }).where(eq(aiPipelineRuns.id, runId)).run();
+      res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
     }
-    db.update(aiPipelineRuns).set({ status: result.status, finishedAt: new Date() }).where(eq(aiPipelineRuns.id, runId)).run();
-
-    res.json({ success: true, data: { runId, status: result.status } });
   }, { requires: ['core.apk:manage'] });
 
   registerEndpoint('GET', '/v1/ai-pipelines/runs/:runId', (req, res) => {
