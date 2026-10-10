@@ -19,7 +19,19 @@ function stableStringify(value: unknown): string {
  * nothing.
  */
 export function computeInputHash(config: NodeConfig, input: Record<string, unknown>): string {
-  return createHash('sha256').update(stableStringify({ config, input })).digest('hex');
+  // Normalize through a JSON round-trip before hashing. Two real gaps otherwise:
+  //   1. A Date hashes as '{}' via stableStringify alone (JSON.stringify never visits a Date's
+  //      own fields directly — it calls toJSON() first when present on a plain object literal
+  //      passed straight to our stringify, which never happens for a bare Date), so two
+  //      different dates could collide into a false "unchanged" hit.
+  //   2. A key explicitly set to `undefined` hashes differently from that key being absent
+  //      entirely — and it matters, because a hash computed in-memory now has to match the same
+  //      hash recomputed after a round-trip through a DB's JSON column in a later run (Task 19),
+  //      and an `undefined`-valued key never survives that round-trip.
+  // JSON.parse(JSON.stringify(...)) collapses both to the same representation up front, so the
+  // hash matches what will actually be persisted and reloaded.
+  const normalized = JSON.parse(JSON.stringify({ config, input }));
+  return createHash('sha256').update(stableStringify(normalized)).digest('hex');
 }
 
 /**
@@ -31,4 +43,4 @@ export function computeInputHash(config: NodeConfig, input: Record<string, unkno
  * not by convention, so a future node kind added to NodeConfig without updating this set stays
  * un-memoized by default rather than silently becoming memoizable.
  */
-export const MEMOIZABLE_KINDS = new Set(['AgentCall', 'Sink']);
+export const MEMOIZABLE_KINDS: ReadonlySet<string> = new Set(['AgentCall', 'Sink']);

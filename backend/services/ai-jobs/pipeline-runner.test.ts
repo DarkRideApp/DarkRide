@@ -614,6 +614,31 @@ describe('runPipeline — multi-trigger zones', () => {
 });
 
 describe('runPipeline — memoization', () => {
+  // The main fix this round: inputHash must be recorded on EVERY memoizable node's result,
+  // regardless of whether reuseUnchanged is even on. Without this, Task 19's persistence layer
+  // has nothing to write to storage, and priorNodeRuns would be {} on every future run forever
+  // — the feature could never fire once wired to real storage.
+  it("records inputHash on every memoizable node's result, even when reuseUnchanged is off (so a later run can match against it)", async () => {
+    const { computeInputHash } = await import('./memoization');
+    const executors = fakeExecutors();
+    const result = await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {});
+
+    const triggerResult = result.nodes.find(n => n.nodeId === 'trigger')!;
+    const agentResult = result.nodes.find(n => n.nodeId === 'agent')!;
+    const sinkResult = result.nodes.find(n => n.nodeId === 'sink')!;
+
+    // Trigger is never in MEMOIZABLE_KINDS — no inputHash, ever.
+    expect(triggerResult.inputHash).toBeUndefined();
+    // AgentCall and Sink both get their real runtime (config, input) hashed and recorded, even
+    // though reuseUnchanged was never passed (defaults off) for this run.
+    expect(agentResult.inputHash).toBe(
+      computeInputHash(linearGraph.nodes[1].config, { trigger: { appName: 'x', versionId: 431 } }),
+    );
+    expect(sinkResult.inputHash).toBe(
+      computeInputHash(linearGraph.nodes[2].config, { agent: { text: 'ok' }, trigger: { appName: 'x', versionId: 431 } }),
+    );
+  });
+
   it('reuses a prior AgentCall output when reuseUnchanged is set and the hash matches, never calls the executor', async () => {
     const { computeInputHash } = await import('./memoization');
     const config = linearGraph.nodes[1].config; // the AgentCall node
@@ -637,6 +662,7 @@ describe('runPipeline — memoization', () => {
     expect(agentResult.status).toBe('ok');
     expect(agentResult.wasMemoized).toBe(true);
     expect(agentResult.output).toEqual({ text: 'cached answer' });
+    expect(agentResult.inputHash).toBe(priorHash); // recorded on the memoized path too, not just the fresh one
   });
 
   it('runs fresh when the hash does not match (input actually changed)', async () => {
@@ -649,16 +675,72 @@ describe('runPipeline — memoization', () => {
     expect(result.nodes.find(n => n.nodeId === 'agent')!.wasMemoized).toBeFalsy();
   });
 
+  it("hands out a deep clone of a memoized output, never the cached object by reference — mutating a run's result must not corrupt the cache for a later run", async () => {
+    const { computeInputHash } = await import('./memoization');
+    const config = linearGraph.nodes[1].config;
+    const input = { trigger: { appName: 'x', versionId: 431 } };
+    const priorHash = computeInputHash(config, input);
+    const cachedOutput = { text: 'cached answer', nested: { count: 1 } };
+
+    const executors = fakeExecutors();
+    const result = await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+      reuseUnchanged: true,
+      priorNodeRuns: { agent: { inputHash: priorHash, output: cachedOutput } },
+    });
+
+    const agentResult = result.nodes.find(n => n.nodeId === 'agent')!;
+    expect(agentResult.output).not.toBe(cachedOutput); // not the same reference
+    expect(agentResult.output).toEqual(cachedOutput); // same content
+
+    // Mutate what the caller got back — a future node implementation might do this in place.
+    (agentResult.output as any).nested.count = 999;
+    expect(cachedOutput.nested.count).toBe(1); // the cache entry itself is untouched
+  });
+
   it('never memoizes Trigger or Report even when a matching hash is supplied', async () => {
     const { computeInputHash } = await import('./memoization');
+
+    // Trigger case — real runtime input shape, not a guess. 'trigger' has no incoming edges, so
+    // buildInput([], outputs) is {}, and input.trigger = outputs.get('trigger') is undefined at
+    // that point (the Trigger hasn't resolved its own output yet when it is the one about to
+    // run). A hash computed against a GUESSED shape (e.g. the raw rawInput, as an earlier draft
+    // of this test did) would never match the real runtime hash — which means even a BROKEN gate
+    // (one that accidentally let Trigger through) would still call the executor for an unrelated
+    // reason (hash mismatch, not structural exclusion), and the test couldn't tell a broken gate
+    // from a working one. This hash is computed against the exact shape the wave loop builds.
     const triggerConfig = linearGraph.nodes[0].config;
-    const hash = computeInputHash(triggerConfig, { versionId: 431 });
+    const triggerHash = computeInputHash(triggerConfig, { trigger: undefined });
     const executors = fakeExecutors();
-    await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
+    const result = await runPipeline(linearGraph, 'trigger', { versionId: 431 }, executors, {}, {
       reuseUnchanged: true,
-      priorNodeRuns: { trigger: { inputHash: hash, output: { appName: 'cached' } } },
+      priorNodeRuns: { trigger: { inputHash: triggerHash, output: { appName: 'cached' } } },
     });
     expect(executors.Trigger).toHaveBeenCalled(); // not skipped, despite a matching hash in priorNodeRuns
+    expect(result.nodes.find(n => n.nodeId === 'trigger')!.wasMemoized).toBeFalsy();
+
+    // Report case — linearGraph has no Report node, so a small dedicated graph. Real runtime
+    // input for 'report': its one incoming edge is from 'a1', so buildInput(['a1'], outputs)
+    // sets input.a1 = outputs.get('a1') ({ text: 'ok' }, the default AgentCall mock), and
+    // input.trigger = outputs.get('trigger') ({ appName: 'x' }, the default Trigger mock with
+    // rawInput {}).
+    const reportGraph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'a1', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'report', config: { kind: 'Report', sections: [{ title: 'One', from: 'a1' }] } },
+      ],
+      edges: [{ from: 'trigger', to: 'a1' }, { from: 'a1', to: 'report' }],
+    };
+    const reportConfig = reportGraph.nodes[2].config;
+    const reportInput = { a1: { text: 'ok' }, trigger: { appName: 'x' } };
+    const reportHash = computeInputHash(reportConfig, reportInput);
+    const reportExecutors = fakeExecutors();
+    const reportResult = await runPipeline(reportGraph, 'trigger', {}, reportExecutors, {}, {
+      reuseUnchanged: true,
+      priorNodeRuns: { report: { inputHash: reportHash, output: { markdown: 'cached' } } },
+    });
+    expect(reportExecutors.Report).toHaveBeenCalled(); // not skipped, despite a matching hash in priorNodeRuns
+    expect(reportResult.nodes.find(n => n.nodeId === 'report')!.wasMemoized).toBeFalsy();
   });
 
   it('reuseUnchanged defaults to off — omitting it runs everything fresh even with priorNodeRuns supplied', async () => {
