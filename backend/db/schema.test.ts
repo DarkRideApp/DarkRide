@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { eq } from 'drizzle-orm';
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import fs from 'fs';
+import path from 'path';
 import * as schema from './schema';
 import { createTestDb } from '../test-utils/create-test-db';
 
@@ -259,5 +263,108 @@ describe('Database Schema', () => {
 
       expect(db.select().from(proxies).all()).toHaveLength(0);
     });
+  });
+});
+
+describe('ai_pipelines tables', () => {
+  it('cascades deletes from aiPipelines through to aiPipelineNodeRuns', () => {
+    const sqlite = new Database(':memory:');
+    sqlite.pragma('foreign_keys = ON');
+    sqlite.exec(`
+      CREATE TABLE ai_pipelines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        job_kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE ai_pipeline_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pipeline_id INTEGER NOT NULL REFERENCES ai_pipelines(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        graph TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft',
+        created_at INTEGER NOT NULL,
+        UNIQUE(pipeline_id, version)
+      );
+      CREATE TABLE ai_pipeline_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pipeline_version_id INTEGER NOT NULL REFERENCES ai_pipeline_versions(id) ON DELETE CASCADE,
+        trigger_node_id TEXT NOT NULL,
+        triggered_by TEXT NOT NULL,
+        input TEXT,
+        reuse_unchanged INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'running',
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+      CREATE TABLE ai_pipeline_node_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES ai_pipeline_runs(id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        input TEXT,
+        input_hash TEXT,
+        was_memoized INTEGER NOT NULL DEFAULT 0,
+        output TEXT,
+        error TEXT,
+        model_used TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+    `);
+    const db = drizzle(sqlite, { schema });
+
+    const now = new Date();
+    db.insert(schema.aiPipelines).values({ id: 1, name: 'Astérix', jobKind: 'apk-analysis', createdAt: now }).run();
+    db.insert(schema.aiPipelineVersions).values({ id: 1, pipelineId: 1, version: 1, graph: { nodes: [], edges: [] }, status: 'published', createdAt: now }).run();
+    db.insert(schema.aiPipelineRuns).values({ id: 1, pipelineVersionId: 1, triggerNodeId: 'trigger', triggeredBy: 'manual', status: 'running', startedAt: now }).run();
+    db.insert(schema.aiPipelineNodeRuns).values({ id: 1, runId: 1, nodeId: 'agent-overview', status: 'ok', startedAt: now }).run();
+
+    db.delete(schema.aiPipelines).where(eq(schema.aiPipelines.id, 1)).run();
+
+    expect(db.select().from(schema.aiPipelineNodeRuns).all()).toHaveLength(0);
+  });
+});
+
+describe('migration 0102_ai_pipelines.sql', () => {
+  function applyMigration(sqlite: Database.Database) {
+    const dir = path.resolve(__dirname, '../../migrations');
+    const file = fs.readdirSync(dir).find((f) => f.startsWith('0102_ai_pipelines'))!;
+    expect(file).toBeTruthy();
+    const sql = fs.readFileSync(path.join(dir, file), 'utf8');
+    for (const stmt of sql.split('--> statement-breakpoint')) if (stmt.trim()) sqlite.exec(stmt);
+  }
+
+  it('creates the four tables and cascades a pipeline delete through all children', () => {
+    const sqlite = new Database(':memory:');
+    sqlite.pragma('foreign_keys = ON');
+    applyMigration(sqlite);
+
+    const tables = (sqlite.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ai_pipeline%' ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
+    expect(tables).toEqual(['ai_pipeline_node_runs', 'ai_pipeline_runs', 'ai_pipeline_versions', 'ai_pipelines']);
+
+    sqlite.exec(`
+      INSERT INTO ai_pipelines (id, name, job_kind, created_at) VALUES (1, 'p', 'apk-analysis', 1000);
+      INSERT INTO ai_pipeline_versions (id, pipeline_id, version, graph, created_at) VALUES (1, 1, 1, '{"nodes":[],"edges":[]}', 1000);
+      INSERT INTO ai_pipeline_runs (id, pipeline_version_id, trigger_node_id, triggered_by, started_at) VALUES (1, 1, 't', 'manual', 1000);
+      INSERT INTO ai_pipeline_node_runs (run_id, node_id, status, started_at) VALUES (1, 'n', 'ok', 1000);
+    `);
+    sqlite.prepare('DELETE FROM ai_pipelines WHERE id = 1').run();
+
+    for (const t of ['ai_pipeline_versions', 'ai_pipeline_runs', 'ai_pipeline_node_runs']) {
+      expect((sqlite.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n).toBe(0);
+    }
+  });
+
+  it('enforces unique (pipeline_id, version)', () => {
+    const sqlite = new Database(':memory:');
+    sqlite.pragma('foreign_keys = ON');
+    applyMigration(sqlite);
+    sqlite.exec(`INSERT INTO ai_pipelines (id, name, job_kind, created_at) VALUES (1, 'p', 'apk-analysis', 1000);`);
+    const ins = sqlite.prepare(`INSERT INTO ai_pipeline_versions (pipeline_id, version, graph, created_at) VALUES (1, 1, '{}', 1000)`);
+    ins.run();
+    expect(() => ins.run()).toThrow(/UNIQUE/);
   });
 });

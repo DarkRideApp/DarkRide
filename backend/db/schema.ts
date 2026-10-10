@@ -794,3 +794,51 @@ export const aiCallRequest = sqliteTable('ai_call_request', {
 });
 
 export * from './oauth-schema';
+
+export const aiPipelines = sqliteTable('ai_pipelines', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull(),
+  jobKind: text('job_kind').notNull(), // 'apk-analysis' | future kinds
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+});
+
+export const aiPipelineVersions = sqliteTable('ai_pipeline_versions', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  pipelineId: integer('pipeline_id').notNull().references(() => aiPipelines.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull(),
+  // Generic shape on purpose: the db layer does not import feature types. Callers narrow it.
+  graph: text('graph', { mode: 'json' }).$type<{ nodes: unknown[]; edges: unknown[] }>().notNull(),
+  status: text('status', { enum: ['draft', 'published'] }).notNull().default('draft'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+}, (t) => ({
+  uniqueVersion: unique().on(t.pipelineId, t.version),
+}));
+
+export const aiPipelineRuns = sqliteTable('ai_pipeline_runs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  pipelineVersionId: integer('pipeline_version_id').notNull().references(() => aiPipelineVersions.id, { onDelete: 'cascade' }),
+  triggerNodeId: text('trigger_node_id').notNull(),
+  triggeredBy: text('triggered_by').notNull(), // 'manual' | 'apk-analysis-complete'
+  input: text('input', { mode: 'json' }).$type<Record<string, unknown>>(),
+  reuseUnchanged: integer('reuse_unchanged', { mode: 'boolean' }).notNull().default(false),
+  status: text('status', { enum: ['running', 'ok', 'failed', 'partial'] }).notNull().default('running'),
+  startedAt: integer('started_at', { mode: 'timestamp' }).notNull(),
+  finishedAt: integer('finished_at', { mode: 'timestamp' }),
+});
+
+export const aiPipelineNodeRuns = sqliteTable('ai_pipeline_node_runs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  runId: integer('run_id').notNull().references(() => aiPipelineRuns.id, { onDelete: 'cascade' }),
+  nodeId: text('node_id').notNull(),
+  status: text('status', { enum: ['ok', 'failed', 'skipped', 'inactive'] }).notNull(),
+  input: text('input', { mode: 'json' }).$type<Record<string, unknown>>(),
+  inputHash: text('input_hash'),
+  wasMemoized: integer('was_memoized', { mode: 'boolean' }).notNull().default(false),
+  output: text('output', { mode: 'json' }).$type<Record<string, unknown>>(),
+  error: text('error'),
+  modelUsed: text('model_used'),
+  inputTokens: integer('input_tokens'),
+  outputTokens: integer('output_tokens'),
+  startedAt: integer('started_at', { mode: 'timestamp' }).notNull(),
+  finishedAt: integer('finished_at', { mode: 'timestamp' }),
+});
