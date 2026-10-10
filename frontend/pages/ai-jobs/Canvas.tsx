@@ -12,9 +12,11 @@ const KIND_COLOR: Record<string, string> = {
 // Layered on top of KIND_COLOR, not replacing it: KIND_COLOR still drives the left border (what
 // kind of node this is); a run's outcome is a second, independent signal shown as the node's
 // outline. `cached` covers a memoized node (`wasMemoized: true`) regardless of its underlying
-// status; `inactive` covers a node untouched by the run (outside the chosen Trigger's zone).
-const STATUS_COLOR: Record<string, string> = {
-  ok: '#22c55e', failed: '#ef4444', cached: '#38bdf8', inactive: '#475569',
+// status; `inactive` covers a node untouched by the run (outside the chosen Trigger's zone);
+// `skipped` covers a node whose predecessor failed — without its own colour it rendered with no
+// outline at all, indistinguishable from a node the run never touched.
+export const STATUS_COLOR: Record<string, string> = {
+  ok: '#22c55e', failed: '#ef4444', cached: '#38bdf8', inactive: '#475569', skipped: '#f97316',
 };
 
 function statusFor(nodeId: string, nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean }>): string | undefined {

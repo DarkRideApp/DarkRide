@@ -70,6 +70,16 @@ const ASTERIX_PATTERN_GRAPH_FIXTURE: PipelineGraph = {
   ],
 };
 
+/**
+ * Rows in the shape GET /v1/apps/recent really returns (backend/api/apps.ts: apkVersions rows
+ * spread, plus packageName/appName from the tracked app). The first is what the workspace's
+ * APK-version picker selects by default.
+ */
+export const RECENT_VERSIONS_FIXTURE = [
+  { id: 42, trackedAppId: 1, versionCode: 1200, versionName: '12.0', appName: 'Parc Astérix', packageName: 'com.parcasterix.app' },
+  { id: 41, trackedAppId: 1, versionCode: 1100, versionName: '11.0', appName: 'Parc Astérix', packageName: 'com.parcasterix.app' },
+];
+
 /** A pipeline version fixture carrying the real Astérix pattern graph. */
 export function mockPipelineVersion(): { graph: PipelineGraph } {
   return { graph: ASTERIX_PATTERN_GRAPH_FIXTURE };
@@ -109,6 +119,9 @@ export function createMockWs(over: Partial<MockApiState> = {}): WebSocketContext
         success: true,
         data: [{ id: 1, jobKind: 'apk-analysis', pipelineVersionId: 1, graph: state.pipelineVersion.graph }],
       });
+    }
+    if (key === 'GET /v1/apps/recent') {
+      return envelope({ success: true, data: RECENT_VERSIONS_FIXTURE });
     }
     return envelope({ success: true });
   });
