@@ -317,3 +317,104 @@ describe('runPipeline — envelope nodes', () => {
     });
   });
 });
+
+describe('runPipeline — dead (non-chosen) Branch paths', () => {
+  it('a 2-hop-deep non-chosen path stays "inactive" the whole way, not degrading to "skipped" one hop down', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary', 'fallback'] } },
+        { id: 'primary-sink', config: { kind: 'Sink', writeFn: 'x' } },
+        { id: 'midAgent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } }, // on the dead edge
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } }, // 2 hops from the dead edge
+      ],
+      edges: [
+        { from: 'trigger', to: 'agent' },
+        { from: 'agent', to: 'branch' },
+        { from: 'branch', to: 'primary-sink', label: 'primary' },
+        { from: 'branch', to: 'midAgent', label: 'fallback' },
+        { from: 'midAgent', to: 'sink' },
+      ],
+    };
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => ({ text: 'ok' })),
+      Branch: vi.fn(() => 'primary'), // never chooses 'fallback' — midAgent/sink are structurally dead
+    });
+    const result = await runPipeline(graph, 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'midAgent')!.status).toBe('inactive');
+    // The bug this test pins: 'inactive' must propagate as 'inactive', not degrade to 'skipped'
+    // once it crosses a hop boundary. sink's only parent is midAgent, which is 'inactive' (a
+    // dead branch), not a real failure — sink must stay 'inactive' too.
+    expect(result.nodes.find(n => n.nodeId === 'sink')!.status).toBe('inactive');
+    expect(executors.AgentCall).toHaveBeenCalledTimes(1); // only 'agent' ever actually ran
+    expect(result.status).toBe('ok'); // nothing failed; the dead path must not drag this to 'partial'
+  });
+
+  it('a Branch sitting entirely on a non-chosen edge never executes, and neither do its descendants', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary', 'fallback'] } },
+        { id: 'primary-sink', config: { kind: 'Sink', writeFn: 'x' } },
+        { id: 'branch2', config: { kind: 'Branch', predicate: 'x', edges: ['primary'] } }, // entirely on the dead edge
+        { id: 'leakSink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'agent' },
+        { from: 'agent', to: 'branch' },
+        { from: 'branch', to: 'primary-sink', label: 'primary' },
+        { from: 'branch', to: 'branch2', label: 'fallback' },
+        { from: 'branch2', to: 'leakSink', label: 'primary' },
+      ],
+    };
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => ({ text: 'ok' })),
+      Branch: vi.fn(() => 'primary'), // outer branch never chooses 'fallback' — branch2 is structurally dead
+    });
+    const result = await runPipeline(graph, 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'branch2')!.status).toBe('inactive');
+    expect(result.nodes.find(n => n.nodeId === 'leakSink')!.status).toBe('inactive');
+    // Being an envelope node exempts a Branch from skip on a REAL ancestor failure — it must
+    // NOT also exempt it from a dead path it was never going to be on in the first place.
+    expect(executors.Branch).toHaveBeenCalledTimes(1); // only the outer branch — branch2 never runs
+    expect(executors.Sink).toHaveBeenCalledTimes(1); // only primary-sink — leakSink never runs
+    expect(result.status).toBe('ok');
+  });
+
+  it('a Report sitting entirely on a non-chosen edge never executes, and neither does its downstream Sink', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary', 'fallback'] } },
+        { id: 'primary-sink', config: { kind: 'Sink', writeFn: 'x' } },
+        { id: 'report2', config: { kind: 'Report', sections: [{ title: 'X', from: 'branch' }] } }, // entirely on the dead edge
+        { id: 'sink2', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'agent' },
+        { from: 'agent', to: 'branch' },
+        { from: 'branch', to: 'primary-sink', label: 'primary' },
+        { from: 'branch', to: 'report2', label: 'fallback' },
+        { from: 'report2', to: 'sink2' },
+      ],
+    };
+    const report = vi.fn(() => ({ markdown: 'x' }));
+    const executors = fakeExecutors({
+      AgentCall: vi.fn(async () => ({ text: 'ok' })),
+      Branch: vi.fn(() => 'primary'), // outer branch never chooses 'fallback' — report2 is structurally dead
+      Report: report,
+    });
+    const result = await runPipeline(graph, 'trigger', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'report2')!.status).toBe('inactive');
+    expect(result.nodes.find(n => n.nodeId === 'sink2')!.status).toBe('inactive');
+    expect(report).not.toHaveBeenCalled();
+    expect(executors.Sink).toHaveBeenCalledTimes(1); // only primary-sink — sink2 never runs
+    expect(result.status).toBe('ok');
+  });
+});
