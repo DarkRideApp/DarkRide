@@ -1174,7 +1174,15 @@ export function runReport(
 ): { markdown: string } {
   const blocks = config.sections.map((section) => {
     const envelope = envelopes[section.from];
-    const body = envelope && envelope.status === 'ok'
+    // Also check typeof envelope.output.text === 'string' alongside envelope.status === 'ok' —
+    // found during Task 15's review, four rounds later: a Report section sourced directly from a
+    // Branch node gets an 'ok' envelope whose output is {chosenEdge: '...'}, with no text field at
+    // all. Without this guard, .trimEnd() throws on undefined, crashing the WHOLE report assembly
+    // and taking every OTHER section's real content down with it — the exact opposite of what
+    // this node exists to do, and a direct violation of this function's own "never throws"
+    // contract stated in the doc comment above. Fixed as its own small, standalone follow-up
+    // (backend/services/ai-jobs/nodes/report.ts), not by reopening this task.
+    const body = envelope && envelope.status === 'ok' && typeof envelope.output.text === 'string'
       ? envelope.output.text.trimEnd()
       : `— ${section.title} unavailable this run. Its source node did not complete.`;
     return `## ${section.title}\n${body}`;
