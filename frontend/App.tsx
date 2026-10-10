@@ -41,6 +41,7 @@ import { CloudBrowser } from './pages/CloudBrowser';
 import { ApiExplorer } from './pages/ApiExplorer';
 import { Jobs } from './pages/Jobs';
 import { PluginsWorkspace } from './pages/plugins/PluginsWorkspace';
+import { AiJobsWorkspace } from './pages/ai-jobs/AiJobsWorkspace';
 import { LegacyPluginsRedirect } from './pages/plugins/LegacyPluginsRedirect';
 import { ProfilePage } from './pages/ProfilePage';
 import { AdminUsersPage } from './pages/AdminUsersPage';
@@ -282,6 +283,7 @@ function AuthenticatedApp() {
                 above). The old Marketplace and Settings > Plugins routes redirect in,
                 query string included, so existing links and docs keep working. */}
             <Route path="plugins" element={<PluginsWorkspace />} />
+            <Route path="pipelines" element={<AiJobsWorkspace />} />
             <Route path="marketplace" element={<LegacyPluginsRedirect tab="discover" />} />
             <Route path="cloud" element={<CloudBrowser />} />
             <Route path="api-catalogue" element={<LegacyNetworkRedirect pane="catalogue" />} />
