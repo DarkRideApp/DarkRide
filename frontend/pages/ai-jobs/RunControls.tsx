@@ -22,14 +22,14 @@ export function RunControls({ triggers, onRun }: {
   }
 
   return (
-    <div className="run-controls">
-      <label>
+    <>
+      <label className="ai-jobs-toolbar-field">
         Entry point
-        <select aria-label="Entry point" value={triggerNodeId} onChange={(e) => setTriggerNodeId(e.target.value)}>
+        <select className="form-select" aria-label="Entry point" value={triggerNodeId} onChange={(e) => setTriggerNodeId(e.target.value)}>
           {triggers.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
         </select>
       </label>
-      <label>
+      <label className="form-checkbox-label">
         <input
           type="checkbox"
           aria-label="Reuse unchanged nodes"
@@ -38,7 +38,7 @@ export function RunControls({ triggers, onRun }: {
         />
         Reuse unchanged nodes
       </label>
-      <button onClick={handleRun} disabled={running}>{running ? 'Running…' : 'Run'}</button>
-    </div>
+      <button type="button" className="btn btn-primary btn-sm" onClick={handleRun} disabled={running}>{running ? 'Running…' : 'Run'}</button>
+    </>
   );
 }

@@ -135,37 +135,42 @@ export function AiJobsWorkspace({ pollIntervalMs = POLL_INTERVAL_MS }: { pollInt
   const triggerNodes = graph.nodes.filter(n => n.config.kind === 'Trigger').map(n => ({ id: n.id, label: n.id }));
 
   return (
-    <div className="ai-jobs-root" style={{ height: '100vh' }}>
-      <label>
-        APK version to run against
-        <select
-          aria-label="APK version"
-          value={selectedVersionId ?? ''}
-          onChange={(e) => setSelectedVersionId(Number(e.target.value))}
-        >
-          {recentVersions.length === 0 && <option value="">No analyzed APK versions yet</option>}
-          {recentVersions.map(v => (
-            <option key={v.id} value={v.id}>{v.appName ?? v.packageName} v{v.versionName ?? '?'} (#{v.id})</option>
-          ))}
-        </select>
-      </label>
-      <RunControls triggers={triggerNodes} onRun={handleRun} />
-      {runMessage && <div role="status">{runMessage}</div>}
-      <Canvas graph={graph} onSelectNode={setSelected} nodeStatuses={nodeStatuses} />
-      {selected && (
-        // key: a different node must get a fresh panel. Without it React reuses the instance and
-        // AgentCallBody's `template` state (seeded once from props) keeps showing the PREVIOUS
-        // node's prompt — and typing then saves it under the new node's id.
-        <SidePanel
-          key={selected}
-          node={graph.nodes.find(n => n.id === selected)!}
-          triggerSchema={findOwningTriggerSchema(graph, selected)}
-          onClose={() => setSelected(null)}
-          onSave={(nodeId, patch) => {
-            setGraph(g => g && ({ ...g, nodes: g.nodes.map(n => n.id === nodeId ? { ...n, config: { ...n.config, ...patch } } : n) }));
-          }}
-        />
-      )}
+    <div className="ai-jobs-root">
+      <div className="ai-jobs-toolbar">
+        <label className="ai-jobs-toolbar-field">
+          APK version to run against
+          <select
+            className="form-select"
+            aria-label="APK version"
+            value={selectedVersionId ?? ''}
+            onChange={(e) => setSelectedVersionId(Number(e.target.value))}
+          >
+            {recentVersions.length === 0 && <option value="">No analyzed APK versions yet</option>}
+            {recentVersions.map(v => (
+              <option key={v.id} value={v.id}>{v.appName ?? v.packageName} v{v.versionName ?? '?'} (#{v.id})</option>
+            ))}
+          </select>
+        </label>
+        <RunControls triggers={triggerNodes} onRun={handleRun} />
+        {runMessage && <div role="status" className="ai-jobs-status">{runMessage}</div>}
+      </div>
+      <div className="ai-jobs-canvas-wrap">
+        <Canvas graph={graph} onSelectNode={setSelected} nodeStatuses={nodeStatuses} />
+        {selected && (
+          // key: a different node must get a fresh panel. Without it React reuses the instance and
+          // AgentCallBody's `template` state (seeded once from props) keeps showing the PREVIOUS
+          // node's prompt — and typing then saves it under the new node's id.
+          <SidePanel
+            key={selected}
+            node={graph.nodes.find(n => n.id === selected)!}
+            triggerSchema={findOwningTriggerSchema(graph, selected)}
+            onClose={() => setSelected(null)}
+            onSave={(nodeId, patch) => {
+              setGraph(g => g && ({ ...g, nodes: g.nodes.map(n => n.id === nodeId ? { ...n, config: { ...n.config, ...patch } } : n) }));
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }
