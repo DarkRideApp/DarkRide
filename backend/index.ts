@@ -606,6 +606,12 @@ apkAnalyzer.setAiConfig(
 );
 // Note: apkAnalyzer.setAiFactory(aiFactory) is called after aiFactory is constructed below.
 
+// Gate for the new pipeline-engine path (Task 21). Defaults to false — opt in deliberately.
+apkAnalyzer.setPipelinesEnabled(() => {
+  const row = db.select().from(settings).where(eq(settings.key, 'ai_pipelines_enabled')).all()[0];
+  return row?.value === 'true';
+});
+
 // Wire up APK diff engine
 const apkDiffEngine = new ApkDiffEngine(db);
 apkDiffEngine.setFileSync(fileSync);
