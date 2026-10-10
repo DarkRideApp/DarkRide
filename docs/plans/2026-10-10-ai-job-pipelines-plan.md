@@ -2207,6 +2207,17 @@ describe('runPipeline — envelope nodes', () => {
   // the overall run is 'ok'. This is the scenario that proved the naive "any dead edge -> Report
   // inactive" rule wrong — six good sections must never be silently dropped because a seventh,
   // optional one wasn't chosen.
+  //
+  // Two more cases found on a THIRD pass over the same fix, both from isEdgeDead not matching
+  // its own stated contract: (5) a Report fed ONLY by a Branch whose predicate function threw —
+  // assert the Report still runs (not 'inactive'), its envelope for that section is
+  // {status:'failed', error: ...}, and its Sink fires with an honest failure placeholder, not a
+  // silent drop. (6) a Report fed by one live, genuinely-ok AgentCall PLUS a direct edge from a
+  // Branch's non-chosen label (no intermediate node between the Branch and the Report) — assert
+  // the Report still runs, the branch-edge section's envelope is exactly {status:'inactive'}
+  // (not the Branch's raw {chosenEdge} output, which would crash runReport's `.text` access),
+  // the assembled markdown contains the live section's real content plus an honest placeholder
+  // for the branch-gated one, and the overall run is 'ok'.
 
   it('a Branch that is NOT the immediate child of a failure sees "skipped", not "failed" — the adjacency rule in practice', async () => {
     const graph: PipelineGraph = {
@@ -2279,6 +2290,41 @@ function buildEnvelope(parentId: string, results: Map<string, { status: string; 
 }
 ```
 
+Also add a second helper, `isEdgeDead`, shared by `unavailabilityStatus` below and by `Report`'s own eligibility check and envelope-building — three different call sites all need the same answer to "did this specific EDGE ever carry anything," not just "what's my parent's own collapsed status":
+
+```ts
+/**
+ * Whether a single incoming edge is "dead" this run — its source never actually fed this edge,
+ * either because the source itself is already 'inactive' (a dead path, recursively), or because
+ * the source is a Branch and THIS edge's label isn't the one it chose (the source itself may
+ * well have resolved 'ok' — a Branch always does when it successfully routes — so checking the
+ * source's own collapsed status is not enough; the per-edge label match is what actually decides
+ * whether this particular edge carried anything).
+ *
+ * A 'failed' or 'skipped' source is deliberately NOT "dead" by this definition, and the check
+ * below must come FIRST, before the Branch-label check — a Branch whose own predicate function
+ * threw has no `output.chosenEdge` at all, so `chosenEdge !== e.label` is true for every one of
+ * its outgoing edges, which would otherwise mark them all "dead" even though the real situation
+ * is a genuine failure, not a routing decision. Caught in this task's review: the first version
+ * of this function skipped straight to the Branch-label check without this guard, which made a
+ * `Report` fed only by a failed `Branch` go `'inactive'` (never running, losing the failure
+ * placeholder and the Sink write) instead of running normally with a `{status:'failed'}` envelope
+ * for that section — exactly the silent-data-loss failure this whole mechanism exists to prevent.
+ */
+function isEdgeDead(e: PipelineEdge, byId: Map<string, PipelineNode>, results: Map<string, NodeRunResult>): boolean {
+  const parentResult = results.get(e.from);
+  if (parentResult?.status === 'failed' || parentResult?.status === 'skipped') return false;
+  if (parentResult?.status === 'inactive') return true;
+  if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
+    const chosenEdge = (parentResult?.output as { chosenEdge?: string } | undefined)?.chosenEdge;
+    return chosenEdge !== e.label;
+  }
+  return false;
+}
+```
+
+(`PipelineEdge` needs adding to this file's existing `import type { PipelineGraph, NodeConfig, ... } from './types';` line alongside `PipelineNode`.)
+
 In the wave loop, change the skip decision — note this anticipates the `unavailabilityStatus` helper Step 3 below replaces `parentUnavailable` with, so write them together rather than one then the other. **The envelope-node exemption applies only to a genuine ancestor failure (`'skipped'`), never to a dead/non-chosen path (`'inactive'`)** — a `Branch` or `Report` sitting entirely on an edge that was never chosen has nothing to decide or assemble, and must not run (this was a real bug caught in this task's own review: the first draft of this block exempted envelope nodes from `'inactive'` too, which let a second `Branch` — or a `Report` — sitting on a non-chosen edge still execute, including any `Sink` beneath it actually writing in production).
 
 **`Report` needs its own, more lenient eligibility rule, not the generic `unavailabilityStatus` check** — this is the spec's own explicit requirement (`docs/specs/2026-10-10-ai-job-pipelines-design.md`'s Node primitives table: "it always runs once every `from` node settles... rather than requiring all-`ok`"), and a second real bug this task's own review caught when the fix above was first drafted: `unavailabilityStatus` returns `'inactive'` the moment even ONE incoming edge is a pure branch-mismatch and none are real failures — correct for `Branch` (exactly one logical predecessor, so "any dead input" and "all dead inputs" are the same thing), wrong for `Report` (many declared sections, where the entire point is tolerating a mix of outcomes). Applying the generic rule to `Report` made a `Report` with, say, six live `ok` sections and a seventh behind a `Branch` that didn't choose that path go entirely `'inactive'` and never run — silently dropping six good sections and reporting the run `'ok'`, the exact "silent gap reported as success" failure mode this whole project exists to eliminate. `Report` must instead go `'inactive'` only when **every** incoming edge is dead; if even one is live (whether `ok`, `failed`, or `skipped` — anything that isn't `'inactive'`), `Report` runs and gets its usual per-section envelopes (Task 9's `runReport` already placeholders a non-`ok` section identically for `failed`/`skipped`/`inactive`, so no change needed there):
@@ -2288,9 +2334,16 @@ In the wave loop, change the skip decision — note this anticipates the `unavai
 
       if (node.config.kind === 'Report') {
         const incomingEdges = graph.edges.filter(e => e.to === nodeId);
-        const allIncomingInactive = incomingEdges.length > 0
-          && incomingEdges.every(e => results.get(e.from)?.status === 'inactive');
-        if (allIncomingInactive) {
+        // Per-EDGE liveness via isEdgeDead, not a raw parent-status check — a Report fed directly
+        // off a Branch's non-chosen labeled edge has a parent (the Branch) that resolved 'ok', so
+        // checking the parent's own collapsed status would miss that THIS specific edge was never
+        // the chosen one. Caught in this task's review: the first draft of this check used
+        // `results.get(e.from)?.status === 'inactive'` directly, which passed every test that
+        // existed at the time but is wrong the moment Report sits immediately downstream of a
+        // Branch rather than behind an intermediate node.
+        const allIncomingDead = incomingEdges.length > 0
+          && incomingEdges.every(e => isEdgeDead(e, byId, results));
+        if (allIncomingDead) {
           results.set(nodeId, { nodeId, status: 'inactive' });
           return;
         }
@@ -2346,7 +2399,20 @@ and in the wave loop, right before the `runOne` call, branch on node kind to bui
       if (node.config.kind === 'Branch') {
         branchEnvelope = buildEnvelope(incoming[0], results);
       } else if (node.config.kind === 'Report') {
-        reportEnvelopes = Object.fromEntries(incoming.map(p => [p, buildEnvelope(p, results)]));
+        // Edge-aware, same reasoning as the eligibility check above: `buildEnvelope` alone only
+        // ever looks at a parent's own collapsed status, so a section sourced directly from a
+        // Branch's non-chosen edge would get `{status:'ok', output:{chosenEdge:...}}` — a real
+        // envelope shape, just the WRONG one, since that edge never actually carried report
+        // content. `runReport` then throws reading `.text` off an object that doesn't have it.
+        // Caught in this task's review: override to `{status:'inactive'}` for any edge
+        // `isEdgeDead` says never carried anything, regardless of what its parent's own status is.
+        const reportIncomingEdges = graph.edges.filter(e => e.to === nodeId);
+        reportEnvelopes = Object.fromEntries(
+          reportIncomingEdges.map(e => [
+            e.from,
+            isEdgeDead(e, byId, results) ? { status: 'inactive' as const } : buildEnvelope(e.from, results),
+          ]),
+        );
       }
 
       const input = buildInput(incoming, outputs);
@@ -2362,7 +2428,7 @@ and in the wave loop, right before the `runOne` call, branch on node kind to bui
 
 Finally, a `Branch`'s *downstream* routing: when deciding whether a node fed by a `Branch` is unavailable, an edge whose `label` doesn't match the Branch's `chosenEdge` must count as unavailable even though the Branch itself is `ok`. But this needs to produce a status distinct from a genuine ancestor failure: a non-chosen edge was never going to run regardless of whether anything upstream failed, so it gets `'inactive'` (the same "structurally outside this run" concept Task 16 uses for a whole non-fired Trigger zone). **Only a real `failed`/`skipped` ancestor produces `'skipped'` — `'inactive'` never does, at any depth.** (An earlier draft of this paragraph said "a real failed/skipped/inactive ancestor still produces skipped" — that's the exact bug this task's own review caught and fixed below: grouping `'inactive'` with the two real-failure statuses made an inactive ancestor degrade into `'skipped'` one hop downstream, which makes a perfectly healthy Branch-routed run report `'partial'` overall purely because one edge was never taken.)
 
-Replace the `incoming.some(p => ...)` boolean from Task 14 with a function that returns the right status instead of a bare boolean. Add `PipelineNode` to this file's existing `import type { PipelineGraph, NodeConfig, ... } from './types';` line — it's used here as an explicit parameter annotation for the first time in this file (everywhere else it was only ever inferred):
+Replace the `incoming.some(p => ...)` boolean from Task 14 with a function that returns the right status instead of a bare boolean, built on top of `isEdgeDead` above. Add `PipelineNode` and `PipelineEdge` to this file's existing `import type { PipelineGraph, NodeConfig, ... } from './types';` line — used here as explicit parameter annotations for the first time in this file (everywhere else they were only ever inferred):
 
 ```ts
 function unavailabilityStatus(
@@ -2375,25 +2441,19 @@ function unavailabilityStatus(
   let anyUnavailable = false;
   let branchMismatchOnly = true; // flips to false the moment a REAL ancestor failure/skip is found — NOT for 'inactive'
   for (const e of incomingEdges) {
-    const parentResult = results.get(e.from);
-    const s = parentResult?.status;
+    const s = results.get(e.from)?.status;
     if (s === 'failed' || s === 'skipped') {
       anyUnavailable = true;
       branchMismatchOnly = false;
       continue;
     }
-    if (s === 'inactive') {
-      // Caught in this task's own review: grouping 'inactive' with 'failed'/'skipped' here made an
-      // inactive ancestor degrade into 'skipped' one hop downstream, turning a fully healthy
-      // Branch-routed run into 'partial' the moment the dead path was more than one node deep (or
-      // rejoined another branch). 'inactive' must propagate as 'inactive', never as a real failure.
-      anyUnavailable = true;
-      continue;
-    }
-    if (byId.get(e.from)?.config.kind === 'Branch' && e.label) {
-      const chosenEdge = (parentResult?.output as { chosenEdge?: string } | undefined)?.chosenEdge;
-      if (chosenEdge !== e.label) anyUnavailable = true; // branchMismatchOnly stays true unless another edge says otherwise
-    }
+    // A dead edge (source already 'inactive', or a Branch's non-chosen label) must propagate as
+    // 'inactive', never degrade to 'skipped' just because it crossed a hop boundary — it does NOT
+    // flip branchMismatchOnly: a dead edge is itself only ever caused by a branch mismatch (or
+    // another dead edge, recursively) further up the chain, never a real failure. isEdgeDead
+    // already returns false for a failed/skipped source (checked above anyway, so redundant here,
+    // but keeps the two functions' contracts consistent for every caller).
+    if (isEdgeDead(e, byId, results)) anyUnavailable = true;
   }
   if (!anyUnavailable) return null;
   return branchMismatchOnly ? 'inactive' : 'skipped';
