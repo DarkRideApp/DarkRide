@@ -417,4 +417,56 @@ describe('runPipeline — dead (non-chosen) Branch paths', () => {
     expect(executors.Sink).toHaveBeenCalledTimes(1); // only primary-sink — sink2 never runs
     expect(result.status).toBe('ok');
   });
+
+  it('a Report with a MIX of live and dead-via-branch sources still runs and keeps the live sections — the regression guard for silently dropping good output', async () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        { id: 'trigger', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent1', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'one', toolAllowlist: [] } },
+        { id: 'agent2', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'two', toolAllowlist: [] } },
+        { id: 'branchAgent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+        { id: 'branch', config: { kind: 'Branch', predicate: 'x', edges: ['primary', 'fallback'] } },
+        { id: 'primarySink', config: { kind: 'Sink', writeFn: 'x' } },
+        { id: 'deadAgent', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'three', toolAllowlist: [] } }, // on the non-chosen edge — would-be 3rd section, never runs
+        { id: 'report', config: { kind: 'Report', sections: [{ title: 'One', from: 'agent1' }, { title: 'Two', from: 'agent2' }, { title: 'Three', from: 'deadAgent' }] } },
+        { id: 'sink', config: { kind: 'Sink', writeFn: 'x' } },
+      ],
+      edges: [
+        { from: 'trigger', to: 'agent1' }, { from: 'trigger', to: 'agent2' }, { from: 'trigger', to: 'branchAgent' },
+        { from: 'branchAgent', to: 'branch' },
+        { from: 'branch', to: 'primarySink', label: 'primary' },
+        { from: 'branch', to: 'deadAgent', label: 'fallback' },
+        { from: 'agent1', to: 'report' }, { from: 'agent2', to: 'report' }, { from: 'deadAgent', to: 'report' },
+        { from: 'report', to: 'sink' },
+      ],
+    };
+    let seenEnvelopes: any;
+    const agentCall = vi.fn(async (config: any) => ({ text: config.instructionTemplate }));
+    const report = vi.fn((_c, envelopes: any) => {
+      seenEnvelopes = envelopes;
+      return { markdown: 'x' };
+    });
+    const executors = fakeExecutors({
+      AgentCall: agentCall,
+      Branch: vi.fn(() => 'primary'), // never chooses 'fallback' — deadAgent/its section are structurally dead
+      Report: report,
+    });
+    const result = await runPipeline(graph, 'trigger', {}, executors, {});
+
+    // The Report executor IS called, unlike the fully-dead case above — a mix of live and dead
+    // sources must never be treated the same as all-dead.
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(result.nodes.find(n => n.nodeId === 'report')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'sink')!.status).toBe('ok'); // Report's own Sink still fires
+    expect(result.nodes.find(n => n.nodeId === 'deadAgent')!.status).toBe('inactive'); // the dead source itself
+    // The two live sections' real content must survive — this is the regression guard for the
+    // "6 good sections silently dropped" bug: the dead 3rd section becomes an explicit 'inactive'
+    // envelope, not a reason to skip the whole Report.
+    expect(seenEnvelopes).toEqual({
+      agent1: { status: 'ok', output: { text: 'one' } },
+      agent2: { status: 'ok', output: { text: 'two' } },
+      deadAgent: { status: 'inactive' },
+    });
+    expect(result.status).toBe('ok');
+  });
 });
