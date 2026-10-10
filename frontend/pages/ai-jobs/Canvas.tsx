@@ -9,6 +9,20 @@ const KIND_COLOR: Record<string, string> = {
   Branch: '#fbbf24', Report: '#818cf8', ForEach: '#f472b6', Sink: '#94a3b8',
 };
 
+// Layered on top of KIND_COLOR, not replacing it: KIND_COLOR still drives the left border (what
+// kind of node this is); a run's outcome is a second, independent signal shown as the node's
+// outline. `cached` covers a memoized node (`wasMemoized: true`) regardless of its underlying
+// status; `inactive` covers a node untouched by the run (outside the chosen Trigger's zone).
+const STATUS_COLOR: Record<string, string> = {
+  ok: '#22c55e', failed: '#ef4444', cached: '#38bdf8', inactive: '#475569',
+};
+
+function statusFor(nodeId: string, nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean }>): string | undefined {
+  const entry = nodeStatuses?.[nodeId];
+  if (!entry) return undefined;
+  return entry.wasMemoized ? 'cached' : entry.status;
+}
+
 /**
  * Node label content. Every node shows its kind + id. A Report node additionally lists its
  * section titles as separate lines, so a read-only viewer can see the report's outline without
@@ -27,13 +41,25 @@ function NodeLabel({ node }: { node: PipelineNode }) {
   );
 }
 
-export function Canvas({ graph, onSelectNode }: { graph: PipelineGraph; onSelectNode: (nodeId: string) => void }) {
-  const nodes: Node[] = useMemo(() => graph.nodes.map((n, i) => ({
-    id: n.id,
-    position: { x: (i % 4) * 260, y: Math.floor(i / 4) * 160 }, // placeholder layout — a real force/dagre layout is a follow-up, not blocking this task's deliverable
-    data: { label: <NodeLabel node={n} /> },
-    style: { borderLeft: `4px solid ${KIND_COLOR[n.config.kind]}`, background: '#161f36', color: '#e4e9fb' },
-  })), [graph]);
+export function Canvas({ graph, onSelectNode, nodeStatuses }: {
+  graph: PipelineGraph;
+  onSelectNode: (nodeId: string) => void;
+  nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean }>;
+}) {
+  const nodes: Node[] = useMemo(() => graph.nodes.map((n, i) => {
+    const status = statusFor(n.id, nodeStatuses);
+    const statusColor = status ? STATUS_COLOR[status] : undefined;
+    return {
+      id: n.id,
+      position: { x: (i % 4) * 260, y: Math.floor(i / 4) * 160 }, // placeholder layout — a real force/dagre layout is a follow-up, not blocking this task's deliverable
+      data: { label: <NodeLabel node={n} /> },
+      style: {
+        borderLeft: `4px solid ${KIND_COLOR[n.config.kind]}`,
+        background: '#161f36', color: '#e4e9fb',
+        ...(statusColor ? { outline: `2px solid ${statusColor}`, outlineOffset: '2px' } : {}),
+      },
+    };
+  }), [graph, nodeStatuses]);
 
   const edges: Edge[] = useMemo(() => graph.edges.map((e, i) => ({
     id: `e${i}`, source: e.from, target: e.to, animated: false,

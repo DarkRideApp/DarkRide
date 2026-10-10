@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useWebSocket, useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Canvas } from './Canvas';
 import { SidePanel } from './SidePanel';
+import { RunControls } from './RunControls';
 import type { PipelineGraph, PipelineNode, TriggerConfig } from '../../../backend/services/ai-jobs/types';
 
 /**
@@ -45,6 +46,7 @@ export function AiJobsWorkspace() {
   const [graph, setGraph] = useState<PipelineGraph | null>(null);
   const [pipelineId, setPipelineId] = useState<number | null>(null); // threaded into Task 24's Run call instead of a hardcoded id
   const [selected, setSelected] = useState<string | null>(null);
+  const [nodeStatuses, setNodeStatuses] = useState<Record<string, { status: string; wasMemoized?: boolean }>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -56,11 +58,43 @@ export function AiJobsWorkspace() {
     return () => { cancelled = true; };
   }, [sendRestApi]);
 
+  /**
+   * Kicks off a run via `POST /v1/ai-pipelines/:id/run`, then follows up with
+   * `GET /v1/ai-pipelines/runs/:runId` to fetch per-node results — the real `/run` endpoint
+   * (`backend/api/ai-pipelines.ts:154`) only ever responds `{ runId, status }`, never `nodes`;
+   * those are persisted to `aiPipelineNodeRuns` and only readable back via the run-detail
+   * endpoint (`ai-pipelines.ts:166-172`, shape `{ run, nodes }`). Without the follow-up GET,
+   * `nodeStatuses` would stay `{}` forever, even after a fully successful run.
+   */
+  async function handleRun(triggerNodeId: string, reuseUnchanged: boolean) {
+    // pipelineId comes from the `pipelineId` state set alongside setGraph above (the real id
+    // GET /v1/ai-pipelines returned for the apk-analysis entry) — never a hardcoded literal.
+    const runRes: any = await sendRestApi('POST', `/v1/ai-pipelines/${pipelineId}/run`, { triggerNodeId, input: {}, reuseUnchanged });
+    const runId = runRes.body?.data?.runId;
+    // The /run response never includes per-node results (see doc comment above) — fetch them
+    // from the run-detail endpoint. A failed POST (409 already-running, 400 bad trigger, 404,
+    // 500) has no runId, so this is skipped and nodeStatuses is simply left unchanged;
+    // surfacing a run failure to the user is real follow-up work, not added here.
+    if (runId != null) {
+      const detailRes: any = await sendRestApi('GET', `/v1/ai-pipelines/runs/${runId}`);
+      const byId: Record<string, { status: string; wasMemoized?: boolean }> = {};
+      for (const n of detailRes.body?.data?.nodes ?? []) byId[n.nodeId] = { status: n.status, wasMemoized: n.wasMemoized };
+      setNodeStatuses(byId);
+    }
+    return runRes.body?.data;
+  }
+
   if (!graph) return <div className="page-header"><h1>Pipelines</h1></div>; // loading state — replace with a real spinner in Task 23, not this task's concern
+
+  // Real label source is a follow-up — Task 20's graph has no human-readable Trigger display
+  // name field today, just its id; adding one is a small, separate schema/UI change, not
+  // blocking this task.
+  const triggerNodes = graph.nodes.filter(n => n.config.kind === 'Trigger').map(n => ({ id: n.id, label: n.id }));
 
   return (
     <div className="ai-jobs-root" style={{ height: '100vh' }}>
-      <Canvas graph={graph} onSelectNode={setSelected} />
+      <RunControls triggers={triggerNodes} onRun={handleRun} />
+      <Canvas graph={graph} onSelectNode={setSelected} nodeStatuses={nodeStatuses} />
       {selected && (
         <SidePanel
           node={graph.nodes.find(n => n.id === selected)!}
