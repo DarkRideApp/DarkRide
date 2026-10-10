@@ -1582,6 +1582,19 @@ export function validateGraph(graph: PipelineGraph): ValidationError[] {
     return errors; // nothing else to check meaningfully without a root
   }
 
+  // Found during Task 16's review (live-probed, not a hypothetical): a Trigger is specified as
+  // "an independent root (zero incoming edges)," but nothing enforced it — a graph like
+  // `t1 -> t2` passed validation with 0 errors, yet broke "exactly one Trigger fires per run" two
+  // different ways (firing t1 also ran t2's executor; firing t2 made it see t1 as an inactive
+  // parent and marked itself inactive, so nothing ran and the failure had no clear message).
+  // Fixed as its own small, standalone follow-up to this file, not by reopening this task.
+  for (const e of graph.edges) {
+    const target = graph.nodes.find(n => n.id === e.to);
+    if (target?.config.kind === 'Trigger') {
+      errors.push({ nodeId: target.id, message: `Trigger "${target.id}" has an incoming edge from "${e.from}" — a Trigger must be an independent root with zero incoming edges.` });
+    }
+  }
+
   for (let i = 1; i < triggers.length; i++) {
     if (!schemasMatch(triggers[0].config, triggers[i].config)) {
       errors.push({
