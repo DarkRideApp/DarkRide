@@ -24,6 +24,14 @@ export interface NodeRunResult {
   output?: Record<string, unknown>;
   error?: string;
   wasMemoized?: boolean;
+  /**
+   * The `computeInputHash(config, input)` for this node's actual run, set whenever the node's
+   * kind is in `MEMOIZABLE_KINDS` — on BOTH the memoized path and a freshly-executed one, and
+   * regardless of whether `reuseUnchanged` was even on for this run. A run with reuse off must
+   * still record this so a LATER run (with reuse turned on) has something in persisted storage
+   * to match against — Task 19's `priorNodeRuns` loader is downstream of this field existing.
+   */
+  inputHash?: string;
 }
 
 /** Options accepted by `runPipeline`'s optional 6th parameter — see "opt-in memoization" below. */
@@ -58,15 +66,19 @@ export interface RunResult {
  * even starts — their executors are never called, and the run-status rollup already excludes
  * `'inactive'` (see below), so another zone's nodes never count toward this run's outcome.
  *
- * Opt-in memoization (Task 17): when `options.reuseUnchanged` is true, an `AgentCall`/`Sink`
- * node whose `(config, input)` hash matches a prior run's recorded hash for that exact node
- * (keyed by `nodeId` in `options.priorNodeRuns`) reuses the prior output instead of
- * re-executing — the executor is never called, `wasMemoized` is set on its `NodeRunResult`, and
- * its output flows downstream exactly as if it had just run. Never applied to `Trigger`
- * (hashing a Trigger's raw input isn't meaningful — it's the thing that produces the canonical
- * shape everything else hashes against) or `Report`/`ForEach` (their own fault-tolerance/
- * per-item semantics would complicate memoization) — enforced structurally via
- * `MEMOIZABLE_KINDS`, not by convention. Off by default.
+ * Opt-in memoization (Task 17): every `AgentCall`/`Sink` node gets its `(config, input)` hash
+ * computed and recorded as `inputHash` on its `NodeRunResult` UNCONDITIONALLY — regardless of
+ * whether `options.reuseUnchanged` is on for this run — because a run with reuse off still has
+ * to leave a hash behind for persistence (Task 19) so a LATER run, with reuse turned on, has
+ * something to match against. Only the *lookup* is gated: when `options.reuseUnchanged` is
+ * true and that hash matches a prior run's recorded hash for that exact node (keyed by
+ * `nodeId` in `options.priorNodeRuns`), the prior output (deep-cloned, never handed out by
+ * reference) is reused instead of re-executing — the executor is never called, `wasMemoized`
+ * is set, and the (cloned) output flows downstream exactly as if it had just run. Never applied
+ * to `Trigger` (hashing a Trigger's raw input isn't meaningful — it's the thing that produces
+ * the canonical shape everything else hashes against) or `Report`/`ForEach` (their own
+ * fault-tolerance/per-item semantics would complicate memoization) — enforced structurally via
+ * `MEMOIZABLE_KINDS`, not by convention. Reuse is off by default; hash recording is not opt-in.
  *
  * `triggerNodeId` names which node in `graph.nodes` is the Trigger to seed with `rawInput` —
  * this is the real parameter driving the special-case "seed this node with rawInput instead of
@@ -201,23 +213,33 @@ export async function runPipeline(
       input.trigger = outputs.get(triggerNodeId);
 
       // Opt-in memoization — only ever checked for AgentCall/Sink (see MEMOIZABLE_KINDS), never
-      // for Trigger/Branch/Report/ForEach/Transform. A hash match means this exact node, with
-      // this exact (config, input), already ran and produced `prior.output` in some earlier run
-      // — reuse it instead of calling the executor, and record `wasMemoized` so callers can tell
-      // a cache hit apart from a fresh 'ok'.
-      if (options.reuseUnchanged && MEMOIZABLE_KINDS.has(node.config.kind)) {
-        const prior = options.priorNodeRuns?.[nodeId];
-        const hash = computeInputHash(node.config, input);
-        if (prior && prior.inputHash === hash) {
-          results.set(nodeId, { nodeId, status: 'ok', output: prior.output, wasMemoized: true });
-          outputs.set(nodeId, prior.output);
-          return;
+      // for Trigger/Branch/Report/ForEach/Transform. `inputHash` is computed and recorded
+      // unconditionally for every memoizable node, REGARDLESS of whether `reuseUnchanged` is on
+      // for this run — a run with reuse off still needs to leave a hash behind so a LATER run
+      // (with reuse turned on) has something in persisted storage to match against. Only the
+      // *lookup* (did a PRIOR run's hash match this one) is gated on `reuseUnchanged`.
+      let inputHash: string | undefined;
+      if (MEMOIZABLE_KINDS.has(node.config.kind)) {
+        inputHash = computeInputHash(node.config, input);
+        if (options.reuseUnchanged) {
+          const prior = options.priorNodeRuns?.[nodeId];
+          if (prior && prior.inputHash === inputHash) {
+            // Clone rather than hand out the cached object by reference: no current node
+            // mutates its received input in place, but nothing structurally prevents a future
+            // one from doing so, and a mutation would silently corrupt the cached entry for
+            // every later run that reuses it. The clone removes that fragility outright instead
+            // of relying on every node implementation, present and future, to behave.
+            const output = structuredClone(prior.output);
+            results.set(nodeId, { nodeId, status: 'ok', output, wasMemoized: true, inputHash });
+            outputs.set(nodeId, output);
+            return;
+          }
         }
       }
 
       try {
         const output = await runOne(node.config, nodeId === triggerNodeId ? rawInput : input, executors, ctx, branchEnvelope, reportEnvelopes);
-        results.set(nodeId, { nodeId, status: 'ok', output });
+        results.set(nodeId, { nodeId, status: 'ok', output, ...(inputHash !== undefined ? { inputHash } : {}) });
         outputs.set(nodeId, output);
       } catch (err) {
         results.set(nodeId, { nodeId, status: 'failed', error: String(err instanceof Error ? err.message : err) });
