@@ -3272,10 +3272,14 @@ describe('ASTERIX_PATTERN_GRAPH', () => {
     expect(validateGraph(ASTERIX_PATTERN_GRAPH)).toEqual([]);
   });
 
-  it('has exactly two Triggers, seven Group-A/B AgentCalls, one Report, two Sinks', () => {
+  it('has exactly two Triggers, eight AgentCalls (7 Group-A/B + agent-diff), one Report, two Sinks', () => {
+    // Found during this task's review: the brief's own earlier draft asserted 7 AgentCalls,
+    // contradicting the very graph it specifies below — 7 Group-A/B nodes feed the Report, but
+    // 'agent-diff' (Quick Rescan's own AgentCall) is an 8th. The Report still declares exactly
+    // 7 sections; that count is unaffected.
     const kinds = ASTERIX_PATTERN_GRAPH.nodes.map(n => n.config.kind);
     expect(kinds.filter(k => k === 'Trigger')).toHaveLength(2);
-    expect(kinds.filter(k => k === 'AgentCall')).toHaveLength(7);
+    expect(kinds.filter(k => k === 'AgentCall')).toHaveLength(8);
     expect(kinds.filter(k => k === 'Report')).toHaveLength(1);
     expect(kinds.filter(k => k === 'Sink')).toHaveLength(2);
   });
@@ -3451,7 +3455,7 @@ Add a `seedApkAnalysisPipeline(db: AppDatabase): void` function to the same file
 
 - [ ] **Step 6: Finish Task 19's `registerAiPipelineEndpoints` wiring in `backend/index.ts`**
 
-Task 19 left this commented out with a `// TODO(Task 20)` note because `buildApkAnalysisExecutors`/`buildApkAnalysisExecutionCtx` didn't exist yet. They do now — uncomment it and fix the one name that was never real (`aiJobExecutors` was always a placeholder, not an actual export anywhere):
+Task 19 left this commented out with a `// TODO(Task 20)` note because `buildApkAnalysisExecutors`/`buildApkAnalysisExecutionCtx` didn't exist yet. They do now — uncomment it and fix the one name that was never real (`aiJobExecutors` was always a placeholder, not an actual export anywhere). **Do not uncomment it in place.** Found during this task's own review: the original TODO comment sits right after `registerJobEndpoints(jobRegistry)`, which comes BEFORE `const aiFactory = new AiAgentFactory(...)` is declared further down the same top-level script — uncommenting there would throw a TDZ `ReferenceError` on every server boot. Move the call to immediately after `aiFactory` is constructed and its core identities registered (e.g. right after `apkDiffEngine.setAiFactory(aiFactory)`, wherever that real line currently sits — re-grep it fresh, don't trust a stale line number), where both `aiFactory` and `db` are genuinely in scope:
 
 ```ts
 registerAiPipelineEndpoints({
