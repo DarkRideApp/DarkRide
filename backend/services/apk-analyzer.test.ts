@@ -1291,9 +1291,114 @@ describe('ApkAnalyzerService', () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
       expect(runPipelineMock).not.toHaveBeenCalled();
+      // No pipeline row routes through recordAiFailure, same as any other run failure: a
+      // 'failed' broadcast carrying an `error` field, plus a written failure note.
       const updates = (broadcastToAll as any).mock.calls.map((c: any) => c[0]).filter((m: any) => m.type === 'apk:ai-agent-update');
       expect(updates.map((u: any) => u.status)).toEqual(['running', 'failed']);
+      expect(updates[1].error).toMatch(/no apk-analysis pipeline row found/i);
+      const note = getNote(db, versionId);
+      expect(note).toContain('## AI Analysis Failed');
+      expect(note).toMatch(/no apk-analysis pipeline row found/i);
       expect(service.isAiAgentRunning(versionId)).toBe(false);
+    });
+
+    it('a published pipeline with no published version is recorded as failed via recordAiFailure, not a bare broadcast', async () => {
+      const now = new Date();
+      const pipelineId = db.insert(schema.aiPipelines).values({
+        name: 'Astérix pattern', jobKind: 'apk-analysis', createdAt: now,
+      }).run().lastInsertRowid as number;
+      // Only a draft version exists — no published row.
+      db.insert(schema.aiPipelineVersions).values({
+        pipelineId, version: 1, graph: SEEDED_GRAPH as any, status: 'draft', createdAt: now,
+      }).run();
+      configureAiFactory();
+      (service as any).setPipelinesEnabled(() => true);
+
+      (broadcastToAll as any).mockClear();
+      service.triggerAiAgentManual(versionId, 42);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(runPipelineMock).not.toHaveBeenCalled();
+      const updates = (broadcastToAll as any).mock.calls.map((c: any) => c[0]).filter((m: any) => m.type === 'apk:ai-agent-update');
+      expect(updates.map((u: any) => u.status)).toEqual(['running', 'failed']);
+      expect(updates[1].error).toMatch(/no published version/i);
+      expect(getNote(db, versionId)).toContain('## AI Analysis Failed');
+      expect(service.isAiAgentRunning(versionId)).toBe(false);
+    });
+
+    it('a rejected runPipeline call is recorded as a failure via recordAiFailure and clears activeAiAgentRuns', async () => {
+      seedPublishedPipeline();
+      runPipelineMock.mockRejectedValue(new Error('pipeline-runner blew up'));
+      configureAiFactory();
+      (service as any).setPipelinesEnabled(() => true);
+
+      (broadcastToAll as any).mockClear();
+      const result = service.triggerAiAgentManual(versionId, 42);
+      expect(result.started).toBe(true);
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      const updates = (broadcastToAll as any).mock.calls.map((c: any) => c[0]).filter((m: any) => m.type === 'apk:ai-agent-update');
+      expect(updates.map((u: any) => u.status)).toEqual(['running', 'failed']);
+      expect(updates[1].error).toBe('pipeline-runner blew up');
+      expect(getNote(db, versionId)).toContain('## AI Analysis Failed');
+      expect(getNote(db, versionId)).toContain('pipeline-runner blew up');
+
+      // The run must not stay wedged — a second trigger for the same version must be allowed.
+      expect(service.isAiAgentRunning(versionId)).toBe(false);
+      const secondResult = service.triggerAiAgentManual(versionId, 42);
+      expect(secondResult.started).toBe(true);
+    });
+
+    it('a runPipeline result with status "failed" is recorded via recordAiFailure, naming the failed node', async () => {
+      seedPublishedPipeline();
+      runPipelineMock.mockResolvedValue({
+        status: 'failed',
+        nodes: [
+          { nodeId: 'agent-overview', status: 'ok' },
+          { nodeId: 'agent-bypass', status: 'failed', error: 'tool call timed out' },
+        ],
+      });
+      configureAiFactory();
+      (service as any).setPipelinesEnabled(() => true);
+
+      (broadcastToAll as any).mockClear();
+      service.triggerAiAgentManual(versionId, 42);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      const updates = (broadcastToAll as any).mock.calls.map((c: any) => c[0]).filter((m: any) => m.type === 'apk:ai-agent-update');
+      expect(updates.map((u: any) => u.status)).toEqual(['running', 'failed']);
+      expect(updates[1].error).toContain('agent-bypass');
+      expect(updates[1].error).toContain('tool call timed out');
+      const note = getNote(db, versionId);
+      expect(note).toContain('## AI Analysis Failed');
+      expect(note).toContain('agent-bypass');
+      expect(service.isAiAgentRunning(versionId)).toBe(false);
+    });
+
+    it('a throw from getAiPrompt on the default (non-pipeline) path propagates synchronously and never registers the run as active', () => {
+      // Regression guard for Finding 2: settings reads must happen BEFORE
+      // activeAiAgentRuns.add()/the 'running' broadcast, or a throwing getter wedges the
+      // version forever. This mirrors the pre-Task-21 ordering, where the equivalent throw
+      // already propagated synchronously out of triggerAiAgentManual (uncaught here, same as
+      // before) rather than async-finally-clearing a run that was never added.
+      const forUser = vi.fn().mockReturnValue({
+        identity: { identityType: 'user', actorUserId: 42, effectiveScopes: ['core.apk:read'] },
+        handleMessage: vi.fn().mockResolvedValue({ usage: {}, conversationId: 1 }),
+      });
+      service.setAiConfig(() => { throw new Error('prompt lookup failed'); }, () => true);
+      service.setAiFactory({ forUser, forCoreService: vi.fn() } as any);
+
+      expect(() => service.triggerAiAgentManual(versionId, 42)).toThrow('prompt lookup failed');
+      expect(service.isAiAgentRunning(versionId)).toBe(false);
+
+      // Not wedged: a second, working trigger for the same version must be allowed to start.
+      service.setAiConfig(() => 'test prompt', () => true);
+      const secondResult = service.triggerAiAgentManual(versionId, 42);
+      expect(secondResult.started).toBe(true);
     });
   });
 });

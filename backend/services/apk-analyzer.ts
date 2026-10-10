@@ -915,6 +915,15 @@ export class ApkAnalyzerService {
       return;
     }
 
+    // Read every setting up front, before registering the run as active or broadcasting
+    // 'running' — found during this task's review: a throw from getAiPrompt/getTierConfig
+    // (both DB reads) after activeAiAgentRuns.add() left versionId wedged forever, with a
+    // 'running' broadcast already sent and nothing to clear it. Reading getPipelinesEnabled
+    // up front for the same reason — it's also a DB read.
+    const usePipeline = this.getPipelinesEnabled?.() ?? false;
+    const prompt = usePipeline ? undefined : this.getAiPrompt!();
+    const tierConfig = usePipeline ? undefined : (this.getTierConfig?.() ?? undefined);
+
     this.activeAiAgentRuns.add(versionId);
 
     broadcastToAll({
@@ -925,20 +934,21 @@ export class ApkAnalyzerService {
 
     log(`Starting AI agent for version ${versionId}`);
 
-    if (this.getPipelinesEnabled?.()) {
-      this.runAiPipeline(versionId, identity).finally(() => {
-        this.activeAiAgentRuns.delete(versionId);
-      });
+    if (usePipeline) {
+      this.runAiPipeline(versionId, identity)
+        .catch((err: any) => {
+          this.recordAiFailure(versionId, err.message || String(err));
+        })
+        .finally(() => {
+          this.activeAiAgentRuns.delete(versionId);
+        });
       return;
     }
-
-    const prompt = this.getAiPrompt!();
-    const tierConfig = this.getTierConfig?.() ?? undefined;
 
     agent
       .handleMessage({
         conversationId: null,
-        message: prompt,
+        message: prompt!,
         pageContext: 'apk-analysis',
         contextId: String(versionId),
         mode: 'silent',
@@ -999,18 +1009,19 @@ export class ApkAnalyzerService {
    * method only ever reads it back.
    */
   private async runAiPipeline(versionId: number, identity: ApkAnalysisIdentity): Promise<void> {
-    const pipeline = this.db.select().from(aiPipelines).where(eq(aiPipelines.jobKind, 'apk-analysis')).all()[0];
+    const pipeline = this.db.select().from(aiPipelines)
+      .where(eq(aiPipelines.jobKind, 'apk-analysis'))
+      .orderBy(aiPipelines.id) // deterministic if more than one apk-analysis row ever exists — found during review
+      .all()[0];
     if (!pipeline) {
-      log(`AI pipeline for version ${versionId}: no apk-analysis pipeline row found — did seedApkAnalysisPipeline run at boot?`);
-      broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: 'failed' });
+      this.recordAiFailure(versionId, 'No apk-analysis pipeline row found — did seedApkAnalysisPipeline run at boot?');
       return;
     }
     const version = this.db.select().from(aiPipelineVersions)
       .where(and(eq(aiPipelineVersions.pipelineId, pipeline.id), eq(aiPipelineVersions.status, 'published')))
       .orderBy(desc(aiPipelineVersions.version)).all()[0];
     if (!version) {
-      log(`AI pipeline for version ${versionId}: pipeline "${pipeline.name}" (id ${pipeline.id}) has no published version`);
-      broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: 'failed' });
+      this.recordAiFailure(versionId, `Pipeline "${pipeline.name}" (id ${pipeline.id}) has no published version`);
       return;
     }
 
@@ -1023,6 +1034,14 @@ export class ApkAnalyzerService {
       buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId }),
     );
 
+    if (result.status === 'failed') {
+      const failedNodes = result.nodes.filter(n => n.status === 'failed').map(n => `${n.nodeId}: ${n.error}`).join('; ');
+      this.recordAiFailure(versionId, failedNodes || 'Pipeline run failed');
+      return;
+    }
+
+    this.clearAiFailure(versionId);
+
     // Scope gap, stated plainly rather than silently absorbed: `frontend/pages/ApkAnalysis.tsx`
     // types `msg.status` as the literal union 'running' | 'completed' | 'failed' — there is no
     // 'partial' value this event can carry without widening that union and updating the page to
@@ -1030,7 +1049,7 @@ export class ApkAnalyzerService {
     // failed but the other six sections landed with Report's placeholder) broadcasts as plain
     // "completed" on the one surface an analyst actually watches during a run. Real, valuable
     // follow-up work; out of scope for this task.
-    broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: result.status === 'failed' ? 'failed' : 'completed' });
+    broadcastToAll({ type: 'apk:ai-agent-update', versionId, status: 'completed' });
     log(`AI pipeline completed for version ${versionId}: ${result.status}`);
   }
 
