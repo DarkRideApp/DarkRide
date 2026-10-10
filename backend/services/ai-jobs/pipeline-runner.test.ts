@@ -566,3 +566,49 @@ describe('runPipeline — dead (non-chosen) Branch paths', () => {
     expect(result.status).toBe('ok'); // nothing failed — the gated edge is inactive, not a negative outcome
   });
 });
+
+describe('runPipeline — multi-trigger zones', () => {
+  const twoTriggerGraph: PipelineGraph = {
+    nodes: [
+      { id: 'full', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+      { id: 'rescan', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+      { id: 'agent-full', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      { id: 'sink-full', config: { kind: 'Sink', writeFn: 'x' } },
+      { id: 'agent-rescan', config: { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] } },
+      { id: 'sink-rescan', config: { kind: 'Sink', writeFn: 'x' } },
+    ],
+    edges: [
+      { from: 'full', to: 'agent-full' }, { from: 'agent-full', to: 'sink-full' },
+      { from: 'rescan', to: 'agent-rescan' }, { from: 'agent-rescan', to: 'sink-rescan' },
+    ],
+  };
+
+  it('firing "rescan" marks every node in the "full" zone inactive, and never calls their executors', async () => {
+    const executors = fakeExecutors();
+    const result = await runPipeline(twoTriggerGraph, 'rescan', {}, executors, {});
+
+    expect(result.nodes.find(n => n.nodeId === 'full')!.status).toBe('inactive');
+    expect(result.nodes.find(n => n.nodeId === 'agent-full')!.status).toBe('inactive');
+    expect(result.nodes.find(n => n.nodeId === 'sink-full')!.status).toBe('inactive');
+    expect(result.nodes.find(n => n.nodeId === 'rescan')!.status).toBe('ok');
+    expect(result.nodes.find(n => n.nodeId === 'agent-rescan')!.status).toBe('ok');
+    // The Trigger executor is called once per run (the fired one), never for the inactive zone's Trigger.
+    expect(executors.Trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it('run status rolls up over the active zone only — inactive nodes never count toward ok/partial/failed', async () => {
+    const executors = fakeExecutors({ AgentCall: vi.fn(async () => { throw new Error('boom'); }) });
+    const result = await runPipeline(twoTriggerGraph, 'rescan', {}, executors, {});
+    // agent-rescan fails, sink-rescan skips — the "full" zone (4 inactive nodes) must not turn this into "partial"
+    // via some leftover inactive-counts-as-ok logic, nor silently inflate node totals.
+    expect(result.status).toBe('failed'); // the whole (2-node) active zone produced nothing
+    const activeZoneNodes = result.nodes.filter(n => n.status !== 'inactive');
+    expect(activeZoneNodes.map(n => n.nodeId).sort()).toEqual(['agent-rescan', 'rescan', 'sink-rescan']);
+  });
+
+  it('throws on a triggerNodeId that does not name a real Trigger node, rather than silently reporting ok', async () => {
+    const executors = fakeExecutors();
+    await expect(runPipeline(twoTriggerGraph, 'not-a-real-node', {}, executors, {})).rejects.toThrow(/not a Trigger node/);
+    await expect(runPipeline(twoTriggerGraph, 'agent-full', {}, executors, {})).rejects.toThrow(/not a Trigger node/); // a real node, but not a Trigger
+  });
+});
