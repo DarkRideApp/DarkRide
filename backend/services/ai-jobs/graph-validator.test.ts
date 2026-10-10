@@ -52,6 +52,19 @@ describe('validateGraph', () => {
     expect(errors.some(e => e.nodeId === 'shared' && /more than one Trigger/i.test(e.message))).toBe(true);
   });
 
+  it('rejects an edge into a Trigger node (a Trigger must have zero incoming edges)', () => {
+    const graph: PipelineGraph = {
+      nodes: [
+        node('t1', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+        node('t2', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
+        node('agent', { kind: 'AgentCall', tier: 'High', instructionTemplate: 'x', toolAllowlist: [] }),
+      ],
+      edges: [{ from: 't1', to: 'agent' }, { from: 't1', to: 't2' }], // t2 is a Trigger fed by t1
+    };
+    const errors = validateGraph(graph);
+    expect(errors.some(e => e.nodeId === 't2' && /incoming edge/.test(e.message) && /independent root/.test(e.message))).toBe(true);
+  });
+
   it('rejects a node reachable from zero Triggers (orphaned)', () => {
     const graph: PipelineGraph = {
       nodes: [
