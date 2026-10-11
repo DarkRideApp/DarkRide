@@ -38,7 +38,7 @@ function LastRunStatus({ runStatus }: { runStatus?: { status: string; wasMemoize
   );
 }
 
-export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDeleteNode, onRename, recentVersions, onRun, runStatus }: {
+export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDeleteNode, onRename, recentVersions, onRun, runStatus, hookCatalog }: {
   node: NodeLike;
   graph: PipelineGraph;
   triggerSchema: SchemaField[];
@@ -49,6 +49,7 @@ export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDelet
   recentVersions?: RecentVersion[];
   onRun?: (input: Record<string, unknown>, reuseUnchanged: boolean) => Promise<unknown>;
   runStatus?: { status: string; wasMemoized?: boolean; error?: string };
+  hookCatalog?: Array<{ name: string; schema: SchemaField[]; description: string }>;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const [name, setName] = useState(node.label ?? nodeKindLabel(node.config.kind));
@@ -96,7 +97,7 @@ export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDelet
       {node.config.kind === 'AgentCall' ? (
         <AgentCallBody node={node} triggerSchema={triggerSchema} onSave={onSave} />
       ) : node.config.kind === 'Trigger' ? (
-        <TriggerBody node={node} onSave={onSave} recentVersions={recentVersions ?? []} onRun={onRun} />
+        <TriggerBody node={node} onSave={onSave} recentVersions={recentVersions ?? []} onRun={onRun} hookCatalog={hookCatalog ?? []} />
       ) : node.config.kind === 'Sink' ? (
         <SinkBody node={node} graph={graph} onSave={onSave} />
       ) : node.config.kind === 'Report' ? (
@@ -229,29 +230,68 @@ function SchemaFieldListEditor({ label, fieldNoun, help, fields, typeOptions, on
   );
 }
 
-function TriggerBody({ node, onSave, recentVersions, onRun }: {
+function TriggerBody({ node, onSave, recentVersions, onRun, hookCatalog }: {
   node: NodeLike; onSave: (nodeId: string, patch: Record<string, unknown>) => void;
   recentVersions: RecentVersion[]; onRun?: (input: Record<string, unknown>, reuseUnchanged: boolean) => Promise<unknown>;
+  hookCatalog: Array<{ name: string; schema: SchemaField[]; description: string }>;
 }) {
-  const expandFn: string = node.config.expandFn;
+  const source: 'function' | 'event' = node.config.source ?? 'function';
+  const expandFn: string = node.config.expandFn ?? '';
+  const eventName: string = node.config.eventName ?? '';
   const inputSchema: SchemaField[] = node.config.inputSchema ?? [];
   const outputSchema: SchemaField[] = node.config.outputSchema;
 
+  const functionOptions = KNOWN_TRIGGER_EXPAND_FNS.map(f => ({ value: f.value, description: f.description }));
+  const eventOptions = hookCatalog.map(h => ({ value: h.name, description: h.description }));
+  // One combined <select> covering both groups — KnownOptionPicker doesn't natively support
+  // <optgroup>, so this renders its own two-section select directly rather than stretching the
+  // shared component's contract for one caller's grouping need.
+  const pickedValue = source === 'event' ? eventName : expandFn;
+  const known = functionOptions.find(f => f.value === pickedValue) ?? eventOptions.find(e => e.value === pickedValue);
+  const [forceCustom, setForceCustom] = useState(false);
+  const isKnown = !forceCustom && (pickedValue === '' || known !== undefined);
+
+  function pickFunction(value: string) {
+    setForceCustom(false);
+    if (value === '') { onSave(node.id, { source: 'function', expandFn: '', eventName: undefined }); return; }
+    const fn = KNOWN_TRIGGER_EXPAND_FNS.find(f => f.value === value)!;
+    onSave(node.id, { source: 'function', expandFn: fn.value, eventName: undefined, inputSchema: fn.inputSchema, outputSchema: fn.outputSchema });
+  }
+
+  function pickEvent(value: string) {
+    setForceCustom(false);
+    const hook = hookCatalog.find(h => h.name === value)!;
+    onSave(node.id, { source: 'event', eventName: hook.name, expandFn: undefined, inputSchema: undefined, outputSchema: hook.schema });
+  }
+
   return (
     <>
-      <KnownOptionPicker
-        id="trigger-expand-fn" label="Starts from"
-        options={KNOWN_TRIGGER_EXPAND_FNS}
-        value={expandFn}
-        onPick={(picked) => {
-          if (picked === '') { onSave(node.id, { expandFn: '' }); return; }
-          const chosen = KNOWN_TRIGGER_EXPAND_FNS.find(f => f.value === picked)!;
-          onSave(node.id, { expandFn: chosen.value, inputSchema: chosen.inputSchema, outputSchema: chosen.outputSchema });
-        }}
-        onCustomType={(typed) => onSave(node.id, { expandFn: typed })}
-        help="Name of a function registered in backend/services/ai-jobs/nodes/trigger.ts."
-        customPlaceholder="custom expand function name"
-      />
+      <div className="form-group">
+        <label htmlFor="trigger-expand-fn">Starts from</label>
+        <select id="trigger-expand-fn" className="form-select" value={isKnown ? pickedValue : '__custom__'}
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v === '__custom__') { setForceCustom(true); onSave(node.id, { source: 'function', expandFn: '', eventName: undefined }); return; }
+            if (functionOptions.some(f => f.value === v)) { pickFunction(v); return; }
+            pickEvent(v);
+          }}>
+          <option value="">— choose —</option>
+          <optgroup label="Starts manually from:">
+            {functionOptions.map(f => <option key={f.value} value={f.value}>{f.value}</option>)}
+          </optgroup>
+          <optgroup label="Fires automatically on:">
+            {eventOptions.map(e => <option key={e.value} value={e.value}>{e.value}</option>)}
+          </optgroup>
+          <option value="__custom__">Custom (registered in code)…</option>
+        </select>
+        {!isKnown && (
+          <input className="form-input" value={expandFn} placeholder="custom expand function name"
+            onChange={(e) => onSave(node.id, { source: 'function', expandFn: e.target.value, eventName: undefined })} />
+        )}
+        <div className="form-help">
+          {known ? known.description : 'A registered function (see nodes/trigger.ts) or a typed event this Trigger fires on.'}
+        </div>
+      </div>
       <SchemaFieldListEditor
         label="Run parameters" fieldNoun="parameter" testId="trigger-input-field-row" typeOptions={RUN_PARAM_TYPES}
         help="A Trigger has no incoming wire on the canvas — these are the values the Run form below asks for each time someone runs it, not data from another node."
@@ -262,7 +302,14 @@ function TriggerBody({ node, onSave, recentVersions, onRun }: {
         help="What this Trigger hands downstream nodes, as {{trigger.field}}."
         fields={outputSchema} onChange={(next) => onSave(node.id, { outputSchema: next })}
       />
-      {onRun && <TriggerRunSection inputSchema={inputSchema} recentVersions={recentVersions} onRun={onRun} />}
+      {source === 'event' ? (
+        <div className="form-group ai-jobs-run-section">
+          <label>Run</label>
+          <div className="form-help">Fires automatically when "{eventName}" happens — no manual Run needed.</div>
+        </div>
+      ) : (
+        onRun && <TriggerRunSection inputSchema={inputSchema} recentVersions={recentVersions} onRun={onRun} />
+      )}
     </>
   );
 }
@@ -401,14 +448,27 @@ function ReportBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGr
   );
 }
 
+// Duplicated from backend/services/ai-jobs/nodes/transform.ts's TRANSFORM_DESCRIPTIONS/TRANSFORM_SCHEMAS
+// — the frontend can't import that module at runtime. Empty until a real Transform function is
+// registered in code; the picker then shows only the Custom escape hatch, same as before this task.
+const KNOWN_TRANSFORM_FNS: Array<{ value: string; description: string; inputSchema: SchemaField[]; outputSchema: SchemaField[] }> = [];
+
 function TransformBody({ node, onSave }: { node: NodeLike; onSave: (nodeId: string, patch: Record<string, unknown>) => void }) {
+  const fn: string = node.config.fn;
   return (
-    <div className="form-group">
-      <label>Transform function</label>
-      <input className="form-input" aria-label="Transform function" value={node.config.fn} placeholder="e.g. my-plugin/my-transform"
-        onChange={(e) => onSave(node.id, { fn: e.target.value })} />
-      <div className="form-help">No Transform functions are registered in this codebase yet — see backend/services/ai-jobs/nodes/transform.ts. A run through this node fails with "Unknown transform" until one is registered in code.</div>
-    </div>
+    <KnownOptionPicker
+      id="transform-fn" label="Transform function"
+      options={KNOWN_TRANSFORM_FNS.map(f => ({ value: f.value, description: f.description }))}
+      value={fn}
+      onPick={(picked) => {
+        if (picked === '') { onSave(node.id, { fn: '' }); return; }
+        const chosen = KNOWN_TRANSFORM_FNS.find(f => f.value === picked)!;
+        onSave(node.id, { fn: chosen.value });
+      }}
+      onCustomType={(typed) => onSave(node.id, { fn: typed })}
+      help="No Transform functions are registered in this codebase yet — see backend/services/ai-jobs/nodes/transform.ts. A run through this node fails with &quot;Unknown transform&quot; until one is registered in code."
+      customPlaceholder="e.g. my-plugin/my-transform"
+    />
   );
 }
 

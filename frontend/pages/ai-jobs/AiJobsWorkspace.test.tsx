@@ -313,6 +313,24 @@ describe('AiJobsWorkspace', () => {
     expect(paths).toContain('POST /v1/ai-pipelines/1/versions');
     expect(paths.indexOf('POST /v1/ai-pipelines/1/versions')).toBeLessThan(paths.indexOf('POST /v1/ai-pipelines/1/publish'));
   });
+
+  it('fetches the hook catalog on load and passes it to the selected node\'s side panel', async () => {
+    const ws = createMockWs({
+      pipelineVersion: mockPipelineVersion(),
+      routes: {
+        'GET /v1/ai-pipelines/hook-catalog': () => ({
+          success: true,
+          data: [{ name: 'apk:analyzed', schema: [{ field: 'apkVersionId', type: 'number', description: 'x' }], description: 'Fires once analysis finishes.' }],
+        }),
+      },
+    });
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Full Analysis'));
+    await screen.findByRole('dialog', { name: 'trigger-full details' });
+    fireEvent.click(screen.getByLabelText('Starts from'));
+    expect(screen.getByRole('option', { name: 'apk:analyzed' })).toBeInTheDocument();
+  });
 });
 
 function postBody(ws: WebSocketContextValue, key: string): any {

@@ -50,6 +50,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 interface RecentVersion { id: number; appName: string | null; packageName: string; versionName: string | null }
+interface HookCatalogEntry { name: string; schema: Array<{ field: string; type: string; description: string }>; description: string }
 
 const EMPTY_GRAPH: PipelineGraph = { nodes: [], edges: [] };
 
@@ -64,6 +65,7 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
   const [selected, setSelected] = useState<string | null>(null);
   const [nodeStatuses, setNodeStatuses] = useState<Record<string, { status: string; wasMemoized?: boolean; error?: string }>>({});
   const [recentVersions, setRecentVersions] = useState<RecentVersion[]>([]);
+  const [hookCatalog, setHookCatalog] = useState<HookCatalogEntry[]>([]);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   useDocumentTitle(pipelineName ? `Pipeline: ${pipelineName}` : 'Pipeline');
@@ -88,6 +90,12 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
     sendRestApi('GET', '/v1/apps/recent').then((res: any) => {
       if (cancelled) return;
       setRecentVersions(res.body?.data ?? []);
+    });
+    // Feeds TriggerBody's "Fires automatically on:" option group — the typed events a Trigger
+    // can bind to instead of a manually-invoked function.
+    sendRestApi('GET', '/v1/ai-pipelines/hook-catalog').then((res: any) => {
+      if (cancelled) return;
+      setHookCatalog(res.body?.data ?? []);
     });
     return () => { cancelled = true; };
   }, [sendRestApi, pipelineId]);
@@ -288,6 +296,7 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
                 recentVersions={recentVersions}
                 onRun={(input, reuseUnchanged) => handleRun(selected, input, reuseUnchanged)}
                 runStatus={nodeStatuses[selected]}
+                hookCatalog={hookCatalog}
               />
             )}
           </>

@@ -127,7 +127,7 @@ describe('SidePanel — Trigger', () => {
     const onSave = vi.fn();
     render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
     fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: '__custom__' } });
-    expect(onSave).toHaveBeenCalledWith('trigger-full', { expandFn: '' });
+    expect(onSave).toHaveBeenCalledWith('trigger-full', { source: 'function', expandFn: '', eventName: undefined });
   });
 
   // Regression guard for the bug Cube hit live: a brand-new Trigger picking a known function from
@@ -140,6 +140,8 @@ describe('SidePanel — Trigger', () => {
     render(<SidePanel node={freshNode} graph={{ nodes: [freshNode], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
     fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: 'apk-analysis/apk-context' } });
     expect(onSave).toHaveBeenCalledWith('trigger-full', {
+      source: 'function',
+      eventName: undefined,
       expandFn: 'apk-analysis/apk-context',
       inputSchema: [{ field: 'versionId', type: 'apk-version', description: 'Which analyzed APK version to run against' }],
       outputSchema: [
@@ -175,7 +177,7 @@ describe('SidePanel — Trigger', () => {
     const customInput = screen.getByPlaceholderText(/custom expand function name/i);
     expect(customInput).toHaveValue('my-plugin/my-trigger');
     fireEvent.change(customInput, { target: { value: 'my-plugin/other-trigger' } });
-    expect(onSave).toHaveBeenCalledWith('trigger-full', { expandFn: 'my-plugin/other-trigger' });
+    expect(onSave).toHaveBeenCalledWith('trigger-full', { source: 'function', expandFn: 'my-plugin/other-trigger', eventName: undefined });
   });
 
   it('adds a new output schema field, defaulting its type to string', () => {
@@ -251,6 +253,38 @@ describe('SidePanel — Trigger', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: /reuse unchanged/i }));
     fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
     await waitFor(() => expect(onRun).toHaveBeenCalledWith({ url: 'https://example.com' }, true));
+  });
+
+  it('lists the hook catalog under "Fires automatically on:" alongside known functions', () => {
+    const hookCatalog = [{ name: 'apk:analyzed', schema: [{ field: 'apkVersionId', type: 'number', description: 'x' }], description: 'Fires once analysis finishes.' }];
+    render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} hookCatalog={hookCatalog} />);
+    expect(screen.getByRole('option', { name: 'apk:analyzed' })).toBeInTheDocument();
+  });
+
+  it('picking an event sets source: event, clears expandFn, and fills outputSchema from the event\'s schema', () => {
+    const onSave = vi.fn();
+    const hookCatalog = [{ name: 'apk:analyzed', schema: [{ field: 'apkVersionId', type: 'number', description: 'x' }], description: 'Fires once analysis finishes.' }];
+    render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} hookCatalog={hookCatalog} />);
+    fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: 'apk:analyzed' } });
+    expect(onSave).toHaveBeenCalledWith('trigger-full', {
+      source: 'event', eventName: 'apk:analyzed', expandFn: undefined, inputSchema: undefined,
+      outputSchema: [{ field: 'apkVersionId', type: 'number', description: 'x' }],
+    });
+  });
+
+  it('an event-sourced Trigger shows "fires automatically" and no Run button', () => {
+    const eventNode = { id: 'trigger-full', config: { kind: 'Trigger' as const, source: 'event' as const, eventName: 'apk:analyzed', outputSchema: [] } };
+    render(<SidePanel node={eventNode} graph={{ nodes: [eventNode], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} onRun={vi.fn()} hookCatalog={[]} />);
+    expect(screen.getByText(/fires automatically when "apk:analyzed"/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^run$/i })).not.toBeInTheDocument();
+  });
+
+  it('picking a function after being event-sourced clears eventName', () => {
+    const onSave = vi.fn();
+    const eventNode = { id: 'trigger-full', config: { kind: 'Trigger' as const, source: 'event' as const, eventName: 'apk:analyzed', outputSchema: [] } };
+    render(<SidePanel node={eventNode} graph={{ nodes: [eventNode], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} hookCatalog={[]} />);
+    fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: 'apk-analysis/apk-context' } });
+    expect(onSave).toHaveBeenCalledWith('trigger-full', expect.objectContaining({ source: 'function', eventName: undefined }));
   });
 });
 
@@ -364,11 +398,12 @@ describe('SidePanel — Report (editable)', () => {
 describe('SidePanel — Transform / Branch / ForEach (unregistered primitives)', () => {
   const graph: PipelineGraph = { nodes: [], edges: [] };
 
-  it('Transform: edits fn and discloses that nothing is registered', () => {
+  it('Transform: picks Custom (no functions registered yet), edits fn, and discloses that nothing is registered', () => {
     const node = { id: 'transform-1', config: { kind: 'Transform' as const, fn: '' } };
     const onSave = vi.fn();
     render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    fireEvent.change(screen.getByRole('textbox', { name: /transform function/i }), { target: { value: 'my/fn' } });
+    fireEvent.change(screen.getByLabelText(/transform function/i), { target: { value: '__custom__' } });
+    fireEvent.change(screen.getByPlaceholderText(/my-plugin\/my-transform/i), { target: { value: 'my/fn' } });
     expect(onSave).toHaveBeenCalledWith('transform-1', { fn: 'my/fn' });
     expect(screen.getByText(/no transform functions are registered/i)).toBeInTheDocument();
   });
