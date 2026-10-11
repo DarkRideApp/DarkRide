@@ -104,7 +104,7 @@ export class HostClient {
     });
   }
 
-  /** A raw pipe to a device service. The socket is returned paused. */
+  /** A raw pipe to a device service. The socket is returned paused; attach 'end'/'close' handlers synchronously after the await, or check `socket.destroyed`/`socket.readableEnded`, because a service that ends right after OKAY can close the paused socket before a late handler exists. */
   async openService(serial: string, service: string): Promise<net.Socket> {
     const socket = await this.dial();
     try {

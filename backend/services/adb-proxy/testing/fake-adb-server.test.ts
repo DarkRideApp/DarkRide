@@ -41,12 +41,43 @@ describe('FakeAdbServer', () => {
     client.destroy();
   });
 
-  it('records every request in order', async () => {
+  it('records requests in order across connections', async () => {
+    const first = net.connect(port, '127.0.0.1');
+    first.write(frame('host:version'));
+    await readUntil(first, (a) => a.includes('0029'));
+    const second = net.connect(port, '127.0.0.1');
+    second.write(frame('host:devices'));
+    await readUntil(second, (a) => a.includes('device\n'));
+    expect(fake.requests).toEqual(['host:version', 'host:devices']);
+    first.destroy();
+    second.destroy();
+  });
+
+  it('answers a transport request and the service request that follows it in one write', async () => {
     const client = net.connect(port, '127.0.0.1');
-    client.write(frame('host:version'));
-    await readUntil(client, (a) => a.includes('0029'));
-    expect(fake.requests).toEqual(['host:version']);
+    client.write(frame('host:transport:SER1') + frame('shell:ls'));
+    const reply = await readUntil(client, (a) => a.includes('ran: ls\n'));
+    expect(reply).toBe('OKAYOKAYran: ls\n');
+    expect(fake.requests).toEqual(['host:transport:SER1', 'shell:ls']);
     client.destroy();
+  });
+
+  it('feeds bytes that follow the service request in the same write to the service', async () => {
+    const client = net.connect(port, '127.0.0.1');
+    client.write(frame('host:transport:SER1') + frame('echo:') + 'abc');
+    const reply = await readUntil(client, (a) => a === 'OKAYOKAYabc');
+    expect(reply).toBe('OKAYOKAYabc');
+    client.destroy();
+  });
+
+  it('closes after a host reply and ignores a second request sent in the same write', async () => {
+    const client = net.connect(port, '127.0.0.1');
+    const closed = new Promise<void>((r) => client.on('close', () => r()));
+    client.write(frame('host:version') + frame('host:devices'));
+    const reply = await readUntil(client, (a) => a.includes('0029'));
+    await closed;
+    expect(reply).toBe('OKAY' + frame('0029'));
+    expect(fake.requests).toEqual(['host:version']);
   });
 
   it('destroys bound service sockets when the device goes offline', async () => {

@@ -15,6 +15,14 @@ function readAll(socket: net.Socket): Promise<string> {
   });
 }
 
+async function waitFor(check: () => boolean, ms = 1000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error(`condition not met within ${ms}ms`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 /** A bare server that accepts one connection, answers the transport request with OKAY, then hands control to onService for the service request. */
 async function scriptedServer(onService: (socket: net.Socket) => void): Promise<{ port: number; close: () => Promise<void> }> {
   const server = net.createServer((socket) => {
@@ -57,6 +65,7 @@ describe('resolveAdbServerAddress', () => {
 
 describe('HostClient', () => {
   let fake: FakeAdbServer;
+  let addr: { host: string; port: number };
   let client: HostClient;
 
   beforeEach(async () => {
@@ -64,10 +73,12 @@ describe('HostClient', () => {
       shell: (_serial, command) => {
         if (command.startsWith('getprop')) return 'prod\nmodel\ndev\n';
         if (command === 'big') return 'x'.repeat(200_000);
+        if (command === 'true') return '';
         return `ran: ${command}\n`;
       },
     });
-    client = new HostClient(await fake.start(), 2000);
+    addr = await fake.start();
+    client = new HostClient(addr, 2000);
   });
   afterEach(async () => {
     await fake.stop();
@@ -143,6 +154,31 @@ describe('HostClient', () => {
     expect(await client.collect('SER1', 'shell:echo hi')).toBe('ran: echo hi\n');
     await expect(client.collect('SER1', 'shell:big', 1000)).rejects.toThrow(/output too large/);
   });
+
+  it('closes the device connection when collect exceeds its size cap', async () => {
+    await expect(client.collect('SER1', 'flood:1000000000', 1000)).rejects.toThrow(/output too large/);
+    await waitFor(() => fake.activeServiceSockets() === 0);
+  });
+
+  it('closes the device connection when collect times out', async () => {
+    const quick = new HostClient(addr, 150);
+    await expect(quick.collect('SER1', 'hold:')).rejects.toThrow(/timeout/);
+    await waitFor(() => fake.activeServiceSockets() === 0);
+  });
+
+  it('hands back a socket that is already closed when the service ends right after OKAY', async () => {
+    // Characterizes the paused-socket hazard: with no data pending, a paused socket still sees the peer's FIN and destroys itself.
+    const socket = await client.openService('SER1', 'shell:true');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(socket.destroyed).toBe(true);
+  });
+
+  it('delivers close to a handler attached synchronously after openService resolves', async () => {
+    const socket = await client.openService('SER1', 'shell:true');
+    const closed = new Promise<void>((resolve) => socket.once('close', () => resolve()));
+    await closed;
+    expect(socket.destroyed).toBe(true);
+  });
 });
 
 describe('HostClient socket handling', () => {
@@ -203,6 +239,34 @@ describe('HostClient socket handling', () => {
     closers.push(() => new Promise<void>((r) => server.close(() => r())));
     const port = (server.address() as net.AddressInfo).port;
     await expect(new HostClient({ host: '127.0.0.1', port }, 2000).query('host:version')).rejects.toThrow(/unexpected status/);
+  });
+
+  it('rejects a FAIL reply with an empty message as a HostProtocolError reading FAIL', async () => {
+    const server = net.createServer((socket) => {
+      socket.on('error', () => {});
+      socket.once('data', () => socket.write('FAIL0000'));
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    closers.push(() => new Promise<void>((r) => server.close(() => r())));
+    const port = (server.address() as net.AddressInfo).port;
+    const failure = await new HostClient({ host: '127.0.0.1', port }, 2000).query('host:version').catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(HostProtocolError);
+    expect((failure as Error).message).toBe('FAIL');
+  });
+
+  it('closes its socket when the service request is refused', async () => {
+    let serverSide!: net.Socket;
+    let markClosed!: () => void;
+    const serverSideClosed = new Promise<void>((r) => (markClosed = r));
+    const server = await scriptedServer((socket) => {
+      serverSide = socket;
+      socket.once('close', () => markClosed());
+      socket.write('FAIL' + frame('refused'));
+    });
+    closers.push(server.close);
+    await expect(new HostClient({ host: '127.0.0.1', port: server.port }, 2000).openService('SER1', 'shell:x')).rejects.toThrow('refused');
+    await serverSideClosed;
+    expect(serverSide.destroyed).toBe(true);
   });
 
   it('frames a multi-byte request by its byte length', async () => {
