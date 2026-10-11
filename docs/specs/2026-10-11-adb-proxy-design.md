@@ -107,7 +107,7 @@ A small adapter (`device-directory.ts`) implements it over `DeviceManager`, whic
    - key is unknown: create or refresh an in-memory pending request and **hold the connection**. The client keeps `unauthorized`, as it does for a phone waiting on its dialog;
    - on approve, send `CNXN` on the held connection; on deny, timeout or disconnect, close.
 
-**Banner.** `device::ro.product.name=<..>;ro.product.model=<..>;ro.product.device=<..>;features=<..>`, NUL-terminated. `features` is the device's real list from the ADB server (`host-serial:<serial>:features`), passed through unchanged except for `delayed_ack`, which is removed. Almost every feature is carried inside opaque stream bytes (`shell_v2` framing, sync, `abb`, `sendrecv_v2*`) and needs nothing from the proxy. `delayed_ack` (burst mode) is the exception: it changes the wire framing (`OPEN` carries a window in `arg1`, `OKAY` carries a 4-byte payload, several `WRTE`s can be in flight), which the proxy does not implement, so it is never offered to a client. Advertised version `0x01000001`, max data 1 MiB.
+**Banner.** `device::ro.product.name=<..>;ro.product.model=<..>;ro.product.device=<..>;features=<..>`, sent without a trailing NUL (a client that finds one drops the last `features=` entry). `features` is the device's real list from the ADB server (`host-serial:<serial>:features`), passed through unchanged except for `delayed_ack`, which is removed. Almost every feature is carried inside opaque stream bytes (`shell_v2` framing, sync, `abb`, `sendrecv_v2*`) and needs nothing from the proxy. `delayed_ack` (burst mode) is the exception: it changes the wire framing (`OPEN` carries a window in `arg1`, `OKAY` carries a 4-byte payload, several `WRTE`s can be in flight), which the proxy does not implement, so it is never offered to a client. Advertised version `0x01000001`, max data 1 MiB.
 
 **Streams.**
 
@@ -287,3 +287,4 @@ Made on 2026-10-11 while grounding the implementation plan in the code. None cha
 - **Risk 5** added: the real client's patience with a long-held `unauthorized` transport is unverified.
 - **Security fix: possession of the offered key is proven first.** Found by the Task 8 review while the session code was still only a plan. The first draft passed any offered public key to the gate, and an already-approved key went straight to `CNXN`, so a copied public blob was enough to connect. The session now keeps the signatures a client sends and requires one to verify under the offered key before the gate is asked.
 - **Status snapshot includes keys**, so the page renders from one message.
+- **The device banner is sent without a trailing NUL.** Both tested clients drop the last `features=` entry when one is present.

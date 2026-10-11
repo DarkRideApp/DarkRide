@@ -98,7 +98,7 @@ export class WireClient {
   }
 
   sendHostCnxn(maxData: number = MAX_DATA): void {
-    this.send(A_CNXN, A_VERSION, maxData, 'host::features=cmd\0');
+    this.send(A_CNXN, A_VERSION, maxData, 'host::features=cmd');
   }
 
   /** CNXN (advertising `maxData`), then answer the AUTH token with a signature from `key`. Returns the proxy's next packet. */

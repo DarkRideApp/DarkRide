@@ -81,12 +81,23 @@ describe('Session handshake', () => {
     expect(reply.command).toBe(A_CNXN);
     expect(reply.arg0).toBe(A_VERSION);
     expect(reply.arg1).toBe(MAX_DATA);
-    expect(reply.data.toString()).toBe(BANNER + '\0');
+    expect(reply.data.toString()).toBe(BANNER);
     expect(h.gate.authenticatedCalls).toEqual([{ deviceId: 'DEV1', keyId: h.key.keyId, peerIp: '10.0.0.5' }]);
     expect(h.server.sessions[0].state).toBe('ready');
     expect(h.server.sessions[0].keyId).toBe(h.key.keyId);
     expect(h.state.leaves).toBe(1);
     expect(h.events.map((e) => e.kind)).toContain('authenticated');
+  });
+
+  it('sends the banner without a trailing NUL, so the last feature of a multi-feature list stays intact', async () => {
+    const banner = 'device::ro.product.name=t;ro.product.model=m;ro.product.device=d;features=cmd,stat_v2,shell_v2';
+    const h = await setup({ banner: async () => banner });
+    const client = await h.connect();
+    const reply = await client.authenticate(h.key);
+    expect(reply.command).toBe(A_CNXN);
+    expect(reply.data.length).toBe(Buffer.byteLength(banner));
+    expect(reply.data[reply.data.length - 1]).not.toBe(0);
+    expect(reply.data.toString().split('features=')[1].split(',')).toEqual(['cmd', 'stat_v2', 'shell_v2']);
   });
 
   it('closes without a banner when the device is offline', async () => {
