@@ -339,6 +339,7 @@ export class DeviceManager {
   private _hasActiveViewers: ((deviceId: string) => boolean) | null = null;
   private stayAwakeDevices = new Set<string>(); // devices with stay_on_while_plugged_in enabled
   private offlineListeners: Array<(deviceId: string) => void> = [];
+  private onlineListeners: Array<(deviceId: string) => void> = [];
   private hookBus: HookBus | null = null;
   private providerRegistry: ProviderRegistry | null = null;
   // TODO(phase-2): read in capture-startup path. Setter is present so the
@@ -405,6 +406,23 @@ export class DeviceManager {
     for (const fn of this.offlineListeners) {
       try { fn(deviceId); } catch (err: any) {
         error(`onDeviceOffline listener failed for ${deviceId}: ${err.message}`);
+      }
+    }
+  }
+
+  /** Register a listener invoked when a device transitions from offline to online, after its row exists. */
+  onDeviceOnline(fn: (deviceId: string) => void): void {
+    this.onlineListeners.push(fn);
+  }
+
+  getOnlineDeviceIds(): string[] {
+    return [...this.onlineDevices];
+  }
+
+  private notifyOnline(deviceId: string): void {
+    for (const fn of this.onlineListeners) {
+      try { fn(deviceId); } catch (err: any) {
+        error(`onDeviceOnline listener failed for ${deviceId}: ${err.message}`);
       }
     }
   }
@@ -506,12 +524,14 @@ export class DeviceManager {
     for (const { id, online, source } of discovered) {
       currentIds.add(id);
 
+      let cameOnline = false;
       if (online) {
         const wasOnline = this.onlineDevices.has(id);
         this.onlineDevices.add(id);
         // On first discovery (or server restart), reset stay_on_while_plugged_in
         // so devices don't stay awake indefinitely from a previous session
         if (!wasOnline) {
+          cameOnline = true;
           this.setStayAwake(id, false).catch(() => {});
           // Clean up a wg0 stranded by a previous DarkRide process before the
           // device is handed to anything else. Detached: it costs an ADB
@@ -568,6 +588,8 @@ export class DeviceManager {
           this.collectDeviceProperties(id).catch(() => {});
         }
       }
+
+      if (cameOnline) this.notifyOnline(id);
     }
 
     // Mark devices no longer seen as offline

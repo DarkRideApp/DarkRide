@@ -357,6 +357,44 @@ describe('DeviceManager', () => {
     });
   });
 
+  describe('online listeners', () => {
+    function stubReconcileSideEffects() {
+      vi.spyOn(manager as any, 'setStayAwake').mockResolvedValue(undefined);
+      vi.spyOn(manager as any, 'reconcileOrphanTunnel').mockResolvedValue(undefined);
+      vi.spyOn(manager as any, 'checkRooted').mockResolvedValue(false);
+      vi.spyOn(manager as any, 'collectDeviceProperties').mockResolvedValue(undefined);
+    }
+
+    it('lists the ids of online devices only', async () => {
+      stubReconcileSideEffects();
+      await (manager as any).reconcileDiscovered([{ id: 'A', online: true }, { id: 'B', online: false }]);
+      expect(manager.getOnlineDeviceIds()).toEqual(['A']);
+    });
+
+    it('notifies once per offline-to-online transition, after the device row exists', async () => {
+      stubReconcileSideEffects();
+      const seen: Array<{ id: string; rowExists: boolean }> = [];
+      manager.onDeviceOnline((id) => {
+        seen.push({ id, rowExists: db.select().from(devices).where(eq(devices.id, id)).all().length === 1 });
+      });
+      await (manager as any).reconcileDiscovered([{ id: 'A', online: true }]);
+      await (manager as any).reconcileDiscovered([{ id: 'A', online: true }]);
+      expect(seen).toEqual([{ id: 'A', rowExists: true }]);
+      await (manager as any).reconcileDiscovered([]);
+      await (manager as any).reconcileDiscovered([{ id: 'A', online: true }]);
+      expect(seen).toHaveLength(2);
+    });
+
+    it('keeps notifying other listeners when one throws', async () => {
+      stubReconcileSideEffects();
+      const second = vi.fn();
+      manager.onDeviceOnline(() => { throw new Error('boom'); });
+      manager.onDeviceOnline(second);
+      await (manager as any).reconcileDiscovered([{ id: 'A', online: true }]);
+      expect(second).toHaveBeenCalledWith('A');
+    });
+  });
+
   describe('singleton', () => {
     it('should return the same instance', () => {
       DeviceManager.resetInstance();
