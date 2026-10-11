@@ -62,17 +62,36 @@ const describeKey = (k: KeyView) =>
 
 const isWhole = (text: string) => /^\d+$/.test(text.trim()) && Number.isSafeInteger(Number(text));
 
+// Same order as describeKey: address and fingerprint, then the device, then the name the machine chose.
+const describeRequest = (p: PendingView, deviceName: string) =>
+  `the machine at ${p.peerIp} with fingerprint ${p.fingerprint}, asking to connect to ${deviceName}, named "${machine(p.comment)}"`;
+
+const shellGrant = (devices: number) => {
+  if (devices === 0) return 'a shell on every proxied device, including devices plugged in later; none is proxied now';
+  if (devices === 1) return 'a shell on the 1 proxied device, including devices plugged in later';
+  return `a shell on all ${devices} proxied devices, including devices plugged in later`;
+};
+
+// adb needs brackets around an IPv6 literal before the port.
+const hostForConnect = (host: string) => (host.includes(':') && !host.startsWith('[') ? `[${host}]` : host);
+
 type NetDraft = { bindHost?: string; portStart?: string; portEnd?: string };
-type Confirmation = { action: 'revoke' | 'forget'; key: KeyView };
+type Confirmation = { action: 'revoke' | 'forget'; key: KeyView } | { action: 'approve'; request: PendingView };
+
+const CONFIRM_LABELS = { approve: 'Approve', revoke: 'Revoke', forget: 'Forget' } as const;
+
+const MANAGE_SCOPE = 'core.adb-proxy:manage';
+const SHELL_SCOPE = 'core.devices:shell';
 
 export function AdbProxyPage() {
   useDocumentTitle('ADB Proxy');
   const auth = useAuthOptional();
   if (auth && !auth.hasScope('core.adb-proxy:read')) return <AccessDenied scope="core.adb-proxy:read" />;
-  return <AdbProxyContent canManage={auth?.hasScope('core.adb-proxy:manage') ?? true} />;
+  const canManage = auth?.hasScope(MANAGE_SCOPE) ?? true;
+  return <AdbProxyContent canManage={canManage} canApprove={canManage && (auth?.hasScope(SHELL_SCOPE) ?? true)} />;
 }
 
-function AdbProxyContent({ canManage }: { canManage: boolean }) {
+function AdbProxyContent({ canManage, canApprove }: { canManage: boolean; canApprove: boolean }) {
   const { sendRestApi } = useWebSocket();
   const { status, error: loadError, refresh } = useAdbProxyStatus();
   const [actionError, setActionError] = useState<string | null>(null);
@@ -179,10 +198,25 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
 
   const runConfirmed = () => {
     if (!confirmation) return;
-    const { action, key } = confirmation;
     setConfirmation(null);
+    if (confirmation.action === 'approve') {
+      const { requestId } = confirmation.request;
+      void call(requestTarget(requestId), 'POST', `/v1/adb-proxy/requests/${encodeURIComponent(requestId)}/approve`);
+      return;
+    }
+    const { action, key } = confirmation;
     if (action === 'revoke') void call(keyTarget(key.id), 'POST', `/v1/adb-proxy/keys/${key.id}/revoke`);
     else void call(keyTarget(key.id), 'DELETE', `/v1/adb-proxy/keys/${key.id}`);
+  };
+
+  const proxiedDevices = (status?.devices ?? []).filter((d) => d.enabled).length;
+
+  const confirmMessage = (c: Confirmation) => {
+    if (c.action === 'approve') {
+      return `Approve ${describeRequest(c.request, deviceName(c.request.deviceId))}? This gives it ${shellGrant(proxiedDevices)}.`;
+    }
+    if (c.action === 'revoke') return `Revoke access for ${describeKey(c.key)}? Its open connections close now and it can no longer connect.`;
+    return `Forget ${describeKey(c.key)}? It is removed from this list. If it connects again, it waits for approval like a new machine.`;
   };
 
   const actionsHeader = canManage ? <th>Actions</th> : null;
@@ -200,7 +234,9 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
         {canManage && (
           <td>
             <div style={{ display: 'flex', gap: 4 }}>
-              <button className="btn btn-sm btn-primary" disabled={busy.has(target)} onClick={() => void call(target, 'POST', `${base}/approve`)}>Approve</button>
+              {canApprove && (
+                <button className="btn btn-sm btn-primary" disabled={busy.has(target)} onClick={() => setConfirmation({ action: 'approve', request: p })}>Approve</button>
+              )}
               <button className="btn btn-sm btn-danger" disabled={busy.has(target)} onClick={() => void call(target, 'POST', `${base}/deny`)}>Deny</button>
             </div>
           </td>
@@ -239,7 +275,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
     const label = d.name ?? d.deviceId;
     const serverPort = d.port === null ? '' : String(d.port);
     const draft = portDrafts.get(d.deviceId) ?? serverPort;
-    const command = d.port === null ? null : `adb connect ${status?.advertisedHost}:${d.port}`;
+    const command = d.port === null ? null : `adb connect ${hostForConnect(status?.advertisedHost ?? '')}:${d.port}`;
     const badge = STATE_BADGES.get(d.state) ?? UNKNOWN_STATE;
     const portBusy = busy.has(devicePortTarget(d.deviceId));
     const enabledBusy = busy.has(deviceEnabledTarget(d.deviceId));
@@ -409,10 +445,14 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
             )}
           </div>
           <p className="form-hint" style={{ marginBottom: 24 }}>
-            The machine name is chosen by the connecting machine, so it proves nothing. Rely on the source address and the key
-            fingerprint, and approve only machines you expect. The fingerprint tells two machines with the same name apart and lets
-            you recognise a key you approved before. The machine runs <code>adb connect host:port</code>; until you approve it, its{' '}
+            Approving a machine gives it a shell on every proxied device, including devices plugged in later. The machine name is
+            chosen by the connecting machine, so it proves nothing. Rely on the source address and the key fingerprint, and approve
+            only machines you expect. The fingerprint tells two machines with the same name apart and lets you recognise a key you
+            approved before. The machine runs <code>adb connect host:port</code>; until you approve it, its{' '}
             <code>adb devices</code> output shows <code>unauthorized</code>.
+            {canManage && !canApprove && (
+              <span data-testid="adb-proxy-approve-hint" style={{ display: 'block', marginTop: 4 }}>Approving needs Device shell access.</span>
+            )}
           </p>
 
           <SectionHeading>Approved machines</SectionHeading>
@@ -480,13 +520,9 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
 
       {confirmation && (
         <ConfirmDialog
-          title={confirmation.action === 'revoke' ? 'Revoke Machine' : 'Forget Machine'}
-          message={
-            confirmation.action === 'revoke'
-              ? `Revoke access for ${describeKey(confirmation.key)}? Its open connections close now and it can no longer connect.`
-              : `Forget ${describeKey(confirmation.key)}? It is removed from this list. If it connects again, it waits for approval like a new machine.`
-          }
-          confirmLabel={confirmation.action === 'revoke' ? 'Revoke' : 'Forget'}
+          title={`${CONFIRM_LABELS[confirmation.action]} Machine`}
+          message={confirmMessage(confirmation)}
+          confirmLabel={CONFIRM_LABELS[confirmation.action]}
           onConfirm={runConfirmed}
           onCancel={() => setConfirmation(null)}
         />

@@ -73,6 +73,8 @@ test.describe('ADB proxy', () => {
     await expect(page.getByTestId('adb-proxy-pending-badge')).toHaveText('1');
 
     await request.getByRole('button', { name: 'Approve' }).click();
+    await expect(page.getByTestId('modal')).toContainText(fingerprintOf(runner.blob));
+    await page.getByTestId('confirm-dialog-confirm').click();
     expect((await waiting.next(WAIT_MS)).command).toBe(A_CNXN);
     await expect(request).toHaveCount(0);
     await expect(page.getByTestId('adb-proxy-approved')).toContainText('e2e@runner');

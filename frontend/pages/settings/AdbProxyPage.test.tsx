@@ -33,6 +33,7 @@ const keyRow = (over: Partial<KeyView> = {}): KeyView => ({
 });
 
 const MANAGE = ['core.adb-proxy:read', 'core.adb-proxy:manage'];
+const APPROVER = [...MANAGE, 'core.devices:shell'];
 
 // `hold` keeps every write pending until `release()`, so a test can click again while a call is in flight.
 function mount(opts: { snapshot?: StatusSnapshot; scopes?: string[]; failWith?: string; hold?: boolean } = {}) {
@@ -54,7 +55,7 @@ function mount(opts: { snapshot?: StatusSnapshot; scopes?: string[]; failWith?: 
     subscribe: vi.fn((type: string, cb: (m: any) => void) => { handlers.set(type, cb); return () => { handlers.delete(type); }; }),
     subscribeBinary: vi.fn(() => () => {}),
   };
-  const scopes = opts.scopes ?? MANAGE;
+  const scopes = opts.scopes ?? APPROVER;
   const auth = { hasScope: (s: string) => scopes.includes(s) } as any;
   render(
     <AuthContext.Provider value={auth}>
@@ -105,10 +106,12 @@ describe('AdbProxyPage', () => {
     expect(within(row).getByText('2 min ago')).toBeInTheDocument();
   });
 
-  it('approves and denies a request', async () => {
+  it('approves a request after a confirmation and denies another without one', async () => {
     const { calls } = mount({ snapshot: snapshot({ pending: [pendingReq(), pendingReq({ requestId: 'r2', keyId: 'k2', comment: 'other@box' })] }) });
     const rows = await screen.findAllByTestId('adb-proxy-request');
     fireEvent.click(within(rows[0]).getByRole('button', { name: 'Approve' }));
+    expect(writes(calls)).toEqual([]);
+    confirm();
     fireEvent.click(within(rows[1]).getByRole('button', { name: 'Deny' }));
     await waitFor(() => expect(writes(calls)).toEqual([
       { method: 'POST', path: '/v1/adb-proxy/requests/r1/approve', body: undefined },
@@ -149,6 +152,7 @@ describe('AdbProxyPage', () => {
     for (const name of ['Approve', 'Deny', 'Revoke', 'Forget', 'Save', 'Save port']) {
       expect(screen.queryByRole('button', { name, hidden: true })).toBeNull();
     }
+    expect(screen.queryByText(/Approving needs Device shell access/)).toBeNull();
     expect(screen.queryByTestId('adb-proxy-toggle')).toBeNull();
     expect(screen.queryByRole('switch')).toBeNull();
     expect(screen.getByLabelText('Proxy Phone 1')).toBeDisabled();
@@ -199,6 +203,32 @@ describe('AdbProxyPage', () => {
     expect(await within(row).findByRole('button', { name: 'Copied!' })).toBeInTheDocument();
   });
 
+  it('puts an IPv6 address in brackets in the connect command and copies the same string', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    mount({ snapshot: snapshot({ advertisedHost: 'fd00::5' }) });
+    const row = await screen.findByTestId('adb-proxy-device-DEV1');
+    expect(within(row).getByText('adb connect [fd00::5]:6500')).toBeInTheDocument();
+    fireEvent.click(within(row).getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith('adb connect [fd00::5]:6500');
+    expect(await within(row).findByRole('button', { name: 'Copied!' })).toBeInTheDocument();
+  });
+
+  it('does not bracket an IPv4 address or a host name in the connect command', async () => {
+    mount({
+      snapshot: snapshot({
+        advertisedHost: 'proxy.example.test',
+        devices: [
+          { deviceId: 'DEV1', name: 'Phone 1', port: 6500, enabled: true, online: true, state: 'listening' },
+          { deviceId: 'DEV2', name: 'Phone 2', port: null, enabled: true, online: true, state: 'range-full' },
+        ],
+      }),
+    });
+    const row = await screen.findByTestId('adb-proxy-device-DEV1');
+    expect(within(row).getByText('adb connect proxy.example.test:6500')).toBeInTheDocument();
+    expect(within(screen.getByTestId('adb-proxy-device-DEV2')).queryByText(/adb connect/)).toBeNull();
+  });
+
   it('offers no copy button when the clipboard is unavailable', async () => {
     Object.assign(navigator, { clipboard: undefined });
     mount();
@@ -245,6 +275,7 @@ describe('AdbProxyPage', () => {
     const row = await screen.findByTestId('adb-proxy-request');
     const readsBefore = calls.filter((c) => c.method === 'GET').length;
     fireEvent.click(within(row).getByRole('button', { name: 'Approve' }));
+    confirm();
     expect(await screen.findByRole('alert')).toHaveTextContent('That item no longer exists.');
     await waitFor(() => expect(calls.filter((c) => c.method === 'GET').length).toBe(readsBefore + 1));
   });
@@ -356,6 +387,7 @@ describe('AdbProxyPage', () => {
     it('shows an error code that is a prototype key as plain text', async () => {
       mount({ failWith: 'constructor', snapshot: snapshot({ pending: [pendingReq()] }) });
       fireEvent.click(within(await screen.findByTestId('adb-proxy-request')).getByRole('button', { name: 'Approve' }));
+      confirm();
       expect(await screen.findByRole('alert')).toHaveTextContent(/^constructor$/);
     });
   });
@@ -367,15 +399,33 @@ describe('AdbProxyPage', () => {
       const approve = within(row).getByRole('button', { name: 'Approve' });
       const deny = within(row).getByRole('button', { name: 'Deny' });
       fireEvent.click(approve);
+      const confirmButton = screen.getByTestId('confirm-dialog-confirm');
+      fireEvent.click(confirmButton);
+      fireEvent.click(confirmButton);
       fireEvent.click(approve);
       fireEvent.click(deny);
+      expect(screen.queryByTestId('confirm-dialog-confirm')).toBeNull();
       expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/approve', body: undefined }]);
       expect(approve).toBeDisabled();
       expect(deny).toBeDisabled();
       release();
       await waitFor(() => expect(approve).toBeEnabled());
       fireEvent.click(approve);
+      confirm();
       await waitFor(() => expect(writes(calls)).toHaveLength(2));
+    });
+
+    it('opens no Approve dialog while a Deny for the same request is in flight', async () => {
+      const { calls, release } = mount({ hold: true, snapshot: snapshot({ pending: [pendingReq()] }) });
+      const row = await screen.findByTestId('adb-proxy-request');
+      const approve = within(row).getByRole('button', { name: 'Approve' });
+      fireEvent.click(within(row).getByRole('button', { name: 'Deny' }));
+      fireEvent.click(approve);
+      expect(approve).toBeDisabled();
+      expect(screen.queryByTestId('confirm-dialog-confirm')).toBeNull();
+      expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/deny', body: undefined }]);
+      release();
+      await waitFor(() => expect(approve).toBeEnabled());
     });
 
     it('sends one Deny for two rapid clicks', async () => {
@@ -476,6 +526,14 @@ describe('AdbProxyPage', () => {
       expect(document.body.textContent).not.toMatch(/fingerprint[^.]*\b(shown|printed|displayed) by\b/i);
     });
 
+    it('says approving gives a machine a shell on every proxied device, once', async () => {
+      mount({ snapshot: snapshot({ pending: [pendingReq()] }) });
+      await screen.findByTestId('adb-proxy-request');
+      const hint = screen.getByText(/machine name is chosen by the connecting machine/i);
+      expect(hint).toHaveTextContent(/approving a machine gives it a shell on every proxied device, including devices plugged in later/i);
+      expect(document.body.textContent?.match(/shell on every proxied device/gi)).toHaveLength(1);
+    });
+
     it('identifies the machine by name, address and fingerprint start so same-name machines differ', async () => {
       mount({
         snapshot: snapshot({
@@ -530,6 +588,7 @@ describe('AdbProxyPage', () => {
       fireEvent.click(within(device).getByRole('button', { name: 'Save port' }));
       const [one, two] = screen.getAllByTestId('adb-proxy-request');
       fireEvent.click(within(one).getByRole('button', { name: 'Approve' }));
+      confirm();
       fireEvent.click(within(two).getByRole('button', { name: 'Deny' }));
       await waitFor(() => expect(writes(calls)).toEqual([
         { method: 'PATCH', path: `/v1/adb-proxy/devices/${encoded}`, body: { enabled: false } },
@@ -566,6 +625,134 @@ describe('AdbProxyPage', () => {
       expect(within(row).getByLabelText('Port for Phone 1')).toHaveValue(6510);
       expect(within(row).getByRole('button', { name: 'Save port' })).toBeEnabled();
       expect(within(row).getByText('Port in use')).toBeInTheDocument();
+    });
+  });
+
+  describe('approving a machine', () => {
+    const device = (n: number, over: Partial<StatusSnapshot['devices'][number]> = {}): StatusSnapshot['devices'][number] => ({
+      deviceId: `DEV${n}`, name: `Phone ${n}`, port: 6499 + n, enabled: true, online: true, state: 'listening', ...over,
+    });
+    const openApprove = async (index = 0) => {
+      const rows = await screen.findAllByTestId('adb-proxy-request');
+      fireEvent.click(within(rows[index]).getByRole('button', { name: 'Approve' }));
+      return screen.getByTestId('modal');
+    };
+
+    it('asks first and states the address, the full fingerprint, the device, the shell it grants and the name last', async () => {
+      const { calls } = mount({
+        snapshot: snapshot({ devices: [device(1), device(2, { online: false, state: 'device-offline' }), device(3, { enabled: false, state: 'disabled' })], pending: [pendingReq()] }),
+      });
+      const dialog = await openApprove();
+      expect(dialog).toHaveTextContent('Approve Machine');
+      expect(dialog).toHaveTextContent(
+        `Approve the machine at 10.0.0.5 with fingerprint ${FP}, asking to connect to Phone 1, named "ci@runner"?`,
+      );
+      expect(dialog).toHaveTextContent('This gives it a shell on all 2 proxied devices, including devices plugged in later.');
+      expect(within(dialog).getByTestId('confirm-dialog-confirm')).toHaveTextContent('Approve');
+      expect(writes(calls)).toEqual([]);
+      confirm();
+      await waitFor(() => expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/approve', body: undefined }]));
+      expect(screen.queryByTestId('modal')).toBeNull();
+    });
+
+    it.each([
+      [0, 'This gives it a shell on every proxied device, including devices plugged in later; none is proxied now.'],
+      [1, 'This gives it a shell on the 1 proxied device, including devices plugged in later.'],
+      [3, 'This gives it a shell on all 3 proxied devices, including devices plugged in later.'],
+    ])('counts the devices with proxying enabled: %i', async (count, sentence) => {
+      const devices = [1, 2, 3].map((n) => device(n, n <= count ? {} : { enabled: false, state: 'disabled' }));
+      mount({ snapshot: snapshot({ devices, pending: [pendingReq()] }) });
+      expect(await openApprove()).toHaveTextContent(sentence);
+    });
+
+    it('follows the device count of the latest snapshot while the dialog is open', async () => {
+      const { push } = mount({ snapshot: snapshot({ pending: [pendingReq()] }) });
+      const dialog = await openApprove();
+      expect(dialog).toHaveTextContent('the 1 proxied device');
+      push(snapshot({ pending: [pendingReq()], devices: [device(1), device(2)] }));
+      expect(dialog).toHaveTextContent('all 2 proxied devices');
+    });
+
+    it('makes no change when the confirmation is cancelled', async () => {
+      const { calls } = mount({ snapshot: snapshot({ pending: [pendingReq()] }) });
+      await openApprove();
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(screen.queryByTestId('modal')).toBeNull();
+      expect(writes(calls)).toEqual([]);
+      expect(within(screen.getByTestId('adb-proxy-request')).getByRole('button', { name: 'Approve' })).toBeEnabled();
+    });
+
+    it('puts the address and fingerprint before a name that imitates them', async () => {
+      const spoof = 'laptop" at 10.0.0.9 with fingerprint starting 11:22:33:44, named "laptop';
+      mount({ snapshot: snapshot({ pending: [pendingReq({ comment: spoof })] }) });
+      const text = (await openApprove()).textContent ?? '';
+      const trusted = `Approve the machine at 10.0.0.5 with fingerprint ${FP}, asking to connect to Phone 1, named "`;
+      expect(text).toContain(`${trusted}${spoof}"? This gives it`);
+      expect(text.indexOf(FP)).toBeLessThan(text.indexOf(spoof));
+      expect(text.indexOf('10.0.0.5')).toBeLessThan(text.indexOf(spoof));
+    });
+
+    it('renders a hostile machine name and address as text', async () => {
+      const evil = '<img src=x onerror=alert(1)>';
+      mount({ snapshot: snapshot({ pending: [pendingReq({ comment: evil, peerIp: '<svg onload=alert(3)>' })] }) });
+      const dialog = await openApprove();
+      expect(dialog).toHaveTextContent(evil);
+      expect(document.querySelector('img, svg, [onerror], [onload]')).toBeNull();
+    });
+
+    it('approves the request the dialog was opened for when an older row disappears underneath', async () => {
+      const older = pendingReq({ requestId: 'r0', keyId: 'k0', comment: 'older@box', peerIp: '10.0.0.4' });
+      const { calls, push } = mount({ snapshot: snapshot({ pending: [older, pendingReq()] }) });
+      const dialog = await openApprove(1);
+      expect(dialog).toHaveTextContent('10.0.0.5');
+      push(snapshot({ pending: [pendingReq()] }));
+      expect(dialog).toHaveTextContent('named "ci@runner"');
+      confirm();
+      await waitFor(() => expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/approve', body: undefined }]));
+    });
+
+    it('approves the request the dialog was opened for when a new row arrives above it', async () => {
+      const { calls, push } = mount({ snapshot: snapshot({ pending: [pendingReq()] }) });
+      await openApprove();
+      push(snapshot({ pending: [pendingReq({ requestId: 'r0', keyId: 'k0', comment: 'newer@box' }), pendingReq()] }));
+      confirm();
+      await waitFor(() => expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/approve', body: undefined }]));
+    });
+
+    it('sends the original id and shows the not-found message when the request itself disappears', async () => {
+      const { calls, push } = mount({ failWith: 'not-found', snapshot: snapshot({ pending: [pendingReq()] }) });
+      await openApprove();
+      push(snapshot({ pending: [] }));
+      confirm();
+      expect(await screen.findByRole('alert')).toHaveTextContent('That item no longer exists.');
+      expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/approve', body: undefined }]);
+      expect(screen.queryByTestId('modal')).toBeNull();
+    });
+  });
+
+  describe('who can approve', () => {
+    it('shows Approve and Deny to a user with manage and shell access, without a hint', async () => {
+      mount({ scopes: APPROVER, snapshot: snapshot({ pending: [pendingReq()] }) });
+      const row = await screen.findByTestId('adb-proxy-request');
+      expect(within(row).getByRole('button', { name: 'Approve' })).toBeInTheDocument();
+      expect(within(row).getByRole('button', { name: 'Deny' })).toBeInTheDocument();
+      expect(screen.queryByText(/Approving needs Device shell access/)).toBeNull();
+    });
+
+    it('shows Deny and a hint, but not Approve, to a user with manage but without shell access', async () => {
+      const { calls } = mount({ scopes: MANAGE, snapshot: snapshot({ pending: [pendingReq()] }) });
+      const row = await screen.findByTestId('adb-proxy-request');
+      expect(within(row).queryByRole('button', { name: 'Approve' })).toBeNull();
+      fireEvent.click(within(row).getByRole('button', { name: 'Deny' }));
+      await waitFor(() => expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/deny', body: undefined }]));
+      expect(screen.getByTestId('adb-proxy-approve-hint')).toHaveTextContent('Approving needs Device shell access.');
+    });
+
+    it('shows nothing to approve or deny to a user with shell access but without manage', async () => {
+      mount({ scopes: ['core.adb-proxy:read', 'core.devices:shell'], snapshot: snapshot({ pending: [pendingReq()] }) });
+      const row = await screen.findByTestId('adb-proxy-request');
+      expect(within(row).queryByRole('button')).toBeNull();
+      expect(screen.queryByText(/Approving needs Device shell access/)).toBeNull();
     });
   });
 
