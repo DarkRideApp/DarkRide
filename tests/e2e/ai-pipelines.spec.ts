@@ -248,4 +248,33 @@ test.describe('AI job pipelines', () => {
     const agentPanel = page.getByRole('dialog');
     await expect(agentPanel.getByTestId('node-run-status')).toContainText('Skipped — an upstream node failed.');
   });
+
+  test('picking a typed event as a Trigger\'s source fills its output schema and removes the Run form', async ({ page }) => {
+    await loginAsAdmin(page);
+    await waitForBackend(page.request);
+    await page.goto('/ui/pipelines');
+    await expect(page.getByTestId('pipelines-table')).toBeVisible({ timeout: 15_000 });
+
+    await page.getByRole('button', { name: '+ New Pipeline' }).click();
+    await page.getByLabel('New pipeline name').fill('E2E Event Trigger Pipeline');
+    await page.getByLabel('New pipeline job kind').fill('e2e-event-trigger');
+    await page.getByRole('button', { name: 'Create' }).click();
+    await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
+
+    await page.getByRole('button', { name: '+ Add node' }).click();
+    await page.getByRole('option', { name: /^Trigger/ }).click();
+    const triggerPanel = page.getByRole('dialog');
+    await expect(triggerPanel).toBeVisible();
+
+    await triggerPanel.getByLabel('Starts from').selectOption('apk:analyzed');
+
+    // Output schema auto-filled from the real, boot-registered apk:analyzed event schema — proves
+    // the hook-catalog endpoint, not a mock, actually served this.
+    const outputRows = triggerPanel.getByTestId('schema-field-row');
+    await expect(outputRows.first().getByPlaceholder('name')).toHaveValue('apkVersionId');
+
+    // No Run form for an event-sourced Trigger — nothing to click, the dispatcher starts these.
+    await expect(triggerPanel.getByText(/fires automatically when "apk:analyzed"/i)).toBeVisible();
+    await expect(triggerPanel.getByRole('button', { name: /^run$/i })).toHaveCount(0);
+  });
 });
