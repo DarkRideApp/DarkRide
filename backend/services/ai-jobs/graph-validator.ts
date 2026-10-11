@@ -30,6 +30,18 @@ export function validateGraph(graph: PipelineGraph): ValidationError[] {
     }
   }
 
+  for (const t of triggers) {
+    const config = t.config as { source?: 'function' | 'event'; expandFn?: string; eventName?: string };
+    const source = config.source ?? 'function';
+    const hasFn = !!config.expandFn;
+    const hasEvent = !!config.eventName;
+    if (source === 'function' ? hasEvent : hasFn) {
+      errors.push({ nodeId: t.id, message: `Trigger "${t.id}" must declare exactly one of expandFn or eventName, matching its source.` });
+    } else if (source === 'function' ? !hasFn : !hasEvent) {
+      errors.push({ nodeId: t.id, message: `Trigger "${t.id}" must declare exactly one of expandFn or eventName, matching its source.` });
+    }
+  }
+
   // A Trigger is an independent root (spec: zero incoming edges). An edge into one breaks the
   // executor's "exactly one Trigger fires per run" invariant: the downstream Trigger gets run
   // when its upstream one fires, and when it is the one fired its own incoming edge is 'inactive',

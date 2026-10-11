@@ -134,4 +134,46 @@ describe('validateGraph', () => {
     const errors = validateGraph(graph);
     expect(errors.some(e => e.nodeId === 'sink' && /not-a-real-edge-source/.test(e.message))).toBe(true);
   });
+
+  it('rejects a Trigger that declares neither expandFn nor eventName', () => {
+    const graph: PipelineGraph = {
+      nodes: [{ id: 't', config: { kind: 'Trigger', source: 'function', outputSchema: [] } }],
+      edges: [],
+    };
+    const errors = validateGraph(graph);
+    expect(errors).toContainEqual(expect.objectContaining({ nodeId: 't', message: expect.stringContaining('exactly one of') }));
+  });
+
+  it('rejects a Trigger that declares both expandFn and eventName', () => {
+    const graph: PipelineGraph = {
+      nodes: [{ id: 't', config: { kind: 'Trigger', source: 'function', expandFn: 'x', eventName: 'y', outputSchema: [] } }],
+      edges: [],
+    };
+    const errors = validateGraph(graph);
+    expect(errors).toContainEqual(expect.objectContaining({ nodeId: 't', message: expect.stringContaining('exactly one of') }));
+  });
+
+  it('accepts a function-sourced Trigger with only expandFn', () => {
+    const graph: PipelineGraph = {
+      nodes: [{ id: 't', config: { kind: 'Trigger', source: 'function', expandFn: 'x', outputSchema: [] } }],
+      edges: [],
+    };
+    expect(validateGraph(graph)).toEqual([]);
+  });
+
+  it('accepts an event-sourced Trigger with only eventName', () => {
+    const graph: PipelineGraph = {
+      nodes: [{ id: 't', config: { kind: 'Trigger', source: 'event', eventName: 'apk:analyzed', outputSchema: [] } }],
+      edges: [],
+    };
+    expect(validateGraph(graph)).toEqual([]);
+  });
+
+  it('treats a Trigger with no declared source as function-sourced, for graphs saved before this field existed', () => {
+    const graph: PipelineGraph = {
+      nodes: [{ id: 't', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } as any }],
+      edges: [],
+    };
+    expect(validateGraph(graph)).toEqual([]);
+  });
 });
