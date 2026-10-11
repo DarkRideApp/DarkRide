@@ -111,7 +111,7 @@ A small adapter (`device-directory.ts`) implements it over `DeviceManager`, whic
 
 **Streams.**
 
-- `OPEN` (arg0 = client id, payload = service plus NUL): apply the services policy, open the backend socket, send the 4-hex-length-prefixed service, wait for the server's `OKAY`. Success: reply `OKAY`. Failure: reply `CLSE`.
+- `OPEN` (arg0 = client id, payload = service plus NUL): strip that one trailing NUL, apply the services policy, open the backend socket, send the 4-hex-length-prefixed service, wait for the server's `OKAY`. Success: reply `OKAY`. Failure: reply `CLSE`.
 - `WRTE` from client: write to the backend socket and send `OKAY` once the write has drained. A second `WRTE` on a stream before that `OKAY` is a protocol error and closes the stream, so inbound data never queues without bound.
 - Backend data: send `WRTE`, then pause that socket until the client's `OKAY`. This is ADB's own flow control; no extra windowing.
 - `CLSE` either way tears down that stream and its backend socket.
@@ -121,7 +121,8 @@ A small adapter (`device-directory.ts`) implements it over `DeviceManager`, whic
 
 - anything starting with `host` (`host:kill`, `host:connect:...`, `host-serial:...`), because the ADB server would treat it as a request to itself and a remote client could stop or reconfigure the host's ADB server;
 - `reverse:*`, because device-initiated streams would go to the local ADB server, bypassing the proxy and the grant;
-- `tcpip:*` and `usb:`, because they flip the phone's `adbd` between USB and network and can strand it where DarkRide cannot reach it.
+- `tcpip:*` and `usb:`, because they flip the phone's `adbd` between USB and network and can strand it where DarkRide cannot reach it;
+- any service with a NUL inside it, except `abb_exec:` and `abb:`. Those two separate their arguments with NULs (`adb install` sends `abb_exec:package\0install\0-S\0<size>`), so interior NULs are allowed for them and only for them. A payload that is not valid UTF-8, is empty or is over 4096 bytes is refused too, and logged as a refused service under the placeholder `<malformed>`.
 
 Everything else passes through, including `root:`, `remount:` and `reboot:`. Approval is full trust in the device, which is what was asked for.
 
@@ -288,3 +289,4 @@ Made on 2026-10-11 while grounding the implementation plan in the code. None cha
 - **Security fix: possession of the offered key is proven first.** Found by the Task 8 review while the session code was still only a plan. The first draft passed any offered public key to the gate, and an already-approved key went straight to `CNXN`, so a copied public blob was enough to connect. The session now keeps the signatures a client sends and requires one to verify under the offered key before the gate is asked.
 - **Status snapshot includes keys**, so the page renders from one message.
 - **The device banner is sent without a trailing NUL.** Both tested clients drop the last `features=` entry when one is present.
+- **`abb_exec:` and `abb:` keep their interior NULs.** Found by the whole-branch review. The first version refused every service with a NUL inside it, but a client uses `abb_exec:` for `adb install` whenever the device lists that feature, so installs failed with `connect error for write: closed`. Interior NULs are now allowed for those two prefixes only, a malformed `OPEN` is logged like any other refusal, and the conformance lane advertises `abb_exec` and runs `install` and `logcat` with both clients.

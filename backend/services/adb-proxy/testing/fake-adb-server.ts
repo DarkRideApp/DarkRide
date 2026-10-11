@@ -21,6 +21,8 @@ export class FakeAdbServer {
   readonly requests: string[] = [];
   /** Files pushed over `sync:` (path to contents). */
   readonly files = new Map<string, Buffer>();
+  /** Package bytes received by each streamed `abb_exec:package install`, in order. */
+  readonly installs: Buffer[] = [];
   private readonly devices = new Map<string, Entry>();
   private readonly sockets = new Set<net.Socket>();
   private readonly deviceSockets = new Map<string, Set<net.Socket>>();
@@ -203,7 +205,39 @@ export class FakeAdbServer {
       this.flood(socket, Number(flood[1]));
       return { raw: () => {} };
     }
+    if (service.startsWith('abb_exec:')) {
+      const args = service.slice('abb_exec:'.length).split('\0');
+      if (args[args.length - 1] === '') args.pop();
+      if (args[0] === 'settings' && args[1] === 'get') {
+        okay();
+        socket.end('null\n');
+        return { raw: () => {} };
+      }
+      const size = args.length === 4 && args[0] === 'package' && args[1] === 'install' && args[2] === '-S' ? Number(args[3]) : NaN;
+      if (Number.isInteger(size) && size >= 0) {
+        okay();
+        return { raw: this.installHandler(socket, size) };
+      }
+    }
     return fail('unknown service');
+  }
+
+  /** The device side of a streamed install: exactly `size` bytes of package, then a status line. */
+  private installHandler(socket: net.Socket, size: number): (chunk: Buffer) => void {
+    const chunks: Buffer[] = [];
+    let received = 0;
+    const finish = () => {
+      this.installs.push(Buffer.concat(chunks));
+      socket.end('Success\n');
+    };
+    if (size === 0) finish();
+    return (chunk) => {
+      if (received >= size) return;
+      const piece = chunk.subarray(0, size - received);
+      chunks.push(Buffer.from(piece));
+      received += piece.length;
+      if (received === size) finish();
+    };
   }
 
   /** The device side of the adb sync v1 protocol: STAT, SEND (with DATA and DONE), RECV and QUIT. */

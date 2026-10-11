@@ -18,23 +18,27 @@ const MIN_PEER_MAX_DATA = 4096;
 const OUTBOUND_HIGH_WATER = 4 * 1024 * 1024;
 // The ADB server dispatches anything starting with "host" as a request to itself, even on a bound connection.
 const REFUSED_PREFIXES = ['host', 'reverse:', 'tcpip:', 'usb:'];
+// These services separate their arguments with NULs; adbd splits them back out.
+const NUL_SEPARATED_PREFIXES = ['abb_exec:', 'abb:'];
+const MALFORMED_SERVICE = '<malformed>';
 
 export function checkService(service: string): { allowed: true } | { allowed: false; reason: string } {
   if (service.length === 0) return { allowed: false, reason: 'empty service' };
   if (service.length > MAX_SERVICE_LENGTH) return { allowed: false, reason: 'service too long' };
-  if (service.includes('\0')) return { allowed: false, reason: 'NUL in service' };
   const prefix = REFUSED_PREFIXES.find((p) => service.startsWith(p));
   if (prefix) return { allowed: false, reason: `${prefix} services are not proxied` };
+  if (service.includes('\0') && !NUL_SEPARATED_PREFIXES.some((p) => service.startsWith(p))) {
+    return { allowed: false, reason: 'NUL in service' };
+  }
   return { allowed: true };
 }
 
-/** The service string of an OPEN payload (text plus one trailing NUL), or null when malformed. */
+/** The service string of an OPEN payload without its one trailing NUL, or null when malformed. */
 function parseService(data: Buffer): string | null {
   // Bound the work before decoding: the ready-state payload cap is 1 MiB.
   if (data.length > MAX_SERVICE_LENGTH + 1) return null;
-  const nul = data.indexOf(0);
-  if (nul !== -1 && nul !== data.length - 1) return null;
-  const raw = nul === -1 ? data : data.subarray(0, nul);
+  const raw = data.length > 0 && data[data.length - 1] === 0 ? data.subarray(0, data.length - 1) : data;
+  if (raw.length === 0) return null;
   const text = raw.toString('utf8');
   return Buffer.from(text, 'utf8').equals(raw) ? text : null;
 }
@@ -308,8 +312,12 @@ export class Session {
 
   private onOpen(p: Packet): void {
     const remoteId = p.arg0;
-    const service = remoteId === 0 ? null : parseService(p.data);
-    if (service === null) return this.refuse(remoteId);
+    if (remoteId === 0) return;
+    const service = parseService(p.data);
+    if (service === null) {
+      this.emit({ kind: 'refused-service', session: this, service: MALFORMED_SERVICE });
+      return this.refuse(remoteId);
+    }
     if (!checkService(service).allowed) {
       this.emit({ kind: 'refused-service', session: this, service });
       return this.refuse(remoteId);

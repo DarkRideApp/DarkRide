@@ -8,7 +8,7 @@ import { AdbProxyService } from './adb-proxy-service';
 import { HostClient } from './host-client';
 import { KeyStore } from './key-store';
 import { DeviceListener } from './listener';
-import { A_AUTH, A_CLSE, A_CNXN, AUTH_RSAPUBLICKEY } from './packet';
+import { A_AUTH, A_CLSE, A_CNXN, A_OPEN, AUTH_RSAPUBLICKEY } from './packet';
 import type { PendingOptions } from './pending';
 import { PendingRegistry } from './pending';
 import { PortAllocator } from './port-allocator';
@@ -960,6 +960,22 @@ describe('AdbProxyService refusal logging', () => {
     expect(summaryLines()).toHaveLength(2);
     expect(summaryLines()).toContain('3 more events suppressed (3 refused service)');
     expect(summaryLines()).toContain('2 more events suppressed (1 approval request, 1 unauthenticated close)');
+  });
+
+  it('logs a malformed OPEN under a placeholder, never its bytes, within the refusal budget', async () => {
+    const h = await setup({ logWindowMs: 600_000, logMaxDetail: 1 });
+    const live = await approvedLiveClient(h);
+    logSpy.mockClear();
+
+    for (let i = 1; i <= 3; i++) {
+      live.send(A_OPEN, i, 0, Buffer.from([0x73, 0x0a, 0xff, 0x00]));
+      await live.waitFor((p) => p.command === A_CLSE && p.arg1 === i);
+    }
+
+    expect(refusalLines()).toHaveLength(1);
+    expect(refusalLines()[0]).toContain('refused service "<malformed>"');
+    await h.service.stop();
+    expect(summaryLines()).toContain('2 more events suppressed (2 refused service)');
   });
 
   it('strips control characters and caps the length of a hostile service string', async () => {

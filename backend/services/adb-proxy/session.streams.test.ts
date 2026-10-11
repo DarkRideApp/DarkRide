@@ -172,12 +172,21 @@ afterEach(async () => {
 });
 
 describe('checkService', () => {
-  it.each(['shell:ls', 'shell,v2,raw:ls', 'sync:', 'exec:cat', 'tcp:5555', 'localabstract:x', 'jdwp:12', 'abb_exec:x', 'framebuffer:', 'root:', 'reboot:'])(
-    'allows %s', (s) => { expect(checkService(s)).toEqual({ allowed: true }); },
+  it.each([
+    'shell:ls', 'shell,v2,raw:ls', 'sync:', 'exec:cat', 'tcp:5555', 'localabstract:x', 'jdwp:12', 'abb_exec:x', 'framebuffer:', 'root:', 'reboot:',
+    'abb_exec:package\0install\0-S\x00300000', 'abb_exec:settings\0get\0global\0enable_adb_incremental_install_default', 'abb:package\0list\0packages',
+  ])(
+    'allows %j', (s) => { expect(checkService(s)).toEqual({ allowed: true }); },
   );
-  it.each(['host:kill', 'host:connect:1.2.3.4:5555', 'host-serial:X:features', 'host-usb:version', 'hostfoo', 'reverse:forward:tcp:1', 'tcpip:5555', 'usb:', '', 'a\0b'])(
+  it.each([
+    'host:kill', 'host:connect:1.2.3.4:5555', 'host-serial:X:features', 'host-usb:version', 'hostfoo', 'reverse:forward:tcp:1', 'tcpip:5555', 'usb:', '',
+    'a\0b', 'shell:a\0b', 'exec:a\0b', 'sync:\0', 'host:x\0', 'host:kill\0abb_exec:x', '\0abb_exec:x', '\0shell:id', ' abb_exec:x\0y', 'ABB_EXEC:x\0y', 'abb_exec\0:x',
+  ])(
     'refuses %j', (s) => { expect(checkService(s).allowed).toBe(false); },
   );
+  it('names the NUL as the reason for a NUL in any other service', () => {
+    expect(checkService('shell:a\0b')).toEqual({ allowed: false, reason: 'NUL in service' });
+  });
   it('refuses an oversize service', () => {
     expect(checkService('shell:' + 'x'.repeat(5000)).allowed).toBe(false);
   });
@@ -267,6 +276,46 @@ describe('Session streams', () => {
     expect(reply.command).toBe(A_CLSE);
     expect(reply.arg1).toBe(5);
     expect(h.fake.requests).toEqual(h.baseline);
+  });
+
+  it('passes NUL separated abb_exec and abb services to the backend unchanged, less the OPEN terminator', async () => {
+    const h = await setup();
+    const install = 'abb_exec:package\0install\0-S\x00300000';
+    const list = 'abb:package\0list\0packages';
+    for (const [i, service] of [install, list].entries()) {
+      h.client.send(A_OPEN, 20 + i, 0, Buffer.from(service + '\0'));
+      await h.client.waitFor((p) => (p.command === A_OKAY || p.command === A_CLSE) && p.arg1 === 20 + i);
+    }
+    const reached = h.fake.requests.slice(h.baseline.length).filter((r) => r.startsWith('abb'));
+    expect(reached.map((r) => Buffer.from(r))).toEqual([Buffer.from(install), Buffer.from(list)]);
+    expect(h.events.filter((e) => e.kind === 'refused-service')).toEqual([]);
+  });
+
+  it.each([
+    ['shell:a\0b'], ['exec:a\0b'], ['host:x\0'], ['\0shell:id'], ['\0abb_exec:package\0install'],
+  ])('refuses the OPEN %j and reports it without contacting the backend', async (service) => {
+    const h = await setup();
+    h.client.send(A_OPEN, 9, 0, Buffer.from(service + '\0'));
+    const reply = await h.client.next();
+    expect(reply.command).toBe(A_CLSE);
+    expect(reply.arg1).toBe(9);
+    expect(h.fake.requests).toEqual(h.baseline);
+    expect(h.events.filter((e) => e.kind === 'refused-service')).toHaveLength(1);
+  });
+
+  it.each([
+    ['invalid UTF-8', Buffer.from([0x73, 0x68, 0xff, 0x00])],
+    ['an oversize service', Buffer.from('shell:' + 'x'.repeat(5000) + '\0')],
+  ])('reports a malformed OPEN (%s) as a refused service with a placeholder', async (_label, payload) => {
+    const h = await setup();
+    h.client.send(A_OPEN, 11, 0, payload);
+    const reply = await h.client.next();
+    expect(reply.command).toBe(A_CLSE);
+    expect(reply.arg1).toBe(11);
+    expect(h.fake.requests).toEqual(h.baseline);
+    const refused = h.events.filter((e) => e.kind === 'refused-service');
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({ service: '<malformed>' });
   });
 
   it('refuses an OPEN with an oversize service or an id of zero without contacting the backend', async () => {

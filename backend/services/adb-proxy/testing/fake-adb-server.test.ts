@@ -207,6 +207,45 @@ describe('FakeAdbServer extra services', () => {
     client.destroy();
   });
 
+  it('answers an abb_exec settings query with a short line, then ends', async () => {
+    const { client, rec } = await bound('abb_exec:settings\0get\0global\0enable_adb_incremental_install_default');
+    await rec.until(() => client.readableEnded);
+    expect(rec.data.toString()).toBe('OKAYOKAYnull\n');
+    client.destroy();
+  });
+
+  it('reads exactly the announced size for an abb_exec install, records it, then answers Success', async () => {
+    const apk = Buffer.from('PK\x03\x04 fake apk body');
+    const { client, rec } = await bound(`abb_exec:package\0install\0-S\0${apk.length}`);
+    const ended = new Promise<void>((r) => client.on('end', () => r()));
+    client.write(apk.subarray(0, 5));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(rec.data.toString()).toBe('OKAYOKAY');
+    client.write(apk.subarray(5));
+    await ended;
+    expect(rec.data.toString()).toBe('OKAYOKAYSuccess\n');
+    expect(fake.installs).toEqual([apk]);
+    client.destroy();
+  });
+
+  it('takes install bytes sent in the same write as the request, and a request that keeps its trailing NUL', async () => {
+    const client = net.connect(port, '127.0.0.1');
+    const rec = recorder(client);
+    client.write(frame('host:transport:SER1') + frame('abb_exec:package\0install\0-S\x003\0') + 'abc');
+    await rec.until((b) => b.toString().endsWith('Success\n'));
+    expect(fake.installs).toEqual([Buffer.from('abc')]);
+    client.destroy();
+  });
+
+  it('refuses an abb_exec command it does not know', async () => {
+    const client = net.connect(port, '127.0.0.1');
+    const rec = recorder(client);
+    client.write(frame('host:transport:SER1') + frame('abb_exec:package\0uninstall\0x'));
+    await rec.until((b) => b.toString().includes('unknown service'));
+    expect(rec.data.toString()).toBe('OKAYFAIL' + frame('unknown service'));
+    client.destroy();
+  });
+
   it('stores a pushed file and serves it back over sync v1', async () => {
     const { client, rec } = await bound('sync:');
     const payload = Buffer.from('hello sync');
