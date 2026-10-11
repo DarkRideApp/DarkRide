@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { createLoggers } from '../../logs';
+
+const { error: logError } = createLoggers('adb-proxy');
 
 export interface PendingEntry {
   requestId: string;
@@ -32,10 +35,12 @@ interface Slot {
 }
 
 const WINDOW_MS = 60_000;
+const MAX_TRACKED_IPS = 4096;
 
 export class PendingRegistry {
   private readonly slots = new Map<string, Slot>();
   private readonly ipHits = new Map<string, number[]>();
+  private stopped = false;
   private readonly maxPending: number;
   private readonly perIpPerMinute: number;
   private readonly timeoutMs: number;
@@ -49,12 +54,13 @@ export class PendingRegistry {
   }
 
   add(input: Omit<PendingEntry, 'requestId' | 'createdAt'>): AddResult {
+    if (this.stopped) return { ok: false, reason: 'cap' };
     const same = [...this.slots.values()].find((s) => s.entry.keyId === input.keyId && s.entry.deviceId === input.deviceId);
     if (!same) {
       if (this.slots.size >= this.maxPending) return { ok: false, reason: 'cap' };
       if (!this.takeRate(input.peerIp)) return { ok: false, reason: 'rate' };
     } else {
-      this.finish(same.entry.requestId, 'replaced');
+      this.detach(same.entry.requestId, 'replaced');
     }
     const entry: PendingEntry = { ...input, requestId: randomUUID(), createdAt: Date.now() };
     let settle!: (d: PendingDecision) => void;
@@ -62,7 +68,7 @@ export class PendingRegistry {
     const timer = setTimeout(() => this.finish(entry.requestId, 'timeout'), this.timeoutMs);
     timer.unref?.();
     this.slots.set(entry.requestId, { entry, settle, timer });
-    this.onChange?.();
+    this.notify();
     return { ok: true, entry, decision, cancel: () => { this.finish(entry.requestId, 'cancelled'); } };
   }
 
@@ -85,23 +91,40 @@ export class PendingRegistry {
   }
 
   stop(): void {
+    this.stopped = true;
     for (const id of [...this.slots.keys()]) this.finish(id, 'cancelled');
   }
 
-  private finish(requestId: string, decision: PendingDecision): boolean {
+  /** Remove a slot and settle its promise without notifying, so a replacement can notify once. */
+  private detach(requestId: string, decision: PendingDecision): boolean {
     const slot = this.slots.get(requestId);
     if (!slot) return false;
     clearTimeout(slot.timer);
     this.slots.delete(requestId);
     slot.settle(decision);
-    this.onChange?.();
     return true;
+  }
+
+  private finish(requestId: string, decision: PendingDecision): boolean {
+    if (!this.detach(requestId, decision)) return false;
+    this.notify();
+    return true;
+  }
+
+  /** A throwing listener must not unwind out of a timer callback or leave the registry half updated. */
+  private notify(): void {
+    try {
+      this.onChange?.();
+    } catch (err) {
+      logError(`pending onChange threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private takeRate(ip: string): boolean {
     const now = Date.now();
     const hits = (this.ipHits.get(ip) ?? []).filter((t) => now - t < WINDOW_MS);
     if (this.ipHits.size > 256) this.pruneRates(now);
+    if (!this.ipHits.has(ip) && this.ipHits.size >= MAX_TRACKED_IPS) return false;
     if (hits.length >= this.perIpPerMinute) {
       this.ipHits.set(ip, hits);
       return false;

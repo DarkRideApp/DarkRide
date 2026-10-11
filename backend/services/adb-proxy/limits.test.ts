@@ -23,6 +23,13 @@ describe('PreAuthLimiter', () => {
     expect(l.acquire('d')).toBeNull();
   });
 
+  it('allows 64 sockets in total by default across IPs and refuses the 65th', () => {
+    const l = new PreAuthLimiter();
+    for (let i = 1; i <= 64; i++) expect(l.acquire(`10.0.0.${i}`)).not.toBeNull();
+    expect(l.active).toBe(64);
+    expect(l.acquire('10.0.1.1')).toBeNull();
+  });
+
   it('gives the slot back on release so the same IP can connect again', () => {
     const l = new PreAuthLimiter(1, 10);
     const release = l.acquire('a')!;
