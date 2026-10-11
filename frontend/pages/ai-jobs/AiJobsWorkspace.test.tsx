@@ -189,7 +189,7 @@ describe('AiJobsWorkspace', () => {
   });
 
   it('shows the pipeline\'s name in the toolbar, fetched from the single-pipeline endpoint', async () => {
-    const ws = createMockWs({ pipelines: [{ id: 1, name: 'My APK Pipeline', jobKind: 'apk-analysis', pipelineVersionId: 1, graph: mockPipelineVersion().graph }] });
+    const ws = createMockWs({ pipelines: [{ id: 1, name: 'My APK Pipeline', pipelineVersionId: 1, graph: mockPipelineVersion().graph }] });
     render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('My APK Pipeline')).toBeInTheDocument());
     expect(calledPaths(ws)).toContain('GET /v1/ai-pipelines/1');

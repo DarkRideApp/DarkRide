@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { eq } from 'drizzle-orm';
 import { describe, it, expect, vi } from 'vitest';
 import * as schema from '../../db/schema';
 import { getNote } from '../apk-notes';
@@ -14,6 +15,7 @@ import {
   buildApkAnalysisExecutionCtx,
   apkVersionIdFromEventPayload,
   seedApkAnalysisPipeline,
+  APK_ANALYSIS_PIPELINE_ID_SETTING,
 } from './apk-analysis-pipeline';
 import { TRIGGER_SCHEMAS } from './nodes/trigger';
 import { APK_VERSION_DETECTED_SCHEMA } from '../apk-tracker';
@@ -28,7 +30,7 @@ function makeDb(): AppDatabase {
     CREATE TABLE tracked_apps (id INTEGER PRIMARY KEY, package_name TEXT NOT NULL, app_name TEXT, auto_analyse INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
     CREATE TABLE apk_versions (id INTEGER PRIMARY KEY, tracked_app_id INTEGER NOT NULL, version_code INTEGER NOT NULL, version_name TEXT, filename TEXT NOT NULL, file_size INTEGER, device_id TEXT, source TEXT DEFAULT 'device', downloaded_at INTEGER NOT NULL);
     CREATE TABLE apk_notes (version_id INTEGER PRIMARY KEY REFERENCES apk_versions(id) ON DELETE CASCADE, content TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
-    CREATE TABLE ai_pipelines (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, job_kind TEXT NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE ai_pipelines (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, created_at INTEGER NOT NULL);
     CREATE TABLE ai_pipeline_versions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       pipeline_id INTEGER NOT NULL REFERENCES ai_pipelines(id) ON DELETE CASCADE,
@@ -38,6 +40,7 @@ function makeDb(): AppDatabase {
       created_at INTEGER NOT NULL,
       UNIQUE(pipeline_id, version)
     );
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   `);
   return drizzle(sqlite, { schema }) as unknown as AppDatabase;
 }
@@ -236,8 +239,12 @@ describe('seedApkAnalysisPipeline', () => {
 
     const pipelines = db.select().from(aiPipelines).all();
     expect(pipelines).toHaveLength(1);
-    expect(pipelines[0].jobKind).toBe('apk-analysis');
     expect(pipelines[0].name).toBe('APK Analysis');
+
+    // Resolved by a settings pointer, not a pipeline-level field — the pipeline itself carries
+    // no job-kind identity.
+    const pointer = db.select().from(schema.settings).where(eq(schema.settings.key, APK_ANALYSIS_PIPELINE_ID_SETTING)).all()[0];
+    expect(pointer?.value).toBe(String(pipelines[0].id));
 
     const versions = db.select().from(aiPipelineVersions).all();
     const published = versions.filter(v => v.status === 'published');
@@ -247,7 +254,8 @@ describe('seedApkAnalysisPipeline', () => {
 
   it('self-heals a stale display name on an existing row instead of inserting a duplicate', () => {
     const db = makeDb();
-    db.insert(aiPipelines).values({ name: 'Astérix pattern', jobKind: 'apk-analysis', createdAt: new Date() }).run();
+    const pipelineId = db.insert(aiPipelines).values({ name: 'Astérix pattern', createdAt: new Date() }).run().lastInsertRowid as number;
+    db.insert(schema.settings).values({ key: APK_ANALYSIS_PIPELINE_ID_SETTING, value: String(pipelineId) }).run();
 
     seedApkAnalysisPipeline(db);
 
@@ -266,7 +274,8 @@ describe('seedApkAnalysisPipeline', () => {
   it('republishes a new version when the published graph has drifted from ASTERIX_PATTERN_GRAPH, exactly like a manual /publish', () => {
     const db = makeDb();
     const now = new Date();
-    const pipelineId = db.insert(aiPipelines).values({ name: 'APK Analysis', jobKind: 'apk-analysis', createdAt: now }).run().lastInsertRowid as number;
+    const pipelineId = db.insert(aiPipelines).values({ name: 'APK Analysis', createdAt: now }).run().lastInsertRowid as number;
+    db.insert(schema.settings).values({ key: APK_ANALYSIS_PIPELINE_ID_SETTING, value: String(pipelineId) }).run();
     const staleGraph = { ...ASTERIX_PATTERN_GRAPH, nodes: [] }; // stand-in for "an older shape"
     const staleVersionId = db.insert(aiPipelineVersions).values({
       pipelineId, version: 1, graph: staleGraph as any, status: 'published', createdAt: now,

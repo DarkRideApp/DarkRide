@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { eq, and, desc } from 'drizzle-orm';
-import { analysisJobs, apkVersions, trackedApps, aiPipelines, aiPipelineVersions } from '../db/schema';
+import { analysisJobs, apkVersions, trackedApps, aiPipelines, aiPipelineVersions, settings } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import type { AnalysisJob } from '../../shared/types/api';
 import type { ToolManager, ToolPaths } from './tool-manager';
@@ -10,7 +10,7 @@ import type { FileStorageService } from './file-storage';
 import type { TierConfig } from './ai-agent';
 import { AI_ANALYSIS_MAX_TURNS } from './ai-agent';
 import type { AiAgentFactory } from './ai-agent-factory';
-import { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, type ApkAnalysisIdentity } from './ai-jobs/apk-analysis-pipeline';
+import { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, APK_ANALYSIS_PIPELINE_ID_SETTING, type ApkAnalysisIdentity } from './ai-jobs/apk-analysis-pipeline';
 import { startPipelineRun } from './ai-jobs/run-executor';
 import type { PipelineGraph } from './ai-jobs/types';
 import { broadcastToAll } from '../websocket/index';
@@ -1023,10 +1023,10 @@ export class ApkAnalyzerService {
    * the whole run.
    */
   private async runAiPipeline(versionId: number, identity: ApkAnalysisIdentity): Promise<void> {
-    const pipeline = this.db.select().from(aiPipelines)
-      .where(eq(aiPipelines.jobKind, 'apk-analysis'))
-      .orderBy(aiPipelines.id) // deterministic if more than one apk-analysis row ever exists — found during review
-      .all()[0];
+    const pointer = this.db.select().from(settings).where(eq(settings.key, APK_ANALYSIS_PIPELINE_ID_SETTING)).all()[0];
+    const pipeline = pointer
+      ? this.db.select().from(aiPipelines).where(eq(aiPipelines.id, Number(pointer.value))).all()[0]
+      : undefined;
     if (!pipeline) {
       this.recordAiFailure(versionId, 'No apk-analysis pipeline row found — did seedApkAnalysisPipeline run at boot?');
       return;

@@ -820,7 +820,6 @@ export * from './oauth-schema';
 export const aiPipelines = sqliteTable('ai_pipelines', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   name: text('name').notNull(),
-  jobKind: text('job_kind').notNull(), // 'apk-analysis' | future kinds
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 

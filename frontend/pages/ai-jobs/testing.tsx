@@ -38,8 +38,8 @@ const GROUP_B_TOOLS = ['search_apk_code', 'get_apk_strings', 'find_api_endpoints
 
 const ASTERIX_PATTERN_GRAPH_FIXTURE: PipelineGraph = {
   nodes: [
-    { id: 'trigger-full', label: 'Full Analysis', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', inputSchema: APK_TRIGGER_INPUT_SCHEMA, outputSchema: APK_CONTEXT_SCHEMA } },
-    { id: 'trigger-rescan', label: 'Quick Rescan', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', inputSchema: APK_TRIGGER_INPUT_SCHEMA, outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-full', label: 'Full Analysis', config: { kind: 'Trigger', source: 'function', expandFn: 'apk-analysis/apk-context', inputSchema: APK_TRIGGER_INPUT_SCHEMA, outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-rescan', label: 'Quick Rescan', config: { kind: 'Trigger', source: 'function', expandFn: 'apk-analysis/apk-context', inputSchema: APK_TRIGGER_INPUT_SCHEMA, outputSchema: APK_CONTEXT_SCHEMA } },
 
     { id: 'agent-overview', label: 'App Overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}. Summarize purpose, framework, permissions and notable SDKs.' } },
     { id: 'agent-wait-times', label: 'Wait Times Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} fetches ride wait times. Search for queue, wait and attraction-status endpoints.' } },
@@ -90,7 +90,7 @@ export function mockPipelineVersion(): { graph: PipelineGraph } {
 }
 
 /** A row as GET /v1/ai-pipelines really returns it (backend/api/ai-pipelines.ts). */
-export interface PipelineRowFixture { id: number; name?: string; jobKind: string; pipelineVersionId: number | null; graph: PipelineGraph | null }
+export interface PipelineRowFixture { id: number; name: string; pipelineVersionId: number | null; graph: PipelineGraph | null }
 
 export interface MockApiState {
   pipelineVersion: { graph: PipelineGraph };
@@ -122,10 +122,10 @@ export function createMockWs(over: Partial<MockApiState> = {}): WebSocketContext
     const custom = state.routes[key];
     if (custom) return envelope(await custom(body));
 
-    const pipelines = state.pipelines ?? [{ id: 1, jobKind: 'apk-analysis', pipelineVersionId: 1, graph: state.pipelineVersion.graph }];
+    const pipelines = state.pipelines ?? [{ id: 1, name: 'APK Analysis', pipelineVersionId: 1, graph: state.pipelineVersion.graph }];
     if (key === 'GET /v1/ai-pipelines') {
       // Matches backend/api/ai-pipelines.ts's real GET handler: an array under `data`, each
-      // row carrying jobKind, pipelineVersionId and the published version's graph inlined.
+      // row carrying name, pipelineVersionId and the published version's graph inlined.
       return envelope({ success: true, data: pipelines });
     }
     const singlePipelineMatch = key.match(/^GET \/v1\/ai-pipelines\/(\d+)$/);

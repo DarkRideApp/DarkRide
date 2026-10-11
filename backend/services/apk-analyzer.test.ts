@@ -61,7 +61,7 @@ import { ApkAnalyzerService } from './apk-analyzer';
 import { broadcastToAll } from '../websocket/index';
 import { getNote, patchNoteSection } from './apk-notes';
 import { createTestDb } from '../test-utils/create-test-db';
-import { ASTERIX_PATTERN_GRAPH } from './ai-jobs/apk-analysis-pipeline';
+import { ASTERIX_PATTERN_GRAPH, APK_ANALYSIS_PIPELINE_ID_SETTING } from './ai-jobs/apk-analysis-pipeline';
 
 function insertTrackedApp(db: BetterSQLite3Database<typeof schema>, packageName: string): number {
   const result = db.insert(schema.trackedApps).values({
@@ -1222,8 +1222,9 @@ describe('ApkAnalyzerService', () => {
     function seedPublishedPipeline() {
       const now = new Date();
       const pipelineId = db.insert(schema.aiPipelines).values({
-        name: 'Astérix pattern', jobKind: 'apk-analysis', createdAt: now,
+        name: 'Astérix pattern', createdAt: now,
       }).run().lastInsertRowid as number;
+      db.insert(schema.settings).values({ key: APK_ANALYSIS_PIPELINE_ID_SETTING, value: String(pipelineId) }).run();
       // An older draft version — must never be the one a run picks up.
       db.insert(schema.aiPipelineVersions).values({
         pipelineId, version: 1, graph: { nodes: [], edges: [] } as any, status: 'draft', createdAt: now,
@@ -1317,8 +1318,9 @@ describe('ApkAnalyzerService', () => {
     it('a published pipeline with no published version is recorded as failed via recordAiFailure, not a bare broadcast', async () => {
       const now = new Date();
       const pipelineId = db.insert(schema.aiPipelines).values({
-        name: 'Astérix pattern', jobKind: 'apk-analysis', createdAt: now,
+        name: 'Astérix pattern', createdAt: now,
       }).run().lastInsertRowid as number;
+      db.insert(schema.settings).values({ key: APK_ANALYSIS_PIPELINE_ID_SETTING, value: String(pipelineId) }).run();
       // Only a draft version exists — no published row.
       db.insert(schema.aiPipelineVersions).values({
         pipelineId, version: 1, graph: SEEDED_GRAPH as any, status: 'draft', createdAt: now,

@@ -46,7 +46,7 @@ function fakeExecutors(overrides: Partial<NodeExecutors> = {}): NodeExecutors {
 
 function seedVersion(db: AppDatabase): number {
   const now = new Date();
-  const pipelineId = db.insert(schema.aiPipelines).values({ name: 'P', jobKind: 'apk-analysis', createdAt: now }).run().lastInsertRowid as number;
+  const pipelineId = db.insert(schema.aiPipelines).values({ name: 'P', createdAt: now }).run().lastInsertRowid as number;
   return db.insert(schema.aiPipelineVersions).values({ pipelineId, version: 1, graph: graph() as any, status: 'published', createdAt: now }).run().lastInsertRowid as number;
 }
 

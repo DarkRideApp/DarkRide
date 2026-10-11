@@ -59,9 +59,9 @@ function graphWithTwoTriggers(): PipelineGraph {
   };
 }
 
-function seedPipeline(db: Db, name = 'Pipeline A', jobKind = 'apk-analysis'): number {
+function seedPipeline(db: Db, name = 'Pipeline A'): number {
   const now = new Date();
-  return db.insert(schema.aiPipelines).values({ name, jobKind, createdAt: now }).run().lastInsertRowid as number;
+  return db.insert(schema.aiPipelines).values({ name, createdAt: now }).run().lastInsertRowid as number;
 }
 
 function seedVersion(
@@ -135,6 +135,33 @@ async function waitForRunToSettle(app: express.Express, runId: number): Promise<
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────
+
+describe('POST /v1/ai-pipelines', () => {
+  let db: Db;
+
+  beforeEach(() => {
+    db = makeDb();
+  });
+
+  it('creates a pipeline from just a name and a graph — no job kind required', async () => {
+    const app = createApp(db, fakeExecutors());
+    const graph = graphWithOneTrigger();
+    const res = await request(app).post('/v1/ai-pipelines').send({ name: 'My Pipeline', graph });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    const pipelineId = res.body.data.id;
+    expect(pipelineId).toEqual(expect.any(Number));
+
+    const row = db.select().from(schema.aiPipelines).where(eq(schema.aiPipelines.id, pipelineId)).all()[0];
+    expect(row.name).toBe('My Pipeline');
+    expect(row).not.toHaveProperty('jobKind');
+
+    const version = db.select().from(schema.aiPipelineVersions).where(eq(schema.aiPipelineVersions.pipelineId, pipelineId)).all()[0];
+    expect(version.status).toBe('draft');
+    expect(version.graph).toEqual(graph);
+  });
+});
 
 describe('GET /v1/ai-pipelines', () => {
   let db: Db;

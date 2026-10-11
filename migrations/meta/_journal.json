@@ -610,6 +610,13 @@
       "when": 1791494784565,
       "tag": "0103_ai_pipelines",
       "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1791494784565,
+      "tag": "0103_drop_ai_pipelines_job_kind",
+      "breakpoints": true
     }
   ]
 }

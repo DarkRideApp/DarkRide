@@ -62,9 +62,9 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
   }, { requires: ['core.apk:read'] });
 
   registerEndpoint('POST', '/v1/ai-pipelines', (req, res) => {
-    const { name, jobKind, graph } = req.body as { name: string; jobKind: string; graph: PipelineGraph };
+    const { name, graph } = req.body as { name: string; graph: PipelineGraph };
     const now = new Date();
-    const pipelineId = db.insert(aiPipelines).values({ name, jobKind, createdAt: now }).run().lastInsertRowid as number;
+    const pipelineId = db.insert(aiPipelines).values({ name, createdAt: now }).run().lastInsertRowid as number;
     db.insert(aiPipelineVersions).values({ pipelineId, version: 1, graph: graph as any, status: 'draft', createdAt: now }).run();
     res.json({ success: true, data: { id: pipelineId } });
   }, { requires: ['core.apk:manage'] });

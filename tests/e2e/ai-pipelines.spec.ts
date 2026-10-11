@@ -81,7 +81,6 @@ test.describe('AI job pipelines', () => {
     // shared e2e DB, so it can't affect this file's read-only test above or any other spec.
     await page.getByRole('button', { name: '+ New Pipeline' }).click();
     await page.getByLabel('New pipeline name').fill('E2E Editor Pipeline');
-    await page.getByLabel('New pipeline job kind').fill('e2e-editor-test');
     await page.getByRole('button', { name: 'Create' }).click();
 
     // Creating navigates straight into the new pipeline's own editor route.
@@ -144,7 +143,6 @@ test.describe('AI job pipelines', () => {
 
     await page.getByRole('button', { name: '+ New Pipeline' }).click();
     await page.getByLabel('New pipeline name').fill('E2E Pin Wiring Pipeline');
-    await page.getByLabel('New pipeline job kind').fill('e2e-pin-test');
     await page.getByRole('button', { name: 'Create' }).click();
     await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
 
@@ -193,7 +191,6 @@ test.describe('AI job pipelines', () => {
 
     await page.getByRole('button', { name: '+ New Pipeline' }).click();
     await page.getByLabel('New pipeline name').fill('E2E Failing Run Pipeline');
-    await page.getByLabel('New pipeline job kind').fill('e2e-failing-run');
     await page.getByRole('button', { name: 'Create' }).click();
     await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
 
@@ -257,7 +254,6 @@ test.describe('AI job pipelines', () => {
 
     await page.getByRole('button', { name: '+ New Pipeline' }).click();
     await page.getByLabel('New pipeline name').fill('E2E Event Trigger Pipeline');
-    await page.getByLabel('New pipeline job kind').fill('e2e-event-trigger');
     await page.getByRole('button', { name: 'Create' }).click();
     await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
 

@@ -16,21 +16,14 @@ describe('PipelinesList', () => {
   it('lists every pipeline by its real name', async () => {
     const ws = createMockWs({
       pipelines: [
-        { id: 1, name: 'APK Analysis', jobKind: 'apk-analysis', pipelineVersionId: 1, graph: mockPipelineVersion().graph },
-        { id: 2, name: 'My New Pipeline', jobKind: 'custom', pipelineVersionId: 2, graph: { nodes: [], edges: [] } },
+        { id: 1, name: 'APK Analysis', pipelineVersionId: 1, graph: mockPipelineVersion().graph },
+        { id: 2, name: 'My New Pipeline', pipelineVersionId: 2, graph: { nodes: [], edges: [] } },
       ],
     });
     render(<PipelinesList />, { wrapper: withProviders(ws) });
 
     await waitFor(() => expect(screen.getByText('APK Analysis')).toBeInTheDocument());
     expect(screen.getByText('My New Pipeline')).toBeInTheDocument();
-  });
-
-  it('falls back to the job kind when a pipeline has no name', async () => {
-    const ws = createMockWs({ pipelines: [{ id: 1, jobKind: 'apk-analysis', pipelineVersionId: 1, graph: null }] });
-    render(<PipelinesList />, { wrapper: withProviders(ws) });
-    // Appears twice — the Name column falls back to it, and the Job kind column shows it too.
-    await waitFor(() => expect(screen.getAllByText('apk-analysis').length).toBe(2));
   });
 
   it('shows an empty state when there are no pipelines yet', async () => {
@@ -42,8 +35,8 @@ describe('PipelinesList', () => {
   it('filters the list by the search box', async () => {
     const ws = createMockWs({
       pipelines: [
-        { id: 1, name: 'APK Analysis', jobKind: 'apk-analysis', pipelineVersionId: 1, graph: null },
-        { id: 2, name: 'My New Pipeline', jobKind: 'custom', pipelineVersionId: 2, graph: null },
+        { id: 1, name: 'APK Analysis', pipelineVersionId: 1, graph: null },
+        { id: 2, name: 'My New Pipeline', pipelineVersionId: 2, graph: null },
       ],
     });
     render(<PipelinesList />, { wrapper: withProviders(ws) });
@@ -61,11 +54,10 @@ describe('PipelinesList', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /new pipeline/i }));
     fireEvent.change(screen.getByLabelText('New pipeline name'), { target: { value: 'My Pipeline' } });
-    fireEvent.change(screen.getByLabelText('New pipeline job kind'), { target: { value: 'custom-thing' } });
     fireEvent.click(screen.getByRole('button', { name: /^create$/i }));
 
     await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines'));
-    expect(postBody(ws, 'POST /v1/ai-pipelines')).toEqual({ name: 'My Pipeline', jobKind: 'custom-thing', graph: { nodes: [], edges: [] } });
+    expect(postBody(ws, 'POST /v1/ai-pipelines')).toEqual({ name: 'My Pipeline', graph: { nodes: [], edges: [] } });
   });
 
   it('navigates to the new pipeline\'s own editor route after creating it', async () => {
@@ -86,14 +78,13 @@ describe('PipelinesList', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /new pipeline/i }));
     fireEvent.change(screen.getByLabelText('New pipeline name'), { target: { value: 'My Pipeline' } });
-    fireEvent.change(screen.getByLabelText('New pipeline job kind'), { target: { value: 'custom-thing' } });
     fireEvent.click(screen.getByRole('button', { name: /^create$/i }));
 
     await waitFor(() => expect(screen.getByText('Editor for pipeline 9')).toBeInTheDocument());
   });
 
   it('navigates to a pipeline\'s own editor route when its row is clicked', async () => {
-    const ws = createMockWs({ pipelines: [{ id: 5, name: 'APK Analysis', jobKind: 'apk-analysis', pipelineVersionId: 1, graph: null }] });
+    const ws = createMockWs({ pipelines: [{ id: 5, name: 'APK Analysis', pipelineVersionId: 1, graph: null }] });
     render(
       <WebSocketContext.Provider value={ws}>
         <ToastProvider>
@@ -112,7 +103,7 @@ describe('PipelinesList', () => {
     await waitFor(() => expect(screen.getByText('Editor for pipeline 5')).toBeInTheDocument());
   });
 
-  it('shows an error instead of creating when name or job kind is blank', async () => {
+  it('shows an error instead of creating when the name is blank', async () => {
     const ws = createMockWs({ pipelines: [] });
     render(<PipelinesList />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText(/no pipelines yet/i)).toBeInTheDocument());
@@ -120,7 +111,7 @@ describe('PipelinesList', () => {
     fireEvent.click(screen.getByRole('button', { name: /new pipeline/i }));
     fireEvent.click(screen.getByRole('button', { name: /^create$/i }));
 
-    expect(screen.getByRole('alert')).toHaveTextContent(/name and a job kind/i);
+    expect(screen.getByRole('alert')).toHaveTextContent(/give the new pipeline a name/i);
     expect(calledPaths(ws)).not.toContain('POST /v1/ai-pipelines');
   });
 });

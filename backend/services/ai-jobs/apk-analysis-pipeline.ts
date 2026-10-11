@@ -10,11 +10,21 @@ import { runForEach } from './nodes/foreach';
 import { runSink } from './nodes/sink';
 import type { AiAgentFactory } from '../ai-agent-factory';
 import type { AppDatabase } from '../../db/index';
-import { aiPipelines, aiPipelineVersions } from '../../db/schema';
+import { aiPipelines, aiPipelineVersions, settings } from '../../db/schema';
 import { APK_VERSION_DETECTED_SCHEMA } from '../apk-tracker';
 
 const PIPELINE_NAME = 'APK Analysis';
-const PIPELINE_JOB_KIND = 'apk-analysis';
+
+/**
+ * Pipelines don't carry a "job kind" identity — a pipeline fires because a Trigger node is bound
+ * to an event or run directly by id, not because of a string a human filled in on a form. The one
+ * genuinely internal exception is apk-analyzer.ts's own Analyze-button flow: it isn't an event (a
+ * human decides when to run it), so it needs SOME way to find "the" APK Analysis pipeline. This
+ * settings key is that pointer — written once by seedApkAnalysisPipeline, read by
+ * apk-analyzer.ts's runAiPipeline. It is never shown to a user and never duplicated as a pipeline
+ * field.
+ */
+export const APK_ANALYSIS_PIPELINE_ID_SETTING = 'apk_analysis_pipeline_id';
 
 // Both Triggers below pull their inputSchema/outputSchema straight from TRIGGER_SCHEMAS
 // (nodes/trigger.ts) — the one place apk-analysis/apk-context's real contract is declared —
@@ -158,9 +168,10 @@ export function buildApkAnalysisExecutionCtx(
 }
 
 /**
- * Idempotent: matches the existing row by `jobKind` alone and patches `name` if it drifted, so
- * restarts never duplicate it. Also keeps the published graph itself in sync with
- * ASTERIX_PATTERN_GRAPH — a code change to the constant (e.g. Quick Rescan moving onto
+ * Idempotent: resolves the existing row via APK_ANALYSIS_PIPELINE_ID_SETTING (self-healing if the
+ * pointer is missing or stale — it's rewritten below whenever a fresh row is created) and patches
+ * `name` if it drifted, so restarts never duplicate it. Also keeps the published graph itself in
+ * sync with ASTERIX_PATTERN_GRAPH — a code change to the constant (e.g. Quick Rescan moving onto
  * apk:version-detected) must reach a pipeline that was already seeded on an earlier boot, or the
  * live system silently keeps running the old wiring until someone re-publishes by hand. Drift is
  * fixed the same way a human would: a new version is inserted and published, the old one demoted
@@ -168,18 +179,23 @@ export function buildApkAnalysisExecutionCtx(
  * an already-published row.
  */
 export function seedApkAnalysisPipeline(db: AppDatabase): void {
-  const existing = db.select().from(aiPipelines)
-    .where(eq(aiPipelines.jobKind, PIPELINE_JOB_KIND))
-    .all()[0];
+  const pointer = db.select().from(settings).where(eq(settings.key, APK_ANALYSIS_PIPELINE_ID_SETTING)).all()[0];
+  const existing = pointer
+    ? db.select().from(aiPipelines).where(eq(aiPipelines.id, Number(pointer.value))).all()[0]
+    : undefined;
+
   if (!existing) {
     const now = new Date();
     const pipelineId = db.insert(aiPipelines).values({
-      name: PIPELINE_NAME, jobKind: PIPELINE_JOB_KIND, createdAt: now,
+      name: PIPELINE_NAME, createdAt: now,
     }).run().lastInsertRowid as number;
 
     db.insert(aiPipelineVersions).values({
       pipelineId, version: 1, graph: ASTERIX_PATTERN_GRAPH as any, status: 'published', createdAt: now,
     }).run();
+
+    db.insert(settings).values({ key: APK_ANALYSIS_PIPELINE_ID_SETTING, value: String(pipelineId) })
+      .onConflictDoUpdate({ target: settings.key, set: { value: String(pipelineId) } }).run();
     return;
   }
 

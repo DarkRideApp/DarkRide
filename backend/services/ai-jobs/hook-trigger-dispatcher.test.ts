@@ -10,7 +10,7 @@ import * as runExecutorModule from './run-executor';
 function makeDb(): AppDatabase {
   const sqlite = new Database(':memory:');
   sqlite.exec(`
-    CREATE TABLE ai_pipelines (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, job_kind TEXT NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE ai_pipelines (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, created_at INTEGER NOT NULL);
     CREATE TABLE ai_pipeline_versions (
       id INTEGER PRIMARY KEY AUTOINCREMENT, pipeline_id INTEGER NOT NULL, version INTEGER NOT NULL,
       graph TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', created_at INTEGER NOT NULL
@@ -20,7 +20,7 @@ function makeDb(): AppDatabase {
 }
 
 function seedPublished(db: AppDatabase, pipelineId: number, versionId: number, graph: unknown) {
-  db.insert(schema.aiPipelines).values({ id: pipelineId, name: 'p', jobKind: 'k', createdAt: new Date() }).run();
+  db.insert(schema.aiPipelines).values({ id: pipelineId, name: 'p', createdAt: new Date() }).run();
   db.insert(schema.aiPipelineVersions).values({
     id: versionId, pipelineId, version: 1, graph: graph as any, status: 'published', createdAt: new Date(),
   }).run();

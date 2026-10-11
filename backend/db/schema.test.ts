@@ -274,7 +274,6 @@ describe('ai_pipelines tables', () => {
       CREATE TABLE ai_pipelines (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
-        job_kind TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
       CREATE TABLE ai_pipeline_versions (
@@ -317,7 +316,7 @@ describe('ai_pipelines tables', () => {
     const db = drizzle(sqlite, { schema });
 
     const now = new Date();
-    db.insert(schema.aiPipelines).values({ id: 1, name: 'Astérix', jobKind: 'apk-analysis', createdAt: now }).run();
+    db.insert(schema.aiPipelines).values({ id: 1, name: 'Astérix', createdAt: now }).run();
     db.insert(schema.aiPipelineVersions).values({ id: 1, pipelineId: 1, version: 1, graph: { nodes: [], edges: [] }, status: 'published', createdAt: now }).run();
     db.insert(schema.aiPipelineRuns).values({ id: 1, pipelineVersionId: 1, triggerNodeId: 'trigger', triggeredBy: 'manual', status: 'running', startedAt: now }).run();
     db.insert(schema.aiPipelineNodeRuns).values({ id: 1, runId: 1, nodeId: 'agent-overview', status: 'ok', startedAt: now }).run();
@@ -379,5 +378,54 @@ describe('migration 0103_ai_pipelines.sql', () => {
     const cols = (name: string) => (sqlite.prepare(`PRAGMA index_info('${name}')`).all() as { name: string }[]).map((r) => r.name);
     expect(cols('ai_pipeline_node_runs_run_idx')).toEqual(['run_id']);
     expect(cols('ai_pipeline_node_runs_memo_idx')).toEqual(['node_id', 'input_hash']);
+  });
+});
+
+describe('migration 0103_drop_ai_pipelines_job_kind.sql', () => {
+  function applyMigrationTagged(sqlite: Database.Database, tag: string) {
+    const dir = path.resolve(__dirname, '../../migrations');
+    const file = fs.readdirSync(dir).find((f) => f.startsWith(tag))!;
+    expect(file).toBeTruthy();
+    const sql = fs.readFileSync(path.join(dir, file), 'utf8');
+    for (const stmt of sql.split('--> statement-breakpoint')) if (stmt.trim()) sqlite.exec(stmt);
+  }
+
+  // settings + ai_pipelines as they existed right before 0103 — 0103 itself only ever runs after
+  // both are already in place in the real migration chain.
+  function setupPre0103(sqlite: Database.Database) {
+    sqlite.exec(`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+    applyMigrationTagged(sqlite, '0102_ai_pipelines');
+  }
+
+  it("backfills apk_analysis_pipeline_id from the existing job_kind='apk-analysis' row before dropping the column", () => {
+    const sqlite = new Database(':memory:');
+    setupPre0103(sqlite);
+    sqlite.exec(`INSERT INTO ai_pipelines (id, name, job_kind, created_at) VALUES (5, 'APK Analysis', 'apk-analysis', 1000);`);
+
+    applyMigrationTagged(sqlite, '0103_drop_ai_pipelines_job_kind');
+
+    const row = sqlite.prepare(`SELECT value FROM settings WHERE key = 'apk_analysis_pipeline_id'`).get() as { value: string } | undefined;
+    expect(row?.value).toBe('5');
+
+    const columns = (sqlite.prepare(`PRAGMA table_info(ai_pipelines)`).all() as { name: string }[]).map((c) => c.name);
+    expect(columns).not.toContain('job_kind');
+  });
+
+  it('writes nothing to settings on a fresh install with no apk-analysis row', () => {
+    const sqlite = new Database(':memory:');
+    setupPre0103(sqlite);
+
+    applyMigrationTagged(sqlite, '0103_drop_ai_pipelines_job_kind');
+
+    const row = sqlite.prepare(`SELECT value FROM settings WHERE key = 'apk_analysis_pipeline_id'`).get();
+    expect(row).toBeUndefined();
+  });
+
+  it('a pipeline can be inserted with no job_kind after the migration', () => {
+    const sqlite = new Database(':memory:');
+    setupPre0103(sqlite);
+    applyMigrationTagged(sqlite, '0103_drop_ai_pipelines_job_kind');
+
+    expect(() => sqlite.exec(`INSERT INTO ai_pipelines (name, created_at) VALUES ('p', 1000);`)).not.toThrow();
   });
 });

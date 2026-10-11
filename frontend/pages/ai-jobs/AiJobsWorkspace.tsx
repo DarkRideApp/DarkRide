@@ -82,7 +82,7 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
     sendRestApi('GET', `/v1/ai-pipelines/${pipelineId}`).then((res: any) => {
       if (cancelled) return;
       const row = res.body?.data;
-      setPipelineName(row?.name ?? row?.jobKind ?? null);
+      setPipelineName(row?.name ?? null);
       setGraph(row?.graph ?? EMPTY_GRAPH);
     });
     // Feeds the Run form's 'apk-version' field renderer (SidePanel.tsx) for any Trigger whose
