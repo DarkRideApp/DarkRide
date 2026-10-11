@@ -1,7 +1,7 @@
 # ADB proxy: design
 
 Date: 2026-10-11
-Status: **Draft for review.** Approach, auth model, hosting and grant scope were decided with Cube in the design discussion; the open points at the end are small calls for the reviewer.
+Status: **Approved 2026-10-11**, revised the same day while writing the implementation plan (see "Revisions after approval" at the end). Approach, auth model, hosting and grant scope were decided with Cube in the design discussion.
 
 ## The problem
 
@@ -55,7 +55,7 @@ remote adb ──TCP :port──▶ listener (one per device)
 
 - Each proxied Android device gets its own TCP listener on a persistent port. One wire connection is one transport is one device, so the port is how a client picks a device.
 - The proxy acts as a device (`adbd`) towards the client. For each stream the client opens, it makes a fresh connection to the local ADB server, binds it with `host:transport:<serial>`, sends the service string and then pipes bytes both ways.
-- Host-level services (`host:kill`, `host:connect`, ...) are unreachable by construction: the proxy only ever sends device services, after the transport is bound.
+- Host-level services (`host:kill`, `host:connect`, ...) must stay unreachable. The ADB server dispatches any request starting with `host` as a host request, even on a connection already bound to a device, so the proxy refuses every service string starting with `host` (see Services policy) instead of relying on the transport binding.
 - The ADB server address is the same one DarkRide's own `adb` calls use (`ANDROID_ADB_SERVER_ADDRESS` and `ANDROID_ADB_SERVER_PORT`, default `127.0.0.1:5037`).
 - `devices.id` is the ADB serial for Android devices, so it is the transport name.
 
@@ -69,10 +69,16 @@ All under `backend/services/adb-proxy/`. Each file has one job and can be tested
 | `adb-key.ts` | Parse the Android public-key blob, build a Node `KeyObject`, compute the display fingerprint and the identity hash, verify a token signature. | `node:crypto` |
 | `host-client.ts` | ADB host-protocol client for the local ADB server: open a bound transport plus service as a socket, fetch the device feature list. Injectable so tests use a fake. | `net` |
 | `session.ts` | One per client connection: handshake state machine, stream table, per-stream flow control. | the three above |
-| `listener.ts` | One `net.Server` per device: connection limits, live-session registry, TCP keepalive. | `session.ts` |
+| `listener.ts` | Thin `net.Server` wrapper per device: bind, TCP keepalive, hand each socket to a callback, close. | `node:net` |
 | `port-allocator.ts` | Persistent port per device from a configurable range. | DB |
-| `key-store.ts` | Key records (approved, denied, revoked) and the in-memory pending map. | DB |
-| `adb-proxy-service.ts` | Orchestrator: starts and stops listeners from device lifecycle, applies settings changes live, closes sessions on revoke, owns counters and WS events. | `DeviceDirectory`, the above |
+| `key-store.ts` | Persisted key records (approved, denied, revoked). | DB |
+| `pending.ts` | In-memory pending requests: caps, per-IP rate limit, timeouts, decision promises. | nothing |
+| `auth-gate.ts` | Implements the session's `AuthGate` over `key-store.ts` and `pending.ts`; caches parsed keys. | the two above |
+| `limits.ts` | Pre-auth connection limiter (per IP and total). | nothing |
+| `throttle.ts` | Run a function at most once per interval, used to log a dead ADB server once per interval. | nothing |
+| `settings.ts` | Load, validate and save the `adb_proxy.*` settings. | DB |
+| `device-directory.ts` | `DeviceDirectory` adapter over `DeviceManager`. | `DeviceManager` |
+| `adb-proxy-service.ts` | Orchestrator: starts and stops listeners from device lifecycle, applies settings changes live, owns the live-session registry, closes sessions on revoke, owns the counters and the status snapshot. | `DeviceDirectory`, the above |
 
 `DeviceDirectory` is a narrow interface the service depends on instead of `DeviceManager` internals:
 
@@ -84,7 +90,7 @@ interface DeviceDirectory {
 }
 ```
 
-A small adapter implements it over `DeviceManager` (its online set, the `device:connected` hook and `onDeviceOffline`). Outside the module: `backend/api/adb-proxy.ts` (REST), a migration, scope entries in `backend/auth/scopes-registry.ts`, and the frontend page.
+A small adapter (`device-directory.ts`) implements it over `DeviceManager`, which gains two public methods because its online set is private: `getOnlineDeviceIds()` and `onDeviceOnline(fn)` (mirroring the existing `onDeviceOffline`). Outside the module: `backend/api/adb-proxy.ts` (REST), a migration, scope entries in `backend/auth/scopes-registry.ts`, and the frontend page.
 
 ## Wire protocol behavior
 
@@ -113,6 +119,7 @@ A small adapter implements it over `DeviceManager` (its online set, the `device:
 
 **Services policy.** Refuse with `CLSE`:
 
+- anything starting with `host` (`host:kill`, `host:connect:...`, `host-serial:...`), because the ADB server would treat it as a request to itself and a remote client could stop or reconfigure the host's ADB server;
 - `reverse:*`, because device-initiated streams would go to the local ADB server, bypassing the proxy and the grant;
 - `tcpip:*` and `usb:`, because they flip the phone's `adbd` between USB and network and can strand it where DarkRide cannot reach it.
 
@@ -160,7 +167,7 @@ Migration `0102_adb_proxy` (see Rollout for the numbering note).
 | `enabled` | integer boolean not null default 1 | |
 | `created_at` | integer timestamp | |
 
-`forget-device.ts` must delete the `adb_proxy_devices` row explicitly: with foreign keys on, parent deletes must clear non-cascading children first, and the test DB helper's DDL drops `ON DELETE CASCADE`. The new tables need DDL in that helper.
+`forget-device.ts` must delete the `adb_proxy_devices` row explicitly: with foreign keys on, parent deletes must clear non-cascading children first, and the test DB helper's DDL drops `ON DELETE CASCADE`. Tests build the tables with `createTestDb([...])`; one test applies the real migration with `applyMigrations`.
 
 Settings (existing `settings` key/value table): `adb_proxy.enabled` (default `false`), `adb_proxy.bind_host` (default `0.0.0.0`), `adb_proxy.port_start` and `adb_proxy.port_end` (default `6500` to `6599`). Changes apply live: toggling starts or stops listeners; a new range only affects ports allocated afterwards.
 
@@ -180,11 +187,11 @@ REST under `/v1/adb-proxy`, also reachable over the WS `restapi` action like the
 | `PATCH /keys/:id` | manage | set the `device_ids` allow-list |
 | `DELETE /keys/:id` | manage | forget the record so the machine can request again |
 
-Live updates use `broadcastToAll` with full small snapshots (`adb-proxy:requests`, `adb-proxy:connections`, `adb-proxy:state`), following the existing message conventions. The advertised host in `/status` comes from the existing LAN-preferring server IP logic, so a VPN interface is never shown.
+Live updates are one WebSocket message type, `adb-proxy`, carrying the full status snapshot (small). It goes through `broadcastToAll` on a filtered channel registered with `requires: ['core.adb-proxy:read']`, so only subscribed clients holding that scope receive pending fingerprints and IPs. The page uses `ws.subscribe('adb-proxy', ...)`, which also sends the server-side subscription. The advertised host in `/status` comes from the existing LAN-preferring server IP logic, so a VPN interface is never shown.
 
 ## UI
 
-A settings page at `settings/adb-proxy` (`frontend/pages/settings/AdbProxyPage.tsx`), with a pending-count badge on its sidebar item. Layout and components follow the nearest existing approve/revoke screens (`CertificatesPage`) rather than a new pattern.
+A settings page at `settings/adb-proxy` (`frontend/pages/settings/AdbProxyPage.tsx`), with a pending-count badge on its sidebar item. Layout and components follow the nearest existing list-with-actions screens (the table, badge and button classes of `AdminUsersPage`, and the enable-switch card of `McpSettings`) rather than a new pattern.
 
 1. **Switch and network:** enable toggle, bind host, port range.
 2. **Pending requests** at the top: comment, fingerprint, source IP, device, age, Approve and Deny.
@@ -213,9 +220,9 @@ A settings page at `settings/adb-proxy` (`frontend/pages/settings/AdbProxyPage.t
 - `session.test.ts` against an in-memory fake ADB server: approved key gets `CNXN`; unknown key is held then approved, denied, timed out or dropped; denied key closed with no new pending entry; revoke closes live streams; flood caps; services policy; flow control under a slow client; device going offline.
 - `key-store`, `port-allocator`, REST (401 without credentials, 403 without the right scope, validation errors) and `AdbProxyPage.test.tsx`.
 
-**Conformance lane** (`npm run test:adb-proxy-conformance`, `vitest.adb-proxy.config.ts`, files named `*.conformance.test.ts`, excluded from the default lane like the live AI config). This feature has no LLM, so this slower lane is its equivalent of the eval suite: it drives the **real `adb` binary** at the proxy, backed by a fake ADB server presenting a canned device. It checks `connect` then `unauthorized`, approval then `device`, and `shell`, `push`/`pull`, `forward`, `install` and `logcat`; a live mode against a physical device is opt-in. It skips when `adb` is missing. Isolation is mandatory: the test client uses its own `HOME`/`ANDROID_USER_HOME` (own key pair) and its own `ANDROID_ADB_SERVER_PORT`, so it can never touch the developer's running ADB server or keys. Runs before ship, not on commit.
+**Conformance lane** (`npm run test:adb-proxy-conformance`, `vitest.adb-proxy.config.ts`, files named `*.conformance.test.ts`, excluded from the default lane like the live AI config). This feature has no LLM, so this slower lane is its equivalent of the eval suite: it drives the **real `adb` binary** at the proxy, backed by a fake ADB server presenting a canned device. It checks `connect` then `unauthorized`, approval then `device`, and `shell`, `push`/`pull`, `forward`, `install` and `logcat`; a live mode against a physical device is opt-in. It skips when `adb` is missing, and runs once per client listed in `ADB_BINS` (default: `adb` on PATH), so an older and a newer platform-tools build are both covered. Isolation is mandatory: the test client uses its own `HOME`/`ANDROID_USER_HOME` (own key pair) and its own `ANDROID_ADB_SERVER_PORT`, so it can never touch the developer's running ADB server or keys. Runs before ship, not on commit.
 
-**Playwright E2E:** approve, deny, revoke and forget from the UI, with a small Node test client built on `packet.ts` standing in for a remote machine.
+**Playwright E2E:** approve, deny, revoke and forget from the UI, with a small Node test client built on `packet.ts` standing in for a remote machine. It runs under its own config (`playwright.adb-proxy.config.ts`, own ports and DB) because the backend needs an online device: the config starts a fake ADB server (the one the gate tests use) and points the backend at it with `ANDROID_ADB_SERVER_PORT`.
 
 ## Rollout
 
@@ -227,13 +234,25 @@ A settings page at `settings/adb-proxy` (`frontend/pages/settings/AdbProxyPage.t
 
 ## Risks and things to verify first
 
-1. **SIGNATURE format.** The client signs the 20-byte token as a SHA-1 PKCS#1 v1.5 DigestInfo, so Node's `crypto.verify` (which hashes again) is wrong; verification has to compare the `publicDecrypt` output with `DigestInfo(sha1) || token`. Confirm against the AOSP `adb_auth_host` source and the real `adb` client before building on it. The first implementation task is a spike that gets a real `adb connect` to reach `device`.
+1. **SIGNATURE format.** The client signs the 20-byte token as a SHA-1 PKCS#1 v1.5 DigestInfo, so Node's `crypto.verify` (which hashes again) is wrong; verification has to compare the `publicDecrypt` output with `DigestInfo(sha1) || token`. Confirm against the AOSP `adb_auth_host` source and the real `adb` client before building on it. The first implementation task is a spike that gets a real `adb connect` to reach `device`. On 2026-10-11 a signature made with `openssl pkeyutl -pkeyopt digest:sha1` over a random token, using a key from a real `adb keygen`, decrypted to exactly the SHA-1 DigestInfo prefix plus the token, and the `.pub` blob parsed as described above. What the spike still has to settle is that the real client signs identically.
 2. **Fingerprint format.** MD5 over the decoded blob, uppercase colon hex, compared against a real device's dialog during the live conformance run.
 3. **Client version spread.** Older and newer `adb` clients differ in banner expectations and in whether they offer STLS. Run the conformance lane against at least the oldest and newest platform-tools in use.
 4. **Public-key blob size.** Only 2048-bit keys (524-byte blob) are accepted, which is all `adb` generates.
+5. **Held-connection patience.** The 5 minute pending hold assumes the real `adb` client keeps an `unauthorized` transport open that long. The spike holds a connection for 5.5 minutes and records whether the client stays; if it gives up sooner, the pending timeout becomes that shorter value.
 
-## Open points for the reviewer
+## Defaults accepted at approval
 
 - **Services deny-list** (`reverse:`, `tcpip:`, `usb:`): defaults chosen to protect the host's ability to reach the phone; say if you want any of them allowed.
 - **Default port range** `6500` to `6599`: chosen to avoid ports already used by DarkRide (3000, 5173, 9100-9399, 49160-49200, 51820) and ADB itself (5037, 5554-5585).
 - **Default bind** `0.0.0.0` once enabled: needed for remote machines; narrow it with `adb_proxy.bind_host`.
+
+## Revisions after approval
+
+Made on 2026-10-11 while grounding the implementation plan in the code. None changes a decision Cube made.
+
+- **Security fix: every service starting with `host` is refused.** The first draft said host services were unreachable by construction because the transport is bound first. The ADB server dispatches `host…` requests on any connection, including a bound one, so a remote client could have sent `host:kill`. The Services policy and "How it works" now say so, and the gate tests assert the fake ADB server never sees a `host…` request from a remote stream.
+- **Live updates** use a filtered WebSocket channel with a scope requirement instead of an unfiltered broadcast, so pending fingerprints and IPs only reach clients holding `core.adb-proxy:read`.
+- **UI pattern reference** corrected: `CertificatesPage` is only a redirect stub. The page follows `AdminUsersPage` and `McpSettings`.
+- **Components** gained `pending.ts`, `auth-gate.ts`, `limits.ts`, `settings.ts` and `device-directory.ts`, and `listener.ts` shrank to a thin socket wrapper, so each unit has one job. `DeviceManager` gains `getOnlineDeviceIds()` and `onDeviceOnline()`.
+- **E2E** runs under its own Playwright config with a fake ADB server, and the conformance lane runs once per client in `ADB_BINS`.
+- **Risk 5** added: the real client's patience with a long-held `unauthorized` transport is unverified.
