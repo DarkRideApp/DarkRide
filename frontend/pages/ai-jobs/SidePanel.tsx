@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { resolvePreview } from './templatePreview';
 import { nodeKindLabel } from './nodeKindLabels';
+import { runStatusMessage, displayRunStatus } from './runStatus';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
 interface SchemaField { field: string; type: string; description: string }
@@ -21,7 +22,22 @@ function WiredFrom({ graph, from }: { graph: PipelineGraph; from?: string }) {
   );
 }
 
-export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDeleteNode, onRename, recentVersions, onRun }: {
+/**
+ * Surfaces why the most recent run left this node in the state its canvas outline already shows
+ * (Canvas.tsx's STATUS_COLOR) — without this, the color was the only signal, and a failed node's
+ * real error text (already returned by GET /v1/ai-pipelines/runs/:runId) never reached the user.
+ */
+function LastRunStatus({ runStatus }: { runStatus?: { status: string; wasMemoized?: boolean; error?: string } }) {
+  if (!runStatus) return null;
+  const status = displayRunStatus(runStatus);
+  return (
+    <div className={`ai-jobs-run-status ai-jobs-run-status-${status}`} data-testid="node-run-status">
+      <strong>Last run:</strong> {runStatusMessage(status, runStatus.error)}
+    </div>
+  );
+}
+
+export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDeleteNode, onRename, recentVersions, onRun, runStatus }: {
   node: NodeLike;
   graph: PipelineGraph;
   triggerSchema: SchemaField[];
@@ -31,6 +47,7 @@ export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDelet
   onRename?: (nodeId: string, label: string) => void;
   recentVersions?: RecentVersion[];
   onRun?: (input: Record<string, unknown>, reuseUnchanged: boolean) => Promise<unknown>;
+  runStatus?: { status: string; wasMemoized?: boolean; error?: string };
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const [name, setName] = useState(node.label ?? nodeKindLabel(node.config.kind));
@@ -74,6 +91,7 @@ export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDelet
           <button ref={closeRef} type="button" className="btn btn-ghost btn-sm" aria-label="Close details" onClick={onClose}>×</button>
         </div>
       </div>
+      <LastRunStatus runStatus={runStatus} />
       {node.config.kind === 'AgentCall' ? (
         <AgentCallBody node={node} triggerSchema={triggerSchema} onSave={onSave} />
       ) : node.config.kind === 'Trigger' ? (

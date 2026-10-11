@@ -96,6 +96,26 @@ describe('Canvas', () => {
     expect(screen.getByText('yes')).toBeInTheDocument();
     expect(screen.getByText('no')).toBeInTheDocument();
   });
+
+  it('a failed node carries its error text as a hover title, so the reason is visible without opening the side panel', () => {
+    const nodeStatuses = { 'agent-overview': { status: 'failed', error: 'boom: something broke' } };
+    render(<Canvas graph={graph} onSelectNode={() => {}} nodeStatuses={nodeStatuses} />);
+    const content = screen.getByText('agent-overview').closest('.ai-jobs-node-content') as HTMLElement;
+    expect(content).toHaveAttribute('title', 'boom: something broke');
+  });
+
+  it('a skipped node explains itself as an upstream failure, even though it carries no error of its own', () => {
+    const nodeStatuses = { 'agent-overview': { status: 'skipped' } };
+    render(<Canvas graph={graph} onSelectNode={() => {}} nodeStatuses={nodeStatuses} />);
+    const content = screen.getByText('agent-overview').closest('.ai-jobs-node-content') as HTMLElement;
+    expect(content).toHaveAttribute('title', 'Skipped — an upstream node failed.');
+  });
+
+  it('a node with no run status, or a successful one, has no title tooltip', () => {
+    render(<Canvas graph={graph} onSelectNode={() => {}} nodeStatuses={{ 'agent-overview': { status: 'ok' } }} />);
+    const content = screen.getByText('agent-overview').closest('.ai-jobs-node-content') as HTMLElement;
+    expect(content).not.toHaveAttribute('title');
+  });
 });
 
 describe('toFlowNodes', () => {

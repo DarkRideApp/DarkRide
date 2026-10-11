@@ -78,6 +78,38 @@ describe('SidePanel — AgentCall', () => {
   });
 });
 
+describe('SidePanel — last run status', () => {
+  it('shows nothing when the node has never been run', () => {
+    render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.queryByText(/last run/i)).not.toBeInTheDocument();
+  });
+
+  it('shows the real error message for a failed node, not just "failed"', () => {
+    const runStatus = { status: 'failed', error: 'apk-analysis/apk-context Trigger requires a numeric "versionId" in its input, got {}' };
+    render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} runStatus={runStatus} />);
+    expect(screen.getByText(/last run/i)).toBeInTheDocument();
+    expect(screen.getByText(/requires a numeric "versionId"/)).toBeInTheDocument();
+  });
+
+  it('explains a skipped node as an upstream failure, not its own error', () => {
+    const runStatus = { status: 'skipped' };
+    render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} runStatus={runStatus} />);
+    expect(screen.getByText(/skipped — an upstream node failed/i)).toBeInTheDocument();
+  });
+
+  it('shows a plain success message for an ok node', () => {
+    const runStatus = { status: 'ok' };
+    render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} runStatus={runStatus} />);
+    expect(screen.getByText(/succeeded/i)).toBeInTheDocument();
+  });
+
+  it('shows a memoized node as reused from a previous run regardless of its underlying status', () => {
+    const runStatus = { status: 'ok', wasMemoized: true };
+    render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} runStatus={runStatus} />);
+    expect(screen.getByText(/reused from a previous run/i)).toBeInTheDocument();
+  });
+});
+
 describe('SidePanel — Trigger', () => {
   const triggerNode = {
     id: 'trigger-full',

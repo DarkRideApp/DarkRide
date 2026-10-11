@@ -57,7 +57,7 @@ describe('AiJobsWorkspace', () => {
               run: { id: 7, status: 'partial' },
               nodes: [
                 { runId: 7, nodeId: 'agent-overview', status: 'ok', wasMemoized: false },
-                { runId: 7, nodeId: 'agent-wait-times', status: 'failed', wasMemoized: false },
+                { runId: 7, nodeId: 'agent-wait-times', status: 'failed', wasMemoized: false, error: 'wait-times agent crashed: rate limited' },
                 { runId: 7, nodeId: 'agent-maps', status: 'skipped', wasMemoized: false },
               ],
             },
@@ -96,6 +96,13 @@ describe('AiJobsWorkspace', () => {
     });
     expect(screen.getByRole('status')).toHaveTextContent('Run 7 finished: partial');
     await waitFor(() => expect(screen.getByRole('button', { name: /^run$/i })).not.toBeDisabled());
+
+    // The failed node's real error text must be discoverable without reading the network tab:
+    // as a hover tooltip on the canvas node itself, and in full in its side panel.
+    const failedContent = screen.getByText('agent-wait-times').closest('.ai-jobs-node-content') as HTMLElement;
+    expect(failedContent).toHaveAttribute('title', 'wait-times agent crashed: rate limited');
+    fireEvent.click(screen.getByText('agent-wait-times'));
+    await screen.findByText(/wait-times agent crashed: rate limited/);
   });
 
   it('runs against whichever APK version was picked in the panel', async () => {

@@ -184,4 +184,64 @@ test.describe('AI job pipelines', () => {
     // the wired-from text shows that name, confirming the section really did pick up the drag.
     await expect(wiredPanel.locator('.ai-jobs-wired-from')).toContainText('Wired from Agent Call');
   });
+
+  test('a failing run shows the real error on the failed node, and explains the skipped node points upstream', async ({ page }) => {
+    await loginAsAdmin(page);
+    await waitForBackend(page.request);
+    await page.goto('/ui/pipelines');
+    await expect(page.getByTestId('pipelines-table')).toBeVisible({ timeout: 15_000 });
+
+    await page.getByRole('button', { name: '+ New Pipeline' }).click();
+    await page.getByLabel('New pipeline name').fill('E2E Failing Run Pipeline');
+    await page.getByLabel('New pipeline job kind').fill('e2e-failing-run');
+    await page.getByRole('button', { name: 'Create' }).click();
+    await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
+
+    // A real registered expand function (apk-analysis/apk-context) that genuinely throws without
+    // a versionId — the whole point of this test is exercising the backend's real error message,
+    // not a mocked one.
+    await page.getByRole('button', { name: '+ Add node' }).click();
+    await page.getByRole('option', { name: /^Trigger/ }).click();
+    const triggerPanel = page.getByRole('dialog');
+    await expect(triggerPanel).toBeVisible();
+    await triggerPanel.getByLabel('Starts from').selectOption('apk-analysis/apk-context');
+    await page.getByRole('button', { name: /close/i }).click();
+
+    await page.getByRole('button', { name: '+ Add node' }).click();
+    await page.getByRole('option', { name: /^Agent Call/ }).click();
+    await page.getByRole('button', { name: /close/i }).click();
+
+    const triggerNode = page.locator('.react-flow__node[data-id^="trigger-"]').first();
+    const agentNode = page.locator('.react-flow__node[data-id^="agent-"]').first();
+    const triggerBox = (await triggerNode.boundingBox())!;
+    const agentBox = (await agentNode.boundingBox())!;
+    await page.mouse.move(triggerBox.x + triggerBox.width / 2, triggerBox.y + triggerBox.height);
+    await page.mouse.down();
+    await page.mouse.move(agentBox.x + agentBox.width / 2, agentBox.y, { steps: 10 });
+    await page.mouse.up();
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1);
+
+    await page.getByRole('button', { name: 'Save Draft' }).click();
+    await expect(page.getByText('All changes saved')).toBeVisible();
+    await page.getByRole('button', { name: 'Publish' }).click();
+    await expect(page.getByRole('status')).toHaveText(/^Published\.$/);
+
+    // No run parameters declared on this Trigger, so Run invokes apk-analysis/apk-context with an
+    // empty input — it throws because it requires a numeric versionId.
+    await triggerNode.click();
+    await triggerPanel.getByRole('button', { name: /^run$/i }).click();
+    await expect(page.getByRole('status')).toHaveText(/finished: failed/i, { timeout: 15_000 });
+
+    // The failed Trigger: a hover title with the real thrown message, and the same text in its
+    // own side panel's "Last run" block.
+    await expect(triggerNode.locator('.ai-jobs-node-content')).toHaveAttribute('title', /requires a numeric "versionId"/);
+    await expect(triggerPanel.getByTestId('node-run-status')).toContainText(/requires a numeric "versionId"/);
+    await page.getByRole('button', { name: /close/i }).click();
+
+    // The downstream AgentCall never ran — it explains itself as an upstream failure, not its own.
+    await expect(agentNode.locator('.ai-jobs-node-content')).toHaveAttribute('title', 'Skipped — an upstream node failed.');
+    await agentNode.click();
+    const agentPanel = page.getByRole('dialog');
+    await expect(agentPanel.getByTestId('node-run-status')).toContainText('Skipped — an upstream node failed.');
+  });
 });

@@ -62,7 +62,7 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
   const [pipelineName, setPipelineName] = useState<string | null>(null);
   const [graph, setGraph] = useState<PipelineGraph | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [nodeStatuses, setNodeStatuses] = useState<Record<string, { status: string; wasMemoized?: boolean }>>({});
+  const [nodeStatuses, setNodeStatuses] = useState<Record<string, { status: string; wasMemoized?: boolean; error?: string }>>({});
   const [recentVersions, setRecentVersions] = useState<RecentVersion[]>([]);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
@@ -227,8 +227,8 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
       const detailRes: any = await sendRestApi('GET', `/v1/ai-pipelines/runs/${runId}`);
       const run = detailRes.body?.data?.run;
       if (run && run.status !== 'running') {
-        const byId: Record<string, { status: string; wasMemoized?: boolean }> = {};
-        for (const n of detailRes.body?.data?.nodes ?? []) byId[n.nodeId] = { status: n.status, wasMemoized: n.wasMemoized };
+        const byId: Record<string, { status: string; wasMemoized?: boolean; error?: string }> = {};
+        for (const n of detailRes.body?.data?.nodes ?? []) byId[n.nodeId] = { status: n.status, wasMemoized: n.wasMemoized, error: n.error };
         setNodeStatuses(byId);
         setStatusMessage(`Run ${runId} finished: ${run.status}`);
         return detailRes.body?.data;
@@ -287,6 +287,7 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
                 onRename={handleRenameNode}
                 recentVersions={recentVersions}
                 onRun={(input, reuseUnchanged) => handleRun(selected, input, reuseUnchanged)}
+                runStatus={nodeStatuses[selected]}
               />
             )}
           </>

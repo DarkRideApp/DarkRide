@@ -8,6 +8,7 @@ import '@xyflow/react/dist/style.css';
 import type { PipelineGraph, PipelineNode } from '../../../backend/services/ai-jobs/types';
 import { nodeKindLabel } from './nodeKindLabels';
 import { nodePins, type Pin } from './nodePins';
+import { runStatusMessage, displayRunStatus } from './runStatus';
 
 const KIND_COLOR: Record<string, string> = {
   Trigger: '#2dd4bf', AgentCall: '#4d8eff', Transform: '#a78bfa',
@@ -24,10 +25,16 @@ export const STATUS_COLOR: Record<string, string> = {
   ok: '#22c55e', failed: '#ef4444', cached: '#38bdf8', inactive: '#475569', skipped: '#f97316',
 };
 
-function statusFor(nodeId: string, nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean }>): string | undefined {
+function statusFor(nodeId: string, nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean; error?: string }>): string | undefined {
   const entry = nodeStatuses?.[nodeId];
   if (!entry) return undefined;
-  return entry.wasMemoized ? 'cached' : entry.status;
+  return displayRunStatus(entry);
+}
+
+/** Hover text for a failed/skipped node, so the reason is visible without opening the side panel. Silent for every other status — a tooltip on a healthy node would just be noise. */
+function statusTitle(status: string | undefined, error: string | undefined): string | undefined {
+  if (status !== 'failed' && status !== 'skipped') return undefined;
+  return runStatusMessage(status, error);
 }
 
 /** One side's pins, each handle and its label positioned by the same percentage so they stay aligned regardless of pin count. */
@@ -72,11 +79,12 @@ function NodeLabel({ node }: { node: PipelineNode }) {
 
 interface PipelineNodeData {
   pipelineNode: PipelineNode;
+  statusTitle?: string;
   [key: string]: unknown;
 }
 
 function PipelineNodeView({ data }: NodeProps) {
-  const { pipelineNode } = data as unknown as PipelineNodeData;
+  const { pipelineNode, statusTitle: title } = data as unknown as PipelineNodeData;
   const { inputs, outputs } = nodePins(pipelineNode.config);
   // No `position: relative` here — Handles and pin labels are positioned absolutely against the
   // nearest positioned ancestor, and that must stay `.react-flow__node` itself (already
@@ -84,7 +92,7 @@ function PipelineNodeView({ data }: NodeProps) {
   // padding/size set in toFlowNodes's `style`), not this inner wrapper — otherwise handles land
   // inset by this wrapper's own padding instead of on the node's real edge.
   return (
-    <div className="ai-jobs-node-content">
+    <div className="ai-jobs-node-content" title={title}>
       <PinRow pins={inputs} type="target" position={Position.Top} />
       <NodeLabel node={pipelineNode} />
       <PinRow pins={outputs} type="source" position={Position.Bottom} />
@@ -104,7 +112,7 @@ function nodeWidth(config: PipelineNode['config']): number {
 
 export function toFlowNodes(
   graph: PipelineGraph,
-  nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean }>,
+  nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean; error?: string }>,
 ): Node[] {
   // The placeholder grid's column spacing must clear the widest node in the graph — a fixed
   // 260px column was fine when every node had one generic handle, but a 630px-wide Report node
@@ -121,7 +129,7 @@ export function toFlowNodes(
       // a real auto-layout pass exists. Once dragged, its real position round-trips through
       // the pipeline's graph (position is presentation-only, never read by the executor).
       position: n.position ?? { x: (i % 4) * columnWidth, y: Math.floor(i / 4) * 160 },
-      data: { pipelineNode: n },
+      data: { pipelineNode: n, statusTitle: statusTitle(status, nodeStatuses?.[n.id]?.error) },
       // A custom node type (below) opts out of React Flow's default node class, which used to
       // supply padding/border-radius for free — now set explicitly here.
       style: {
@@ -165,7 +173,7 @@ export function toFlowEdges(graph: PipelineGraph): Edge[] {
 export function Canvas({ graph, onSelectNode, nodeStatuses, onNodeMove, onConnectNodes, onDeleteNode, onDeleteEdge }: {
   graph: PipelineGraph;
   onSelectNode: (nodeId: string) => void;
-  nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean }>;
+  nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean; error?: string }>;
   /** Fired once a drag ends with the node's final position — never during the drag itself. */
   onNodeMove?: (nodeId: string, position: { x: number; y: number }) => void;
   onConnectNodes?: (from: string, to: string, sourceHandle: string | null, targetHandle: string | null) => void;
