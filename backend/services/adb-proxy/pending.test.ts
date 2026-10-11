@@ -81,6 +81,20 @@ describe('PendingRegistry', () => {
     expect(reg.add(input({ keyId: 'd' })).ok).toBe(true);
   });
 
+  it('counts every address in one IPv6 /64 against the same per-minute budget and keeps the real address on the entry', () => {
+    const reg = new PendingRegistry({ perIpPerMinute: 3 });
+    for (let i = 1; i <= 3; i++) expect(reg.add(input({ keyId: `k${i}`, peerIp: `2001:db8:0:1::${i}` })).ok).toBe(true);
+    expect(reg.add(input({ keyId: 'k4', peerIp: '2001:db8:0:1::4' }))).toEqual({ ok: false, reason: 'rate' });
+    expect(reg.add(input({ keyId: 'k5', peerIp: '2001:db8:0:2::1' })).ok).toBe(true);
+    expect(reg.list().map((e) => e.peerIp)).toEqual(['2001:db8:0:1::1', '2001:db8:0:1::2', '2001:db8:0:1::3', '2001:db8:0:2::1']);
+  });
+
+  it('shares a rate bucket between a mapped IPv4 address and the plain address', () => {
+    const reg = new PendingRegistry({ perIpPerMinute: 1 });
+    expect(reg.add(input({ keyId: 'a', peerIp: '::ffff:10.0.0.5' })).ok).toBe(true);
+    expect(reg.add(input({ keyId: 'b', peerIp: '10.0.0.5' }))).toEqual({ ok: false, reason: 'rate' });
+  });
+
   it('times out after 5 minutes by default', async () => {
     const reg = new PendingRegistry();
     const r = reg.add(input());

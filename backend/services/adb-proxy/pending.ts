@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createLoggers } from '../../logs';
+import { peerKey } from './peer-key';
 
 const { error: logError } = createLoggers('adb-proxy');
 
@@ -121,16 +122,17 @@ export class PendingRegistry {
   }
 
   private takeRate(ip: string): boolean {
+    const peer = peerKey(ip);
     const now = Date.now();
-    const hits = (this.ipHits.get(ip) ?? []).filter((t) => now - t < WINDOW_MS);
+    const hits = (this.ipHits.get(peer) ?? []).filter((t) => now - t < WINDOW_MS);
     if (this.ipHits.size > 256) this.pruneRates(now);
-    if (!this.ipHits.has(ip) && this.ipHits.size >= MAX_TRACKED_IPS) return false;
+    if (!this.ipHits.has(peer) && this.ipHits.size >= MAX_TRACKED_IPS) return false;
     if (hits.length >= this.perIpPerMinute) {
-      this.ipHits.set(ip, hits);
+      this.ipHits.set(peer, hits);
       return false;
     }
     hits.push(now);
-    this.ipHits.set(ip, hits);
+    this.ipHits.set(peer, hits);
     return true;
   }
 
