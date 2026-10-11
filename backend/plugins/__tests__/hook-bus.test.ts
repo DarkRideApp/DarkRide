@@ -42,10 +42,14 @@ describe('HookBus', () => {
 
   it('define registers a hook name for documentation', () => {
     const bus = new HookBusImpl();
+    // Legacy Record<string,string> shape — normalized into SchemaField[] (a plugin already
+    // compiled against this shape must keep working; see packages/plugin-sdk/src/__tests__/
+    // hook-bus-impl.test.ts for the dedicated regression tests on this normalization).
     bus.define('my-plugin:data-ready', { id: 'number' });
     expect(bus.getDefinedHooks()).toContainEqual({
       name: 'my-plugin:data-ready',
-      schema: { id: 'number' },
+      schema: [{ field: 'id', type: 'number', description: '' }],
+      description: '',
     });
   });
 
