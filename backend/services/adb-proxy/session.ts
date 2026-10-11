@@ -2,6 +2,7 @@ import type net from 'node:net';
 import { randomBytes, type KeyObject } from 'node:crypto';
 import { createLoggers } from '../../logs';
 import { parseAdbPublicKey, verifyAuthSignature, type ParsedAdbKey } from './adb-key';
+import { DeviceUnavailableError } from './host-client';
 import {
   A_AUTH, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_VERSION, A_WRTE, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN,
   MAX_DATA, PREAUTH_MAX_PAYLOAD, PacketError, PacketParser, commandName, encodePacket, type Packet,
@@ -22,6 +23,8 @@ const REFUSED_PREFIXES = ['host', 'reverse:', 'tcpip:', 'usb:'];
 // These services separate their arguments with NULs; adbd splits them back out.
 const NUL_SEPARATED_PREFIXES = ['abb_exec:', 'abb:'];
 const MALFORMED_SERVICE = '<malformed>';
+// adbd restarts or the phone reboots after these, so the client waits for the transport to drop as it would on a real one.
+const DEVICE_RESTART_PREFIXES = ['root:', 'unroot:', 'reboot'];
 
 export function checkService(service: string): { allowed: true } | { allowed: false; reason: string } {
   if (service.length === 0) return { allowed: false, reason: 'empty service' };
@@ -53,6 +56,7 @@ interface Stream {
   backendEnded: boolean;
   /** A client WRTE is written to the backend but not yet acknowledged. */
   ackPending: boolean;
+  restartsDevice: boolean;
 }
 
 export type SessionState = 'await-cnxn' | 'await-auth' | 'pending' | 'finishing' | 'ready' | 'closed';
@@ -126,6 +130,8 @@ export class Session {
   private nextLocalId = 1;
   private peerMaxData = MAX_DATA;
   private readsPaused = false;
+  /** The device is restarting: the session closes once the last CLSE is flushed and takes no new packets meanwhile. */
+  private restarting = false;
 
   constructor(private readonly opts: SessionOptions) {
     this.deviceId = opts.deviceId;
@@ -304,6 +310,7 @@ export class Session {
   }
 
   private onReadyPacket(p: Packet): void {
+    if (this.restarting) return;
     switch (p.command) {
       case A_OPEN: return this.onOpen(p);
       case A_WRTE: return this.onWrite(p);
@@ -333,6 +340,7 @@ export class Session {
     if (duplicate || this.streams.size >= (this.opts.maxStreams ?? DEFAULT_MAX_STREAMS)) return this.refuse(remoteId);
     const stream: Stream = {
       localId: this.nextLocalId++, remoteId, backend: null, windowOpen: false, outQueue: [], backendEnded: false, ackPending: false,
+      restartsDevice: DEVICE_RESTART_PREFIXES.some((p) => service.startsWith(p)),
     };
     this.streams.set(stream.localId, stream);
     let opening: Promise<net.Socket>;
@@ -351,8 +359,11 @@ export class Session {
         }
         this.attach(stream, sock);
       }),
-      () => this.guardStream(stream, 'open', () => {
-        if (this.streams.delete(stream.localId)) this.refuse(remoteId);
+      (err) => this.guardStream(stream, 'open', () => {
+        if (!this.streams.delete(stream.localId)) return;
+        // A client keeps retrying OPEN while its transport looks alive, each one a fresh dial; a real adbd would have dropped it.
+        if (err instanceof DeviceUnavailableError) return this.close('device unavailable');
+        this.refuse(remoteId);
       }),
     );
   }
@@ -440,7 +451,10 @@ export class Session {
   private closeStream(stream: Stream, notify: boolean): void {
     if (!this.streams.delete(stream.localId)) return;
     this.destroyBackend(stream);
-    if (notify) this.send(A_CLSE, stream.localId, stream.remoteId);
+    const restarting = stream.restartsDevice && stream.backend !== null;
+    if (restarting) this.restarting = true;
+    if (notify) this.send(A_CLSE, stream.localId, stream.remoteId, undefined, restarting ? () => this.close('device restarting') : undefined);
+    else if (restarting) this.close('device restarting');
   }
 
   private destroyBackend(stream: Stream): void {
@@ -474,9 +488,13 @@ export class Session {
     this.opts.onLeavePreAuth?.();
   }
 
-  private send(command: number, arg0: number, arg1: number, data?: Buffer): void {
-    if (this.closed || this.opts.socket.destroyed) return;
-    this.opts.socket.write(encodePacket({ command, arg0, arg1, data }));
+  /** `flushed` runs once the packet has been handed to the operating system, or right away if it cannot be sent. */
+  private send(command: number, arg0: number, arg1: number, data?: Buffer, flushed?: () => void): void {
+    if (this.closed || this.opts.socket.destroyed) {
+      flushed?.();
+      return;
+    }
+    this.opts.socket.write(encodePacket({ command, arg0, arg1, data }), flushed && (() => this.guard('flush', flushed)));
     this.limitBacklog();
   }
 

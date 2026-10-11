@@ -195,6 +195,12 @@ export class FakeAdbServer {
       okay();
       return { raw: this.syncHandler(socket) };
     }
+    // A real adbd prints a line and then restarts or reboots, dropping the transport.
+    if (service === 'root:' || service === 'unroot:' || service.startsWith('reboot')) {
+      okay();
+      socket.end(service.startsWith('reboot') ? '' : `restarting adbd as ${service === 'root:' ? 'root' : 'non root'}\n`);
+      return { raw: () => {} };
+    }
     if (service === 'hold:') {
       okay();
       return { raw: () => {} };

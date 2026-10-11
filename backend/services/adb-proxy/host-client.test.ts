@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import net from 'node:net';
 import { FakeAdbServer } from './testing/fake-adb-server';
-import { HostClient, HostProtocolError, resolveAdbServerAddress } from './host-client';
+import { DeviceUnavailableError, HostClient, HostProtocolError, resolveAdbServerAddress } from './host-client';
 
 const frame = (s: string) => Buffer.byteLength(s).toString(16).padStart(4, '0') + s;
 
@@ -119,6 +119,19 @@ describe('HostClient', () => {
 
   it('rejects opening a service on an offline device', async () => {
     await expect(client.openService('OFF1', 'shell:x')).rejects.toThrow(HostProtocolError);
+  });
+
+  it.each(['OFF1', 'NOPE'])('names a transport the ADB server refuses for %s as the device being unavailable', async (serial) => {
+    const failure = await client.openService(serial, 'shell:x').catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(DeviceUnavailableError);
+    expect(failure).toBeInstanceOf(HostProtocolError);
+    expect((failure as Error).message).toBe(`device '${serial}' not found`);
+  });
+
+  it('does not call a refused service on an available device unavailable', async () => {
+    const failure = await client.openService('SER1', 'nosuch:').catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(HostProtocolError);
+    expect(failure).not.toBeInstanceOf(DeviceUnavailableError);
   });
 
   it('builds the CNXN banner from properties and features', async () => {
@@ -283,9 +296,24 @@ describe('HostClient socket handling', () => {
       socket.write('FAIL' + frame('refused'));
     });
     closers.push(server.close);
-    await expect(new HostClient({ host: '127.0.0.1', port: server.port }, 2000).openService('SER1', 'shell:x')).rejects.toThrow('refused');
+    const failure = await new HostClient({ host: '127.0.0.1', port: server.port }, 2000).openService('SER1', 'shell:x').catch((e: unknown) => e);
+    expect((failure as Error).message).toBe('refused');
+    expect(failure).not.toBeInstanceOf(DeviceUnavailableError);
     await serverSideClosed;
     expect(serverSide.destroyed).toBe(true);
+  });
+
+  it('does not call a connection dropped during the transport request a device that is unavailable', async () => {
+    const server = net.createServer((socket) => {
+      socket.on('error', () => {});
+      socket.once('data', () => socket.destroy());
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    closers.push(() => new Promise<void>((r) => server.close(() => r())));
+    const port = (server.address() as net.AddressInfo).port;
+    const failure = await new HostClient({ host: '127.0.0.1', port }, 2000).openService('SER1', 'shell:x').catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(DeviceUnavailableError);
   });
 
   it('frames a multi-byte request by its byte length', async () => {

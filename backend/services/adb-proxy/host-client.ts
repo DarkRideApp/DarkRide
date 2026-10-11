@@ -19,6 +19,17 @@ export class HostProtocolError extends Error {
   }
 }
 
+/** The ADB server answered FAIL to a request, as opposed to a dropped or stalled connection. */
+class HostRefusal extends HostProtocolError {}
+
+/** The ADB server refused `host:transport:<serial>`: the device is gone, offline or unauthorized. */
+export class DeviceUnavailableError extends HostProtocolError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DeviceUnavailableError';
+  }
+}
+
 function frame(service: string): Buffer {
   const body = Buffer.from(service, 'utf8');
   return Buffer.concat([Buffer.from(body.length.toString(16).padStart(4, '0'), 'ascii'), body]);
@@ -70,7 +81,7 @@ async function sendRequest(socket: net.Socket, service: string, timeoutMs: numbe
   if (status === 'FAIL') {
     const len = parseInt((await readExact(socket, 4, timeoutMs)).toString('ascii'), 16);
     const message = len > 0 ? (await readExact(socket, len, timeoutMs)).toString('utf8') : '';
-    throw new HostProtocolError(message || 'FAIL');
+    throw new HostRefusal(message || 'FAIL');
   }
   throw new HostProtocolError(`unexpected status ${JSON.stringify(status)}`);
 }
@@ -115,7 +126,11 @@ export class HostClient {
   async openService(serial: string, service: string): Promise<net.Socket> {
     const socket = await this.dial();
     try {
-      await sendRequest(socket, `host:transport:${serial}`, this.timeoutMs);
+      try {
+        await sendRequest(socket, `host:transport:${serial}`, this.timeoutMs);
+      } catch (e) {
+        throw e instanceof HostRefusal ? new DeviceUnavailableError(e.message) : e;
+      }
       await sendRequest(socket, service, this.timeoutMs);
       return socket;
     } catch (e) {

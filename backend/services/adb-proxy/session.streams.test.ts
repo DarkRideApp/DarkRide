@@ -378,6 +378,69 @@ describe('Session streams', () => {
     expect(closed.arg1).toBe(1);
   });
 
+  describe('when the device restarts or disappears', () => {
+    const transportRequests = (h: Awaited<ReturnType<typeof setup>>) => h.fake.requests.filter((r) => r === 'host:transport:DEV1').length;
+    const closeReasons = (h: Awaited<ReturnType<typeof setup>>) =>
+      h.events.flatMap((e) => (e.kind === 'closed' ? [e.reason] : []));
+
+    it('closes the whole session once the host reports the device unavailable, instead of refusing one stream', async () => {
+      const h = await setup();
+      h.fake.setOnline('DEV1', false);
+      const before = transportRequests(h);
+
+      h.client.send(A_OPEN, 1, 0, 'shell:id\0');
+
+      expect(await h.client.waitClosed()).toBe(true);
+      expect(closeReasons(h)).toEqual(['device unavailable']);
+      expect(transportRequests(h)).toBe(before + 1);
+    });
+
+    it('costs one dial for a client that retries OPEN as soon as each one is refused', async () => {
+      const h = await setup();
+      h.fake.setOnline('DEV1', false);
+      const before = transportRequests(h);
+
+      for (let i = 1; i <= 1200 && !h.client.closed; i++) {
+        h.client.send(A_OPEN, i, 0, 'shell:id\0');
+        await h.client.waitFor((p) => p.command === A_CLSE && p.arg1 === i, 2000).catch(() => null);
+      }
+
+      expect(h.client.closed).toBe(true);
+      expect(transportRequests(h) - before).toBe(1);
+      expect(closeReasons(h)).toEqual(['device unavailable']);
+    });
+
+    it('keeps the session when the device refuses only the service', async () => {
+      const h = await setup();
+      expect((await h.client.openRaw('nosuch:', 1)).command).toBe(A_CLSE);
+      expect(await h.client.quiet(100)).toBe(true);
+      expect(h.client.closed).toBe(false);
+    });
+
+    it.each(['root:', 'unroot:', 'reboot:', 'reboot:bootloader'])(
+      'closes the session after a %s stream has ended and its CLSE reached the client',
+      async (service) => {
+        const h = await setup();
+        const { localId } = await h.client.open(service, 1);
+        const output = await h.client.collectStream(1, localId, 'close');
+
+        expect(await h.client.waitClosed()).toBe(true);
+        expect(h.client.packets.some((p) => p.command === A_CLSE && p.arg0 === localId && p.arg1 === 1)).toBe(true);
+        expect(closeReasons(h)).toEqual(['device restarting']);
+        if (service === 'root:') expect(output.toString()).toBe('restarting adbd as root\n');
+      },
+    );
+
+    it('keeps the session after an ordinary shell stream ends', async () => {
+      const h = await setup();
+      const { localId } = await h.client.open('shell:echo hi', 1);
+      await h.client.collectStream(1, localId, 'close');
+      expect(await h.client.quiet(100)).toBe(true);
+      expect(h.client.closed).toBe(false);
+      expect((await h.client.open('shell:id', 2)).localId).toBeGreaterThan(0);
+    });
+  });
+
   it('destroys every backend stream when the client disappears', async () => {
     const h = await setup();
     await h.client.open('hold:', 1);
