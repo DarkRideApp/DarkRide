@@ -15,15 +15,23 @@ const API_ERRORS = new Map<string, string>([
   ['invalid', 'That value is not valid.'],
 ]);
 
-const STATE_BADGES: Record<DeviceProxyState, { label: string; className: string }> = {
-  listening: { label: 'Listening', className: 'badge badge-success' },
-  'device-offline': { label: 'Device offline', className: 'badge badge-offline' },
-  disabled: { label: 'Disabled', className: 'badge badge-offline' },
-  off: { label: 'Off', className: 'badge badge-offline' },
-  'port-in-use': { label: 'Port in use', className: 'badge badge-error' },
-  'range-full': { label: 'No free port', className: 'badge badge-error' },
-  error: { label: 'Error', className: 'badge badge-error' },
-};
+const STATE_BADGES = new Map<DeviceProxyState, { label: string; className: string }>([
+  ['listening', { label: 'Listening', className: 'badge badge-success' }],
+  ['device-offline', { label: 'Device offline', className: 'badge badge-offline' }],
+  ['disabled', { label: 'Disabled', className: 'badge badge-offline' }],
+  ['off', { label: 'Off', className: 'badge badge-offline' }],
+  ['port-in-use', { label: 'Port in use', className: 'badge badge-error' }],
+  ['range-full', { label: 'No free port', className: 'badge badge-error' }],
+  ['error', { label: 'Error', className: 'badge badge-error' }],
+]);
+const UNKNOWN_STATE = { label: 'Unknown', className: 'badge badge-offline' };
+
+const ENABLE_TARGET = 'settings:enabled';
+const NETWORK_TARGET = 'settings:network';
+const requestTarget = (requestId: string) => `request:${requestId}`;
+const keyTarget = (id: number) => `key:${id}`;
+const devicePortTarget = (deviceId: string) => `device-port:${deviceId}`;
+const deviceEnabledTarget = (deviceId: string) => `device-enabled:${deviceId}`;
 
 // Values from the network can be long and unbroken, so they wrap instead of widening the table.
 const WRAP: React.CSSProperties = { overflowWrap: 'anywhere' };
@@ -45,6 +53,10 @@ function duration(ms: number): string {
 
 const machine = (comment: string | null) => comment || '(no name)';
 
+// The name is chosen by the connecting machine, so the dialogs also show the address and the start of the fingerprint.
+const describeKey = (k: KeyView) =>
+  `"${machine(k.comment)}" (${k.lastSeenIp ? `from ${k.lastSeenIp}, ` : ''}fingerprint starting ${k.fingerprint.slice(0, 12)})`;
+
 const isWhole = (text: string) => /^\d+$/.test(text.trim()) && Number.isSafeInteger(Number(text));
 
 type NetDraft = { bindHost?: string; portStart?: string; portEnd?: string };
@@ -58,39 +70,50 @@ export function AdbProxyPage() {
 }
 
 function AdbProxyContent({ canManage }: { canManage: boolean }) {
-  const ws = useWebSocket();
+  const { sendRestApi } = useWebSocket();
   const { status, error: loadError, refresh } = useAdbProxyStatus();
   const [actionError, setActionError] = useState<string | null>(null);
   const [netDraft, setNetDraft] = useState<NetDraft>({});
-  const [netSaving, setNetSaving] = useState(false);
   const [netSaved, setNetSaved] = useState(false);
-  const [portDrafts, setPortDrafts] = useState<Record<string, string>>({});
+  const [portDrafts, setPortDrafts] = useState<ReadonlyMap<string, string>>(new Map());
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inFlight = useRef(new Set<string>());
 
   useEffect(() => () => {
     if (copyTimer.current) clearTimeout(copyTimer.current);
   }, []);
 
+  // A second request for a target whose first one has not settled is dropped; the ref covers clicks before the next render.
   const call = useCallback(
-    async (method: string, path: string, body?: unknown): Promise<boolean> => {
+    async (target: string, method: string, path: string, body?: unknown): Promise<boolean> => {
+      if (inFlight.current.has(target)) return false;
+      inFlight.current.add(target);
+      setBusy(new Set(inFlight.current));
       setActionError(null);
+      let ok = false;
       try {
-        const res = await ws.sendRestApi(method, path, body);
+        const res = await sendRestApi(method, path, body);
         if (res.body?.success) {
-          await refresh();
-          return true;
+          ok = true;
+        } else {
+          const code = typeof res.body?.error === 'string' ? res.body.error : undefined;
+          setActionError((code && API_ERRORS.get(code)) || code || 'The request failed.');
         }
-        const code = typeof res.body?.error === 'string' ? res.body.error : undefined;
-        setActionError((code && API_ERRORS.get(code)) || code || 'The request failed.');
       } catch {
         setActionError('The request failed.');
       }
-      await refresh();
-      return false;
+      try {
+        await refresh();
+      } finally {
+        inFlight.current.delete(target);
+        setBusy(new Set(inFlight.current));
+      }
+      return ok;
     },
-    [ws, refresh],
+    [sendRestApi, refresh],
   );
 
   const copy = (id: string, text: string) => {
@@ -126,24 +149,28 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
   };
 
   const saveNetwork = async () => {
-    if (!net || !netValid) return;
-    setNetSaving(true);
-    const ok = await call('PUT', '/v1/adb-proxy/settings', {
+    if (!net || !netValid || inFlight.current.has(NETWORK_TARGET)) return;
+    const ok = await call(NETWORK_TARGET, 'PUT', '/v1/adb-proxy/settings', {
       bindHost: net.bindHost.trim(),
       portStart: Number(net.portStart),
       portEnd: Number(net.portEnd),
     });
-    setNetSaving(false);
     if (ok) {
       setNetDraft({});
       setNetSaved(true);
     }
   };
 
+  const setPortDraft = (deviceId: string, value: string) => setPortDrafts((drafts) => new Map(drafts).set(deviceId, value));
+
   const savePort = async (deviceId: string, draft: string) => {
-    const ok = await call('PATCH', `/v1/adb-proxy/devices/${encodeURIComponent(deviceId)}`, { port: Number(draft) });
+    const ok = await call(devicePortTarget(deviceId), 'PATCH', `/v1/adb-proxy/devices/${encodeURIComponent(deviceId)}`, { port: Number(draft) });
     if (ok) {
-      setPortDrafts(({ [deviceId]: _saved, ...rest }) => rest);
+      setPortDrafts((drafts) => {
+        const next = new Map(drafts);
+        next.delete(deviceId);
+        return next;
+      });
     }
   };
 
@@ -151,29 +178,33 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
     if (!confirmation) return;
     const { action, key } = confirmation;
     setConfirmation(null);
-    if (action === 'revoke') void call('POST', `/v1/adb-proxy/keys/${key.id}/revoke`);
-    else void call('DELETE', `/v1/adb-proxy/keys/${key.id}`);
+    if (action === 'revoke') void call(keyTarget(key.id), 'POST', `/v1/adb-proxy/keys/${key.id}/revoke`);
+    else void call(keyTarget(key.id), 'DELETE', `/v1/adb-proxy/keys/${key.id}`);
   };
 
   const actionsHeader = canManage ? <th>Actions</th> : null;
 
-  const renderPending = (p: PendingView) => (
-    <tr key={p.requestId} data-testid="adb-proxy-request">
-      <td style={WRAP}>{machine(p.comment)}</td>
-      <td><code style={WRAP}>{p.fingerprint}</code></td>
-      <td style={WRAP}>{p.peerIp}</td>
-      <td style={WRAP}>{deviceName(p.deviceId)}</td>
-      <td>{ago(p.createdAt)}</td>
-      {canManage && (
-        <td>
-          <div style={{ display: 'flex', gap: 4 }}>
-            <button className="btn btn-sm btn-primary" onClick={() => void call('POST', `/v1/adb-proxy/requests/${encodeURIComponent(p.requestId)}/approve`)}>Approve</button>
-            <button className="btn btn-sm btn-danger" onClick={() => void call('POST', `/v1/adb-proxy/requests/${encodeURIComponent(p.requestId)}/deny`)}>Deny</button>
-          </div>
-        </td>
-      )}
-    </tr>
-  );
+  const renderPending = (p: PendingView) => {
+    const target = requestTarget(p.requestId);
+    const base = `/v1/adb-proxy/requests/${encodeURIComponent(p.requestId)}`;
+    return (
+      <tr key={p.requestId} data-testid="adb-proxy-request">
+        <td style={WRAP}>{machine(p.comment)}</td>
+        <td><code style={WRAP}>{p.fingerprint}</code></td>
+        <td style={WRAP}>{p.peerIp}</td>
+        <td style={WRAP}>{deviceName(p.deviceId)}</td>
+        <td>{ago(p.createdAt)}</td>
+        {canManage && (
+          <td>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <button className="btn btn-sm btn-primary" disabled={busy.has(target)} onClick={() => void call(target, 'POST', `${base}/approve`)}>Approve</button>
+              <button className="btn btn-sm btn-danger" disabled={busy.has(target)} onClick={() => void call(target, 'POST', `${base}/deny`)}>Deny</button>
+            </div>
+          </td>
+        )}
+      </tr>
+    );
+  };
 
   const renderApproved = (k: KeyView) => (
     <tr key={k.id}>
@@ -182,7 +213,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
       <td style={WRAP}>{ago(k.lastSeenAt)}{k.lastSeenIp ? ` from ${k.lastSeenIp}` : ''}</td>
       {canManage && (
         <td>
-          <button className="btn btn-sm btn-danger" onClick={() => setConfirmation({ action: 'revoke', key: k })}>Revoke</button>
+          <button className="btn btn-sm btn-danger" disabled={busy.has(keyTarget(k.id))} onClick={() => setConfirmation({ action: 'revoke', key: k })}>Revoke</button>
         </td>
       )}
     </tr>
@@ -195,7 +226,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
       <td><span className="badge badge-error">{k.status === 'denied' ? 'Denied' : 'Revoked'}</span></td>
       {canManage && (
         <td>
-          <button className="btn btn-sm" onClick={() => setConfirmation({ action: 'forget', key: k })}>Forget</button>
+          <button className="btn btn-sm" disabled={busy.has(keyTarget(k.id))} onClick={() => setConfirmation({ action: 'forget', key: k })}>Forget</button>
         </td>
       )}
     </tr>
@@ -204,9 +235,11 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
   const renderDevice = (d: DeviceStatusView) => {
     const label = d.name ?? d.deviceId;
     const serverPort = d.port === null ? '' : String(d.port);
-    const draft = portDrafts[d.deviceId] ?? serverPort;
+    const draft = portDrafts.get(d.deviceId) ?? serverPort;
     const command = d.port === null ? null : `adb connect ${status?.advertisedHost}:${d.port}`;
-    const badge = STATE_BADGES[d.state];
+    const badge = STATE_BADGES.get(d.state) ?? UNKNOWN_STATE;
+    const portBusy = busy.has(devicePortTarget(d.deviceId));
+    const enabledBusy = busy.has(deviceEnabledTarget(d.deviceId));
     return (
       <tr key={d.deviceId} data-testid={`adb-proxy-device-${d.deviceId}`}>
         <td style={WRAP}>{label}{d.name ? <div className="form-hint">{d.deviceId}</div> : null}</td>
@@ -218,11 +251,11 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
               style={{ width: 90 }}
               aria-label={`Port for ${label}`}
               value={draft}
-              disabled={!canManage}
-              onChange={(e) => setPortDrafts({ ...portDrafts, [d.deviceId]: e.target.value })}
+              disabled={!canManage || portBusy}
+              onChange={(e) => setPortDraft(d.deviceId, e.target.value)}
             />
             {canManage && draft !== serverPort && (
-              <button className="btn btn-sm" disabled={!isWhole(draft)} onClick={() => void savePort(d.deviceId, draft)}>
+              <button className="btn btn-sm" disabled={!isWhole(draft) || portBusy} onClick={() => void savePort(d.deviceId, draft)}>
                 Save port
               </button>
             )}
@@ -234,8 +267,8 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
             type="checkbox"
             aria-label={`Proxy ${label}`}
             checked={d.enabled}
-            disabled={!canManage}
-            onChange={(e) => void call('PATCH', `/v1/adb-proxy/devices/${encodeURIComponent(d.deviceId)}`, { enabled: e.target.checked })}
+            disabled={!canManage || enabledBusy}
+            onChange={(e) => void call(deviceEnabledTarget(d.deviceId), 'PATCH', `/v1/adb-proxy/devices/${encodeURIComponent(d.deviceId)}`, { enabled: e.target.checked })}
           />
         </td>
         <td>
@@ -288,8 +321,9 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
                   className={`toggle-switch ${status.enabled ? 'toggle-on' : ''}`}
                   role="switch"
                   aria-checked={status.enabled}
-                  aria-label={status.enabled ? 'Disable ADB proxy' : 'Enable ADB proxy'}
-                  onClick={() => void call('PUT', '/v1/adb-proxy/settings', { enabled: !status.enabled })}
+                  aria-label="ADB proxy"
+                  disabled={busy.has(ENABLE_TARGET)}
+                  onClick={() => void call(ENABLE_TARGET, 'PUT', '/v1/adb-proxy/settings', { enabled: !status.enabled })}
                   style={{
                     width: 44, height: 24, borderRadius: 12, border: 'none', cursor: 'pointer',
                     background: status.enabled ? 'var(--accent)' : 'var(--border-color)',
@@ -349,7 +383,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
               </div>
               {canManage && (
                 <SaveButton
-                  saving={netSaving}
+                  saving={busy.has(NETWORK_TARGET)}
                   saved={netSaved && !netDirty}
                   disabled={!netDirty || !netValid}
                   onClick={() => void saveNetwork()}
@@ -372,8 +406,10 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
             )}
           </div>
           <p className="form-hint" style={{ marginBottom: 24 }}>
-            Approve only machines you recognise by name and address. The machine runs <code>adb connect host:port</code>; until you
-            approve it, its <code>adb devices</code> output shows <code>unauthorized</code>.
+            The machine name is chosen by the connecting machine, so it proves nothing. Rely on the source address and the key
+            fingerprint, and approve only machines you expect. The fingerprint tells two machines with the same name apart and lets
+            you recognise a key you approved before. The machine runs <code>adb connect host:port</code>; until you approve it, its{' '}
+            <code>adb devices</code> output shows <code>unauthorized</code>.
           </p>
 
           <SectionHeading>Approved machines</SectionHeading>
@@ -444,8 +480,8 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
           title={confirmation.action === 'revoke' ? 'Revoke Machine' : 'Forget Machine'}
           message={
             confirmation.action === 'revoke'
-              ? `Revoke access for "${machine(confirmation.key.comment)}"? Its open connections close now and it can no longer connect.`
-              : `Forget "${machine(confirmation.key.comment)}"? It is removed from this list. If it connects again, it waits for approval like a new machine.`
+              ? `Revoke access for ${describeKey(confirmation.key)}? Its open connections close now and it can no longer connect.`
+              : `Forget ${describeKey(confirmation.key)}? It is removed from this list. If it connects again, it waits for approval like a new machine.`
           }
           confirmLabel={confirmation.action === 'revoke' ? 'Revoke' : 'Forget'}
           onConfirm={runConfirmed}

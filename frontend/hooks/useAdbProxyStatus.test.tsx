@@ -39,6 +39,49 @@ describe('useAdbProxyStatus', () => {
     expect(result.current.status).toBeNull();
   });
 
+  describe('when the host re-renders with a new context object', () => {
+    // The host builds a fresh context object on every render; only the functions in it are stable.
+    function makeSwappableWs(connected: boolean) {
+      const { ws, wrapper: _unused, ...rest } = makeWs({ success: true, data: SNAP });
+      let current: WebSocketContextValue = { ...ws, connected };
+      const wrapper = ({ children }: { children: React.ReactNode }) => (
+        <WebSocketContext.Provider value={current}>{children}</WebSocketContext.Provider>
+      );
+      return { ws, ...rest, wrapper, swap: (patch: Partial<WebSocketContextValue>) => { current = { ...current, ...patch }; } };
+    }
+
+    it('does not fetch again or resubscribe when only the object identity changes', async () => {
+      const { ws, unsubscribe, wrapper, swap } = makeSwappableWs(true);
+      const { result, rerender } = renderHook(() => useAdbProxyStatus(), { wrapper });
+      await waitFor(() => expect(result.current.status).not.toBeNull());
+      expect(ws.sendRestApi).toHaveBeenCalledTimes(1);
+      expect(ws.subscribe).toHaveBeenCalledTimes(1);
+
+      swap({});
+      rerender();
+      swap({});
+      rerender();
+      await act(async () => {});
+
+      expect(ws.sendRestApi).toHaveBeenCalledTimes(1);
+      expect(ws.subscribe).toHaveBeenCalledTimes(1);
+      expect(unsubscribe).not.toHaveBeenCalled();
+    });
+
+    it('fetches once more when the connection comes back', async () => {
+      const { ws, wrapper, swap } = makeSwappableWs(false);
+      const { result, rerender } = renderHook(() => useAdbProxyStatus(), { wrapper });
+      await waitFor(() => expect(result.current.status).not.toBeNull());
+      expect(ws.sendRestApi).toHaveBeenCalledTimes(1);
+
+      swap({ connected: true });
+      rerender();
+      await waitFor(() => expect(ws.sendRestApi).toHaveBeenCalledTimes(2));
+      await act(async () => {});
+      expect(ws.sendRestApi).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it('unsubscribes on unmount', async () => {
     const { unsubscribe, wrapper } = makeWs({ success: true, data: SNAP });
     const { unmount, result } = renderHook(() => useAdbProxyStatus(), { wrapper });

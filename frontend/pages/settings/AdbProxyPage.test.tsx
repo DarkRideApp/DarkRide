@@ -5,7 +5,13 @@ import { AuthContext, WebSocketContext, type WebSocketContextValue } from '@dark
 import type { KeyView, PendingView, StatusSnapshot } from '../../../shared/types/adb-proxy';
 import { AdbProxyPage } from './AdbProxyPage';
 
-afterEach(cleanup);
+const originalClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+
+afterEach(() => {
+  cleanup();
+  if (originalClipboard) Object.defineProperty(navigator, 'clipboard', originalClipboard);
+  else delete (navigator as any).clipboard;
+});
 
 const FP = 'AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99';
 
@@ -28,14 +34,18 @@ const keyRow = (over: Partial<KeyView> = {}): KeyView => ({
 
 const MANAGE = ['core.adb-proxy:read', 'core.adb-proxy:manage'];
 
-function mount(opts: { snapshot?: StatusSnapshot; scopes?: string[]; failWith?: string } = {}) {
+// `hold` keeps every write pending until `release()`, so a test can click again while a call is in flight.
+function mount(opts: { snapshot?: StatusSnapshot; scopes?: string[]; failWith?: string; hold?: boolean } = {}) {
   const current = opts.snapshot ?? snapshot();
   const handlers = new Map<string, (m: any) => void>();
   const calls: Array<{ method: string; path: string; body?: any }> = [];
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
   const ws: WebSocketContextValue = {
     connected: true, serverReady: true, startupMessage: '', sendMessage: vi.fn(),
     sendRestApi: vi.fn(async (method: string, path: string, body?: any) => {
       calls.push({ method, path, body });
+      if (method !== 'GET' && opts.hold) await gate;
       if (method !== 'GET' && opts.failWith) {
         return { type: 'restapi' as const, id: '1', status: 409, body: { success: false, error: opts.failWith } };
       }
@@ -53,7 +63,7 @@ function mount(opts: { snapshot?: StatusSnapshot; scopes?: string[]; failWith?: 
       </WebSocketContext.Provider>
     </AuthContext.Provider>,
   );
-  return { calls, push: (s: StatusSnapshot) => act(() => handlers.get('adb-proxy')!({ type: 'adb-proxy', ...s })) };
+  return { calls, release: () => release(), push: (s: StatusSnapshot) => act(() => handlers.get('adb-proxy')!({ type: 'adb-proxy', ...s })) };
 }
 
 const writes = (calls: Array<{ method: string }>) => calls.filter((c) => c.method !== 'GET');
@@ -125,15 +135,22 @@ describe('AdbProxyPage', () => {
     expect(screen.getByTestId('adb-proxy-approved')).toHaveTextContent(evilIp);
     expect(within(screen.getByTestId('adb-proxy-connections')).getByText(evilIp)).toBeInTheDocument();
     expect(document.querySelector('img, script, svg, [onerror], [onload]')).toBeNull();
+
+    fireEvent.click(within(screen.getByTestId('adb-proxy-approved')).getByRole('button', { name: 'Revoke' }));
+    const dialog = screen.getByTestId('modal');
+    expect(dialog).toHaveTextContent(evil);
+    expect(dialog).toHaveTextContent(evilIp);
+    expect(document.querySelector('img, script, svg, [onerror], [onload]')).toBeNull();
   });
 
   it('hides every action from a read-only user', async () => {
     mount({ scopes: ['core.adb-proxy:read'], snapshot: snapshot({ pending: [pendingReq()], keys: [keyRow(), keyRow({ id: 2, keyId: 'k2', status: 'denied' })] }) });
     await screen.findByTestId('adb-proxy-request');
-    for (const name of ['Approve', 'Deny', 'Revoke', 'Forget', 'Disable', 'Enable', 'Save', 'Save port']) {
+    for (const name of ['Approve', 'Deny', 'Revoke', 'Forget', 'Save', 'Save port']) {
       expect(screen.queryByRole('button', { name, hidden: true })).toBeNull();
     }
     expect(screen.queryByTestId('adb-proxy-toggle')).toBeNull();
+    expect(screen.queryByRole('switch')).toBeNull();
     expect(screen.getByLabelText('Proxy Phone 1')).toBeDisabled();
     expect(screen.getByLabelText('Port for Phone 1')).toBeDisabled();
     expect(screen.getByLabelText('Bind address')).toBeDisabled();
@@ -287,5 +304,250 @@ describe('AdbProxyPage', () => {
     await screen.findByText('No machines are waiting for approval.');
     push(snapshot({ pending: [pendingReq({ comment: 'fresh@box' })] }));
     expect(await screen.findByText('fresh@box')).toBeInTheDocument();
+  });
+
+  describe('ids that are object prototype keys', () => {
+    it('renders, edits and saves devices named constructor, __proto__ and toString', async () => {
+      const ids = ['constructor', '__proto__', 'toString'];
+      const devices = ids.map((deviceId, i) => ({
+        deviceId, name: null, port: 6500 + i, enabled: true, online: true, state: 'listening' as const,
+      }));
+      const { calls } = mount({ snapshot: snapshot({ devices }) });
+      for (const [i, id] of ids.entries()) {
+        const row = await screen.findByTestId(`adb-proxy-device-${id}`);
+        fireEvent.change(within(row).getByLabelText(`Port for ${id}`), { target: { value: String(6590 + i) } });
+        fireEvent.click(within(row).getByRole('button', { name: 'Save port' }));
+      }
+      await waitFor(() => expect(writes(calls)).toEqual(ids.map((id, i) => ({
+        method: 'PATCH', path: `/v1/adb-proxy/devices/${id}`, body: { port: 6590 + i },
+      }))));
+    });
+
+    it('shows an error code that is a prototype key as plain text', async () => {
+      mount({ failWith: 'constructor', snapshot: snapshot({ pending: [pendingReq()] }) });
+      fireEvent.click(within(await screen.findByTestId('adb-proxy-request')).getByRole('button', { name: 'Approve' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(/^constructor$/);
+    });
+  });
+
+  describe('repeated clicks while a call is in flight', () => {
+    it('sends one Approve for two rapid clicks and locks the whole request until it settles', async () => {
+      const { calls, release } = mount({ hold: true, snapshot: snapshot({ pending: [pendingReq()] }) });
+      const row = await screen.findByTestId('adb-proxy-request');
+      const approve = within(row).getByRole('button', { name: 'Approve' });
+      const deny = within(row).getByRole('button', { name: 'Deny' });
+      fireEvent.click(approve);
+      fireEvent.click(approve);
+      fireEvent.click(deny);
+      expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/approve', body: undefined }]);
+      expect(approve).toBeDisabled();
+      expect(deny).toBeDisabled();
+      release();
+      await waitFor(() => expect(approve).toBeEnabled());
+      fireEvent.click(approve);
+      await waitFor(() => expect(writes(calls)).toHaveLength(2));
+    });
+
+    it('sends one Deny for two rapid clicks', async () => {
+      const { calls, release } = mount({ hold: true, snapshot: snapshot({ pending: [pendingReq()] }) });
+      const deny = within(await screen.findByTestId('adb-proxy-request')).getByRole('button', { name: 'Deny' });
+      fireEvent.click(deny);
+      fireEvent.click(deny);
+      expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/deny', body: undefined }]);
+      release();
+      await waitFor(() => expect(deny).toBeEnabled());
+    });
+
+    it('sends one Revoke and one Forget per confirmed machine and disables the row meanwhile', async () => {
+      const { calls, release } = mount({
+        hold: true,
+        snapshot: snapshot({ keys: [keyRow(), keyRow({ id: 2, keyId: 'k2', comment: 'old@box', status: 'denied' })] }),
+      });
+      const revoke = within(await screen.findByTestId('adb-proxy-approved')).getByRole('button', { name: 'Revoke' });
+      fireEvent.click(revoke);
+      confirm();
+      fireEvent.click(revoke);
+      expect(revoke).toBeDisabled();
+      const forget = within(screen.getByTestId('adb-proxy-blocked')).getByRole('button', { name: 'Forget', hidden: true });
+      fireEvent.click(forget);
+      confirm();
+      fireEvent.click(forget);
+      expect(forget).toBeDisabled();
+      expect(writes(calls)).toEqual([
+        { method: 'POST', path: '/v1/adb-proxy/keys/1/revoke', body: undefined },
+        { method: 'DELETE', path: '/v1/adb-proxy/keys/2', body: undefined },
+      ]);
+      release();
+      await waitFor(() => expect(revoke).toBeEnabled());
+      await waitFor(() => expect(forget).toBeEnabled());
+    });
+
+    it('sends one change for two rapid clicks on a device port save and a device toggle', async () => {
+      const { calls, release } = mount({ hold: true });
+      const row = await screen.findByTestId('adb-proxy-device-DEV1');
+      fireEvent.change(within(row).getByLabelText('Port for Phone 1'), { target: { value: '6510' } });
+      const save = within(row).getByRole('button', { name: 'Save port' });
+      fireEvent.click(save);
+      fireEvent.click(save);
+      const toggle = within(row).getByLabelText('Proxy Phone 1');
+      fireEvent.click(toggle);
+      fireEvent.click(toggle);
+      expect(writes(calls)).toEqual([
+        { method: 'PATCH', path: '/v1/adb-proxy/devices/DEV1', body: { port: 6510 } },
+        { method: 'PATCH', path: '/v1/adb-proxy/devices/DEV1', body: { enabled: false } },
+      ]);
+      expect(save).toBeDisabled();
+      expect(toggle).toBeDisabled();
+      release();
+      await waitFor(() => expect(toggle).toBeEnabled());
+    });
+
+    it('sends one change for two rapid clicks on the main switch', async () => {
+      const { calls, release } = mount({ hold: true, snapshot: snapshot({ enabled: false }) });
+      const toggle = await screen.findByTestId('adb-proxy-toggle');
+      fireEvent.click(toggle);
+      fireEvent.click(toggle);
+      expect(writes(calls)).toEqual([{ method: 'PUT', path: '/v1/adb-proxy/settings', body: { enabled: true } }]);
+      expect(toggle).toBeDisabled();
+      release();
+      await waitFor(() => expect(toggle).toBeEnabled());
+    });
+
+    it('sends one network save for two rapid clicks', async () => {
+      const { calls, release } = mount({ hold: true });
+      fireEvent.change(await screen.findByLabelText('First port'), { target: { value: '7000' } });
+      const save = screen.getByRole('button', { name: 'Save' });
+      fireEvent.click(save);
+      fireEvent.click(save);
+      expect(writes(calls)).toEqual([
+        { method: 'PUT', path: '/v1/adb-proxy/settings', body: { bindHost: '0.0.0.0', portStart: 7000, portEnd: 6599 } },
+      ]);
+      release();
+      expect(await screen.findByRole('button', { name: 'Saved' })).toBeDisabled();
+    });
+  });
+
+  describe('guidance and confirmation text', () => {
+    it('says the machine name is not proof and what the fingerprint is for', async () => {
+      mount({ snapshot: snapshot({ pending: [pendingReq()] }) });
+      await screen.findByTestId('adb-proxy-request');
+      expect(screen.getByText(/machine name is chosen by the connecting machine/i)).toHaveTextContent(
+        /rely on the source address and the key fingerprint/i,
+      );
+      expect(screen.getByText(/machine name is chosen by the connecting machine/i)).toHaveTextContent(
+        /fingerprint tells two machines with the same name apart and lets you recognise a key you approved before/i,
+      );
+      expect(document.body.textContent).not.toMatch(/fingerprint[^.]*\b(shown|printed|displayed) by\b/i);
+    });
+
+    it('identifies the machine by name, address and fingerprint start so same-name machines differ', async () => {
+      mount({
+        snapshot: snapshot({
+          keys: [
+            keyRow({ id: 1, comment: 'laptop', lastSeenIp: '10.0.0.7' }),
+            keyRow({ id: 4, keyId: 'k4', comment: 'laptop', lastSeenIp: '10.0.0.9', fingerprint: '11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00' }),
+            keyRow({ id: 5, keyId: 'k5', comment: 'old@box', status: 'denied', lastSeenIp: null }),
+          ],
+        }),
+      });
+      const approved = await screen.findByTestId('adb-proxy-approved');
+      const [first, second] = within(approved).getAllByRole('button', { name: 'Revoke' });
+
+      fireEvent.click(first);
+      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for "laptop" (from 10.0.0.7, fingerprint starting AA:BB:CC:DD:)?');
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+      fireEvent.click(second);
+      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for "laptop" (from 10.0.0.9, fingerprint starting 11:22:33:44:)?');
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+      fireEvent.click(within(screen.getByTestId('adb-proxy-blocked')).getByRole('button', { name: 'Forget', hidden: true }));
+      expect(screen.getByTestId('modal')).toHaveTextContent('Forget "old@box" (fingerprint starting AA:BB:CC:DD:)?');
+    });
+  });
+
+  describe('request paths and form values', () => {
+    it('encodes ids that contain slashes, question marks and hashes', async () => {
+      const id = 'a/b?c#d';
+      const encoded = 'a%2Fb%3Fc%23d';
+      const { calls } = mount({
+        snapshot: snapshot({
+          devices: [{ deviceId: id, name: 'Odd', port: 6500, enabled: true, online: true, state: 'listening' }],
+          pending: [pendingReq({ requestId: id, deviceId: id }), pendingReq({ requestId: `${id}2`, keyId: 'k2', deviceId: id })],
+        }),
+      });
+      const device = await screen.findByTestId(`adb-proxy-device-${id}`);
+      fireEvent.click(within(device).getByLabelText('Proxy Odd'));
+      fireEvent.change(within(device).getByLabelText('Port for Odd'), { target: { value: '6510' } });
+      fireEvent.click(within(device).getByRole('button', { name: 'Save port' }));
+      const [one, two] = screen.getAllByTestId('adb-proxy-request');
+      fireEvent.click(within(one).getByRole('button', { name: 'Approve' }));
+      fireEvent.click(within(two).getByRole('button', { name: 'Deny' }));
+      await waitFor(() => expect(writes(calls)).toEqual([
+        { method: 'PATCH', path: `/v1/adb-proxy/devices/${encoded}`, body: { enabled: false } },
+        { method: 'PATCH', path: `/v1/adb-proxy/devices/${encoded}`, body: { port: 6510 } },
+        { method: 'POST', path: `/v1/adb-proxy/requests/${encoded}/approve`, body: undefined },
+        { method: 'POST', path: `/v1/adb-proxy/requests/${encoded}2/deny`, body: undefined },
+      ]));
+    });
+
+    it('trims the bind address on save', async () => {
+      const { calls } = mount();
+      fireEvent.change(await screen.findByLabelText('Bind address'), { target: { value: '  192.168.1.10  ' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(writes(calls)).toEqual([
+        { method: 'PUT', path: '/v1/adb-proxy/settings', body: { bindHost: '192.168.1.10', portStart: 6500, portEnd: 6599 } },
+      ]));
+    });
+
+    it('keeps a dirty First port draft when a pushed snapshot changes Last port', async () => {
+      const { push } = mount();
+      const first = await screen.findByLabelText('First port');
+      fireEvent.change(first, { target: { value: '7000' } });
+      push(snapshot({ portEnd: 6700 }));
+      expect(screen.getByLabelText('Last port')).toHaveValue(6700);
+      expect(first).toHaveValue(7000);
+      expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+    });
+
+    it('keeps a dirty device port draft when a pushed snapshot changes that device', async () => {
+      const { push } = mount();
+      const row = await screen.findByTestId('adb-proxy-device-DEV1');
+      fireEvent.change(within(row).getByLabelText('Port for Phone 1'), { target: { value: '6510' } });
+      push(snapshot({ devices: [{ deviceId: 'DEV1', name: 'Phone 1', port: 6505, enabled: true, online: true, state: 'port-in-use' }] }));
+      expect(within(row).getByLabelText('Port for Phone 1')).toHaveValue(6510);
+      expect(within(row).getByRole('button', { name: 'Save port' })).toBeEnabled();
+      expect(within(row).getByText('Port in use')).toBeInTheDocument();
+    });
+  });
+
+  describe('server refusals', () => {
+    it.each([
+      ['an unmapped error code', 'disk-on-fire'],
+      ['a settings refusal message', 'bind host must be an IP address'],
+    ])('shows %s as it was sent', async (_name, failWith) => {
+      mount({ failWith, snapshot: snapshot({ enabled: false }) });
+      fireEvent.click(await screen.findByTestId('adb-proxy-toggle'));
+      expect(await screen.findByRole('alert')).toHaveTextContent(new RegExp(`^${failWith}$`));
+    });
+
+    it('renders a hostile error message as text', async () => {
+      const evil = '<img src=x onerror=alert(1)>';
+      mount({ failWith: evil, snapshot: snapshot({ enabled: false }) });
+      fireEvent.click(await screen.findByTestId('adb-proxy-toggle'));
+      expect(await screen.findByRole('alert')).toHaveTextContent(evil);
+      expect(document.querySelector('img')).toBeNull();
+    });
+  });
+
+  describe('main switch accessibility', () => {
+    it('keeps a fixed name and carries the state in aria-checked', async () => {
+      const { push } = mount();
+      const toggle = await screen.findByRole('switch', { name: 'ADB proxy' });
+      expect(toggle).toHaveAttribute('aria-checked', 'true');
+      push(snapshot({ enabled: false }));
+      const after = await screen.findByRole('switch', { name: 'ADB proxy' });
+      expect(after).toHaveAttribute('aria-checked', 'false');
+    });
   });
 });
