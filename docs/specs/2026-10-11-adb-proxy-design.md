@@ -107,15 +107,15 @@ A small adapter (`device-directory.ts`) implements it over `DeviceManager`, whic
    - key is unknown: create or refresh an in-memory pending request and **hold the connection**. The client keeps `unauthorized`, as it does for a phone waiting on its dialog;
    - on approve, send `CNXN` on the held connection; on deny, timeout or disconnect, close.
 
-**Banner.** `device::ro.product.name=<..>;ro.product.model=<..>;ro.product.device=<..>;features=<..>`, NUL-terminated. `features` is the device's real list from the ADB server (`host-serial:<serial>:features`), passed through unchanged. That is safe because every feature is carried inside opaque stream bytes (`shell_v2` framing, sync, `abb`, `sendrecv_v2*`); none changes the wire framing. Advertised version `0x01000001`, max data 1 MiB.
+**Banner.** `device::ro.product.name=<..>;ro.product.model=<..>;ro.product.device=<..>;features=<..>`, NUL-terminated. `features` is the device's real list from the ADB server (`host-serial:<serial>:features`), passed through unchanged except for `delayed_ack`, which is removed. Almost every feature is carried inside opaque stream bytes (`shell_v2` framing, sync, `abb`, `sendrecv_v2*`) and needs nothing from the proxy. `delayed_ack` (burst mode) is the exception: it changes the wire framing (`OPEN` carries a window in `arg1`, `OKAY` carries a 4-byte payload, several `WRTE`s can be in flight), which the proxy does not implement, so it is never offered to a client. Advertised version `0x01000001`, max data 1 MiB.
 
 **Streams.**
 
 - `OPEN` (arg0 = client id, payload = service plus NUL): apply the services policy, open the backend socket, send the 4-hex-length-prefixed service, wait for the server's `OKAY`. Success: reply `OKAY`. Failure: reply `CLSE`.
-- `WRTE` from client: write to the backend socket and send `OKAY` once the write has drained.
+- `WRTE` from client: write to the backend socket and send `OKAY` once the write has drained. A second `WRTE` on a stream before that `OKAY` is a protocol error and closes the stream, so inbound data never queues without bound.
 - Backend data: send `WRTE`, then pause that socket until the client's `OKAY`. This is ADB's own flow control; no extra windowing.
 - `CLSE` either way tears down that stream and its backend socket.
-- Caps: 128 open streams per session; payloads at most the advertised max data.
+- Caps: 128 open streams per session; payloads at most the advertised max data. Backend data is split into `WRTE`s of at most the smaller of the client's `CNXN` max data and ours (never below 4096). The session stops reading from a client socket while more than 4 MiB is queued to be written to it, and resumes on `drain`, so a client that sends but never reads cannot grow the buffer without limit.
 
 **Services policy.** Refuse with `CLSE`:
 

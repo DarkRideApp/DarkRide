@@ -127,6 +127,25 @@ describe('HostClient', () => {
     );
   });
 
+  it.each([
+    ['in the middle', 'shell_v2,delayed_ack,cmd,stat_v2', 'shell_v2,cmd,stat_v2'],
+    ['at the start', 'delayed_ack,shell_v2,cmd,stat_v2', 'shell_v2,cmd,stat_v2'],
+    ['at the end', 'shell_v2,cmd,stat_v2,delayed_ack', 'shell_v2,cmd,stat_v2'],
+    ['on its own', 'delayed_ack', ''],
+    ['only as an exact token', 'cmd,delayed_ack2,xdelayed_ack,stat_v2', 'cmd,delayed_ack2,xdelayed_ack,stat_v2'],
+    ['when absent', 'shell_v2,cmd,stat_v2', 'shell_v2,cmd,stat_v2'],
+  ])('drops delayed_ack from the banner features %s', async (_where, features, expected) => {
+    const server = new FakeAdbServer([{ serial: 'D1', features }], { shell: () => 'prod\nmodel\ndev\n' });
+    const c = new HostClient(await server.start(), 2000);
+    try {
+      expect(await c.deviceBanner('D1')).toBe(
+        `device::ro.product.name=prod;ro.product.model=model;ro.product.device=dev;features=${expected}`,
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('strips separators and control characters from property values', async () => {
     const dirty = new FakeAdbServer([{ serial: 'D1' }], { shell: () => 'a;b=c\nmo\u0001del\ndev\n' });
     const c = new HostClient(await dirty.start(), 2000);

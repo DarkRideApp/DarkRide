@@ -97,13 +97,13 @@ export class WireClient {
     return this.packets.length === before;
   }
 
-  sendHostCnxn(): void {
-    this.send(A_CNXN, A_VERSION, MAX_DATA, 'host::features=cmd\0');
+  sendHostCnxn(maxData: number = MAX_DATA): void {
+    this.send(A_CNXN, A_VERSION, maxData, 'host::features=cmd\0');
   }
 
-  /** CNXN, then answer the AUTH token with a signature from `key`. Returns the proxy's next packet. */
-  async authenticate(key: TestAdbKey): Promise<Packet> {
-    this.sendHostCnxn();
+  /** CNXN (advertising `maxData`), then answer the AUTH token with a signature from `key`. Returns the proxy's next packet. */
+  async authenticate(key: TestAdbKey, maxData: number = MAX_DATA): Promise<Packet> {
+    this.sendHostCnxn(maxData);
     const token = await this.next();
     if (token.command !== A_AUTH || token.arg0 !== AUTH_TOKEN) throw new Error('expected an AUTH token');
     this.send(A_AUTH, AUTH_SIGNATURE, 0, key.sign(token.data));

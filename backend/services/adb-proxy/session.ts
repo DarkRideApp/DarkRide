@@ -13,6 +13,9 @@ const MAX_SIGNATURE_ATTEMPTS = 3;
 const DEFAULT_PREAUTH_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_STREAMS = 128;
 const MAX_SERVICE_LENGTH = 4096;
+// A client advertising less than this (or nothing) still gets WRTEs of this size, the classic ADB payload.
+const MIN_PEER_MAX_DATA = 4096;
+const OUTBOUND_HIGH_WATER = 4 * 1024 * 1024;
 // The ADB server dispatches anything starting with "host" as a request to itself, even on a bound connection.
 const REFUSED_PREFIXES = ['host', 'reverse:', 'tcpip:', 'usb:'];
 
@@ -43,6 +46,8 @@ interface Stream {
   windowOpen: boolean;
   outQueue: Buffer[];
   backendEnded: boolean;
+  /** A client WRTE is written to the backend but not yet acknowledged. */
+  ackPending: boolean;
 }
 
 export type SessionState = 'await-cnxn' | 'await-auth' | 'pending' | 'finishing' | 'ready' | 'closed';
@@ -112,6 +117,8 @@ export class Session {
   private closed = false;
   private readonly streams = new Map<number, Stream>();
   private nextLocalId = 1;
+  private peerMaxData = MAX_DATA;
+  private readsPaused = false;
 
   constructor(private readonly opts: SessionOptions) {
     this.deviceId = opts.deviceId;
@@ -182,6 +189,7 @@ export class Session {
   private onCnxn(p: Packet): void {
     if (p.command !== A_CNXN) return this.close('expected CNXN');
     if (!this.opts.isDeviceOnline()) return this.close('device offline');
+    this.peerMaxData = Math.min(MAX_DATA, Math.max(MIN_PEER_MAX_DATA, p.arg1));
     this.sendToken();
     this.state = 'await-auth';
   }
@@ -307,7 +315,9 @@ export class Session {
     }
     const duplicate = [...this.streams.values()].some((s) => s.remoteId === remoteId);
     if (duplicate || this.streams.size >= (this.opts.maxStreams ?? DEFAULT_MAX_STREAMS)) return this.refuse(remoteId);
-    const stream: Stream = { localId: this.nextLocalId++, remoteId, backend: null, windowOpen: false, outQueue: [], backendEnded: false };
+    const stream: Stream = {
+      localId: this.nextLocalId++, remoteId, backend: null, windowOpen: false, outQueue: [], backendEnded: false, ackPending: false,
+    };
     this.streams.set(stream.localId, stream);
     let opening: Promise<net.Socket>;
     try {
@@ -361,9 +371,9 @@ export class Session {
     if (stream.windowOpen && stream.outQueue.length > 0) {
       const head = stream.outQueue[0];
       let piece = head;
-      if (head.length > MAX_DATA) {
-        piece = head.subarray(0, MAX_DATA);
-        stream.outQueue[0] = head.subarray(MAX_DATA);
+      if (head.length > this.peerMaxData) {
+        piece = head.subarray(0, this.peerMaxData);
+        stream.outQueue[0] = head.subarray(this.peerMaxData);
       } else {
         stream.outQueue.shift();
       }
@@ -384,9 +394,13 @@ export class Session {
   private onWrite(p: Packet): void {
     const stream = this.streams.get(p.arg1);
     if (!stream || stream.remoteId !== p.arg0 || !stream.backend) return;
+    // ADB allows one unacknowledged WRTE per stream; a second one is a protocol error and would otherwise queue without bound.
+    if (stream.ackPending) return this.closeStream(stream, true);
     const backend = stream.backend;
+    stream.ackPending = true;
     this.guardStream(stream, 'write', () => {
       backend.write(p.data, (err) => this.guardStream(stream, 'write callback', () => {
+        stream.ackPending = false;
         if (this.closed || !this.streams.has(stream.localId)) return;
         if (err) return this.closeStream(stream, true);
         this.send(A_OKAY, stream.localId, stream.remoteId);
@@ -447,6 +461,19 @@ export class Session {
   private send(command: number, arg0: number, arg1: number, data?: Buffer): void {
     if (this.closed || this.opts.socket.destroyed) return;
     this.opts.socket.write(encodePacket({ command, arg0, arg1, data }));
+    this.limitBacklog();
+  }
+
+  /** A client that sends but never reads would grow the write buffer without limit; stop reading it until the buffer drains. */
+  private limitBacklog(): void {
+    const socket = this.opts.socket;
+    if (this.readsPaused || socket.writableLength <= OUTBOUND_HIGH_WATER) return;
+    this.readsPaused = true;
+    socket.pause();
+    socket.once('drain', () => {
+      this.readsPaused = false;
+      if (!this.closed) this.guard('resume', () => socket.resume());
+    });
   }
 
   /** Runs a callback supplied by the owner; a throw is logged and never reaches the caller. */

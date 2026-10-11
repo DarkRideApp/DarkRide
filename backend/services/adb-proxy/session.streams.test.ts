@@ -1,8 +1,12 @@
 import { EventEmitter } from 'node:events';
 import type net from 'node:net';
+import { Duplex } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseAdbPublicKey } from './adb-key';
-import { A_CLSE, A_OKAY, A_OPEN, A_WRTE, MAX_DATA, encodePacket } from './packet';
+import {
+  A_AUTH, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_VERSION, A_WRTE, AUTH_SIGNATURE, MAX_DATA,
+  PacketParser, encodePacket, type Packet,
+} from './packet';
 import { HostClient } from './host-client';
 import { Session, checkService, type BackendConnector, type SessionEvent } from './session';
 import { FakeAdbServer } from './testing/fake-adb-server';
@@ -20,6 +24,8 @@ const recordEscape = (e: unknown) => { escapes.push(e); };
 
 interface SetupOptions {
   maxStreams?: number;
+  /** The max data the client advertises in its CNXN. */
+  clientMaxData?: number;
   shell?: (serial: string, command: string) => string;
   /** Wraps the real backend so a test can inject faults. */
   backend?: (real: HostClient) => BackendConnector;
@@ -43,7 +49,7 @@ async function setup(opts: SetupOptions = {}) {
   );
   const client = await WireClient.connect(server.port);
   cleanups.push(() => client.close(), () => server.close(), () => fake.stop());
-  await client.authenticate(key);
+  await client.authenticate(key, opts.clientMaxData);
   return { fake, server, client, events, closed, baseline: [...fake.requests] };
 }
 
@@ -55,8 +61,11 @@ class FakeBackendSocket extends EventEmitter {
   readableEnded = false;
   destroyCalls = 0;
   writeError: Error | null = null;
+  /** Hold every write callback until the test calls the entries of `pendingWrites`. */
+  deferWrites = false;
   readonly faults = new Set<Fault>();
   readonly written: Buffer[] = [];
+  readonly pendingWrites: Array<() => void> = [];
 
   private maybeThrow(fault: Fault): void {
     if (this.faults.has(fault)) throw new Error(`${fault} boom`);
@@ -67,7 +76,8 @@ class FakeBackendSocket extends EventEmitter {
   write(data: Buffer, cb?: (err?: Error | null) => void): boolean {
     this.maybeThrow('write');
     this.written.push(data);
-    cb?.(this.writeError);
+    if (this.deferWrites) this.pendingWrites.push(() => cb?.(this.writeError));
+    else cb?.(this.writeError);
     return true;
   }
   destroy(): this {
@@ -95,11 +105,51 @@ function fakeBackend(pick: (service: string) => FakeBackendSocket | Error | unde
   });
 }
 
-async function setupWithFake(prepare: (sock: FakeBackendSocket) => void = () => {}) {
+async function setupWithFake(prepare: (sock: FakeBackendSocket) => void = () => {}, extra: SetupOptions = {}) {
   const sock = new FakeBackendSocket();
   prepare(sock);
-  const h = await setup({ backend: fakeBackend((s) => (s === 'fake:' ? sock : undefined)) });
+  const h = await setup({ ...extra, backend: fakeBackend((s) => (s === 'fake:' ? sock : undefined)) });
   return { h, sock };
+}
+
+/** A client-side socket whose writes can be stalled, so the bytes queued for the client stay in the writable buffer. */
+class StallableSocket extends Duplex {
+  readonly sent: Packet[] = [];
+  stalled = false;
+  private held: Array<() => void> = [];
+  private readonly parser = new PacketParser(MAX_DATA);
+
+  _read(): void {}
+
+  _write(chunk: Buffer, _encoding: BufferEncoding, cb: (err?: Error | null) => void): void {
+    this.sent.push(...this.parser.push(chunk));
+    if (this.stalled) this.held.push(() => cb());
+    else cb();
+  }
+
+  release(): void {
+    this.stalled = false;
+    for (const flush of this.held.splice(0)) flush();
+  }
+}
+
+/** A session on a StallableSocket, taken through the whole handshake to the ready state. */
+async function readySessionOnStallableSocket() {
+  const sock = new StallableSocket();
+  const key = makeTestAdbKey();
+  const gate = new StubGate();
+  gate.approved = [{ keyId: key.keyId, key: parseAdbPublicKey(key.publicKeyText).key }];
+  const backend: BackendConnector = { openService: vi.fn(), deviceBanner: async () => 'device::features=cmd' };
+  const session = new Session({
+    socket: sock as unknown as net.Socket, deviceId: 'DEV1', peerIp: '10.0.0.5', gate, backend, isDeviceOnline: () => true,
+  });
+  cleanups.push(() => session.destroy('test over'));
+  sock.push(encodePacket({ command: A_CNXN, arg0: A_VERSION, arg1: MAX_DATA, data: Buffer.from('host::features=cmd\0') }));
+  await vi.waitFor(() => expect(sock.sent.some((p) => p.command === A_AUTH)).toBe(true));
+  const token = sock.sent.find((p) => p.command === A_AUTH)!;
+  sock.push(encodePacket({ command: A_AUTH, arg0: AUTH_SIGNATURE, arg1: 0, data: key.sign(token.data) }));
+  await vi.waitFor(() => expect(session.state).toBe('ready'));
+  return { sock, session };
 }
 
 /** Fails the test if an uncaught exception or unhandled rejection reached the process. */
@@ -445,5 +495,128 @@ describe('Session streams, contained failures', () => {
     expect(h.server.sessions[0].streamCount).toBe(0);
     expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('destroy boom'));
     await expectNothingEscaped();
+  });
+});
+
+describe('Session streams, bounded buffering', () => {
+  it('closes a stream that sends a second WRTE before the first is acknowledged', async () => {
+    const { h, sock } = await setupWithFake((s) => { s.deferWrites = true; });
+    const { localId } = await h.client.open('fake:', 1);
+    h.client.send(A_WRTE, 1, localId, 'one');
+    await vi.waitFor(() => expect(sock.written).toHaveLength(1));
+    h.client.send(A_WRTE, 1, localId, 'two');
+    const close = await h.client.next();
+    expect(close.command).toBe(A_CLSE);
+    expect(close.arg0).toBe(localId);
+    expect(close.arg1).toBe(1);
+    expect(sock.written).toHaveLength(1);
+    expect(sock.destroyCalls).toBeGreaterThan(0);
+    expect(h.server.sessions[0].streamCount).toBe(0);
+    for (const flush of sock.pendingWrites.splice(0)) flush();
+    expect(await h.client.quiet(100)).toBe(true);
+    expect(h.server.sessions[0].state).toBe('ready');
+  });
+
+  it('accepts the next WRTE once the previous one has been acknowledged', async () => {
+    const { h, sock } = await setupWithFake((s) => { s.deferWrites = true; });
+    const { localId } = await h.client.open('fake:', 1);
+    h.client.send(A_WRTE, 1, localId, 'one');
+    await vi.waitFor(() => expect(sock.pendingWrites).toHaveLength(1));
+    sock.pendingWrites.shift()!();
+    expect((await h.client.next()).command).toBe(A_OKAY);
+    h.client.send(A_WRTE, 1, localId, 'two');
+    await vi.waitFor(() => expect(sock.pendingWrites).toHaveLength(1));
+    sock.pendingWrites.shift()!();
+    expect((await h.client.next()).command).toBe(A_OKAY);
+    expect(sock.written.map((b) => b.toString())).toEqual(['one', 'two']);
+    expect(h.server.sessions[0].streamCount).toBe(1);
+  });
+
+  it('stops reading a client that never reads its replies, and resumes after drain', async () => {
+    const { sock, session } = await readySessionOnStallableSocket();
+    const refusal = encodePacket({ command: A_OPEN, arg0: 1, arg1: 0, data: Buffer.from('host:kill\0') });
+    const perPush = 2730;
+    const pushes = 70;
+    const burst = Buffer.concat(Array.from({ length: perPush }, () => refusal));
+    sock.stalled = true;
+    for (let i = 0; i < pushes; i++) sock.push(burst);
+    const highWater = 4 * 1024 * 1024;
+    const repliesPerPush = perPush * 24;
+    expect(sock.writableLength).toBeGreaterThan(highWater);
+    expect(sock.writableLength).toBeLessThanOrEqual(highWater + repliesPerPush);
+    expect(sock.isPaused()).toBe(true);
+    expect(sock.readableLength).toBeGreaterThan(0);
+    expect(session.isClosed).toBe(false);
+
+    sock.release();
+    const total = perPush * pushes;
+    const closes = () => sock.sent.filter((p) => p.command === A_CLSE).length;
+    await vi.waitFor(() => expect(closes()).toBe(total), { timeout: 3000 });
+    expect(sock.writableLength).toBe(0);
+    expect(sock.isPaused()).toBe(false);
+    await expectNothingEscaped();
+  });
+});
+
+describe('Session streams, chunking and limits', () => {
+  it('splits backend data into WRTEs of at most MAX_DATA and releases the next only after the client OKAY', async () => {
+    const { h, sock } = await setupWithFake();
+    const { localId } = await h.client.open('fake:', 1);
+    sock.emit('data', Buffer.alloc(MAX_DATA + 1, 'a'));
+    const first = await h.client.next();
+    expect(first.command).toBe(A_WRTE);
+    expect(first.data.length).toBe(MAX_DATA);
+    expect(await h.client.quiet(100)).toBe(true);
+    h.client.send(A_OKAY, 1, localId);
+    const second = await h.client.next();
+    expect(second.command).toBe(A_WRTE);
+    expect(second.data.length).toBe(1);
+  });
+
+  it.each([
+    [4096, 4096],
+    [0, 4096],
+    [1000, 4096],
+    [8192, 8192],
+  ])('splits at the max data the client advertised (%i gives %i)', async (advertised, expected) => {
+    const { h, sock } = await setupWithFake(() => {}, { clientMaxData: advertised });
+    const { localId } = await h.client.open('fake:', 1);
+    sock.emit('data', Buffer.alloc(20000, 'a'));
+    const got = await h.client.collectStream(1, localId, 20000);
+    expect(got.length).toBe(20000);
+    const sizes = h.client.packets.filter((p) => p.command === A_WRTE).map((p) => p.data.length);
+    expect(sizes[0]).toBe(expected);
+    expect(Math.max(...sizes)).toBe(expected);
+  });
+
+  it('ignores CLSE, OKAY and WRTE that name the wrong remote id', async () => {
+    const { h, sock } = await setupWithFake();
+    const { localId } = await h.client.open('fake:', 1);
+    sock.emit('data', Buffer.from('a'));
+    sock.emit('data', Buffer.from('b'));
+    expect((await h.client.next()).command).toBe(A_WRTE);
+    h.client.send(A_OKAY, 99, localId);
+    h.client.send(A_WRTE, 99, localId, 'x');
+    h.client.send(A_CLSE, 99, localId);
+    expect(await h.client.quiet(100)).toBe(true);
+    expect(sock.written).toHaveLength(0);
+    expect(sock.destroyCalls).toBe(0);
+    expect(h.server.sessions[0].streamCount).toBe(1);
+    h.client.send(A_OKAY, 1, localId);
+    const queued = await h.client.next();
+    expect(queued.command).toBe(A_WRTE);
+    expect(queued.data.toString()).toBe('b');
+  });
+
+  it('caps a session at 128 streams by default', async () => {
+    const made: FakeBackendSocket[] = [];
+    const h = await setup({ backend: fakeBackend((s) => (s === 'hold:' ? (made[made.push(new FakeBackendSocket()) - 1]) : undefined)) });
+    for (let id = 1; id <= 128; id++) h.client.send(A_OPEN, id, 0, 'hold:\0');
+    await vi.waitFor(() => expect(h.client.packets.filter((p) => p.command === A_OKAY)).toHaveLength(128));
+    h.client.send(A_OPEN, 129, 0, 'hold:\0');
+    const refused = await h.client.waitFor((p) => p.command === A_CLSE && p.arg1 === 129);
+    expect(refused.arg0).toBe(0);
+    expect(h.server.sessions[0].streamCount).toBe(128);
+    expect(made).toHaveLength(128);
   });
 });

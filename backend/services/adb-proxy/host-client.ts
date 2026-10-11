@@ -79,6 +79,13 @@ function cleanProp(value: string | undefined): string {
   return (value ?? '').replace(/[;=\u0000-\u001f\u007f]/g, '').trim().slice(0, 64);
 }
 
+// Burst mode changes the stream framing (OPEN carries a window, OKAY carries a byte count), which the session does not implement.
+const UNSUPPORTED_FEATURES = new Set(['delayed_ack']);
+
+function supportedFeatures(features: string): string {
+  return features.trim().split(',').filter((f) => !UNSUPPORTED_FEATURES.has(f)).join(',');
+}
+
 export class HostClient {
   constructor(
     private readonly addr: AdbServerAddress = resolveAdbServerAddress(),
@@ -166,13 +173,13 @@ export class HostClient {
     });
   }
 
-  /** The CNXN banner text: device identity plus the device's real feature list. */
+  /** The CNXN banner text: device identity plus the device's real feature list, minus features the proxy cannot carry. */
   async deviceBanner(serial: string): Promise<string> {
     const [features, props] = await Promise.all([
       this.features(serial),
       this.collect(serial, 'shell:getprop ro.product.name; getprop ro.product.model; getprop ro.product.device').catch(() => ''),
     ]);
     const [name, model, device] = props.split(/\r?\n/);
-    return `device::ro.product.name=${cleanProp(name)};ro.product.model=${cleanProp(model)};ro.product.device=${cleanProp(device)};features=${features.trim()}`;
+    return `device::ro.product.name=${cleanProp(name)};ro.product.model=${cleanProp(model)};ro.product.device=${cleanProp(device)};features=${supportedFeatures(features)}`;
   }
 }
