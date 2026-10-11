@@ -65,7 +65,7 @@ Viewing needs the scope `core.adb-proxy:read`. Approving, denying, revoking, for
 ## Limits
 
 - At most 8 connections per source address and 64 in total may be unauthenticated at once. A source address is an IPv4 address or an IPv6 /64 network, and an IPv4-mapped IPv6 address counts as its IPv4 address. A connection that has not finished the handshake after 10 seconds is dropped. A connection that is waiting for approval is exempt.
-- A connection can send at most 3 signatures; a fourth closes it.
+- A connection can send at most 8 signatures; a ninth closes it. `adb` signs once with each key it holds (its own key, then each key in `ADB_VENDOR_KEYS`), so a machine with more than 8 keys cannot connect.
 - At most 20 requests wait at once, and a source address can create 3 new ones per minute. A machine that asks again for a device it already has a waiting request for does not use that allowance. Extra requests are dropped. Each dropped request is logged, within the log rate limit, and counted in `counters.floodDrops` in the response of `GET /v1/adb-proxy/status`. Connections refused at the unauthenticated limit are counted in the same counter but not logged individually. The page does not show the count.
 - A waiting request is held for at most 5 minutes.
 - At most 128 streams may be open on one connection. Further streams are refused.

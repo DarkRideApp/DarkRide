@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -225,6 +225,36 @@ for (const bin of adbBins()) {
       await vi.waitFor(() => expect(proxy.service.snapshot().connections).toEqual([]), WAIT);
       expect((await adb.devices()).get(serial)).not.toBe('device');
       expect(proxy.service.snapshot().pending).toEqual([]);
+    });
+
+    // A client signs once with each key it holds before it offers its own public key.
+    it('lets a client that holds four vendor keys besides its own request approval and connect', async () => {
+      const proxy2 = await startProxy();
+      let many: IsolatedAdb | undefined;
+      const keyDir = mkdtempSync(join(tmpdir(), 'adb-proxy-vendor-keys-'));
+      try {
+        const paths = Array.from({ length: 4 }, (_, i) => {
+          const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, publicExponent: 65537 });
+          const path = join(keyDir, `vendor${i}.adb_key`);
+          writeFileSync(path, privateKey.export({ type: 'pkcs1', format: 'pem' }));
+          return path;
+        });
+        many = await IsolatedAdb.create(bin, { ADB_VENDOR_KEYS: paths.join(':') });
+        const target = `127.0.0.1:${proxy2.port}`;
+        await many.run(['connect', target]);
+        await vi.waitFor(() => expect(proxy2.service.snapshot().pending).toHaveLength(1), WAIT);
+        const [req] = proxy2.service.snapshot().pending;
+        const b64 = readFileSync(join(many.home, '.android', 'adbkey.pub'), 'utf8').trim().split(/\s+/)[0];
+        expect(req.fingerprint).toBe(fingerprintOf(Buffer.from(b64, 'base64')));
+        expect(proxy2.service.snapshot().counters.authFailures).toBeGreaterThanOrEqual(5);
+        expect(proxy2.service.approveRequest(req.requestId, null)).toEqual({ ok: true });
+        await many.waitForState(target, 'device');
+        await expectShell(many, target);
+      } finally {
+        await many?.stop();
+        await proxy2.stop();
+        rmSync(keyDir, { recursive: true, force: true });
+      }
     });
 
     // The device advertises delayed_ack; the proxy must not pass it on, so a client switched to offer it still gets plain framing.

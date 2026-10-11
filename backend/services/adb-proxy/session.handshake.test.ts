@@ -108,20 +108,52 @@ describe('Session handshake', () => {
     expect(client.packets).toHaveLength(0);
   });
 
-  it('sends a fresh token after each unknown signature and drops the fourth attempt', async () => {
+  it('sends a fresh token after each unknown signature and drops the ninth attempt', async () => {
     const h = await setup();
     const client = await h.connect();
     client.sendHostCnxn();
     const tokens = [await client.next()];
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 8; i++) {
       client.send(A_AUTH, AUTH_SIGNATURE, 0, randomBytes(256));
       tokens.push(await client.next());
     }
     expect(tokens.every((t) => t.command === A_AUTH && t.arg0 === AUTH_TOKEN)).toBe(true);
-    expect(new Set(tokens.map((t) => t.data.toString('hex'))).size).toBe(4);
+    expect(new Set(tokens.map((t) => t.data.toString('hex'))).size).toBe(9);
     client.send(A_AUTH, AUTH_SIGNATURE, 0, randomBytes(256));
     expect(await client.waitClosed()).toBe(true);
-    expect(h.events.filter((e) => e.kind === 'auth-failed')).toHaveLength(3);
+    expect(h.events.filter((e) => e.kind === 'auth-failed')).toHaveLength(8);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'too many signatures' });
+  });
+
+  it('lets a client that holds five keys sign with each, then offer its first key, and reach the gate', async () => {
+    const h = await setup();
+    const keys = Array.from({ length: 5 }, (_, i) => makeTestAdbKey(`key${i}@client`));
+    const client = await h.connect();
+    client.sendHostCnxn();
+    let token = await client.next();
+    for (const key of keys) {
+      client.send(A_AUTH, AUTH_SIGNATURE, 0, key.sign(token.data));
+      token = await client.next();
+      expect(token.arg0).toBe(AUTH_TOKEN);
+    }
+    client.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, keys[0].publicKeyText);
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    expect(h.gate.offers[0].keyId).toBe(keys[0].keyId);
+    expect(h.events.filter((e) => e.kind === 'auth-failed')).toHaveLength(5);
+  });
+
+  it('still requires possession after eight failed signatures', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    client.sendHostCnxn();
+    await client.next();
+    for (let i = 0; i < 8; i++) {
+      client.send(A_AUTH, AUTH_SIGNATURE, 0, randomBytes(256));
+      await client.next();
+    }
+    client.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, makeTestAdbKey().publicKeyText);
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.gate.offers).toHaveLength(0);
   });
 
   it('holds an unknown key as pending and sends CNXN on the same connection once approved', async () => {

@@ -9,7 +9,8 @@ import {
 
 const { error: logError } = createLoggers('adb-proxy');
 
-const MAX_SIGNATURE_ATTEMPTS = 3;
+// A client signs once per key it holds before it offers a public key, so this bounds how many keys it may hold.
+const MAX_SIGNATURE_ATTEMPTS = 8;
 const DEFAULT_PREAUTH_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_STREAMS = 128;
 const MAX_SERVICE_LENGTH = 4096;
