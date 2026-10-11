@@ -16,16 +16,18 @@ import { freePortBase } from '../../backend/services/adb-proxy/testing/free-port
 import { StubDirectory } from '../../backend/services/adb-proxy/testing/stub-directory';
 import { IsolatedAdb, adbAvailable, adbBins, delayedAckSwitch } from './support/real-adb';
 
-// delayed_ack mid-list and a different feature last, so a dropped last entry shows; none of these changes how a client talks to the fake.
-const ADVERTISED = 'cmd,delayed_ack,track_app';
-const EXPECTED_FEATURES = ['cmd', 'track_app'];
+// delayed_ack mid-list and a different feature last, so a dropped last entry shows; abb_exec makes the client install over abb_exec:.
+const ADVERTISED = 'cmd,delayed_ack,abb_exec,track_app';
+const EXPECTED_FEATURES = ['abb_exec', 'cmd', 'track_app'];
 const WAIT = { timeout: 10_000, interval: 100 };
+const LOG_LINE = '10-11 12:00:00.000  1234  1234 I fake    : conformance log line';
 
 async function startProxy() {
   const fake = new FakeAdbServer([{ serial: 'FAKE1', features: ADVERTISED }], {
     shell: (_serial, command) => {
       if (command.startsWith('getprop')) return 'fakeprod\nFakeModel\nfakedev\n';
       if (command === 'big') return 'x'.repeat(1_000_000);
+      if (command.includes('exec logcat')) return `${LOG_LINE}\n`;
       return `ran: ${command}\n`;
     },
   });
@@ -72,6 +74,24 @@ async function expectPushPull(adb: IsolatedAdb, serial: string, work: string) {
   const pull = await adb.run(['-s', serial, 'pull', '/data/local/tmp/in.bin', back], 30_000);
   expect(pull.code, pull.stderr).toBe(0);
   expect(sha(readFileSync(back))).toBe(sha(data));
+}
+
+async function expectInstall(adb: IsolatedAdb, serial: string, work: string, fake: FakeAdbServer) {
+  const apk = randomBytes(200_000);
+  const local = join(work, 'app.apk');
+  writeFileSync(local, apk);
+  const before = fake.installs.length;
+  const out = await adb.run(['-s', serial, 'install', local], 30_000);
+  expect(out.code, `${out.stdout}${out.stderr}`).toBe(0);
+  expect(out.stdout).toContain('Success');
+  expect(fake.installs).toHaveLength(before + 1);
+  expect(sha(fake.installs[before])).toBe(sha(apk));
+}
+
+async function expectLogcat(adb: IsolatedAdb, serial: string) {
+  const out = await adb.run(['-s', serial, 'logcat', '-d']);
+  expect(out.code, out.stderr).toBe(0);
+  expect(out.stdout).toContain(LOG_LINE);
 }
 
 for (const bin of adbBins()) {
@@ -144,6 +164,15 @@ for (const bin of adbBins()) {
 
     it('pushes and pulls a file byte for byte', async () => {
       await expectPushPull(adb, serial, work);
+    });
+
+    it('installs a package through abb_exec, byte for byte', async () => {
+      await expectInstall(adb, serial, work, proxy.fake);
+      expect(proxy.fake.requests.some((r) => r.startsWith('abb_exec:package\0install\0'))).toBe(true);
+    });
+
+    it('dumps the log', async () => {
+      await expectLogcat(adb, serial);
     });
 
     it('forwards a TCP port to the device', async () => {
@@ -220,6 +249,8 @@ for (const bin of adbBins()) {
           await expectShell(switched, target);
           await expectBigOutput(switched, target);
           await expectPushPull(switched, target, dir);
+          await expectInstall(switched, target, dir, advertising.fake);
+          await expectLogcat(switched, target);
         } finally {
           await switched?.stop();
           await advertising.stop();
