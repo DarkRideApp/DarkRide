@@ -19,6 +19,7 @@ import { IsolatedAdb, adbAvailable, adbBins, delayedAckSwitch } from './support/
 // delayed_ack mid-list and a different feature last, so a dropped last entry shows; none of these changes how a client talks to the fake.
 const ADVERTISED = 'cmd,delayed_ack,track_app';
 const EXPECTED_FEATURES = ['cmd', 'track_app'];
+const WAIT = { timeout: 10_000, interval: 100 };
 
 async function startProxy() {
   const fake = new FakeAdbServer([{ serial: 'FAKE1', features: ADVERTISED }], {
@@ -56,7 +57,9 @@ async function expectShell(adb: IsolatedAdb, serial: string) {
 async function expectBigOutput(adb: IsolatedAdb, serial: string) {
   const out = await adb.run(['-s', serial, 'shell', 'big'], 30_000);
   expect(out.code, out.stderr).toBe(0);
-  expect(out.stdout.length).toBeGreaterThanOrEqual(1_000_000);
+  const body = out.stdout.replace(/[\r\n]/g, '');
+  expect(body.length).toBe(1_000_000);
+  expect(/^x+$/.test(body), 'output holds something other than x').toBe(true);
 }
 
 async function expectPushPull(adb: IsolatedAdb, serial: string, work: string) {
@@ -73,16 +76,30 @@ async function expectPushPull(adb: IsolatedAdb, serial: string, work: string) {
 
 for (const bin of adbBins()) {
   const usable = await adbAvailable(bin);
-  const ackSwitch = usable ? await delayedAckSwitch(bin) : null;
-  describe.skipIf(!usable)(`real adb client: ${bin}`, () => {
+  let ackSwitch: string | null = null;
+  let skipReason = usable ? '' : 'the binary does not run `version`';
+  if (usable) {
+    try {
+      ackSwitch = await delayedAckSwitch(bin);
+    } catch (e) {
+      skipReason = `no isolated server could be started (${String((e as Error).message).split('\n')[0]})`;
+    }
+  }
+  describe.skipIf(skipReason !== '')(`real adb client: ${bin}${skipReason ? ` (skipped: ${skipReason})` : ''}`, () => {
     let proxy: Awaited<ReturnType<typeof startProxy>>;
     let adb: IsolatedAdb;
     let serial: string;
     let work: string;
 
     beforeAll(async () => {
-      proxy = await startProxy();
-      adb = await IsolatedAdb.create(bin);
+      const started = await startProxy();
+      try {
+        adb = await IsolatedAdb.create(bin);
+      } catch (e) {
+        await started.stop();
+        throw e;
+      }
+      proxy = started;
       serial = `127.0.0.1:${proxy.port}`;
       work = mkdtempSync(join(tmpdir(), 'adb-proxy-conformance-'));
     });
@@ -97,7 +114,7 @@ for (const bin of adbBins()) {
       // The text `adb connect` prints for an unknown key differs between client versions; `adb devices` is the truth.
       await adb.run(['connect', serial]);
       await adb.waitForState(serial, 'unauthorized');
-      await vi.waitFor(() => expect(proxy.service.snapshot().pending).toHaveLength(1));
+      await vi.waitFor(() => expect(proxy.service.snapshot().pending).toHaveLength(1), WAIT);
 
       const [req] = proxy.service.snapshot().pending;
       const pub = readFileSync(join(adb.home, '.android', 'adbkey.pub'), 'utf8').trim();
@@ -113,7 +130,7 @@ for (const bin of adbBins()) {
       await adb.waitForState(serial, 'device');
     });
 
-    it('sees every feature the device advertises except delayed_ack, last entry included', async () => {
+    it('is shown the device feature list it supports, last entry included', async () => {
       await expectFeatures(adb, serial);
     });
 
@@ -136,6 +153,7 @@ for (const bin of adbBins()) {
       const echoed = await new Promise<string>((resolve, reject) => {
         const s = net.connect(local, '127.0.0.1');
         s.on('error', reject);
+        s.on('close', () => reject(new Error('the forwarded connection closed before an echo came back')));
         s.on('connect', () => s.write('ping'));
         s.once('data', (d) => {
           s.destroy();
@@ -152,14 +170,30 @@ for (const bin of adbBins()) {
       expect(hostRequests).toEqual([]);
     });
 
-    it('drops the connection when the key is revoked and never returns to device', async () => {
+    it('refuses tcpip and reverse from the client and never passes them to the device', async () => {
+      const tcpip = await adb.run(['-s', serial, 'tcpip', '5555']);
+      expect(tcpip.code, `tcpip should fail, stdout: ${tcpip.stdout}`).not.toBe(0);
+      const reverse = await adb.run(['-s', serial, 'reverse', 'tcp:12345', 'tcp:12345']);
+      expect(reverse.code, `reverse should fail, stdout: ${reverse.stdout}`).not.toBe(0);
+      // The fake records every service string that reaches it, so an earlier shell proves the filter can see one.
+      expect(proxy.fake.requests.some((r) => r.startsWith('shell:'))).toBe(true);
+      expect(proxy.fake.requests.filter((r) => r.startsWith('tcpip:') || r.startsWith('reverse:'))).toEqual([]);
+    });
+
+    it('drops the connection when the key is revoked and refuses the reconnect without a new request', async () => {
       const rec = proxy.service.listKeys()[0];
+      const before = proxy.service.snapshot().counters;
       expect(proxy.service.revokeKey(rec.id, null)).toEqual({ ok: true });
       await vi.waitFor(async () => {
         expect((await adb.devices()).get(serial)).not.toBe('device');
       }, { timeout: 10_000, interval: 250 });
+      // The refusal only means something once the client has come back: nudge it, then wait for a new connection
+      // and for a signature from the revoked key to be turned away.
       await adb.run(['connect', serial]);
-      await new Promise((r) => setTimeout(r, 2000));
+      await vi.waitFor(() => expect(proxy.service.snapshot().counters.connections).toBeGreaterThan(before.connections), WAIT);
+      await vi.waitFor(() => expect(proxy.service.snapshot().counters.authFailures).toBeGreaterThan(before.authFailures), WAIT);
+      // Every session has closed again, so the handshake ended without any session becoming ready.
+      await vi.waitFor(() => expect(proxy.service.snapshot().connections).toEqual([]), WAIT);
       expect((await adb.devices()).get(serial)).not.toBe('device');
       expect(proxy.service.snapshot().pending).toEqual([]);
     });
@@ -167,17 +201,18 @@ for (const bin of adbBins()) {
     // The device advertises delayed_ack; the proxy must not pass it on, so a client switched to offer it still gets plain framing.
     it.skipIf(!ackSwitch)(
       ackSwitch
-        ? `keeps working when the client offers delayed ack (${ackSwitch}=1)`
-        : 'keeps working when the client offers delayed ack (skipped: neither ADB_DELAYED_ACK=1 nor ADB_BURST_MODE=1 changes what this client offers)',
+        ? `never sees delayed_ack in the device features and keeps working when the client offers it (${ackSwitch}=1)`
+        : 'never sees delayed_ack in the device features when the client offers it (skipped: neither ADB_DELAYED_ACK=1 nor ADB_BURST_MODE=1 changes what this client offers)',
       async () => {
         const advertising = await startProxy();
-        const switched = await IsolatedAdb.create(bin, { [ackSwitch as string]: '1' });
+        let switched: IsolatedAdb | undefined;
         const dir = mkdtempSync(join(tmpdir(), 'adb-proxy-conformance-'));
         try {
+          switched = await IsolatedAdb.create(bin, { [ackSwitch as string]: '1' });
           const target = `127.0.0.1:${advertising.port}`;
           await switched.run(['connect', target]);
           await switched.waitForState(target, 'unauthorized');
-          await vi.waitFor(() => expect(advertising.service.snapshot().pending).toHaveLength(1));
+          await vi.waitFor(() => expect(advertising.service.snapshot().pending).toHaveLength(1), WAIT);
           expect(advertising.service.approveRequest(advertising.service.snapshot().pending[0].requestId, null)).toEqual({ ok: true });
           await switched.waitForState(target, 'device');
 
@@ -186,7 +221,7 @@ for (const bin of adbBins()) {
           await expectBigOutput(switched, target);
           await expectPushPull(switched, target, dir);
         } finally {
-          await switched.stop();
+          await switched?.stop();
           await advertising.stop();
           rmSync(dir, { recursive: true, force: true });
         }
@@ -205,11 +240,12 @@ describe.skipIf(!process.env.ADB_PROXY_LIVE_SERIAL)('live device through the pro
     saveSettings(db, { enabled: true, bindHost: '127.0.0.1', portStart: base, portEnd: base + 4 });
     const service = new AdbProxyService({ db, directory: new StubDirectory([liveSerial]), backend: new HostClient() });
     await service.start();
-    const adb = await IsolatedAdb.create(bin);
+    let adb: IsolatedAdb | undefined;
     try {
+      adb = await IsolatedAdb.create(bin);
       const serial = `127.0.0.1:${service.snapshot().devices[0].port}`;
       await adb.run(['connect', serial]);
-      await vi.waitFor(() => expect(service.snapshot().pending).toHaveLength(1));
+      await vi.waitFor(() => expect(service.snapshot().pending).toHaveLength(1), WAIT);
       service.approveRequest(service.snapshot().pending[0].requestId, null);
       await adb.waitForState(serial, 'device');
       const viaProxy = await adb.run(['-s', serial, 'shell', 'getprop', 'ro.product.model']);
@@ -219,7 +255,7 @@ describe.skipIf(!process.env.ADB_PROXY_LIVE_SERIAL)('live device through the pro
       expect(viaProxy.stdout.trim()).toBe(direct.trim());
       expect(viaProxy.stdout.trim().length).toBeGreaterThan(0);
     } finally {
-      await adb.stop();
+      await adb?.stop();
       await service.stop();
     }
   });

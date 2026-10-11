@@ -49,7 +49,7 @@ export class IsolatedAdb {
     return adb;
   }
 
-  private env(extra: Record<string, string>): NodeJS.ProcessEnv {
+  private env(): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       HOME: this.home,
@@ -71,15 +71,14 @@ export class IsolatedAdb {
     ]) {
       delete env[k];
     }
-    return { ...env, ...this.serverEnv, ...extra };
+    return { ...env, ...this.serverEnv };
   }
 
-  /** `extraEnv` is layered over the isolated environment for this one command. */
-  run(args: string[], timeoutMs = 20_000, extraEnv: Record<string, string> = {}): Promise<RunResult> {
+  run(args: string[], timeoutMs = 20_000): Promise<RunResult> {
     // An explicit -P makes the client ignore every server-selecting environment variable.
     const argv = ['-P', String(this.serverPort), ...args];
     return new Promise((resolve) => {
-      execFile(this.bin, argv, { env: this.env(extraEnv), timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' }, (err, stdout, stderr) => {
+      execFile(this.bin, argv, { env: this.env(), timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' }, (err, stdout, stderr) => {
         const code = err ? ((err as NodeJS.ErrnoException & { code?: unknown }).code) : 0;
         resolve({ code: typeof code === 'number' ? code : err ? 1 : 0, stdout, stderr });
       });
