@@ -1331,6 +1331,33 @@ describe('AdbProxyService device banner cache', () => {
     expect(banner.calls('DEV1')).toBe(5);
   });
 
+  it('fetches a fresh banner after a session closed because the device restarted, and refuses a reconnect to a device that is gone', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    await approveKey(h, key, 'DEV2');
+    const features = () => h.fake.requests.filter((r) => r === 'host-serial:DEV1:features').length;
+
+    const rebooting = await signIn(h, key);
+    expect((await rebooting.next()).command).toBe(A_CNXN);
+    const before = features();
+    const { localId } = await rebooting.open('reboot:', 1);
+    await rebooting.collectStream(1, localId, 'close');
+    expect(await rebooting.waitClosed()).toBe(true);
+
+    expect(await fresh(h, key)).toBe(true);
+    expect(features()).toBe(before + 1);
+
+    const live = await signIn(h, key);
+    expect((await live.next()).command).toBe(A_CNXN);
+    h.fake.setOnline('DEV1', false);
+    live.send(A_OPEN, 1, 0, 'shell:id\0');
+    expect(await live.waitClosed()).toBe(true);
+
+    const reconnect = await signIn(h, key);
+    expect(await reconnect.waitClosed()).toBe(true);
+    expect(reconnect.packets.some((p) => p.command === A_CNXN)).toBe(false);
+  });
+
   it('drops the cached banner when the device goes offline', async () => {
     const banner = holdableBanner();
     const h = await setup({ wrapBackend: banner.wrap });

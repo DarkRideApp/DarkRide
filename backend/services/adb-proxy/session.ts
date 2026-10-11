@@ -87,6 +87,8 @@ export interface BackendConnector {
 
 export type SessionEvent =
   | { kind: 'auth-failed' | 'authenticated' | 'pending' | 'blocked'; session: Session }
+  /** A stream told the device to restart; the session closes once its CLSE is flushed. */
+  | { kind: 'device-restarting'; session: Session }
   | { kind: 'refused-service'; session: Session; service: string }
   | { kind: 'closed'; session: Session; reason: string };
 
@@ -452,7 +454,10 @@ export class Session {
     if (!this.streams.delete(stream.localId)) return;
     this.destroyBackend(stream);
     const restarting = stream.restartsDevice && stream.backend !== null;
-    if (restarting) this.restarting = true;
+    if (restarting && !this.restarting) {
+      this.restarting = true;
+      this.emit({ kind: 'device-restarting', session: this });
+    }
     if (notify) this.send(A_CLSE, stream.localId, stream.remoteId, undefined, restarting ? () => this.close('device restarting') : undefined);
     else if (restarting) this.close('device restarting');
   }

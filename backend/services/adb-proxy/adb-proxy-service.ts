@@ -57,6 +57,7 @@ const SESSION_CAP_LOG_MS = 60_000;
 // Each banner fetch runs a shell on the phone, so a reconnect storm shares one.
 const BANNER_CACHE_MS = 5000;
 const LISTEN_FAILURE_LOG_MS = 5 * 60_000;
+const DEVICE_GONE_REASONS = new Set(['device restarting', 'device unavailable']);
 const short = (keyId: string) => keyId.slice(0, 12);
 // The service string comes from the client: keep printable ASCII only so it cannot forge or hide log lines.
 const printable = (text: string) => text.slice(0, REFUSAL_LOG_LENGTH).replace(/[^\x20-\x7e]/g, '?');
@@ -668,7 +669,12 @@ export class AdbProxyService {
       case 'refused-service':
         this.refusalLog.log('refused service', `session ${e.session.id} refused service "${printable(e.service)}" ${who}`);
         return;
+      case 'device-restarting':
+        // A banner cached before the restart would let a reconnect through to a device that is not back yet.
+        this.banners.delete(e.session.deviceId);
+        return;
       case 'closed': {
+        if (DEVICE_GONE_REASONS.has(e.reason)) this.banners.delete(e.session.deviceId);
         if (this.capped.has(e.session)) break;
         // Anyone can open and drop connections, so only a session that authenticated gets a line of its own.
         const line = `session ${e.session.id} closed (${e.reason}) ${who}`;

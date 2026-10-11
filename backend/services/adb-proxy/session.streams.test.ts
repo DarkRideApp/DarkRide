@@ -427,6 +427,9 @@ describe('Session streams', () => {
         expect(await h.client.waitClosed()).toBe(true);
         expect(h.client.packets.some((p) => p.command === A_CLSE && p.arg0 === localId && p.arg1 === 1)).toBe(true);
         expect(closeReasons(h)).toEqual(['device restarting']);
+        const kinds = h.events.map((e) => e.kind);
+        expect(kinds.indexOf('device-restarting')).toBeGreaterThan(-1);
+        expect(kinds.indexOf('device-restarting')).toBeLessThan(kinds.indexOf('closed'));
         if (service === 'root:') expect(output.toString()).toBe('restarting adbd as root\n');
       },
     );

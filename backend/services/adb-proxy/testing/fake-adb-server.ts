@@ -165,7 +165,8 @@ export class FakeAdbServer {
     const features = /^host-serial:(.+):features$/.exec(request);
     if (features) {
       const d = this.devices.get(features[1]);
-      return d ? reply(d.features) : fail(`device '${features[1]}' not found`);
+      if (!d) return fail(`device '${features[1]}' not found`);
+      return d.online ? reply(d.features) : fail('device offline');
     }
     const transport = /^host:transport:(.+)$/.exec(request);
     if (transport) {
