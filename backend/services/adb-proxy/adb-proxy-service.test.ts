@@ -247,6 +247,22 @@ describe('AdbProxyService approval flow', () => {
     expect(snap.connections.filter((c) => c.state === 'ready')).toHaveLength(2);
   });
 
+  it('names a connection after its stored key when the client proved itself by signature, and leaves a keyless one unnamed', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey('ci@runner');
+    await approveKey(h, key);
+    await vi.waitFor(() => expect(h.service.snapshot().connections).toEqual([]));
+
+    const returning = await h.connect();
+    expect((await returning.authenticate(key)).command).toBe(A_CNXN);
+    await h.connect();
+    await vi.waitFor(() => expect(h.service.snapshot().connections).toHaveLength(2));
+
+    const { connections } = h.service.snapshot();
+    expect(connections.find((c) => c.state === 'ready')).toMatchObject({ keyId: key.keyId, comment: 'ci@runner' });
+    expect(connections.find((c) => c.keyId === null)).toMatchObject({ comment: null });
+  });
+
   it('denies a request, closes the client, and then ignores the key without a new request', async () => {
     const h = await setup();
     const key = makeTestAdbKey();

@@ -3,7 +3,7 @@ import { ConfirmDialog, EmptyState, LoadingSpinner, useAuthOptional, useDocument
 import { AccessDenied } from '../../components/auth/AccessDenied';
 import { FieldRow, SaveButton, SectionCard, SectionHeading } from '../../components/settings/SettingsShared';
 import { useAdbProxyStatus } from '../../hooks/useAdbProxyStatus';
-import type { ConnectionView, DeviceProxyState, DeviceStatusView, KeyView, PendingView } from '../../../shared/types/adb-proxy';
+import type { DeviceProxyState, DeviceStatusView, KeyView, PendingView } from '../../../shared/types/adb-proxy';
 
 const API_ERRORS = new Map<string, string>([
   ['not-found', 'That item no longer exists. The list has been refreshed.'],
@@ -35,6 +35,9 @@ const deviceEnabledTarget = (deviceId: string) => `device-enabled:${deviceId}`;
 
 // Values from the network can be long and unbroken, so they wrap instead of widening the table.
 const WRAP: React.CSSProperties = { overflowWrap: 'anywhere' };
+
+// On narrow screens a table keeps a minimum width inside a card that clips, so each card scrolls sideways instead.
+const SCROLL_X: React.CSSProperties = { overflowX: 'auto' };
 
 function ago(ms: number): string {
   const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
@@ -131,8 +134,6 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
   const blocked = (status?.keys ?? []).filter((k) => k.status !== 'approved');
   const live = (status?.connections ?? []).filter((c) => c.state === 'ready');
   const deviceName = (id: string) => status?.devices.find((d) => d.deviceId === id)?.name ?? id;
-  // A returning machine proves itself with a signature and never resends its name, so the stored key supplies it.
-  const connectionName = (c: ConnectionView) => c.comment || (status?.keys.find((k) => k.keyId === c.keyId)?.comment ?? null);
   const canCopy = !!navigator.clipboard?.writeText;
 
   const net = status && {
@@ -397,7 +398,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
           </SectionCard>
 
           <SectionHeading>Waiting for approval ({status.pending.length})</SectionHeading>
-          <div className="table-card" data-testid="adb-proxy-pending">
+          <div className="table-card" style={SCROLL_X} data-testid="adb-proxy-pending">
             {status.pending.length === 0 ? (
               <EmptyState message="No machines are waiting for approval." />
             ) : (
@@ -415,7 +416,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
           </p>
 
           <SectionHeading>Approved machines</SectionHeading>
-          <div className="table-card" data-testid="adb-proxy-approved">
+          <div className="table-card" style={SCROLL_X} data-testid="adb-proxy-approved">
             {approved.length === 0 ? (
               <EmptyState message="No machines have been approved yet." />
             ) : (
@@ -428,7 +429,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
           {blocked.length > 0 && (
             <details data-testid="adb-proxy-blocked" style={{ marginTop: 12 }}>
               <summary>Denied and revoked ({blocked.length})</summary>
-              <div className="table-card" style={{ marginTop: 8 }}>
+              <div className="table-card" style={{ ...SCROLL_X, marginTop: 8 }}>
                 <table className="data-table">
                   <thead><tr><th>Machine</th><th>Key fingerprint</th><th>State</th>{actionsHeader}</tr></thead>
                   <tbody>{blocked.map(renderBlocked)}</tbody>
@@ -440,7 +441,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
           <div style={{ marginTop: 24 }}>
             <SectionHeading>Devices</SectionHeading>
           </div>
-          <div className="table-card">
+          <div className="table-card" style={SCROLL_X}>
             {status.devices.length === 0 ? (
               <EmptyState message="No Android devices are attached." />
             ) : (
@@ -454,7 +455,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
           <div style={{ marginTop: 24 }}>
             <SectionHeading>Live connections</SectionHeading>
           </div>
-          <div className="table-card" data-testid="adb-proxy-connections">
+          <div className="table-card" style={SCROLL_X} data-testid="adb-proxy-connections">
             {live.length === 0 ? (
               <EmptyState message="No machines are connected." />
             ) : (
@@ -463,7 +464,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
                 <tbody>
                   {live.map((c) => (
                     <tr key={c.id}>
-                      <td style={WRAP}>{machine(connectionName(c))}</td>
+                      <td style={WRAP}>{machine(c.comment)}</td>
                       <td style={WRAP}>{c.peerIp}</td>
                       <td style={WRAP}>{deviceName(c.deviceId)}</td>
                       <td>{duration(c.since)}</td>

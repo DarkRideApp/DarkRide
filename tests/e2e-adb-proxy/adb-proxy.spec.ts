@@ -107,13 +107,27 @@ test.describe('ADB proxy', () => {
     await expect(page.getByTestId('adb-proxy-request')).toHaveCount(0);
   });
 
-  test('an admin can deny a request', async ({ page }) => {
+  // The pending budget is 3 new requests per address per minute and this spec uses all 3, so the narrow-screen check shares this one.
+  test('an admin can deny a request on a narrow screen, where the table scrolls sideways', async ({ page }) => {
     await loginAsAdmin(page);
+    await page.setViewportSize({ width: 600, height: 900 });
     await page.goto('/ui/settings/adb-proxy');
     const stranger = makeTestAdbKey('stranger@box');
     const waiting = await connect();
     await waiting.offerKey(stranger);
-    await page.getByTestId('adb-proxy-request').getByRole('button', { name: 'Deny' }).click();
+
+    const card = page.getByTestId('adb-proxy-pending');
+    await expect(card).toContainText('stranger@box');
+    await expect(card).toHaveCSS('overflow-x', 'auto');
+    await card.evaluate((el) => {
+      el.scrollLeft = el.scrollWidth;
+    });
+    const deny = card.getByRole('button', { name: 'Deny' });
+    const [button, bounds] = [await deny.boundingBox(), await card.boundingBox()];
+    expect(button!.x).toBeGreaterThanOrEqual(bounds!.x);
+    expect(button!.x + button!.width).toBeLessThanOrEqual(bounds!.x + bounds!.width);
+
+    await deny.click();
     expect(await waiting.waitClosed(5000)).toBe(true);
     await page.getByText(/Denied and revoked \(1\)/).click();
     await expect(page.getByTestId('adb-proxy-blocked')).toContainText('stranger@box');

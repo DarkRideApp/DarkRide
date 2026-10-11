@@ -170,6 +170,9 @@ export class AdbProxyService {
     const rows = this.ports.all();
     const ids = [...new Set<string>([...this.online, ...rows.map((r) => r.deviceId)])].sort();
     const names = this.deviceNames(ids);
+    const keys = this.listKeys();
+    // A client that proves a known key by signature never sends its name, so the stored key supplies it.
+    const keyNames = new Map(keys.map((k) => [k.keyId, k.comment]));
     return {
       enabled: this.settings.enabled,
       bindHost: this.settings.bindHost,
@@ -188,12 +191,15 @@ export class AdbProxyService {
           state: this.stateFor(id, row?.enabled, online),
         };
       }),
-      connections: [...this.sessions].map((s) => s.info()),
+      connections: [...this.sessions].map((s) => {
+        const info = s.info();
+        return { ...info, comment: info.comment ?? (info.keyId ? keyNames.get(info.keyId) ?? null : null) };
+      }),
       pending: this.pending.list().map((p) => ({
         requestId: p.requestId, keyId: p.keyId, fingerprint: p.fingerprint, comment: p.comment,
         deviceId: p.deviceId, peerIp: p.peerIp, createdAt: p.createdAt,
       })),
-      keys: this.listKeys(),
+      keys,
       counters: { ...this.counters },
     };
   }

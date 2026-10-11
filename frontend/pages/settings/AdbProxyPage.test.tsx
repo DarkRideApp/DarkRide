@@ -292,20 +292,34 @@ describe('AdbProxyPage', () => {
     expect(within(live).queryByText('10.0.0.8')).toBeNull();
   });
 
-  it('names a live connection after its stored key when the session did not carry a name', async () => {
+  it('shows the name a live connection carries and (no name) when it carries none, without looking the key up', async () => {
     mount({
       snapshot: snapshot({
         keys: [keyRow({ keyId: 'k1', comment: 'dev@laptop' })],
         connections: [
-          { id: 1, deviceId: 'DEV1', peerIp: '10.0.0.7', state: 'ready', keyId: 'k1', comment: null, since: Date.now() - 90_000, streams: 0 },
-          { id: 2, deviceId: 'DEV1', peerIp: '10.0.0.8', state: 'ready', keyId: 'unknown', comment: null, since: Date.now() - 90_000, streams: 0 },
+          { id: 1, deviceId: 'DEV1', peerIp: '10.0.0.7', state: 'ready', keyId: 'k2', comment: 'ci@runner', since: Date.now() - 90_000, streams: 0 },
+          { id: 2, deviceId: 'DEV1', peerIp: '10.0.0.8', state: 'ready', keyId: 'k1', comment: null, since: Date.now() - 90_000, streams: 0 },
         ],
       }),
     });
     const live = await screen.findByTestId('adb-proxy-connections');
     const rows = within(live).getAllByRole('row');
-    expect(within(rows[1]).getByText('dev@laptop')).toBeInTheDocument();
+    expect(within(rows[1]).getByText('ci@runner')).toBeInTheDocument();
     expect(within(rows[2]).getByText('(no name)')).toBeInTheDocument();
+  });
+
+  it('lets every table scroll sideways inside its card so no column is out of reach on a narrow screen', async () => {
+    mount({
+      snapshot: snapshot({
+        pending: [pendingReq()],
+        keys: [keyRow(), keyRow({ id: 2, keyId: 'k2', status: 'revoked' })],
+        connections: [{ id: 1, deviceId: 'DEV1', peerIp: '10.0.0.7', state: 'ready', keyId: 'k1', comment: 'dev@laptop', since: Date.now() - 90_000, streams: 0 }],
+      }),
+    });
+    await screen.findByTestId('adb-proxy-pending');
+    const tables = document.querySelectorAll('table');
+    expect(tables).toHaveLength(5);
+    for (const table of tables) expect(table.closest('.table-card')).toHaveStyle({ overflowX: 'auto' });
   });
 
   it('shows empty states', async () => {
