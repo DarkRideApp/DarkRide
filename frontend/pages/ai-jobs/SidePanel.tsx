@@ -272,7 +272,7 @@ function TriggerBody({ node, onSave, recentVersions, onRun, hookCatalog }: {
           onChange={(e) => {
             const v = e.target.value;
             if (v === '__custom__') { setForceCustom(true); onSave(node.id, { source: 'function', expandFn: '', eventName: undefined }); return; }
-            if (functionOptions.some(f => f.value === v)) { pickFunction(v); return; }
+            if (v === '' || functionOptions.some(f => f.value === v)) { pickFunction(v); return; }
             pickEvent(v);
           }}>
           <option value="">— choose —</option>

@@ -110,6 +110,16 @@ describe('SidePanel — last run status', () => {
   });
 });
 
+// Vitest's toEqual-based equality treats an explicit `undefined` value as equal to a missing
+// key — `{a: undefined}` and `{}` pass `toEqual`/`toHaveBeenCalledWith` against each other. A
+// bare `{ eventName: undefined }` expectation can't tell "explicitly cleared" from "never sent",
+// so a test that must prove a field was actually cleared checks key presence directly.
+function expectKeyExplicitlyUndefined(onSave: ReturnType<typeof vi.fn>, key: string) {
+  const patch = onSave.mock.calls.at(-1)![1] as Record<string, unknown>;
+  expect(key in patch).toBe(true);
+  expect(patch[key]).toBeUndefined();
+}
+
 describe('SidePanel — Trigger', () => {
   const triggerNode = {
     id: 'trigger-full',
@@ -128,6 +138,7 @@ describe('SidePanel — Trigger', () => {
     render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
     fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: '__custom__' } });
     expect(onSave).toHaveBeenCalledWith('trigger-full', { source: 'function', expandFn: '', eventName: undefined });
+    expectKeyExplicitlyUndefined(onSave, 'eventName');
   });
 
   // Regression guard for the bug Cube hit live: a brand-new Trigger picking a known function from
@@ -154,6 +165,7 @@ describe('SidePanel — Trigger', () => {
         { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
       ],
     });
+    expectKeyExplicitlyUndefined(onSave, 'eventName');
   });
 
   it('switching from one known function to another overwrites the stale schema from the previous one', () => {
@@ -178,6 +190,7 @@ describe('SidePanel — Trigger', () => {
     expect(customInput).toHaveValue('my-plugin/my-trigger');
     fireEvent.change(customInput, { target: { value: 'my-plugin/other-trigger' } });
     expect(onSave).toHaveBeenCalledWith('trigger-full', { source: 'function', expandFn: 'my-plugin/other-trigger', eventName: undefined });
+    expectKeyExplicitlyUndefined(onSave, 'eventName');
   });
 
   it('adds a new output schema field, defaulting its type to string', () => {
@@ -270,6 +283,8 @@ describe('SidePanel — Trigger', () => {
       source: 'event', eventName: 'apk:analyzed', expandFn: undefined, inputSchema: undefined,
       outputSchema: [{ field: 'apkVersionId', type: 'number', description: 'x' }],
     });
+    expectKeyExplicitlyUndefined(onSave, 'expandFn');
+    expectKeyExplicitlyUndefined(onSave, 'inputSchema');
   });
 
   it('an event-sourced Trigger shows "fires automatically" and no Run button', () => {
@@ -285,6 +300,18 @@ describe('SidePanel — Trigger', () => {
     render(<SidePanel node={eventNode} graph={{ nodes: [eventNode], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} hookCatalog={[]} />);
     fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: 'apk-analysis/apk-context' } });
     expect(onSave).toHaveBeenCalledWith('trigger-full', expect.objectContaining({ source: 'function', eventName: undefined }));
+    expectKeyExplicitlyUndefined(onSave, 'eventName');
+  });
+
+  // Regression guard: "— choose —" (value '') is neither '__custom__' nor a known function/event
+  // value, so the combined picker's onChange must route it to pickFunction, not fall through to
+  // pickEvent (which does `hookCatalog.find(...)!.name` and throws on an empty value).
+  it('selecting "— choose —" after a function was selected clears it without throwing', () => {
+    const onSave = vi.fn();
+    render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} hookCatalog={[]} />);
+    expect(() => fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: '' } })).not.toThrow();
+    expect(onSave).toHaveBeenCalledWith('trigger-full', { source: 'function', expandFn: '', eventName: undefined });
+    expectKeyExplicitlyUndefined(onSave, 'eventName');
   });
 });
 

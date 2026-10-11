@@ -104,7 +104,7 @@ import { registerNotificationEndpoints } from './api/notifications';
 import { JobRegistry } from './services/job-registry';
 import { registerJobEndpoints } from './api/jobs';
 import { registerAiPipelineEndpoints } from './api/ai-pipelines';
-import { APK_ANALYZER_AI_SCOPES, buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, seedApkAnalysisPipeline } from './services/ai-jobs/apk-analysis-pipeline';
+import { APK_ANALYZER_AI_SCOPES, buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, apkVersionIdFromEventPayload, seedApkAnalysisPipeline } from './services/ai-jobs/apk-analysis-pipeline';
 import { HookTriggerDispatcher } from './services/ai-jobs/hook-trigger-dispatcher';
 import { isPipelinesEnabled, resetRunningPipelineRuns } from './services/ai-jobs/run-executor';
 import { PluginManager } from './plugins/plugin-manager';
@@ -848,7 +848,7 @@ const hookTriggerDispatcher = new HookTriggerDispatcher({
   // An event payload has no "identity" the way a manual run does — every event-fired run
   // executes as the apk-analyzer core-service identity, same as apk-analyzer.ts's own existing
   // auto-trigger path does today (buildApkAnalysisExecutionCtx's `identity` param).
-  buildCtx: (payload) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity: { type: 'core-service' }, versionId: payload.apkVersionId as number }),
+  buildCtx: (payload) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity: { type: 'core-service' }, versionId: apkVersionIdFromEventPayload(payload) }),
 });
 
 registerAiPipelineEndpoints({

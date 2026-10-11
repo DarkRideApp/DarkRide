@@ -123,6 +123,23 @@ export function buildApkAnalysisExecutors(): NodeExecutors {
   };
 }
 
+/**
+ * Maps an arbitrary HookBus event payload to this job kind's required `versionId` — used only by
+ * HookTriggerDispatcher's event-sourced buildCtx (backend/index.ts), never by the manual REST
+ * /run path (which reads a Trigger's own declared inputSchema and is expected to let an absent
+ * versionId flow through to the Trigger's own expand function for a more specific, node-
+ * attributed error). `apk:analyzed`'s payload has `apkVersionId`; `apk:version-detected`'s does
+ * not (it has `trackedAppId` — see Task 1's declared schema) — picking that event as a Trigger's
+ * source must fail loudly here, not silently build a ctx with contextId "undefined".
+ */
+export function apkVersionIdFromEventPayload(payload: Record<string, unknown>): number {
+  const value = payload.apkVersionId;
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    throw new Error(`This event's payload requires a numeric apkVersionId to drive the apk-analysis job kind, got ${JSON.stringify(payload)}`);
+  }
+  return value;
+}
+
 export function buildApkAnalysisExecutionCtx(
   deps: { db: AppDatabase; aiFactory: AiAgentFactory; identity: ApkAnalysisIdentity; versionId: number },
 ): ExecutionCtx {

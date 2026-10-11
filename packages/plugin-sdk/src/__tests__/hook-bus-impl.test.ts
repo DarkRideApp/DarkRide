@@ -45,4 +45,37 @@ describe('HookBusImpl.define / getDefinedHooks', () => {
     bus.emit('apk:analyzed', { apkVersionId: 42 });
     expect(handler).toHaveBeenCalledWith({ apkVersionId: 42 });
   });
+
+  // Regression guard: real, already-compiled plugins (darkride-plugin-maps, -couchbase-tpw,
+  // -mdesync, -attractions-io) call define() with the pre-existing documented signature —
+  // define(name, Record<string,string>) or define(name) with no schema at all. Plugins run
+  // in-process against this host's live HookBusImpl, so what matters is the arguments their
+  // already-shipped JS actually passes at runtime, not what SDK version they were built
+  // against. A caller on the old shape must normalize safely, not corrupt getDefinedHooks()
+  // into a non-array schema that crashes the editor's SchemaFieldListEditor (fields.map).
+  it('normalizes a legacy Record<string,string> schema into SchemaField[], with an empty per-field description', () => {
+    const bus = new HookBusImpl();
+    (bus.define as any)('maps:tile-downloaded', { versionId: 'number' });
+    expect(bus.getDefinedHooks()).toEqual([
+      { name: 'maps:tile-downloaded', schema: [{ field: 'versionId', type: 'number', description: '' }], description: '' },
+    ]);
+  });
+
+  it('normalizes a legacy call with no schema at all into an empty array', () => {
+    const bus = new HookBusImpl();
+    (bus.define as any)('my-plugin:item-created');
+    expect(bus.getDefinedHooks()).toEqual([
+      { name: 'my-plugin:item-created', schema: [], description: '' },
+    ]);
+  });
+
+  it('a legacy multi-field Record preserves every field, in declaration order', () => {
+    const bus = new HookBusImpl();
+    (bus.define as any)('mdesync:reconcile-complete', { ruleId: 'number', missing: 'number', stale: 'number' });
+    expect(bus.getDefinedHooks()[0].schema).toEqual([
+      { field: 'ruleId', type: 'number', description: '' },
+      { field: 'missing', type: 'number', description: '' },
+      { field: 'stale', type: 'number', description: '' },
+    ]);
+  });
 });

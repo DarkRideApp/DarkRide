@@ -12,6 +12,7 @@ import {
   ASTERIX_PATTERN_GRAPH,
   buildApkAnalysisExecutors,
   buildApkAnalysisExecutionCtx,
+  apkVersionIdFromEventPayload,
   seedApkAnalysisPipeline,
 } from './apk-analysis-pipeline';
 import { TRIGGER_SCHEMAS } from './nodes/trigger';
@@ -145,6 +146,31 @@ describe('ASTERIX_PATTERN_GRAPH', () => {
 
     expect(forCoreService).toHaveBeenCalledTimes(2); // not once, reused — once per node
     expect(forCoreService).toHaveBeenCalledWith('apk-analyzer', { tier: 'High' });
+  });
+});
+
+describe('apkVersionIdFromEventPayload', () => {
+  // Regression guard from the final review's I2: HookTriggerDispatcher's buildCtx (backend/
+  // index.ts) builds this job kind's ctx from an arbitrary event's payload, cast `as number`.
+  // apk:version-detected's real payload has trackedAppId, not apkVersionId (see Task 1's
+  // declared schema) — without this guard, picking that event as a Trigger's source silently
+  // builds a ctx with contextId "undefined" and every Sink write targets a bogus version row.
+  // Scoped to the dispatcher's own payload-to-versionId mapping, not buildApkAnalysisExecutionCtx
+  // itself — that function is also used by the manual REST /run path, where an absent versionId
+  // is expected to flow through and fail later with a more specific, node-attributed error from
+  // the Trigger's own expand function (see apk-analysis-pipeline e2e "failing run" test).
+  it('returns apkVersionId when the payload actually has one (apk:analyzed)', () => {
+    expect(apkVersionIdFromEventPayload({ apkVersionId: 42, packageName: 'x' })).toBe(42);
+  });
+
+  it('throws when the payload has no apkVersionId at all (apk:version-detected)', () => {
+    expect(() => apkVersionIdFromEventPayload({ trackedAppId: 1, packageName: 'x' }))
+      .toThrow(/requires a numeric apkVersionId/);
+  });
+
+  it('throws when apkVersionId is present but not a number', () => {
+    expect(() => apkVersionIdFromEventPayload({ apkVersionId: 'not-a-number' }))
+      .toThrow(/requires a numeric apkVersionId/);
   });
 });
 
