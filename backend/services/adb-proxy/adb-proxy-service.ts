@@ -254,7 +254,7 @@ export class AdbProxyService {
     return this.serialised(async () => {
       const known = this.deps.db.select({ id: devices.id }).from(devices).where(eq(devices.id, deviceId)).get();
       if (!known) return { ok: false, error: 'unknown-device' } as const;
-      const row = this.ports.ensure(deviceId);
+      const row = await this.ensureRow(deviceId);
       if ('error' in row) return { ok: false, error: 'range-full' } as const;
       try {
         if (patch.port !== undefined && patch.port !== row.port) {
@@ -401,9 +401,21 @@ export class AdbProxyService {
     return run;
   }
 
+  /** The device's port row; when the range is full, the port of the stalest offline device is taken back first. */
+  private async ensureRow(deviceId: string): Promise<ReturnType<PortAllocator['ensure']>> {
+    const row = this.ports.ensure(deviceId);
+    if (!('error' in row)) return row;
+    const reclaimed = this.ports.reclaimStalest(new Set(this.online));
+    if (!reclaimed) return row;
+    log(`gave port ${reclaimed.port} of offline device ${reclaimed.deviceId} to ${deviceId}: the port range is full`);
+    // Its listener outlives the device going offline and would still hold the port.
+    await this.stopDevice(reclaimed.deviceId);
+    return this.ports.ensure(deviceId);
+  }
+
   private async listenFor(deviceId: string): Promise<void> {
     try {
-      const row = this.ports.ensure(deviceId);
+      const row = await this.ensureRow(deviceId);
       if ('error' in row) {
         this.deviceErrors.set(deviceId, 'range-full');
         return;
@@ -534,7 +546,7 @@ export class AdbProxyService {
 
   private starvedDevices(): string[] {
     const stuck = [...this.online].filter((id) => this.deviceErrors.get(id) === 'range-full');
-    return stuck.length > 0 && this.ports.hasFree() ? stuck : [];
+    return stuck.length > 0 && (this.ports.hasFree() || this.ports.hasReclaimable(this.online)) ? stuck : [];
   }
 
   /** Concurrent fetches for one serial share a promise; a success is kept for a few seconds, a failure is not kept. */

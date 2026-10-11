@@ -114,6 +114,65 @@ describe('PortAllocator', () => {
     expect(ctx.alloc.setEnabled('NOPE', false)).toBeUndefined();
   });
 
+  describe('reclaimStalest', () => {
+    const at = (iso: string) => new Date(iso);
+
+    function timed(range = { start: 6500, end: 6501 }) {
+      const db = createTestDb([deviceInstances, devices, adbProxyDevices], { foreignKeys: true });
+      for (const id of ['A', 'B', 'C', 'D']) db.insert(devices).values({ id }).run();
+      const clock = { now: at('2026-10-01T00:00:00Z') };
+      return { db, clock, alloc: new PortAllocator(db, () => range, () => clock.now) };
+    }
+
+    it('frees the port of the oldest row whose device is not kept, so a third device gets it', () => {
+      const { alloc, clock } = timed();
+      alloc.ensure('A');
+      clock.now = at('2026-10-02T00:00:00Z');
+      alloc.ensure('B');
+      expect(alloc.ensure('C')).toEqual({ error: 'range-full' });
+
+      expect(alloc.reclaimStalest(new Set(['C']))).toMatchObject({ deviceId: 'A', port: 6500 });
+
+      expect(alloc.get('A')).toBeUndefined();
+      expect(alloc.ensure('C')).toMatchObject({ deviceId: 'C', port: 6500 });
+    });
+
+    it('never reclaims a kept device, and frees nothing when every row is kept', () => {
+      const { alloc, clock } = timed();
+      alloc.ensure('A');
+      clock.now = at('2026-10-02T00:00:00Z');
+      alloc.ensure('B');
+      expect(alloc.reclaimStalest(new Set(['A']))).toMatchObject({ deviceId: 'B' });
+      alloc.ensure('C');
+      expect(alloc.reclaimStalest(new Set(['A', 'C']))).toBeUndefined();
+      expect(alloc.all().map((r) => r.deviceId).sort()).toEqual(['A', 'C']);
+      expect(alloc.ensure('D')).toEqual({ error: 'range-full' });
+    });
+
+    it('leaves a device someone disabled, and a row whose port is outside the range, alone', () => {
+      const { alloc, clock, db } = timed();
+      alloc.ensure('A');
+      alloc.setEnabled('A', false);
+      clock.now = at('2026-10-02T00:00:00Z');
+      alloc.ensure('B');
+      db.insert(adbProxyDevices).values({ deviceId: 'C', port: 7000, enabled: true, createdAt: at('2026-09-01T00:00:00Z') }).run();
+      expect(alloc.hasReclaimable(new Set())).toBe(true);
+      expect(alloc.reclaimStalest(new Set())).toMatchObject({ deviceId: 'B' });
+      expect(alloc.hasReclaimable(new Set())).toBe(false);
+      expect(alloc.reclaimStalest(new Set())).toBeUndefined();
+    });
+
+    it('gives a reclaimed device a new row when it comes back', () => {
+      const { alloc, clock } = timed();
+      alloc.ensure('A');
+      clock.now = at('2026-10-02T00:00:00Z');
+      alloc.ensure('B');
+      alloc.reclaimStalest(new Set());
+      clock.now = at('2026-10-03T00:00:00Z');
+      expect(alloc.ensure('A')).toMatchObject({ deviceId: 'A', port: 6500, createdAt: at('2026-10-03T00:00:00Z') });
+    });
+  });
+
   it('lists every row', () => {
     ctx.alloc.ensure('A'); ctx.alloc.ensure('B');
     expect(ctx.alloc.all().map((r) => r.deviceId)).toEqual(['A', 'B']);

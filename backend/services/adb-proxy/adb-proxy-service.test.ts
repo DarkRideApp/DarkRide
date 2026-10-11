@@ -630,9 +630,10 @@ describe('AdbProxyService device presence reconciliation', () => {
   });
 
   it('gives a device that found the range full a port once a stale device is forgotten', async () => {
+    // Disabled, so the full range does not simply take its port back.
     const h = await setup({
       online: ['DEV2'], portCount: 1, reconcileMs: 20,
-      seed: (db, base) => db.insert(adbProxyDevices).values({ deviceId: 'DEV1', port: base, enabled: true, createdAt: new Date() }).run(),
+      seed: (db, base) => db.insert(adbProxyDevices).values({ deviceId: 'DEV1', port: base, enabled: false, createdAt: new Date() }).run(),
     });
     expect(stateOf(h, 'DEV2')).toBe('range-full');
 
@@ -646,20 +647,22 @@ describe('AdbProxyService device presence reconciliation', () => {
     expect(await client.waitClosed(100)).toBe(false);
   });
 
-  it('releases the port of a device that went offline and was then forgotten, so a waiting device can use it', async () => {
-    const h = await setup({ portCount: 1, reconcileMs: 20 });
+  it('releases the port of a device that went offline and was then forgotten, so the next device can use it', async () => {
+    const h = await setup({ portCount: 1, reconcileMs: 20, online: ['DEV1'] });
     expect(stateOf(h, 'DEV1')).toBe('listening');
-    expect(stateOf(h, 'DEV2')).toBe('range-full');
     h.directory.online.delete('DEV1');
     await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('device-offline'), { timeout: 3000 });
 
     h.db.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, 'DEV1')).run();
 
+    await vi.waitFor(() => expectPortFree(h.base), { timeout: 3000 });
+    h.directory.goOnline('DEV2');
     await vi.waitFor(
       () => expect(h.service.snapshot().devices.find((d) => d.deviceId === 'DEV2')).toMatchObject({ state: 'listening', port: h.base }),
       { timeout: 3000 },
     );
     expect(h.service.snapshot().devices.map((d) => d.deviceId)).toEqual(['DEV2']);
+    expect(logged().filter((line) => line.includes('the port range is full'))).toEqual([]);
   });
 
   it('stays quiet while the range is still full: no log line, no broadcast, no state change per tick', async () => {
@@ -762,6 +765,58 @@ describe('AdbProxyService device presence reconciliation', () => {
     expect(polled).not.toHaveBeenCalled();
     expect(h.service.snapshot().devices.map((d) => d.deviceId)).toEqual(['DEV1']);
     expect(h.db.select().from(adbProxyDevices).all().map((r) => r.deviceId)).toEqual(['DEV1']);
+  });
+});
+
+describe('AdbProxyService full port range', () => {
+  const rowOf = (h: Harness, id: string) => h.db.select().from(adbProxyDevices).where(eq(adbProxyDevices.deviceId, id)).get();
+  const reclaimLines = () => logged().filter((line) => line.includes('the port range is full'));
+
+  it('gives a new device the port of the stalest offline device, and the reclaimed device a new row when it returns', async () => {
+    const h = await setup({ portCount: 2, extraDevices: ['DEV3'], online: ['DEV1', 'DEV2'] });
+    const first = h.portOf('DEV1');
+    h.directory.goOffline('DEV1');
+
+    h.directory.goOnline('DEV3');
+
+    await vi.waitFor(() => expect(h.service.snapshot().devices.find((d) => d.deviceId === 'DEV3')).toMatchObject({ state: 'listening', port: first }));
+    expect(rowOf(h, 'DEV1')).toBeUndefined();
+    expect(reclaimLines()).toHaveLength(1);
+    expect(reclaimLines()[0]).toContain('DEV1');
+    expect(stateOf(h, 'DEV2')).toBe('listening');
+
+    h.directory.goOffline('DEV2');
+    h.directory.goOnline('DEV1');
+
+    await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('listening'));
+    expect(rowOf(h, 'DEV1')).toMatchObject({ port: h.base + 1 });
+    expect(rowOf(h, 'DEV2')).toBeUndefined();
+  });
+
+  it('never takes the port of an online device: with every row online the range stays full', async () => {
+    const h = await setup({ portCount: 2, extraDevices: ['DEV3'] });
+    expect(stateOf(h, 'DEV3')).toBe('range-full');
+    expect(rowOf(h, 'DEV1')).toBeDefined();
+    expect(rowOf(h, 'DEV2')).toBeDefined();
+    expect(reclaimLines()).toEqual([]);
+  });
+
+  it('gives a device waiting on a full range the port of a device that goes offline later', async () => {
+    const h = await setup({ portCount: 1, reconcileMs: 20 });
+    expect(stateOf(h, 'DEV2')).toBe('range-full');
+
+    h.directory.goOffline('DEV1');
+
+    await vi.waitFor(() => expect(h.service.snapshot().devices.find((d) => d.deviceId === 'DEV2')).toMatchObject({ state: 'listening', port: h.base }), { timeout: 3000 });
+    expect(rowOf(h, 'DEV1')).toBeUndefined();
+  });
+
+  it('answers range-full from setDevice only when nothing can be reclaimed', async () => {
+    const h = await setup({ portCount: 1, online: ['DEV1'] });
+    expect(await h.service.setDevice('DEV2', { enabled: true })).toEqual({ ok: false, error: 'range-full' });
+    h.directory.goOffline('DEV1');
+    expect(await h.service.setDevice('DEV2', { enabled: true })).toEqual({ ok: true });
+    expect(rowOf(h, 'DEV2')).toMatchObject({ port: h.base });
   });
 });
 
