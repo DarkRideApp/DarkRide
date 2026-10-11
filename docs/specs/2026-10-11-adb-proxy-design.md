@@ -102,7 +102,7 @@ A small adapter (`device-directory.ts`) implements it over `DeviceManager`, whic
 2. If the device is not online, the proxy closes the socket. It never sends a banner it cannot back, because a client reads the banner as "this device is usable".
 3. Proxy sends `AUTH` type TOKEN with 20 bytes from `crypto.randomBytes`.
 4. Client answers `AUTH` type SIGNATURE. The proxy tries each approved key whose allow-list includes this device. A match means `CNXN` back (banner below). No match means a fresh TOKEN, up to 3 attempts.
-5. Client then sends `AUTH` type RSAPUBLICKEY (base64 key blob plus `user@host`). The proxy:
+5. Client then sends `AUTH` type RSAPUBLICKEY (base64 key blob plus `user@host`). A public key is not secret, so the proxy first checks that one of the signatures this client already sent on this connection verifies, over the token the proxy issued for it, under the offered key. If none does, it closes without creating anything and without asking the gate. Real clients sign first and offer the key second, so this costs them nothing. Then the proxy:
    - key is denied or revoked: close, no new request;
    - key is unknown: create or refresh an in-memory pending request and **hold the connection**. The client keeps `unauthorized`, as it does for a phone waiting on its dialog;
    - on approve, send `CNXN` on the held connection; on deny, timeout or disconnect, close.
@@ -128,6 +128,7 @@ Everything else passes through, including `root:`, `remount:` and `reboot:`. App
 ## Security model
 
 - **Off by default.** `adb_proxy.enabled` is false; nothing listens. Then a per-device toggle (default on). Bind address and port range are settings.
+- **Possession is proven before anything is created.** Presenting a public key, even an approved one, never authenticates a connection and never creates or replaces a pending request; only a signature over this connection's token does. Without this, anyone on the LAN who copied an approved key's public blob from the wire or from a file would be let in, and could take over another machine's waiting request.
 - **Identity** is the client's ADB key: `key_id` is SHA-256 over the decoded key blob. The display fingerprint is MD5 over the same bytes as uppercase colon-separated hex, matching what Android's USB-debugging dialog shows so a human can compare.
 - **Pre-auth surface** is deliberately tiny: fixed 24-byte headers, a 4 KiB payload cap before auth, at most 8 unauthenticated sockets per IP and 64 total, a 10 second budget from accept to a decided handshake (held pending connections are exempt, see below), no parsing of anything past the header until the magic checks out. Every socket handler is wrapped so an exception closes that socket and never reaches the process.
 - **Verification cost.** The SIGNATURE reply names no key, so the proxy tries each approved key. Parsed keys are cached in memory; attempts are capped at 3 per connection; the per-IP connection and pending-rate limits bound the rest.
@@ -284,3 +285,4 @@ Made on 2026-10-11 while grounding the implementation plan in the code. None cha
 - **Components** gained `pending.ts`, `auth-gate.ts`, `limits.ts`, `settings.ts` and `device-directory.ts`, and `listener.ts` shrank to a thin socket wrapper, so each unit has one job. `DeviceManager` gains `getOnlineDeviceIds()` and `onDeviceOnline()`.
 - **E2E** runs under its own Playwright config with a fake ADB server, and the conformance lane runs once per client in `ADB_BINS`.
 - **Risk 5** added: the real client's patience with a long-held `unauthorized` transport is unverified.
+- **Security fix: possession of the offered key is proven first.** Found by the Task 8 review while the session code was still only a plan. The first draft passed any offered public key to the gate, and an already-approved key went straight to `CNXN`, so a copied public blob was enough to connect. The session now keeps the signatures a client sends and requires one to verify under the offered key before the gate is asked.

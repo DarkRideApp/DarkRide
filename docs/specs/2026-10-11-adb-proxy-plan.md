@@ -20,6 +20,7 @@ Every task's requirements include this section. Values are copied from the spec.
 - **Pre-auth limits:** at most 8 unauthenticated sockets per IP and 64 in total; 10 s from accept to a decided handshake (a held pending connection is exempt).
 - **Pending requests:** memory only, never written to the DB; at most 20 in total; at most 3 new per IP per minute; a repeat attempt for the same (key, device) replaces the older one and does not use the rate budget; held for at most 5 minutes.
 - **Keys:** only 2048-bit adb keys (524-byte blob, 64 words, exponent 65537). Identity (`key_id`) is the SHA-256 hex of the decoded blob. Display fingerprint is MD5 of the same bytes, uppercase hex pairs separated by colons. The key comment is capped at 128 characters with control characters stripped.
+- **Possession:** a key offer (AUTH RSAPUBLICKEY) is only honoured when one signature this connection already sent verifies, over a token this connection was issued, under the offered key. A public key alone never authenticates, never creates a pending request and never replaces one.
 - **Refused services** (reply `CLSE`): anything starting with `host`, `reverse:`, `tcpip:`, `usb:`.
 - **Scopes:** `core.adb-proxy:read` (view) and `core.adb-proxy:manage` (approve, deny, revoke, change settings), category `Devices`.
 - **Android only.** iOS devices are never proxied.
@@ -2877,7 +2878,7 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
   - `type SessionEvent = { kind: 'auth-failed' | 'authenticated' | 'pending' | 'blocked'; session: Session } | { kind: 'refused-service'; session: Session; service: string } | { kind: 'closed'; session: Session; reason: string }`
   - `interface SessionOptions { socket: net.Socket; deviceId: string; peerIp: string; gate: AuthGate; backend: BackendConnector; isDeviceOnline(): boolean; onEvent?(e: SessionEvent): void; onClose?(s: Session): void; onLeavePreAuth?(): void; preAuthTimeoutMs?: number }`
   - `class Session { readonly id: number; readonly createdAt: number; readonly deviceId: string; readonly peerIp: string; state: SessionState; keyId: string | null; keyComment: string | null; get isClosed(): boolean; destroy(reason: string): void }`
-- Produces (test support): `WireClient` (`static connect(port)`, `send(command, arg0, arg1, data?)`, `next(timeoutMs?)`, `waitFor(predicate, timeoutMs?)`, `waitClosed(timeoutMs?)`, `quiet(ms?)`, `authenticate(key)`, `offerKey(key)`, `openRaw(service, remoteId)`, `open(service, remoteId)`, `collectStream(remoteId, localId, until)`, `close()`, `readonly packets`), `startSessionServer(make)` returning `{ port, sessions, sockets, close() }`, and `StubGate`.
+- Produces (test support): `WireClient` (`static connect(port)`, `send(command, arg0, arg1, data?)`, `next(timeoutMs?)`, `waitFor(predicate, timeoutMs?)`, `waitClosed(timeoutMs?)`, `quiet(ms?)`, `authenticate(key)`, `offerKey(key)`, `offerKeyWithoutProof(key)`, `openRaw(service, remoteId)`, `open(service, remoteId)`, `collectStream(remoteId, localId, until)`, `close()`, `readonly packets`), `startSessionServer(make)` returning `{ port, sessions, sockets, close() }`, and `StubGate`.
 
 - [ ] **Step 1: Write the test support**
 
@@ -2996,8 +2997,19 @@ export class WireClient {
     return this.next();
   }
 
-  /** CNXN, one signature no approved key can match, then offer the public key. */
+  /** CNXN, a signature over the token made with `key` (a real client signs first), then offer the public key. */
   async offerKey(key: TestAdbKey): Promise<void> {
+    this.sendHostCnxn();
+    const token = await this.next();
+    if (token.command !== A_AUTH || token.arg0 !== AUTH_TOKEN) throw new Error('expected an AUTH token');
+    this.send(A_AUTH, AUTH_SIGNATURE, 0, key.sign(token.data));
+    const again = await this.next();
+    if (again.command !== A_AUTH || again.arg0 !== AUTH_TOKEN) throw new Error('expected a second AUTH token');
+    this.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, key.publicKeyText);
+  }
+
+  /** Like offerKey, but the signature is garbage: this client cannot show it holds the private key. */
+  async offerKeyWithoutProof(key: TestAdbKey): Promise<void> {
     this.sendHostCnxn();
     const token = await this.next();
     if (token.command !== A_AUTH || token.arg0 !== AUTH_TOKEN) throw new Error('expected an AUTH token');
@@ -3241,6 +3253,68 @@ describe('Session handshake', () => {
     expect((await client.next()).command).toBe(A_CNXN);
   });
 
+  it('refuses an offered key the client never signed with, without asking the gate', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    await client.offerKeyWithoutProof(makeTestAdbKey());
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.gate.offers).toHaveLength(0);
+    expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+  });
+
+  it('does not let a copied approved public key through (no authentication by public key alone)', async () => {
+    const h = await setup();
+    h.gate.outcome = { kind: 'approved' };
+    const client = await h.connect();
+    await client.offerKeyWithoutProof(h.key);
+    expect(await client.waitClosed()).toBe(true);
+    expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    expect(h.gate.authenticatedCalls).toEqual([]);
+  });
+
+  it('refuses a key whose signature was made by a different key', async () => {
+    const h = await setup();
+    const offered = makeTestAdbKey();
+    const other = makeTestAdbKey();
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const token = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, other.sign(token.data));
+    await client.next();
+    client.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, offered.publicKeyText);
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.gate.offers).toHaveLength(0);
+  });
+
+  it('refuses a signature made over a token this connection never issued', async () => {
+    const h = await setup();
+    const offered = makeTestAdbKey();
+    const client = await h.connect();
+    client.sendHostCnxn();
+    await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, offered.sign(randomBytes(20)));
+    await client.next();
+    client.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, offered.publicKeyText);
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.gate.offers).toHaveLength(0);
+  });
+
+  it('accepts the offer when one of several signatures came from the offered key', async () => {
+    const h = await setup();
+    const offered = makeTestAdbKey();
+    const other = makeTestAdbKey();
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const first = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, other.sign(first.data));
+    const second = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, offered.sign(second.data));
+    await client.next();
+    client.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, offered.publicKeyText);
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    expect(h.gate.offers[0].keyId).toBe(offered.keyId);
+  });
+
   it('cancels the pending request when the client disconnects', async () => {
     const h = await setup();
     const cancel = vi.fn();
@@ -3424,6 +3498,7 @@ export class Session {
   private readonly parser = new PacketParser(PREAUTH_MAX_PAYLOAD);
   private token: Buffer | null = null;
   private signatureAttempts = 0;
+  private proofs: Array<{ token: Buffer; signature: Buffer }> = [];
   private preAuthTimer: NodeJS.Timeout | null;
   private cancelPending: (() => void) | null = null;
   private preAuthLeft = false;
@@ -3509,6 +3584,7 @@ export class Session {
         return;
       }
     }
+    this.proofs.push({ token, signature });
     this.emit({ kind: 'auth-failed', session: this });
     this.sendToken();
   }
@@ -3520,6 +3596,8 @@ export class Session {
     } catch {
       return this.close('bad public key');
     }
+    // A public key is not secret; only a signature over a token issued on this connection shows the client holds the private key.
+    if (!this.proofs.some((p) => verifyAuthSignature(parsed.key, p.token, p.signature))) return this.close('key not proven');
     this.keyId = parsed.keyId;
     this.keyComment = parsed.comment;
     const outcome = this.opts.gate.offer({ deviceId: this.deviceId, parsed, peerIp: this.peerIp });
@@ -3604,7 +3682,7 @@ export class Session {
 - [ ] **Step 5: Run it to verify it passes**
 
 Run: `npx vitest run backend/services/adb-proxy/session.handshake.test.ts`
-Expected: PASS, 17 tests.
+Expected: PASS, 22 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -4035,7 +4113,7 @@ interface Stream {
 - [ ] **Step 4: Run it to verify it passes**
 
 Run: `npx vitest run backend/services/adb-proxy/session.streams.test.ts backend/services/adb-proxy/session.handshake.test.ts`
-Expected: PASS (streams: 35 including the `it.each` cases; handshake 17).
+Expected: PASS (streams: 35 including the `it.each` cases; handshake 22).
 
 - [ ] **Step 5: Commit**
 
@@ -4983,6 +5061,38 @@ describe('AdbProxyService approval flow', () => {
     await requestApproval(h, makeTestAdbKey());
     expect(h.service.snapshot().counters.authFailures).toBe(1);
   });
+
+  it('creates no pending request for a key the client cannot prove it holds', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    await client.offerKeyWithoutProof(makeTestAdbKey('thief@elsewhere'));
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.service.snapshot().pending).toEqual([]);
+  });
+
+  it('refuses a stranger who copies an approved key public blob', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    await approveKey(h, key);
+    const stranger = await h.connect();
+    await stranger.offerKeyWithoutProof(key);
+    expect(await stranger.waitClosed()).toBe(true);
+    expect(stranger.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    expect(h.service.snapshot().connections.filter((c) => c.state === 'ready')).toHaveLength(0);
+  });
+
+  it('does not let a stranger take over a waiting request by presenting its public blob', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey('legit@runner');
+    const legit = await requestApproval(h, key);
+    const stranger = await h.connect();
+    await stranger.offerKeyWithoutProof(key);
+    expect(await stranger.waitClosed()).toBe(true);
+    const [req] = h.service.snapshot().pending;
+    expect(req.comment).toBe('legit@runner');
+    expect(h.service.approveRequest(req.requestId, 1)).toEqual({ ok: true });
+    expect((await legit.next()).command).toBe(A_CNXN);
+  });
 });
 
 describe('AdbProxyService device lifecycle', () => {
@@ -5598,7 +5708,7 @@ export class AdbProxyService {
 - [ ] **Step 5: Run it to verify it passes**
 
 Run: `npx vitest run backend/services/adb-proxy/adb-proxy-service.test.ts`
-Expected: PASS, 24 tests. If the flood-limit test is flaky on a slow machine, raise its two 100 ms sleeps, not the production limits.
+Expected: PASS, 27 tests. If the flood-limit test is flaky on a slow machine, raise its two 100 ms sleeps, not the production limits.
 
 - [ ] **Step 6: Run the whole module to catch cross-file breakage**
 
