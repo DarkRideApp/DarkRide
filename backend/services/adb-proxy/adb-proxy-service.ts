@@ -237,6 +237,7 @@ export class AdbProxyService {
       if (before.enabled && !after.enabled) {
         await this.stopAllDevices();
       } else if (!before.enabled && after.enabled) {
+        this.refreshOnline();
         await this.startAll();
       } else if (after.enabled && before.bindHost !== after.bindHost) {
         await this.stopAllDevices();
@@ -484,6 +485,8 @@ export class AdbProxyService {
   private deviceOnline(deviceId: string): Promise<void> {
     const known = this.online.has(deviceId);
     this.online.add(deviceId);
+    // While off the list is only kept for the page; nothing listens and nothing is broadcast.
+    if (!this.settings.enabled) return Promise.resolve();
     return this.serialised(async () => {
       await this.startDevice(deviceId);
       if (!known) this.notifyChanged();
@@ -495,11 +498,17 @@ export class AdbProxyService {
     this.banners.delete(deviceId);
     this.listenFailureLogs.delete(deviceId);
     this.closeSessions((s) => s.deviceId === deviceId, 'device offline');
-    this.notifyChanged();
+    if (this.settings.enabled) this.notifyChanged();
   }
 
+  /** Nothing runs while the proxy is off; turning it on rebuilds the online list once. */
   private reconcile(): void {
-    if (!this.started) return;
+    if (!this.started || !this.settings.enabled) return;
+    this.refreshOnline();
+    this.retryBlocked();
+  }
+
+  private refreshOnline(): void {
     let present: Set<string>;
     try {
       const own = this.ownEndpoints();
@@ -510,7 +519,6 @@ export class AdbProxyService {
     }
     for (const id of [...this.online]) if (!present.has(id)) this.deviceOffline(id);
     for (const id of present) if (!this.online.has(id)) void this.deviceOnline(id);
-    this.retryBlocked();
   }
 
   /** A tick with nothing to do schedules nothing; a retry that fails the same way again changes no state, so it broadcasts nothing. */

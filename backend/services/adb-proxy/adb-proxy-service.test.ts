@@ -769,6 +769,64 @@ describe('AdbProxyService device presence reconciliation', () => {
   });
 });
 
+describe('AdbProxyService while disabled', () => {
+  const watch = (h: Harness) => {
+    const listed = vi.spyOn(h.directory, 'listOnlineAndroid');
+    const queries = (['select', 'insert', 'update', 'delete'] as const).map((m) => vi.spyOn(h.db, m));
+    const before = h.broadcasts.length;
+    return {
+      listed: () => listed.mock.calls.length,
+      queries: () => queries.reduce((n, q) => n + q.mock.calls.length, 0),
+      broadcasts: () => h.broadcasts.length - before,
+      reset: () => { listed.mockClear(); queries.forEach((q) => q.mockClear()); },
+    };
+  };
+
+  it('does no work on the presence tick: no directory listing, no query, no broadcast', async () => {
+    const h = await setup({ enabled: false, reconcileMs: 10 });
+    await sleep(100);
+    const w = watch(h);
+
+    h.directory.online.add('DEV3');
+    h.directory.online.delete('DEV2');
+    await sleep(300);
+
+    expect({ listed: w.listed(), queries: w.queries(), broadcasts: w.broadcasts() }).toEqual({ listed: 0, queries: 0, broadcasts: 0 });
+  });
+
+  it('picks up the devices that came and went while it was off when it is turned on, and stops the work again when turned off', async () => {
+    const h = await setup({ enabled: false, reconcileMs: 10, online: ['DEV1'], extraDevices: ['DEV3'] });
+    h.directory.online.add('DEV3');
+    h.directory.online.delete('DEV1');
+    await sleep(100);
+
+    await h.service.updateSettings({ enabled: true });
+
+    expect(h.service.snapshot().devices.filter((d) => d.online).map((d) => [d.deviceId, d.state])).toEqual([['DEV3', 'listening']]);
+    await sleep(100);
+    await h.service.updateSettings({ enabled: false });
+    await sleep(100);
+    const w = watch(h);
+    h.directory.online.add('DEV2');
+    await sleep(300);
+    expect({ listed: w.listed(), queries: w.queries(), broadcasts: w.broadcasts() }).toEqual({ listed: 0, queries: 0, broadcasts: 0 });
+  });
+
+  it('broadcasts nothing for online and offline events while off, and still shows the devices', async () => {
+    const h = await setup({ enabled: false, online: ['DEV1'] });
+    await sleep(100);
+    const w = watch(h);
+
+    h.directory.goOnline('DEV2');
+    h.directory.goOffline('DEV1');
+    await sleep(150);
+
+    expect(w.broadcasts()).toBe(0);
+    expect(w.listed()).toBe(0);
+    expect(h.service.snapshot().devices.map((d) => [d.deviceId, d.online, d.state])).toEqual([['DEV2', true, 'off']]);
+  });
+});
+
 describe('AdbProxyService own endpoints and connect address', () => {
   it('never proxies a serial that names one of its own listeners, whether listed at start, announced, or found by the presence poll', async () => {
     let own: string[] = [];
