@@ -3123,7 +3123,7 @@ Create `backend/services/adb-proxy/session.handshake.test.ts`:
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { parseAdbPublicKey } from './adb-key';
-import { A_AUTH, A_CNXN, A_OPEN, A_VERSION, AUTH_SIGNATURE, AUTH_TOKEN, MAX_DATA, encodePacket } from './packet';
+import { A_AUTH, A_CNXN, A_OPEN, A_VERSION, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN, MAX_DATA, encodePacket } from './packet';
 import { Session, type SessionEvent } from './session';
 import { makeTestAdbKey } from './testing/test-keys';
 import { StubGate } from './testing/stub-gate';
