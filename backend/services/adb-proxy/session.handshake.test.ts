@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { parseAdbPublicKey } from './adb-key';
 import { A_AUTH, A_CNXN, A_OPEN, A_VERSION, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN, MAX_DATA, encodePacket } from './packet';
@@ -8,10 +8,26 @@ import { StubGate } from './testing/stub-gate';
 import { startSessionServer, type SessionServer } from './testing/session-server';
 import { WireClient } from './testing/wire-client';
 
+const { logErrorSpy } = vi.hoisted(() => ({ logErrorSpy: vi.fn() }));
+vi.mock('../../logs', () => ({ createLoggers: () => ({ log: vi.fn(), error: logErrorSpy }) }));
+
 const BANNER = 'device::ro.product.name=t;features=cmd';
 const open: Array<{ close(): void | Promise<unknown> }> = [];
+const escapes: unknown[] = [];
+const recordEscape = (e: unknown) => { escapes.push(e); };
 
-async function setup(opts: { preAuthTimeoutMs?: number; deviceOnline?: boolean; banner?: () => Promise<string> } = {}) {
+interface SetupOptions {
+  preAuthTimeoutMs?: number;
+  deviceOnline?: boolean;
+  banner?: () => Promise<string>;
+  /** Replaces the online check. */
+  isDeviceOnline?: () => boolean;
+  /** Runs after the harness's own bookkeeping, so it can throw. */
+  onLeavePreAuth?: () => void;
+  onClose?: () => void;
+}
+
+async function setup(opts: SetupOptions = {}) {
   const gate = new StubGate();
   const key = makeTestAdbKey();
   gate.approved = [{ keyId: key.keyId, key: parseAdbPublicKey(key.publicKeyText).key }];
@@ -22,10 +38,10 @@ async function setup(opts: { preAuthTimeoutMs?: number; deviceOnline?: boolean; 
   const server: SessionServer = await startSessionServer((socket) =>
     new Session({
       socket, deviceId: 'DEV1', peerIp: '10.0.0.5', gate, backend,
-      isDeviceOnline: () => state.online,
+      isDeviceOnline: opts.isDeviceOnline ?? (() => state.online),
       onEvent: (e) => events.push(e),
-      onClose: (s) => closed.push(s),
-      onLeavePreAuth: () => { state.leaves++; },
+      onClose: (s) => { closed.push(s); opts.onClose?.(); },
+      onLeavePreAuth: () => { state.leaves++; opts.onLeavePreAuth?.(); },
       preAuthTimeoutMs: opts.preAuthTimeoutMs ?? 5000,
     }),
   );
@@ -38,8 +54,23 @@ async function setup(opts: { preAuthTimeoutMs?: number; deviceOnline?: boolean; 
   return { gate, key, events, closed, state, backend, server, connect };
 }
 
+/** Fails the test if an uncaught exception or unhandled rejection reached the process. */
+async function expectNothingEscaped(): Promise<void> {
+  await new Promise((r) => setTimeout(r, 50));
+  expect(escapes).toEqual([]);
+}
+
+beforeEach(() => {
+  escapes.length = 0;
+  logErrorSpy.mockClear();
+  process.on('unhandledRejection', recordEscape);
+  process.on('uncaughtException', recordEscape);
+});
+
 afterEach(async () => {
   for (const o of open.splice(0)) await o.close();
+  process.off('unhandledRejection', recordEscape);
+  process.off('uncaughtException', recordEscape);
 });
 
 describe('Session handshake', () => {
@@ -204,6 +235,21 @@ describe('Session handshake', () => {
     await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
   });
 
+  it('calls cancel() on the outcome object, so a method that uses this works', async () => {
+    const h = await setup();
+    const outcome = {
+      kind: 'pending' as const, requestId: 'r1', decision: new Promise<'approved' | 'denied'>(() => {}), cancels: 0,
+      cancel() { this.cancels++; },
+    };
+    h.gate.outcome = outcome;
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    client.close();
+    await vi.waitFor(() => expect(outcome.cancels).toBe(1));
+    await expectNothingEscaped();
+  });
+
   it('drops a client that connects and sends nothing, and gives its pre-auth slot back', async () => {
     const h = await setup({ preAuthTimeoutMs: 50 });
     const client = await h.connect();
@@ -277,6 +323,7 @@ describe('Session handshake', () => {
     client.send(A_AUTH, AUTH_SIGNATURE, 0, h.key.sign(token.data));
     expect(await client.waitClosed()).toBe(true);
     expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('banner failed: backend down'));
   });
 
   it('destroy() closes the connection and reports the reason once', async () => {
@@ -323,6 +370,7 @@ describe('Session handshake', () => {
     expect(await client.waitClosed()).toBe(true);
     expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
     expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'handler error' });
+    expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('handler error: store down'));
   });
 
   it('closes a pending connection when the gate fails to record its approval', async () => {
@@ -337,5 +385,152 @@ describe('Session handshake', () => {
     expect(await client.waitClosed()).toBe(true);
     expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
     expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'handler error' });
+    expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('handler error: store down'));
+    await expectNothingEscaped();
+  });
+
+  it('ignores a further signature and key offer while pending', async () => {
+    const h = await setup();
+    let approve!: (d: 'approved' | 'denied') => void;
+    h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise((r) => { approve = r; }), cancel: vi.fn() };
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, randomBytes(256));
+    client.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, makeTestAdbKey().publicKeyText);
+    expect(await client.quiet(150)).toBe(true);
+    expect(client.closed).toBe(false);
+    expect(h.gate.offers).toHaveLength(1);
+    expect(h.server.sessions[0].state).toBe('pending');
+    approve('approved');
+    expect((await client.next()).command).toBe(A_CNXN);
+  });
+
+  it('closes when a packet arrives while the banner is still being fetched', async () => {
+    let release!: (banner: string) => void;
+    const h = await setup({ banner: () => new Promise<string>((r) => { release = r; }) });
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const token = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, h.key.sign(token.data));
+    await vi.waitFor(() => expect(h.server.sessions[0].state).toBe('finishing'));
+    client.send(A_OPEN, 1, 0, 'shell:id\0');
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'unexpected OPEN while finishing' });
+    release(BANNER);
+    expect(await client.quiet(50)).toBe(true);
+    expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+  });
+
+  it('closes without a banner when the device goes offline between CNXN and a valid signature', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const token = await client.next();
+    h.state.online = false;
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, h.key.sign(token.data));
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.backend.deviceBanner).not.toHaveBeenCalled();
+    expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'device offline' });
+  });
+
+  it('closes a pending connection whose decision promise rejects', async () => {
+    const h = await setup();
+    let fail!: (e: Error) => void;
+    const decision = new Promise<'approved' | 'denied'>((_, reject) => { fail = reject; });
+    h.gate.outcome = { kind: 'pending', requestId: 'r1', decision, cancel: vi.fn() };
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    fail(new Error('registry gone'));
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'decision error' });
+    await expectNothingEscaped();
+  });
+
+  describe('callbacks that throw', () => {
+    it('onLeavePreAuth throwing on the pre-auth timeout still closes the socket', async () => {
+      const h = await setup({ preAuthTimeoutMs: 50, onLeavePreAuth: () => { throw new Error('leave hook down'); } });
+      const client = await h.connect();
+      expect(await client.waitClosed(1000)).toBe(true);
+      expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'pre-auth timeout' });
+      expect(h.closed).toHaveLength(1);
+      expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('leave hook down'));
+      await expectNothingEscaped();
+    });
+
+    it('onLeavePreAuth throwing while the session becomes ready closes it instead of leaking a rejection', async () => {
+      const h = await setup({ onLeavePreAuth: () => { throw new Error('leave hook down'); } });
+      const client = await h.connect();
+      client.sendHostCnxn();
+      const token = await client.next();
+      client.send(A_AUTH, AUTH_SIGNATURE, 0, h.key.sign(token.data));
+      expect(await client.waitClosed()).toBe(true);
+      expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+      expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'handler error' });
+      expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('leave hook down'));
+      await expectNothingEscaped();
+    });
+
+    it('isDeviceOnline throwing after the signature closes the session instead of leaking a rejection', async () => {
+      let calls = 0;
+      const h = await setup({ isDeviceOnline: () => { if (++calls === 2) throw new Error('registry down'); return true; } });
+      const client = await h.connect();
+      client.sendHostCnxn();
+      const token = await client.next();
+      client.send(A_AUTH, AUTH_SIGNATURE, 0, h.key.sign(token.data));
+      expect(await client.waitClosed()).toBe(true);
+      expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+      expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'handler error' });
+      expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('registry down'));
+      await expectNothingEscaped();
+    });
+
+    it('cancel() throwing when a pending client disconnects still finishes closing', async () => {
+      const h = await setup();
+      const cancel = vi.fn(() => { throw new Error('cancel down'); });
+      h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise(() => {}), cancel };
+      const client = await h.connect();
+      await client.offerKey(makeTestAdbKey());
+      await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+      client.close();
+      await vi.waitFor(() => expect(h.closed).toHaveLength(1));
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('cancel down'));
+      await expectNothingEscaped();
+    });
+
+    it('cancel() throwing during destroy() neither reaches the caller nor keeps the socket open', async () => {
+      const h = await setup();
+      h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise(() => {}), cancel: () => { throw new Error('cancel down'); } };
+      const client = await h.connect();
+      await client.offerKey(makeTestAdbKey());
+      await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+      expect(() => h.server.sessions[0].destroy('revoked')).not.toThrow();
+      expect(await client.waitClosed()).toBe(true);
+      expect(h.closed).toHaveLength(1);
+      await expectNothingEscaped();
+    });
+
+    it('onClose throwing after a client disconnects does not escape', async () => {
+      const h = await setup({ onClose: () => { throw new Error('close hook down'); } });
+      const client = await h.connect();
+      await client.authenticate(h.key);
+      client.close();
+      await vi.waitFor(() => expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('close hook down')));
+      expect(h.closed).toHaveLength(1);
+      await expectNothingEscaped();
+    });
+
+    it('onClose throwing during destroy() does not reach the caller', async () => {
+      const h = await setup({ onClose: () => { throw new Error('close hook down'); } });
+      const client = await h.connect();
+      await client.authenticate(h.key);
+      expect(() => h.server.sessions[0].destroy('revoked')).not.toThrow();
+      expect(await client.waitClosed()).toBe(true);
+      expect(logErrorSpy).toHaveBeenCalledWith(expect.stringContaining('close hook down'));
+      await expectNothingEscaped();
+    });
   });
 });

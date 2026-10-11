@@ -27,7 +27,7 @@ export type OfferOutcome =
 export interface AuthGate {
   /** Approved keys that may reach this device. */
   approvedKeys(deviceId: string): ApprovedKey[];
-  /** A client offered a key that no signature matched. */
+  /** A client proved possession of a key that is not approved for this device. */
   offer(o: { deviceId: string; parsed: ParsedAdbKey; peerIp: string }): OfferOutcome;
   /** A client proved possession of an approved key. */
   authenticated(i: { deviceId: string; keyId: string; peerIp: string }): void;
@@ -153,7 +153,7 @@ export class Session {
       if (verifyAuthSignature(k.key, token, signature)) {
         this.keyId = k.keyId;
         this.opts.gate.authenticated({ deviceId: this.deviceId, keyId: k.keyId, peerIp: this.peerIp });
-        void this.becomeReady();
+        this.startReady();
         return;
       }
     }
@@ -180,29 +180,36 @@ export class Session {
     }
     if (outcome.kind === 'approved') {
       this.opts.gate.authenticated({ deviceId: this.deviceId, keyId: parsed.keyId, peerIp: this.peerIp });
-      void this.becomeReady();
+      this.startReady();
       return;
     }
     this.state = 'pending';
     this.leavePreAuth();
-    this.cancelPending = outcome.cancel;
+    this.cancelPending = () => outcome.cancel();
     this.emit({ kind: 'pending', session: this });
     outcome.decision.then(
       (decision) => {
         if (this.closed) return;
         this.cancelPending = null;
         if (decision !== 'approved') return this.close('denied');
-        // This runs outside onData's try/catch, so a throw would be an unhandled rejection and leave the socket open.
+        // Async continuation: not covered by onData's catch.
         try {
           this.opts.gate.authenticated({ deviceId: this.deviceId, keyId: parsed.keyId, peerIp: this.peerIp });
         } catch (e: any) {
           logError(`session ${this.id} handler error: ${e?.message ?? e}`);
           return this.close('handler error');
         }
-        void this.becomeReady();
+        this.startReady();
       },
       () => this.close('decision error'),
     );
+  }
+
+  private startReady(): void {
+    this.becomeReady().catch((e: any) => {
+      logError(`session ${this.id} handler error: ${e?.message ?? e}`);
+      this.close('handler error');
+    });
   }
 
   private async becomeReady(): Promise<void> {
@@ -236,23 +243,29 @@ export class Session {
     this.opts.socket.write(encodePacket({ command, arg0, arg1, data }));
   }
 
-  private emit(e: SessionEvent): void {
+  /** Runs a callback supplied by the owner; a throw is logged and never reaches the caller. */
+  private guard(label: string, fn: () => void): void {
     try {
-      this.opts.onEvent?.(e);
+      fn();
     } catch (err: any) {
-      logError(`session ${this.id} event handler error: ${err?.message ?? err}`);
+      logError(`session ${this.id} ${label} error: ${err?.message ?? err}`);
     }
+  }
+
+  private emit(e: SessionEvent): void {
+    this.guard('event handler', () => this.opts.onEvent?.(e));
   }
 
   private close(reason: string): void {
     if (this.closed) return;
     this.closed = true;
     this.state = 'closed';
-    this.leavePreAuth();
-    this.cancelPending?.();
-    this.cancelPending = null;
     this.opts.socket.destroy();
+    this.guard('pre-auth release', () => this.leavePreAuth());
+    const cancel = this.cancelPending;
+    this.cancelPending = null;
+    if (cancel) this.guard('cancel', cancel);
     this.emit({ kind: 'closed', session: this, reason });
-    this.opts.onClose?.(this);
+    this.guard('close handler', () => this.opts.onClose?.(this));
   }
 }
