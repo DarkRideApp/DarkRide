@@ -62,6 +62,15 @@ const short = (keyId: string) => keyId.slice(0, 12);
 // The service string comes from the client: keep printable ASCII only so it cannot forge or hide log lines.
 const printable = (text: string) => text.slice(0, REFUSAL_LOG_LENGTH).replace(/[^\x20-\x7e]/g, '?');
 
+/** This machine's interface addresses, or none where the list cannot be read; loopback is matched without them. */
+function localAddresses(): string[] {
+  try {
+    return Object.values(os.networkInterfaces()).flatMap((list) => (list ?? []).map((i) => i.address));
+  } catch {
+    return [];
+  }
+}
+
 export class AdbProxyService {
   private settings: AdbProxySettings = { ...DEFAULT_SETTINGS };
   private readonly keys: KeyStore;
@@ -367,9 +376,7 @@ export class AdbProxyService {
     const ctx = {
       portStart, portEnd, bindHost,
       advertisedHost: advertisedHostFor(bindHost, this.deps.advertisedHost),
-      localAddresses: isWildcard(bindHost)
-        ? Object.values(os.networkInterfaces()).flatMap((list) => (list ?? []).map((i) => i.address))
-        : [],
+      localAddresses: isWildcard(bindHost) ? localAddresses() : [],
     };
     return (deviceId) => isOwnEndpoint(deviceId, ctx);
   }

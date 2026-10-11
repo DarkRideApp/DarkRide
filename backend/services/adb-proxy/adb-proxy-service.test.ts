@@ -890,6 +890,24 @@ describe('AdbProxyService own endpoints and connect address', () => {
     expect(h.service.snapshot().advertisedHost).toBe(expected);
   });
 
+  it('still starts, takes devices and filters loopback endpoints when the interface list cannot be read', async () => {
+    let ownId = '';
+    const h = await setup({
+      start: false, enabled: false, bindHost: '0.0.0.0', extraDevices: ['DEV3'],
+      seed: (db, base) => { ownId = `127.0.0.1:${base}`; db.insert(devices).values({ id: ownId }).run(); },
+    });
+    const interfaces = vi.spyOn(os, 'networkInterfaces').mockImplementation(() => {
+      throw new Error('uv_interface_addresses returned Unknown system error 1');
+    });
+    h.directory.online.add(ownId);
+
+    await expect(h.service.start()).resolves.toBeUndefined();
+    h.directory.goOnline('DEV3');
+
+    expect(interfaces).toHaveBeenCalled();
+    expect(h.service.snapshot().devices.map((d) => d.deviceId)).toEqual(['DEV1', 'DEV2', 'DEV3']);
+  });
+
   it('names the detected address under the shipped defaults', async () => {
     const db = createTestDb([users, deviceInstances, devices, settings, adbProxyKeys, adbProxyDevices], { foreignKeys: true });
     const service = new AdbProxyService({
