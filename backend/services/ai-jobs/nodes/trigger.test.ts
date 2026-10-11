@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { describe, it, expect } from 'vitest';
 import * as schema from '../../../db/schema';
-import { TRIGGER_REGISTRY, TRIGGER_DESCRIPTIONS, TRIGGER_SCHEMAS } from './trigger';
+import { TRIGGER_REGISTRY, TRIGGER_DESCRIPTIONS, TRIGGER_SCHEMAS, runTrigger } from './trigger';
 
 function makeDb() {
   const sqlite = new Database(':memory:');
@@ -80,5 +80,50 @@ describe('apk-analysis/apk-context trigger', () => {
         { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
       ],
     });
+  });
+});
+
+describe('runTrigger', () => {
+  it('function-sourced: looks up TRIGGER_REGISTRY by expandFn and calls it', async () => {
+    const db = makeDb();
+    db.insert(schema.trackedApps).values({ id: 1, packageName: 'x', appName: 'X', createdAt: new Date() }).run();
+    db.insert(schema.apkVersions).values({
+      id: 1, trackedAppId: 1, versionCode: 1, versionName: '1', filename: 'x.apk', fileSize: 1,
+      source: 'device', downloadedAt: new Date(),
+    }).run();
+    const result = await runTrigger(
+      { kind: 'Trigger', source: 'function', expandFn: 'apk-analysis/apk-context', outputSchema: [] } as any,
+      { versionId: 1 }, { db },
+    );
+    expect(result.appName).toBe('X');
+  });
+
+  it('function-sourced with an unregistered expandFn throws "Unknown trigger expander"', async () => {
+    const db = makeDb();
+    await expect(runTrigger(
+      { kind: 'Trigger', source: 'function', expandFn: 'nope', outputSchema: [] } as any, {}, { db },
+    )).rejects.toThrow(/Unknown trigger expander/);
+  });
+
+  it('event-sourced: returns the raw input unchanged, with no registry lookup', async () => {
+    const db = makeDb();
+    const payload = { apkVersionId: 42, packageName: 'x' };
+    const result = await runTrigger(
+      { kind: 'Trigger', source: 'event', eventName: 'apk:analyzed', outputSchema: [] } as any, payload, { db },
+    );
+    expect(result).toBe(payload); // returns the same reference — no copy, no transform, nothing to call
+  });
+
+  it('a missing source defaults to function-mode, for graphs saved before this field existed', async () => {
+    const db = makeDb();
+    db.insert(schema.trackedApps).values({ id: 1, packageName: 'x', appName: 'X', createdAt: new Date() }).run();
+    db.insert(schema.apkVersions).values({
+      id: 1, trackedAppId: 1, versionCode: 1, versionName: '1', filename: 'x.apk', fileSize: 1,
+      source: 'device', downloadedAt: new Date(),
+    }).run();
+    const result = await runTrigger(
+      { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: [] } as any, { versionId: 1 }, { db },
+    );
+    expect(result.appName).toBe('X');
   });
 });

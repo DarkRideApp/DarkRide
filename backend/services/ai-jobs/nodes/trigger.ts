@@ -85,3 +85,18 @@ registerTrigger('apk-analysis/apk-context', async (rawInput, ctx) => {
     { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
   ],
 });
+
+export async function runTrigger(
+  config: { source?: 'function' | 'event'; expandFn?: string; eventName?: string },
+  rawInput: Record<string, unknown>,
+  ctx: TriggerCtx,
+): Promise<Record<string, unknown>> {
+  const source = config.source ?? 'function';
+  if (source === 'event') {
+    // The event payload already IS the expanded output — nothing to call.
+    return rawInput;
+  }
+  const expand = registry.get(config.expandFn!);
+  if (!expand) throw new Error(`Unknown trigger expander "${config.expandFn}"`);
+  return expand(rawInput, ctx);
+}

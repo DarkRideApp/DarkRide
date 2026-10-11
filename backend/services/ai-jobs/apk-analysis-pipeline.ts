@@ -1,7 +1,7 @@
 import { eq } from 'drizzle-orm';
 import type { PipelineGraph, Envelope } from './types';
 import type { NodeExecutors, ExecutionCtx } from './pipeline-runner';
-import { TRIGGER_REGISTRY, TRIGGER_SCHEMAS } from './nodes/trigger';
+import { TRIGGER_SCHEMAS, runTrigger } from './nodes/trigger';
 import { runAgentCall } from './nodes/agent-call';
 import { runTransform } from './nodes/transform';
 import { runBranch } from './nodes/branch';
@@ -94,11 +94,7 @@ export type ApkAnalysisIdentity = { type: 'core-service' } | { type: 'user'; use
 
 export function buildApkAnalysisExecutors(): NodeExecutors {
   return {
-    Trigger: async (config, rawInput, ctx) => {
-      const expand = TRIGGER_REGISTRY[config.expandFn];
-      if (!expand) throw new Error(`Unknown trigger expander "${config.expandFn}"`);
-      return expand(rawInput, { db: (ctx as { db: AppDatabase }).db });
-    },
+    Trigger: (config, rawInput, ctx) => runTrigger(config, rawInput, { db: (ctx as { db: AppDatabase }).db }),
     // Binds its OWN BoundAgent, per node, using this node's own config.tier — the whole point of
     // "one tier per AgentCall, no shared research/write pair" (spec, Architecture). A single
     // agent bound once for the entire run and reused by every node would silently defeat that:
