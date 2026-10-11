@@ -55,12 +55,39 @@ describe('KeyAuthGate', () => {
     await expect(outcome.decision).resolves.toBe('approved');
   });
 
-  it('maps timeout, replacement and cancellation to denied', async () => {
+  it('maps an admin denial to denied', async () => {
+    const outcome = ctx.gate.offer(offered(makeTestAdbKey().publicKeyText));
+    if (outcome.kind !== 'pending') throw new Error('expected pending');
+    ctx.pending.resolve(ctx.pending.list()[0].requestId, 'denied');
+    await expect(outcome.decision).resolves.toBe('denied');
+  });
+
+  it('maps a timed-out request to denied and drops it from the registry', async () => {
+    const short = setup({ timeoutMs: 20 });
+    try {
+      const outcome = short.gate.offer(offered(makeTestAdbKey().publicKeyText));
+      if (outcome.kind !== 'pending') throw new Error('expected pending');
+      await expect(outcome.decision).resolves.toBe('denied');
+      expect(short.pending.list()).toEqual([]);
+    } finally {
+      short.pending.stop();
+    }
+  });
+
+  it('maps a replaced request to denied and keeps only the newer one', async () => {
     const k = makeTestAdbKey();
     const first = ctx.gate.offer(offered(k.publicKeyText));
-    ctx.gate.offer(offered(k.publicKeyText));
-    if (first.kind !== 'pending') throw new Error('expected pending');
+    const second = ctx.gate.offer(offered(k.publicKeyText));
+    if (first.kind !== 'pending' || second.kind !== 'pending') throw new Error('expected pending');
     await expect(first.decision).resolves.toBe('denied');
+    expect(ctx.pending.list().map((e) => e.requestId)).toEqual([second.requestId]);
+  });
+
+  it('maps a cancelled request to denied', async () => {
+    const outcome = ctx.gate.offer(offered(makeTestAdbKey().publicKeyText));
+    if (outcome.kind !== 'pending') throw new Error('expected pending');
+    outcome.cancel();
+    await expect(outcome.decision).resolves.toBe('denied');
   });
 
   it('cancel() on the outcome removes the pending request', () => {
@@ -108,11 +135,20 @@ describe('KeyAuthGate', () => {
     expect(ctx.keys.findByKeyId(p.keyId)).toMatchObject({ lastSeenIp: '10.0.0.9', lastDeviceId: 'DEV2' });
   });
 
-  it('stops offering a key after invalidate() and the key is revoked', () => {
-    const { p, rec } = approve();
-    ctx.gate.approvedKeys('DEV1');
+  it('stops offering a revoked key without any invalidate() call', () => {
+    const { rec } = approve();
+    expect(ctx.gate.approvedKeys('DEV1')).toHaveLength(1);
     ctx.keys.setStatus(rec.id, 'revoked', null);
-    ctx.gate.invalidate(p.keyId);
     expect(ctx.gate.approvedKeys('DEV1')).toEqual([]);
+  });
+
+  it('reuses the parsed key object until invalidate() drops it', () => {
+    const { p } = approve();
+    const first = ctx.gate.approvedKeys('DEV1')[0].key;
+    expect(ctx.gate.approvedKeys('DEV1')[0].key).toBe(first);
+    ctx.gate.invalidate(p.keyId);
+    const reparsed = ctx.gate.approvedKeys('DEV1')[0].key;
+    expect(reparsed).not.toBe(first);
+    expect(reparsed.equals(first)).toBe(true);
   });
 });

@@ -19,6 +19,19 @@ import {
 
 const { devices } = schema;
 
+// device-manager.ts destructures its logger at import, so the error function is swapped at module level.
+const deviceManagerLogError = vi.hoisted(() => vi.fn());
+vi.mock('../logs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../logs')>();
+  return {
+    ...actual,
+    createLoggers: (id: string, options?: { colour?: string }) => {
+      const logger = actual.createLoggers(id, options);
+      return id === 'device-manager' ? { ...logger, error: deviceManagerLogError } : logger;
+    },
+  };
+});
+
 // Mock child_process exec + execFile + spawn + execSync.
 // Note on `execFile`: production code now invokes adb via `execFile('adb', [args...])`
 // for shell-injection safety. To keep the rest of this file's dispatch logic
@@ -165,6 +178,7 @@ describe('DeviceManager', () => {
 
   beforeEach(() => {
     DeviceManager.resetInstance();
+    deviceManagerLogError.mockClear();
     db = createTestDb();
     manager = new DeviceManager(db);
   });
@@ -392,6 +406,7 @@ describe('DeviceManager', () => {
       manager.onDeviceOnline(second);
       await (manager as any).reconcileDiscovered([{ id: 'A', online: true }]);
       expect(second).toHaveBeenCalledWith('A');
+      expect(deviceManagerLogError).toHaveBeenCalledWith('onDeviceOnline listener failed for A: boom');
     });
   });
 
