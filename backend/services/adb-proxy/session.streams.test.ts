@@ -481,6 +481,36 @@ describe('Session streams', () => {
       expect(events.filter((e) => e.kind === 'closed')).toEqual([expect.objectContaining({ reason: 'device restarting' })]);
     });
 
+    /** Opens `service` on a device stand-in that writes `chunks` and ends, and reports whether the session then closed. */
+    const runService = async (service: string, chunks: Array<string | Buffer> = []) => {
+      const device = new FakeBackendSocket();
+      const h = await setup({ backend: fakeBackend((s) => (s === service ? device : undefined)) });
+      const { localId } = await h.client.open(service, 1);
+      const output = h.client.collectStream(1, localId, 'close');
+      for (const chunk of chunks) device.emit('data', typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+      const head = () => ([...(h.server.sessions[0] as any).streams.values()][0]?.head as Buffer | undefined)?.length ?? 0;
+      const keptBeforeEnd = head();
+      device.emit('end');
+      await output;
+      const closed = await h.client.waitClosed(500);
+      return { closed, reasons: closeReasons(h), keptBeforeEnd };
+    };
+
+    it.each([['root:x'], ['unroot:x']])('treats %s like its bare service, closing the session when adbd announces a restart', async (service) => {
+      expect(await runService(service, ['restarting adbd\n'])).toMatchObject({ closed: true, reasons: ['device restarting'] });
+    });
+
+    it.each([['shell:root:'], ['shell:reboot'], ['rebootx:'], ['shell:echo restarting']])(
+      'keeps the session after %s, which is not a restart service',
+      async (service) => {
+        expect(await runService(service, ['restarting adbd as root\n'])).toMatchObject({ closed: false, reasons: [] });
+      },
+    );
+
+    it.each([['reboot:'], ['reboot:bootloader']])('closes the session after %s even with no output', async (service) => {
+      expect(await runService(service)).toMatchObject({ closed: true, reasons: ['device restarting'] });
+    });
+
     it('keeps the session after an ordinary shell stream ends', async () => {
       const h = await setup();
       const { localId } = await h.client.open('shell:echo hi', 1);

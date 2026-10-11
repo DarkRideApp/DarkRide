@@ -24,9 +24,9 @@ const REFUSED_PREFIXES = ['host', 'reverse:', 'tcpip:', 'usb:'];
 const NUL_SEPARATED_PREFIXES = ['abb_exec:', 'abb:'];
 const MALFORMED_SERVICE = '<malformed>';
 // The phone always reboots after these, so the client waits for the transport to drop as it would on a real one.
-const DEVICE_REBOOT_PREFIXES = ['reboot'];
+const DEVICE_REBOOT_PREFIXES = ['reboot:'];
 // adbd restarts after these only when it says so; a production build refuses root and keeps running.
-const ADBD_RESTART_SERVICES = ['root:', 'unroot:'];
+const ADBD_RESTART_PREFIXES = ['root:', 'unroot:'];
 const ADBD_RESTART_ANNOUNCEMENT = 'restarting';
 // The announcement is the first line of output, so only this much of it is kept.
 const RESTART_OUTPUT_LIMIT = 256;
@@ -36,7 +36,7 @@ type RestartRule = 'never' | 'always' | 'if-announced';
 
 function restartRuleFor(service: string): RestartRule {
   if (DEVICE_REBOOT_PREFIXES.some((p) => service.startsWith(p))) return 'always';
-  if (ADBD_RESTART_SERVICES.includes(service)) return 'if-announced';
+  if (ADBD_RESTART_PREFIXES.some((p) => service.startsWith(p))) return 'if-announced';
   return 'never';
 }
 
@@ -406,7 +406,7 @@ export class Session {
     });
     sock.on('end', ended);
     sock.on('close', ended);
-    sock.on('error', () => this.guardStream(stream, 'error', () => this.closeStream(stream, true)));
+    sock.on('error', () => this.guardStream(stream, 'error', () => this.closeStream(stream)));
     if (sock.destroyed || sock.readableEnded) {
       ended();
       return;
@@ -434,7 +434,7 @@ export class Session {
       return;
     }
     if (stream.backendEnded) {
-      if (stream.windowOpen) this.closeStream(stream, true);
+      if (stream.windowOpen) this.closeStream(stream);
       return;
     }
     if (stream.windowOpen) stream.backend?.resume();
@@ -444,14 +444,14 @@ export class Session {
     const stream = this.streams.get(p.arg1);
     if (!stream || stream.remoteId !== p.arg0 || !stream.backend) return;
     // ADB allows one unacknowledged WRTE per stream; a second one is a protocol error and would otherwise queue without bound.
-    if (stream.ackPending) return this.closeStream(stream, true);
+    if (stream.ackPending) return this.closeStream(stream);
     const backend = stream.backend;
     stream.ackPending = true;
     this.guardStream(stream, 'write', () => {
       backend.write(p.data, (err) => this.guardStream(stream, 'write callback', () => {
         stream.ackPending = false;
         if (this.closed || !this.streams.has(stream.localId)) return;
-        if (err) return this.closeStream(stream, true);
+        if (err) return this.closeStream(stream);
         this.send(A_OKAY, stream.localId, stream.remoteId);
       }));
     });
@@ -467,10 +467,10 @@ export class Session {
   private onPeerClose(p: Packet): void {
     const stream = this.streams.get(p.arg1);
     if (!stream || stream.remoteId !== p.arg0) return;
-    this.closeStream(stream, true);
+    this.closeStream(stream);
   }
 
-  private closeStream(stream: Stream, notify: boolean): void {
+  private closeStream(stream: Stream): void {
     if (!this.streams.delete(stream.localId)) return;
     this.destroyBackend(stream);
     const restarting = stream.backend !== null && (stream.restart === 'always'
@@ -482,8 +482,7 @@ export class Session {
       this.restartTimer.unref?.();
       this.emit({ kind: 'device-restarting', session: this });
     }
-    if (notify) this.send(A_CLSE, stream.localId, stream.remoteId, undefined, restarting ? () => this.close('device restarting') : undefined);
-    else if (restarting) this.close('device restarting');
+    this.send(A_CLSE, stream.localId, stream.remoteId, undefined, restarting ? () => this.close('device restarting') : undefined);
   }
 
   private destroyBackend(stream: Stream): void {
@@ -501,7 +500,7 @@ export class Session {
     } catch (err: any) {
       logError(`session ${this.id} stream ${stream.localId} ${label} error: ${err?.message ?? err}`);
       try {
-        this.closeStream(stream, true);
+        this.closeStream(stream);
       } catch (again: any) {
         logError(`session ${this.id} stream ${stream.localId} close error: ${again?.message ?? again}`);
         this.close('handler error');
