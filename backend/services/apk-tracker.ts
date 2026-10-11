@@ -245,6 +245,15 @@ export class ApkTracker {
 
   setHookBus(bus: import('@darkrideapp/plugin-sdk').HookBus): void {
     this.hookBus = bus;
+    this.hookBus.define('apk:version-detected', [
+      { field: 'trackedAppId', type: 'number', description: 'The tracked app this version belongs to' },
+      { field: 'packageName', type: 'string', description: 'Reverse-DNS package name' },
+      { field: 'appName', type: 'string', description: 'Display name, if known' },
+      { field: 'source', type: 'string', description: 'Where this version was found' },
+      { field: 'versionName', type: 'string', description: 'Human version string' },
+      { field: 'previousVersion', type: 'string', description: 'The prior tracked version, if any' },
+      { field: 'analysed', type: 'boolean', description: 'Whether this version has already been analysed' },
+    ], 'Fires when a new or changed APK version is detected for a tracked app.');
   }
 
   /**

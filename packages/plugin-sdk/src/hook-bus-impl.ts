@@ -1,8 +1,9 @@
-import type { HookBus } from './types/hooks';
+import type { HookBus, SchemaField } from './types/hooks';
 
 interface HookDefinition {
   name: string;
-  schema?: Record<string, string>;
+  schema: SchemaField[];
+  description: string;
 }
 
 type HookHandler = (...args: any[]) => void | Promise<void>;
@@ -11,8 +12,8 @@ export class HookBusImpl implements HookBus {
   private handlers = new Map<string, Set<HookHandler>>();
   private definitions: HookDefinition[] = [];
 
-  define(name: string, schema?: Record<string, string>): void {
-    this.definitions.push({ name, schema });
+  define(name: string, schema: SchemaField[], description: string): void {
+    this.definitions.push({ name, schema, description });
   }
 
   on(name: string, handler: HookHandler): void {

@@ -386,6 +386,19 @@ describe('ApkTracker', () => {
         expect(db.select().from(apkVersions).all()).toHaveLength(0);
       });
 
+      it("declares apk:version-detected's real schema when a HookBus is wired", () => {
+        const ps = fakeSource();
+        const tracker = trackerWith(ps);
+        const { bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        expect(bus.define).toHaveBeenCalledWith(
+          'apk:version-detected',
+          expect.arrayContaining([expect.objectContaining({ field: 'trackedAppId', type: 'number' })]),
+          expect.any(String),
+        );
+      });
+
       it('emits apk:version-detected with analysed:false', async () => {
         const appId = addApp(false);
         seedSource(appId, { lastVersion: '2.0.0' });

@@ -96,6 +96,18 @@ describe('ApkAnalyzerService', () => {
     vi.restoreAllMocks();
   });
 
+  describe('setHookBus()', () => {
+    it('declares apk:analyzed\'s real schema when a HookBus is wired', () => {
+      const bus = { define: vi.fn(), on: vi.fn(), off: vi.fn(), emit: vi.fn() };
+      service.setHookBus(bus as any);
+      expect(bus.define).toHaveBeenCalledWith(
+        'apk:analyzed',
+        expect.arrayContaining([expect.objectContaining({ field: 'apkVersionId', type: 'number' })]),
+        expect.any(String),
+      );
+    });
+  });
+
   describe('enqueue()', () => {
     it('should create a pending job and return its ID', async () => {
       const appId = insertTrackedApp(db, 'com.example.app');

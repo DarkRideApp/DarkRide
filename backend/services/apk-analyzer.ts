@@ -71,6 +71,14 @@ export class ApkAnalyzerService {
 
   setHookBus(bus: import('@darkrideapp/plugin-sdk').HookBus): void {
     this.hookBus = bus;
+    this.hookBus.define('apk:analyzed', [
+      { field: 'apkVersionId', type: 'number', description: "The analyzed APK version's id" },
+      { field: 'packageName', type: 'string', description: 'Reverse-DNS package name' },
+      { field: 'apkPath', type: 'string', description: 'Local path to the analyzed APK file' },
+      { field: 'dbPath', type: 'string', description: 'Path to the analysis SQLite database' },
+      { field: 'outputDir', type: 'string', description: "Directory holding this analysis run's output" },
+      { field: 'versionLabel', type: 'string', description: 'Human-readable "v<code> (<name>)" label' },
+    ], 'Fires once an APK version finishes its full analysis pipeline.');
   }
 
   setAiFactory(factory: AiAgentFactory): void {
