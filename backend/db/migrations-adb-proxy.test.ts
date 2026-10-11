@@ -10,6 +10,11 @@ import { forgetDeviceRow } from '../services/forget-device';
 
 const TAG = '0102_adb_proxy';
 
+// Only entries before a migration count: later migrations legitimately have a greater `when`.
+function maxWhenBefore(entries: { idx: number; when: number }[], idx: number): number {
+  return Math.max(...entries.filter((e) => e.idx < idx).map((e) => e.when));
+}
+
 describe('migration 0102: ADB proxy keys and device ports', () => {
   let db: Database.Database;
 
@@ -100,8 +105,12 @@ describe('migration 0102 journal entry', () => {
     const entry = j.entries.find((e: any) => e.idx === 102);
     expect(entry?.tag).toBe(TAG);
     expect(entry.breakpoints).toBe(true);
-    const maxOther = Math.max(...j.entries.filter((e: any) => e.idx !== 102).map((e: any) => e.when));
-    expect(entry.when).toBeGreaterThan(maxOther);
+    expect(entry.when).toBeGreaterThan(maxWhenBefore(j.entries, 102));
+  });
+
+  it('ignores later entries with a larger when, so a migration added after 0102 cannot break the check', () => {
+    const entries = [{ idx: 1, when: 10 }, { idx: 2, when: 20 }, { idx: 3, when: 30 }];
+    expect(maxWhenBefore(entries, 2)).toBe(10);
   });
 });
 
