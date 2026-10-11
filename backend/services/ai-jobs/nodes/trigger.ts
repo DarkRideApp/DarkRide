@@ -2,6 +2,7 @@ import { eq } from 'drizzle-orm';
 import { apkVersions, trackedApps } from '../../../db/schema';
 import type { AppDatabase } from '../../../db/index';
 import type { SchemaField } from '../types';
+import { createFunctionRegistry } from './function-registry';
 
 export interface TriggerCtx {
   db: AppDatabase;
@@ -9,9 +10,14 @@ export interface TriggerCtx {
 
 export type TriggerExpander = (rawInput: Record<string, unknown>, ctx: TriggerCtx) => Promise<Record<string, unknown>>;
 
-export const TRIGGER_REGISTRY: Record<string, TriggerExpander> = Object.create(null);
+const registry = createFunctionRegistry<TriggerExpander>();
+export const TRIGGER_REGISTRY: Record<string, TriggerExpander> = new Proxy({} as Record<string, TriggerExpander>, {
+  get: (_t, name: string) => registry.get(name),
+});
 /** Human-readable "what this trigger does" text per registered expand function, for the editor UI. */
-export const TRIGGER_DESCRIPTIONS: Record<string, string> = Object.create(null);
+export const TRIGGER_DESCRIPTIONS: Record<string, string> = new Proxy({} as Record<string, string>, {
+  get: (_t, name: string) => registry.list().find(e => e.name === name)?.description,
+});
 /**
  * The real, machine-checkable contract per registered expand function: what run parameters it
  * reads from rawInput, and what fields it returns. The one source of truth the editor's "Starts
@@ -19,15 +25,19 @@ export const TRIGGER_DESCRIPTIONS: Record<string, string> = Object.create(null);
  * elsewhere, so they can't silently drift from what the function underneath actually does (as
  * apk-analysis-pipeline.ts's old APK_TRIGGER_INPUT_SCHEMA/APK_CONTEXT_SCHEMA constants did).
  */
-export const TRIGGER_SCHEMAS: Record<string, { inputSchema: SchemaField[]; outputSchema: SchemaField[] }> = Object.create(null);
+export const TRIGGER_SCHEMAS: Record<string, { inputSchema: SchemaField[]; outputSchema: SchemaField[] }> =
+  new Proxy({} as Record<string, { inputSchema: SchemaField[]; outputSchema: SchemaField[] }>, {
+    get: (_t, name: string) => {
+      const entry = registry.list().find(e => e.name === name);
+      return entry && { inputSchema: entry.inputSchema ?? [], outputSchema: entry.outputSchema ?? [] };
+    },
+  });
 
 export function registerTrigger(
   name: string, fn: TriggerExpander, description: string,
   schema: { inputSchema: SchemaField[]; outputSchema: SchemaField[] },
 ): void {
-  TRIGGER_REGISTRY[name] = fn;
-  TRIGGER_DESCRIPTIONS[name] = description;
-  TRIGGER_SCHEMAS[name] = schema;
+  registry.register(name, fn, description, schema);
 }
 
 registerTrigger('apk-analysis/apk-context', async (rawInput, ctx) => {
