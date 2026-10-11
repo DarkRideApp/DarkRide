@@ -3,14 +3,47 @@ import { randomBytes, type KeyObject } from 'node:crypto';
 import { createLoggers } from '../../logs';
 import { parseAdbPublicKey, verifyAuthSignature, type ParsedAdbKey } from './adb-key';
 import {
-  A_AUTH, A_CNXN, A_VERSION, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN, MAX_DATA, PREAUTH_MAX_PAYLOAD,
-  PacketError, PacketParser, commandName, encodePacket, type Packet,
+  A_AUTH, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_VERSION, A_WRTE, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN,
+  MAX_DATA, PREAUTH_MAX_PAYLOAD, PacketError, PacketParser, commandName, encodePacket, type Packet,
 } from './packet';
 
 const { error: logError } = createLoggers('adb-proxy');
 
 const MAX_SIGNATURE_ATTEMPTS = 3;
 const DEFAULT_PREAUTH_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_STREAMS = 128;
+const MAX_SERVICE_LENGTH = 4096;
+// The ADB server dispatches anything starting with "host" as a request to itself, even on a bound connection.
+const REFUSED_PREFIXES = ['host', 'reverse:', 'tcpip:', 'usb:'];
+
+export function checkService(service: string): { allowed: true } | { allowed: false; reason: string } {
+  if (service.length === 0) return { allowed: false, reason: 'empty service' };
+  if (service.length > MAX_SERVICE_LENGTH) return { allowed: false, reason: 'service too long' };
+  if (service.includes('\0')) return { allowed: false, reason: 'NUL in service' };
+  const prefix = REFUSED_PREFIXES.find((p) => service.startsWith(p));
+  if (prefix) return { allowed: false, reason: `${prefix} services are not proxied` };
+  return { allowed: true };
+}
+
+/** The service string of an OPEN payload (text plus one trailing NUL), or null when malformed. */
+function parseService(data: Buffer): string | null {
+  // Bound the work before decoding: the ready-state payload cap is 1 MiB.
+  if (data.length > MAX_SERVICE_LENGTH + 1) return null;
+  const nul = data.indexOf(0);
+  if (nul !== -1 && nul !== data.length - 1) return null;
+  const raw = nul === -1 ? data : data.subarray(0, nul);
+  const text = raw.toString('utf8');
+  return Buffer.from(text, 'utf8').equals(raw) ? text : null;
+}
+
+interface Stream {
+  localId: number;
+  remoteId: number;
+  backend: net.Socket | null;
+  windowOpen: boolean;
+  outQueue: Buffer[];
+  backendEnded: boolean;
+}
 
 export type SessionState = 'await-cnxn' | 'await-auth' | 'pending' | 'finishing' | 'ready' | 'closed';
 
@@ -55,6 +88,7 @@ export interface SessionOptions {
   /** Called once when the connection stops counting against the pre-auth limits (pending, ready or closed). */
   onLeavePreAuth?(): void;
   preAuthTimeoutMs?: number;
+  maxStreams?: number;
 }
 
 let sessionCounter = 0;
@@ -76,6 +110,8 @@ export class Session {
   private cancelPending: (() => void) | null = null;
   private preAuthLeft = false;
   private closed = false;
+  private readonly streams = new Map<number, Stream>();
+  private nextLocalId = 1;
 
   constructor(private readonly opts: SessionOptions) {
     this.deviceId = opts.deviceId;
@@ -89,6 +125,23 @@ export class Session {
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  get streamCount(): number {
+    return this.streams.size;
+  }
+
+  info() {
+    return {
+      id: this.id,
+      deviceId: this.deviceId,
+      peerIp: this.peerIp,
+      state: this.state,
+      keyId: this.keyId,
+      comment: this.keyComment,
+      since: this.createdAt,
+      streams: this.streams.size,
+    };
   }
 
   destroy(reason: string): void {
@@ -121,7 +174,7 @@ export class Session {
       case 'await-cnxn': return this.onCnxn(p);
       case 'await-auth': return this.onAuth(p);
       case 'pending': return;
-      case 'ready': return;
+      case 'ready': return this.onReadyPacket(p);
       default: this.close(`unexpected ${commandName(p.command)} while ${this.state}`);
     }
   }
@@ -230,6 +283,159 @@ export class Session {
     this.emit({ kind: 'authenticated', session: this });
   }
 
+  private onReadyPacket(p: Packet): void {
+    switch (p.command) {
+      case A_OPEN: return this.onOpen(p);
+      case A_WRTE: return this.onWrite(p);
+      case A_OKAY: return this.onOkay(p);
+      case A_CLSE: return this.onPeerClose(p);
+      default: return;
+    }
+  }
+
+  private refuse(remoteId: number): void {
+    if (remoteId !== 0) this.send(A_CLSE, 0, remoteId);
+  }
+
+  private onOpen(p: Packet): void {
+    const remoteId = p.arg0;
+    const service = remoteId === 0 ? null : parseService(p.data);
+    if (service === null) return this.refuse(remoteId);
+    if (!checkService(service).allowed) {
+      this.emit({ kind: 'refused-service', session: this, service });
+      return this.refuse(remoteId);
+    }
+    const duplicate = [...this.streams.values()].some((s) => s.remoteId === remoteId);
+    if (duplicate || this.streams.size >= (this.opts.maxStreams ?? DEFAULT_MAX_STREAMS)) return this.refuse(remoteId);
+    const stream: Stream = { localId: this.nextLocalId++, remoteId, backend: null, windowOpen: false, outQueue: [], backendEnded: false };
+    this.streams.set(stream.localId, stream);
+    let opening: Promise<net.Socket>;
+    try {
+      opening = Promise.resolve(this.opts.backend.openService(this.deviceId, service));
+    } catch (err: any) {
+      logError(`session ${this.id} stream ${stream.localId} open error: ${err?.message ?? err}`);
+      this.streams.delete(stream.localId);
+      return this.refuse(remoteId);
+    }
+    opening.then(
+      (sock) => this.guardStream(stream, 'open', () => {
+        if (this.closed || !this.streams.has(stream.localId)) {
+          sock.destroy();
+          return;
+        }
+        this.attach(stream, sock);
+      }),
+      () => this.guardStream(stream, 'open', () => {
+        if (this.streams.delete(stream.localId)) this.refuse(remoteId);
+      }),
+    );
+  }
+
+  private attach(stream: Stream, sock: net.Socket): void {
+    stream.backend = sock;
+    stream.windowOpen = true;
+    this.send(A_OKAY, stream.localId, stream.remoteId);
+    // The socket arrives paused and may already have ended; listen now, in the same tick, or its end is never seen.
+    sock.on('data', (chunk: Buffer) => this.guardStream(stream, 'data', () => {
+      stream.outQueue.push(chunk);
+      sock.pause();
+      this.pump(stream);
+    }));
+    const ended = () => this.guardStream(stream, 'end', () => {
+      stream.backendEnded = true;
+      this.pump(stream);
+    });
+    sock.on('end', ended);
+    sock.on('close', ended);
+    sock.on('error', () => this.guardStream(stream, 'error', () => this.closeStream(stream, true)));
+    if (sock.destroyed || sock.readableEnded) {
+      ended();
+      return;
+    }
+    sock.resume();
+  }
+
+  /** Send queued backend data one WRTE at a time; ADB allows a single unacknowledged WRTE per stream. */
+  private pump(stream: Stream): void {
+    if (this.closed || !this.streams.has(stream.localId)) return;
+    if (stream.windowOpen && stream.outQueue.length > 0) {
+      const head = stream.outQueue[0];
+      let piece = head;
+      if (head.length > MAX_DATA) {
+        piece = head.subarray(0, MAX_DATA);
+        stream.outQueue[0] = head.subarray(MAX_DATA);
+      } else {
+        stream.outQueue.shift();
+      }
+      stream.windowOpen = false;
+      this.send(A_WRTE, stream.localId, stream.remoteId, piece);
+    }
+    if (stream.outQueue.length > 0) {
+      stream.backend?.pause();
+      return;
+    }
+    if (stream.backendEnded) {
+      if (stream.windowOpen) this.closeStream(stream, true);
+      return;
+    }
+    if (stream.windowOpen) stream.backend?.resume();
+  }
+
+  private onWrite(p: Packet): void {
+    const stream = this.streams.get(p.arg1);
+    if (!stream || stream.remoteId !== p.arg0 || !stream.backend) return;
+    const backend = stream.backend;
+    this.guardStream(stream, 'write', () => {
+      backend.write(p.data, (err) => this.guardStream(stream, 'write callback', () => {
+        if (this.closed || !this.streams.has(stream.localId)) return;
+        if (err) return this.closeStream(stream, true);
+        this.send(A_OKAY, stream.localId, stream.remoteId);
+      }));
+    });
+  }
+
+  private onOkay(p: Packet): void {
+    const stream = this.streams.get(p.arg1);
+    if (!stream || stream.remoteId !== p.arg0) return;
+    stream.windowOpen = true;
+    this.guardStream(stream, 'ack', () => this.pump(stream));
+  }
+
+  private onPeerClose(p: Packet): void {
+    const stream = this.streams.get(p.arg1);
+    if (!stream || stream.remoteId !== p.arg0) return;
+    this.closeStream(stream, true);
+  }
+
+  private closeStream(stream: Stream, notify: boolean): void {
+    if (!this.streams.delete(stream.localId)) return;
+    this.destroyBackend(stream);
+    if (notify) this.send(A_CLSE, stream.localId, stream.remoteId);
+  }
+
+  private destroyBackend(stream: Stream): void {
+    try {
+      stream.backend?.destroy();
+    } catch (err: any) {
+      logError(`session ${this.id} stream ${stream.localId} destroy error: ${err?.message ?? err}`);
+    }
+  }
+
+  /** Runs stream work that fires outside onData: a throw is logged and closes that stream, or the session if even that fails. */
+  private guardStream(stream: Stream, label: string, fn: () => void): void {
+    try {
+      fn();
+    } catch (err: any) {
+      logError(`session ${this.id} stream ${stream.localId} ${label} error: ${err?.message ?? err}`);
+      try {
+        this.closeStream(stream, true);
+      } catch (again: any) {
+        logError(`session ${this.id} stream ${stream.localId} close error: ${again?.message ?? again}`);
+        this.close('handler error');
+      }
+    }
+  }
+
   private leavePreAuth(): void {
     if (this.preAuthLeft) return;
     this.preAuthLeft = true;
@@ -261,6 +467,8 @@ export class Session {
     this.closed = true;
     this.state = 'closed';
     this.opts.socket.destroy();
+    for (const s of this.streams.values()) this.destroyBackend(s);
+    this.streams.clear();
     this.guard('pre-auth release', () => this.leavePreAuth());
     const cancel = this.cancelPending;
     this.cancelPending = null;
