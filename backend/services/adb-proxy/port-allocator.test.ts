@@ -156,10 +156,9 @@ describe('PortAllocator', () => {
       clock.now = at('2026-10-02T00:00:00Z');
       alloc.ensure('B');
       db.insert(adbProxyDevices).values({ deviceId: 'C', port: 7000, enabled: true, createdAt: at('2026-09-01T00:00:00Z') }).run();
-      expect(alloc.hasReclaimable(new Set())).toBe(true);
       expect(alloc.reclaimStalest(new Set())).toMatchObject({ deviceId: 'B' });
-      expect(alloc.hasReclaimable(new Set())).toBe(false);
       expect(alloc.reclaimStalest(new Set())).toBeUndefined();
+      expect(alloc.all().map((r) => r.deviceId).sort()).toEqual(['A', 'C']);
     });
 
     it('gives a reclaimed device a new row when it comes back', () => {

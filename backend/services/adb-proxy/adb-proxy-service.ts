@@ -571,7 +571,8 @@ export class AdbProxyService {
 
   private starvedDevices(): string[] {
     const stuck = [...this.online].filter((id) => this.deviceErrors.get(id) === 'range-full');
-    return stuck.length > 0 && (this.ports.hasFree() || this.ports.hasReclaimable(this.online)) ? stuck : [];
+    // Only a free port: taking an offline device's port here would take it from a phone that is merely rebooting.
+    return stuck.length > 0 && this.ports.hasFree() ? stuck : [];
   }
 
   /** Concurrent fetches for one serial share a promise; a success is kept for a few seconds, a failure is not kept. */

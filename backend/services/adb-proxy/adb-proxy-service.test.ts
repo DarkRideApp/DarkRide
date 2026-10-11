@@ -910,14 +910,18 @@ describe('AdbProxyService full port range', () => {
     expect(reclaimLines()).toEqual([]);
   });
 
-  it('gives a device waiting on a full range the port of a device that goes offline later', async () => {
+  it('lets a device that is only briefly offline, such as one rebooting, keep its port while another waits on the full range', async () => {
     const h = await setup({ portCount: 1, reconcileMs: 20 });
     expect(stateOf(h, 'DEV2')).toBe('range-full');
 
     h.directory.goOffline('DEV1');
+    await sleep(200);
+    h.directory.goOnline('DEV1');
 
-    await vi.waitFor(() => expect(h.service.snapshot().devices.find((d) => d.deviceId === 'DEV2')).toMatchObject({ state: 'listening', port: h.base }), { timeout: 3000 });
-    expect(rowOf(h, 'DEV1')).toBeUndefined();
+    await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('listening'));
+    expect(rowOf(h, 'DEV1')).toMatchObject({ port: h.base });
+    expect(stateOf(h, 'DEV2')).toBe('range-full');
+    expect(reclaimLines()).toEqual([]);
   });
 
   it('answers range-full from setDevice only when nothing can be reclaimed', async () => {

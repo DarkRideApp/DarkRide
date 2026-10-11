@@ -48,24 +48,15 @@ export class PortAllocator {
     return { error: 'range-full' };
   }
 
-  /** Whether `reclaimStalest(keep)` would free a port; deletes nothing. */
-  hasReclaimable(keep: ReadonlySet<string>): boolean {
-    return this.stalest(keep) !== undefined;
-  }
-
   /**
    * Deletes the oldest row of a device not in `keep` (the online devices) and returns it. Only rows with an in-range
    * port free space for `ensure`; a row someone disabled is kept, since a new row would come back enabled.
    */
   reclaimStalest(keep: ReadonlySet<string>): ProxyDeviceRow | undefined {
-    const row = this.stalest(keep);
+    const { start, end } = this.range();
+    const row = this.all().find((r) => !keep.has(r.deviceId) && r.enabled && r.port >= start && r.port <= end);
     if (row) this.db.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, row.deviceId)).run();
     return row;
-  }
-
-  private stalest(keep: ReadonlySet<string>): ProxyDeviceRow | undefined {
-    const { start, end } = this.range();
-    return this.all().find((r) => !keep.has(r.deviceId) && r.enabled && r.port >= start && r.port <= end);
   }
 
   /** Moves a device to a free in-range port; undefined when the device has no row yet. */
