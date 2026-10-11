@@ -16,6 +16,7 @@ import {
   seedApkAnalysisPipeline,
 } from './apk-analysis-pipeline';
 import { TRIGGER_SCHEMAS } from './nodes/trigger';
+import { APK_VERSION_DETECTED_SCHEMA } from '../apk-tracker';
 import type { AiAgentFactory } from '../ai-agent-factory';
 import type { AppDatabase } from '../../db/index';
 import { aiPipelines, aiPipelineVersions } from '../../db/schema';
@@ -46,19 +47,28 @@ describe('ASTERIX_PATTERN_GRAPH', () => {
     expect(validateGraph(ASTERIX_PATTERN_GRAPH)).toEqual([]);
   });
 
-  // Regression guard for the bug Cube hit live: both Triggers used to carry their own
-  // hand-copied APK_TRIGGER_INPUT_SCHEMA/APK_CONTEXT_SCHEMA constants, kept in sync with
-  // apk-analysis/apk-context's real contract by nothing but a code comment. They now come
-  // straight from TRIGGER_SCHEMAS (nodes/trigger.ts), so this seed can never drift from what
-  // the function underneath actually reads and returns.
-  it("both Triggers' schemas come from TRIGGER_SCHEMAS, not a hand-maintained copy", () => {
-    const triggers = ASTERIX_PATTERN_GRAPH.nodes.filter(n => n.config.kind === 'Trigger');
-    expect(triggers).toHaveLength(2);
-    for (const t of triggers) {
-      const config = t.config as { expandFn: string; inputSchema?: unknown; outputSchema: unknown };
-      expect(config.inputSchema).toEqual(TRIGGER_SCHEMAS[config.expandFn].inputSchema);
-      expect(config.outputSchema).toEqual(TRIGGER_SCHEMAS[config.expandFn].outputSchema);
-    }
+  // Regression guard for the bug Cube hit live: Full Analysis's schema used to be a hand-copied
+  // APK_TRIGGER_INPUT_SCHEMA/APK_CONTEXT_SCHEMA constant, kept in sync with apk-analysis/apk-
+  // context's real contract by nothing but a code comment. It now comes straight from
+  // TRIGGER_SCHEMAS (nodes/trigger.ts), so this seed can never drift from what the function
+  // underneath actually reads and returns.
+  it("Full Analysis's schema comes from TRIGGER_SCHEMAS, not a hand-maintained copy", () => {
+    const trigger = ASTERIX_PATTERN_GRAPH.nodes.find(n => n.id === 'trigger-full')!;
+    const config = trigger.config as { expandFn: string; inputSchema?: unknown; outputSchema: unknown };
+    expect(config.inputSchema).toEqual(TRIGGER_SCHEMAS[config.expandFn].inputSchema);
+    expect(config.outputSchema).toEqual(TRIGGER_SCHEMAS[config.expandFn].outputSchema);
+  });
+
+  // Same drift guard for Quick Rescan: its schema must come straight from apk-tracker.ts's own
+  // APK_VERSION_DETECTED_SCHEMA, since it's event-sourced from apk:version-detected — never a
+  // hand-copied literal that could drift from what that event actually carries.
+  it("Quick Rescan is event-sourced from apk:version-detected, schema from APK_VERSION_DETECTED_SCHEMA", () => {
+    const trigger = ASTERIX_PATTERN_GRAPH.nodes.find(n => n.id === 'trigger-rescan')!;
+    const config = trigger.config as { source?: string; eventName?: string; expandFn?: string; outputSchema: unknown };
+    expect(config.source).toBe('event');
+    expect(config.eventName).toBe('apk:version-detected');
+    expect(config.expandFn).toBeUndefined();
+    expect(config.outputSchema).toEqual(APK_VERSION_DETECTED_SCHEMA);
   });
 
   it('has exactly two Triggers, eight AgentCalls (seven Group-A/B feeding the Report, plus the separate diff AgentCall), one Report, two Sinks', () => {
@@ -152,19 +162,22 @@ describe('ASTERIX_PATTERN_GRAPH', () => {
 describe('apkVersionIdFromEventPayload', () => {
   // Regression guard from the final review's I2: HookTriggerDispatcher's buildCtx (backend/
   // index.ts) builds this job kind's ctx from an arbitrary event's payload, cast `as number`.
-  // apk:version-detected's real payload has trackedAppId, not apkVersionId (see Task 1's
-  // declared schema) — without this guard, picking that event as a Trigger's source silently
-  // builds a ctx with contextId "undefined" and every Sink write targets a bogus version row.
-  // Scoped to the dispatcher's own payload-to-versionId mapping, not buildApkAnalysisExecutionCtx
-  // itself — that function is also used by the manual REST /run path, where an absent versionId
-  // is expected to flow through and fail later with a more specific, node-attributed error from
-  // the Trigger's own expand function (see apk-analysis-pipeline e2e "failing run" test).
-  it('returns apkVersionId when the payload actually has one (apk:analyzed)', () => {
+  // Without this guard, an event whose payload lacks a real numeric apkVersionId silently builds
+  // a ctx with contextId "undefined" and every Sink write targets a bogus version row.
+  it('returns apkVersionId when the payload actually has one (apk:analyzed, or apk:version-detected when a download happened)', () => {
     expect(apkVersionIdFromEventPayload({ apkVersionId: 42, packageName: 'x' })).toBe(42);
   });
 
-  it('throws when the payload has no apkVersionId at all (apk:version-detected)', () => {
+  it('throws when the payload has no apkVersionId key at all', () => {
     expect(() => apkVersionIdFromEventPayload({ trackedAppId: 1, packageName: 'x' }))
+      .toThrow(/requires a numeric apkVersionId/);
+  });
+
+  // apk:version-detected emits apkVersionId: null when auto-analyse is off and nothing was
+  // downloaded — Quick Rescan has nothing to re-scan in that case, and must fail loud here
+  // (HookTriggerDispatcher logs and moves on) rather than running against a bogus version.
+  it('throws when apkVersionId is explicitly null (apk:version-detected, auto-analyse off)', () => {
+    expect(() => apkVersionIdFromEventPayload({ apkVersionId: null, trackedAppId: 1 }))
       .toThrow(/requires a numeric apkVersionId/);
   });
 
@@ -243,5 +256,40 @@ describe('seedApkAnalysisPipeline', () => {
     expect(pipelines[0].name).toBe('APK Analysis');
     // No version was inserted for the pre-existing row — seeding only patches the name.
     expect(db.select().from(aiPipelineVersions).all()).toHaveLength(0);
+  });
+
+  // Covers the real migration this seed now has to perform: a pipeline that was seeded before
+  // Quick Rescan became event-sourced has a published version whose graph no longer matches
+  // ASTERIX_PATTERN_GRAPH. A boot-time constant change must actually reach a pipeline that was
+  // seeded before this code shipped, or the live system never picks up the new wiring until
+  // someone manually re-publishes through the UI.
+  it('republishes a new version when the published graph has drifted from ASTERIX_PATTERN_GRAPH, exactly like a manual /publish', () => {
+    const db = makeDb();
+    const now = new Date();
+    const pipelineId = db.insert(aiPipelines).values({ name: 'APK Analysis', jobKind: 'apk-analysis', createdAt: now }).run().lastInsertRowid as number;
+    const staleGraph = { ...ASTERIX_PATTERN_GRAPH, nodes: [] }; // stand-in for "an older shape"
+    const staleVersionId = db.insert(aiPipelineVersions).values({
+      pipelineId, version: 1, graph: staleGraph as any, status: 'published', createdAt: now,
+    }).run().lastInsertRowid as number;
+
+    seedApkAnalysisPipeline(db);
+
+    const versions = db.select().from(aiPipelineVersions).all().filter(v => v.pipelineId === pipelineId);
+    expect(versions).toHaveLength(2);
+
+    const stale = versions.find(v => v.id === staleVersionId)!;
+    expect(stale.status).toBe('draft'); // demoted, not deleted — matches /publish's own demotion
+
+    const published = versions.find(v => v.status === 'published')!;
+    expect(published.version).toBe(2);
+    expect(published.graph).toEqual(ASTERIX_PATTERN_GRAPH);
+  });
+
+  it('does not republish when the published graph already matches ASTERIX_PATTERN_GRAPH', () => {
+    const db = makeDb();
+    seedApkAnalysisPipeline(db);
+    seedApkAnalysisPipeline(db); // second call: graph already matches, must be a no-op
+
+    expect(db.select().from(aiPipelineVersions).all()).toHaveLength(1);
   });
 });

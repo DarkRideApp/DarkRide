@@ -23,10 +23,27 @@ import { enumerateApkPaths } from '../utils/apk-utils';
 import { applyRetentionForApp, applyRetentionForAllApps } from './apk-retention';
 import { backfillApkCloudFiles, cleanupStaleAnalysisDirs } from './apk-backfill';
 import { backfillNotesFromDisk } from './apk-notes';
+import type { SchemaField } from './ai-jobs/types';
 
 const execAsync = promisify(exec);
 const { log, error } = createLoggers('apk-tracker');
 const DEFAULT_CHECK_INTERVAL = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * `apk:version-detected`'s real, canonical schema — exported so a Trigger bound to this event
+ * (apk-analysis-pipeline.ts's "Quick Rescan") declares the same shape passed to `hookBus.define`
+ * below, instead of a hand-copied literal that could drift from what this service actually emits.
+ */
+export const APK_VERSION_DETECTED_SCHEMA: SchemaField[] = [
+  { field: 'trackedAppId', type: 'number', description: 'The tracked app this version belongs to' },
+  { field: 'packageName', type: 'string', description: 'Reverse-DNS package name' },
+  { field: 'appName', type: 'string', description: 'Display name, if known' },
+  { field: 'source', type: 'string', description: 'Where this version was found' },
+  { field: 'versionName', type: 'string', description: 'Human version string' },
+  { field: 'previousVersion', type: 'string', description: 'The prior tracked version, if any' },
+  { field: 'analysed', type: 'boolean', description: 'Whether this version has already been analysed' },
+  { field: 'apkVersionId', type: 'number', description: 'The apk_versions row id, if the APK was downloaded — null when auto-analyse is off and nothing was fetched' },
+];
 
 /** Density preference order for mipmap icon extraction (highest first). */
 const DENSITY_ORDER = ['xxxhdpi', 'xxhdpi', 'xhdpi', 'hdpi', 'mdpi'] as const;
@@ -245,15 +262,7 @@ export class ApkTracker {
 
   setHookBus(bus: import('@darkrideapp/plugin-sdk').HookBus): void {
     this.hookBus = bus;
-    this.hookBus.define('apk:version-detected', [
-      { field: 'trackedAppId', type: 'number', description: 'The tracked app this version belongs to' },
-      { field: 'packageName', type: 'string', description: 'Reverse-DNS package name' },
-      { field: 'appName', type: 'string', description: 'Display name, if known' },
-      { field: 'source', type: 'string', description: 'Where this version was found' },
-      { field: 'versionName', type: 'string', description: 'Human version string' },
-      { field: 'previousVersion', type: 'string', description: 'The prior tracked version, if any' },
-      { field: 'analysed', type: 'boolean', description: 'Whether this version has already been analysed' },
-    ], 'Fires when a new or changed APK version is detected for a tracked app.');
+    this.hookBus.define('apk:version-detected', APK_VERSION_DETECTED_SCHEMA, 'Fires when a new or changed APK version is detected for a tracked app.');
   }
 
   /**
@@ -267,7 +276,7 @@ export class ApkTracker {
   private emitVersionDetected(payload: {
     trackedAppId: number; packageName: string; appName: string | null;
     source: string; versionName: string; previousVersion: string | null;
-    analysed: boolean;
+    analysed: boolean; apkVersionId: number | null;
   }): void {
     if (!this.hookBus) return;
     try {
@@ -487,7 +496,7 @@ export class ApkTracker {
           this.emitVersionDetected({
             trackedAppId: app.id, packageName: app.packageName, appName: app.appName,
             source: source.id, versionName: versionInfo.versionName,
-            previousVersion, analysed: false,
+            previousVersion, analysed: false, apkVersionId: null,
           });
         }
         log(`${source.label}: ${app.packageName} ${versionInfo.versionName} detected (auto-analyse off, not downloading)`);
@@ -539,7 +548,7 @@ export class ApkTracker {
         this.emitVersionDetected({
           trackedAppId: app.id, packageName: app.packageName, appName: app.appName,
           source: source.id, versionName: versionInfo.versionName,
-          previousVersion, analysed: true,
+          previousVersion, analysed: true, apkVersionId: versionId,
         });
       }
 

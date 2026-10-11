@@ -397,6 +397,14 @@ describe('ApkTracker', () => {
           expect.arrayContaining([expect.objectContaining({ field: 'trackedAppId', type: 'number' })]),
           expect.any(String),
         );
+        // apkVersionId is what lets a pipeline Trigger bound to this event actually run an
+        // apk-analysis job against the version — without it, an event-sourced Trigger has no way
+        // to say which APK version it's for.
+        expect(bus.define).toHaveBeenCalledWith(
+          'apk:version-detected',
+          expect.arrayContaining([expect.objectContaining({ field: 'apkVersionId', type: 'number' })]),
+          expect.any(String),
+        );
       });
 
       it('emits apk:version-detected with analysed:false', async () => {
@@ -416,10 +424,12 @@ describe('ApkTracker', () => {
           versionName: '3.0.0',
           previousVersion: '2.0.0',
           analysed: false,
+          // No APK was downloaded in this branch — there is no version row to point at.
+          apkVersionId: null,
         }));
       });
 
-      it('emits apk:version-detected with analysed:true when it did download', async () => {
+      it('emits apk:version-detected with analysed:true and the real apkVersionId when it did download', async () => {
         const appId = addApp(true);
         seedSource(appId, { lastVersion: '2.0.0' });
         const ps = fakeSource();
@@ -427,10 +437,14 @@ describe('ApkTracker', () => {
         const { emit, bus } = hookBus();
         tracker.setHookBus(bus);
 
-        await tracker.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, ps);
+        const result = await tracker.checkRemoteSource({ id: appId, packageName: 'com.example.app', appName: null }, ps);
 
         expect(ps.downloadApk).toHaveBeenCalled();
-        expect(emit).toHaveBeenCalledWith('apk:version-detected', expect.objectContaining({ analysed: true }));
+        expect(result.newVersionId).not.toBeNull();
+        expect(emit).toHaveBeenCalledWith('apk:version-detected', expect.objectContaining({
+          analysed: true,
+          apkVersionId: result.newVersionId,
+        }));
       });
 
       it('does not re-announce an unchanged version', async () => {

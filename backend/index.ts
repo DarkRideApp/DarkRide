@@ -1256,6 +1256,10 @@ httpServer.listen(PORT, HOST, () => {
   deviceManager.setHookBus(pluginManager.getHookBus());
   captureManager.setHookBus(pluginManager.getHookBus());
   runner.setHookBus(pluginManager.getHookBus());
+  // Before attach/refresh: seedApkAnalysisPipeline republishes when ASTERIX_PATTERN_GRAPH has
+  // drifted from what's stored (e.g. Quick Rescan moving onto apk:version-detected) — refresh
+  // must see that republished version on THIS boot, not wait for the next one.
+  seedApkAnalysisPipeline(db);
   hookTriggerDispatcher.attach(pluginManager.getHookBus());
   hookTriggerDispatcher.refresh(); // covers a published version that existed before this feature shipped
 
@@ -1443,8 +1447,6 @@ httpServer.listen(PORT, HOST, () => {
   // it kicks off on boot can never be caught by this reset.
   resetRunningPipelineRuns(db);
   apkAnalyzer.start();
-  // Seed the Astérix pattern pipeline + its published version — idempotent, safe on every boot.
-  seedApkAnalysisPipeline(db);
   fridaReleaseManager.start().catch(err => error('Frida release manager failed: ' + err.message));
   fileSync.start();
   jobRegistry.start();

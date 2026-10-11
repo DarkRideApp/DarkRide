@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { eq, and, desc } from 'drizzle-orm';
 import type { PipelineGraph, Envelope } from './types';
 import type { NodeExecutors, ExecutionCtx } from './pipeline-runner';
 import { TRIGGER_SCHEMAS, runTrigger } from './nodes/trigger';
@@ -11,6 +11,7 @@ import { runSink } from './nodes/sink';
 import type { AiAgentFactory } from '../ai-agent-factory';
 import type { AppDatabase } from '../../db/index';
 import { aiPipelines, aiPipelineVersions } from '../../db/schema';
+import { APK_VERSION_DETECTED_SCHEMA } from '../apk-tracker';
 
 const PIPELINE_NAME = 'APK Analysis';
 const PIPELINE_JOB_KIND = 'apk-analysis';
@@ -46,14 +47,18 @@ const GROUP_B_TOOLS = ['search_apk_code', 'get_apk_strings', 'find_api_endpoints
 
 /**
  * The literal, real pipeline graph for the `apk-analysis` job kind — not a test fixture. Two
- * disjoint Trigger zones: "Full Analysis" (trigger-full) fans out to seven Group-A/B AgentCalls
- * feeding a Report feeding a Sink, and "Quick Rescan" (trigger-rescan) runs a single diff
- * AgentCall feeding its own Sink.
+ * disjoint Trigger zones: "Full Analysis" (trigger-full) is a manual/on-demand command — a human
+ * (or apk-analyzer.ts's own auto-analysis-on-download flow) decides when to run it, so it stays
+ * function-sourced — fanning out to seven Group-A/B AgentCalls feeding a Report feeding a Sink.
+ * "Quick Rescan" (trigger-rescan) is event-sourced from apk-tracker.ts's real `apk:version-
+ * detected` hook — it genuinely IS an event ("a new version showed up"), so it runs through
+ * HookTriggerDispatcher like any other event-sourced Trigger, with zero bespoke wiring — a single
+ * diff AgentCall feeding its own Sink.
  */
 export const ASTERIX_PATTERN_GRAPH: PipelineGraph = {
   nodes: [
     { id: 'trigger-full', label: 'Full Analysis', config: { kind: 'Trigger', source: 'function', expandFn: 'apk-analysis/apk-context', inputSchema: APK_TRIGGER_INPUT_SCHEMA, outputSchema: APK_CONTEXT_SCHEMA } },
-    { id: 'trigger-rescan', label: 'Quick Rescan', config: { kind: 'Trigger', source: 'function', expandFn: 'apk-analysis/apk-context', inputSchema: APK_TRIGGER_INPUT_SCHEMA, outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-rescan', label: 'Quick Rescan', config: { kind: 'Trigger', source: 'event', eventName: 'apk:version-detected', outputSchema: APK_VERSION_DETECTED_SCHEMA } },
 
     { id: 'agent-overview', label: 'App Overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}. Summarize purpose, framework, permissions and notable SDKs.' } },
     { id: 'agent-wait-times', label: 'Wait Times Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} fetches ride wait times. Search for queue, wait and attraction-status endpoints.' } },
@@ -152,24 +157,52 @@ export function buildApkAnalysisExecutionCtx(
   };
 }
 
-/** Idempotent: matches the existing row by `jobKind` alone and patches `name` if it drifted, so restarts never duplicate it. */
+/**
+ * Idempotent: matches the existing row by `jobKind` alone and patches `name` if it drifted, so
+ * restarts never duplicate it. Also keeps the published graph itself in sync with
+ * ASTERIX_PATTERN_GRAPH — a code change to the constant (e.g. Quick Rescan moving onto
+ * apk:version-detected) must reach a pipeline that was already seeded on an earlier boot, or the
+ * live system silently keeps running the old wiring until someone re-publishes by hand. Drift is
+ * fixed the same way a human would: a new version is inserted and published, the old one demoted
+ * to draft — exactly POST /v1/ai-pipelines/:id/publish's own semantics, never an in-place edit of
+ * an already-published row.
+ */
 export function seedApkAnalysisPipeline(db: AppDatabase): void {
   const existing = db.select().from(aiPipelines)
     .where(eq(aiPipelines.jobKind, PIPELINE_JOB_KIND))
     .all()[0];
-  if (existing) {
-    if (existing.name !== PIPELINE_NAME) {
-      db.update(aiPipelines).set({ name: PIPELINE_NAME }).where(eq(aiPipelines.id, existing.id)).run();
-    }
+  if (!existing) {
+    const now = new Date();
+    const pipelineId = db.insert(aiPipelines).values({
+      name: PIPELINE_NAME, jobKind: PIPELINE_JOB_KIND, createdAt: now,
+    }).run().lastInsertRowid as number;
+
+    db.insert(aiPipelineVersions).values({
+      pipelineId, version: 1, graph: ASTERIX_PATTERN_GRAPH as any, status: 'published', createdAt: now,
+    }).run();
     return;
   }
 
+  if (existing.name !== PIPELINE_NAME) {
+    db.update(aiPipelines).set({ name: PIPELINE_NAME }).where(eq(aiPipelines.id, existing.id)).run();
+  }
+
+  // No version at all for this row is left alone, same as before this drift check existed — we
+  // only know how to correct a graph we already recognize as a prior shape of our own, not
+  // conjure one from nothing for an arbitrary pre-existing row.
+  const latest = db.select().from(aiPipelineVersions)
+    .where(eq(aiPipelineVersions.pipelineId, existing.id))
+    .orderBy(desc(aiPipelineVersions.version)).all()[0];
+  if (!latest || JSON.stringify(latest.graph) === JSON.stringify(ASTERIX_PATTERN_GRAPH)) return;
+
   const now = new Date();
-  const pipelineId = db.insert(aiPipelines).values({
-    name: PIPELINE_NAME, jobKind: PIPELINE_JOB_KIND, createdAt: now,
+  const nextVersion = latest.version + 1;
+  const newVersionId = db.insert(aiPipelineVersions).values({
+    pipelineId: existing.id, version: nextVersion, graph: ASTERIX_PATTERN_GRAPH as any, status: 'draft', createdAt: now,
   }).run().lastInsertRowid as number;
 
-  db.insert(aiPipelineVersions).values({
-    pipelineId, version: 1, graph: ASTERIX_PATTERN_GRAPH as any, status: 'published', createdAt: now,
-  }).run();
+  db.update(aiPipelineVersions).set({ status: 'draft' })
+    .where(and(eq(aiPipelineVersions.pipelineId, existing.id), eq(aiPipelineVersions.status, 'published')))
+    .run();
+  db.update(aiPipelineVersions).set({ status: 'published' }).where(eq(aiPipelineVersions.id, newVersionId)).run();
 }
