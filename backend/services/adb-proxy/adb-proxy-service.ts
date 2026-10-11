@@ -17,7 +17,7 @@ import { PendingRegistry, type PendingOptions } from './pending';
 import { PortAllocator, PortError } from './port-allocator';
 import { Session, type BackendConnector, type SessionEvent } from './session';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings, type AdbProxySettings } from './settings';
-import { createBurstLog, onceEvery, type BurstLog } from './throttle';
+import { createBudgetLog, onceEvery, type BudgetLog } from './throttle';
 
 const { log, error: logError } = createLoggers('adb-proxy');
 
@@ -34,8 +34,10 @@ export interface AdbProxyServiceDeps {
   pending?: PendingOptions;
   /** How often the online device list is compared with the service's own view; default 5000. */
   reconcileMs?: number;
-  /** Length of one log interval for lines a peer without an approved key can provoke; default 1000. */
-  logIntervalMs?: number;
+  /** Window of the log budget for lines a peer without an approved key can provoke; default 60000. */
+  logWindowMs?: number;
+  /** Detail lines per window in that budget; default 5. */
+  logMaxDetail?: number;
 }
 
 type Failure<E extends string> = { ok: false; error: E };
@@ -43,7 +45,8 @@ type Done = { ok: true };
 
 const NOTIFY_DELAY_MS = 50;
 const DEFAULT_RECONCILE_MS = 5000;
-const DEFAULT_LOG_INTERVAL_MS = 1000;
+const DEFAULT_LOG_WINDOW_MS = 60_000;
+const DEFAULT_LOG_MAX_DETAIL = 5;
 const REFUSAL_LOG_LENGTH = 60;
 const short = (keyId: string) => keyId.slice(0, 12);
 // The service string comes from the client: keep printable ASCII only so it cannot forge or hide log lines.
@@ -71,21 +74,21 @@ export class AdbProxyService {
   private readonly backend: BackendConnector;
   private readonly logBackendFailure = onceEvery(30_000, (message: string) => logError(message));
   private readonly logPresenceFailure = onceEvery(30_000, (message: string) => logError(message));
-  // The log buffer is shared by the whole server, so lines a peer without an approved key can provoke are rate limited.
-  private readonly logRefusal: BurstLog;
-  private readonly logUnauthenticatedClose: BurstLog;
-  private readonly logBlocked: BurstLog;
-  private readonly logFloodDrop: BurstLog;
-  private readonly logRequested: BurstLog;
+  // The log buffer is shared by the whole server. Lines a peer without an approved key can provoke draw on one
+  // budget; refusals need an authenticated session, so they have a budget of their own.
+  private readonly peerLog: BudgetLog;
+  private readonly refusalLog: BudgetLog;
   private readonly trusted = new WeakSet<Session>();
 
   constructor(private readonly deps: AdbProxyServiceDeps) {
-    const burst = (kind: string) => createBurstLog(deps.logIntervalMs ?? DEFAULT_LOG_INTERVAL_MS, kind, (line) => log(line));
-    this.logRefusal = burst('refused service');
-    this.logUnauthenticatedClose = burst('unauthenticated close');
-    this.logBlocked = burst('blocked key');
-    this.logFloodDrop = burst('approval flood-drop');
-    this.logRequested = burst('approval request');
+    const budget = () => createBudgetLog({
+      windowMs: deps.logWindowMs ?? DEFAULT_LOG_WINDOW_MS,
+      maxDetail: deps.logMaxDetail ?? DEFAULT_LOG_MAX_DETAIL,
+      emit: log,
+      onError: (e: any) => logError(`could not write to the log: ${e?.message ?? e}`),
+    });
+    this.peerLog = budget();
+    this.refusalLog = budget();
     // A dead host ADB server is logged once per interval, not once per stream.
     this.backend = {
       openService: async (serial, service) => {
@@ -145,7 +148,8 @@ export class AdbProxyService {
     this.reconcileTimer = null;
     for (const s of [...this.sessions]) s.destroy('service stopping');
     await this.stopAllDevices();
-    for (const burst of [this.logRefusal, this.logUnauthenticatedClose, this.logBlocked, this.logFloodDrop, this.logRequested]) burst.stop();
+    this.peerLog.stop();
+    this.refusalLog.stop();
     // Last, so each session's cancel() above ran against a live registry.
     this.pending.stop();
   }
@@ -501,12 +505,14 @@ export class AdbProxyService {
         this.trusted.add(e.session);
         log(`session ${e.session.id} authenticated ${who}`);
         break;
-      case 'refused-service': this.logRefusal.log(`session ${e.session.id} refused service "${printable(e.service)}" ${who}`); return;
+      case 'refused-service':
+        this.refusalLog.log('refused service', `session ${e.session.id} refused service "${printable(e.service)}" ${who}`);
+        return;
       case 'closed': {
         // Anyone can open and drop connections, so only a session that authenticated gets a line of its own.
         const line = `session ${e.session.id} closed (${e.reason}) ${who}`;
         if (this.trusted.has(e.session)) log(line);
-        else this.logUnauthenticatedClose.log(line);
+        else this.peerLog.log('unauthenticated close', line);
         break;
       }
       default: break;
@@ -517,14 +523,14 @@ export class AdbProxyService {
   private onGateEvent(e: GateEvent): void {
     switch (e.kind) {
       case 'requested':
-        this.logRequested.log(`key ${short(e.entry.keyId)} (${e.entry.comment}) is waiting for approval for device=${e.entry.deviceId} ip=${e.entry.peerIp}`);
+        this.peerLog.log('approval request', `key ${short(e.entry.keyId)} (${e.entry.comment}) is waiting for approval for device=${e.entry.deviceId} ip=${e.entry.peerIp}`);
         break;
       case 'blocked':
-        this.logBlocked.log(`blocked key ${short(e.keyId)} (${e.reason}) device=${e.deviceId} ip=${e.peerIp}`);
+        this.peerLog.log('blocked key', `blocked key ${short(e.keyId)} (${e.reason}) device=${e.deviceId} ip=${e.peerIp}`);
         break;
       case 'flood-drop':
         this.counters.floodDrops++;
-        this.logFloodDrop.log(`dropped an approval request (${e.reason} limit) device=${e.deviceId} ip=${e.peerIp}`);
+        this.peerLog.log('approval flood-drop', `dropped an approval request (${e.reason} limit) device=${e.deviceId} ip=${e.peerIp}`);
         break;
     }
   }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createBurstLog, onceEvery } from './throttle';
+import { createBudgetLog, onceEvery } from './throttle';
 
 describe('onceEvery', () => {
   it('runs the first call and drops calls inside the interval', () => {
@@ -30,7 +30,7 @@ describe('onceEvery', () => {
   });
 });
 
-describe('createBurstLog', () => {
+describe('createBudgetLog', () => {
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -38,165 +38,197 @@ describe('createBurstLog', () => {
     vi.useRealTimers();
   });
 
-  it('emits the first event of an interval at once, in full', () => {
+  const SUMMARY = / more events suppressed \(/;
+  const isSummary = (line: string) => SUMMARY.test(line);
+  /** The per-kind counts of a summary line, e.g. "35 more events suppressed (9 b, 8 a)". */
+  const countsOf = (line: string) =>
+    [...line.slice(line.indexOf('(')).matchAll(/(\d+) ([^,)]+)/g)].map((m) => [m[2], Number(m[1])] as const);
+
+  it('emits events in full, at once, up to the budget', () => {
     const emit = vi.fn();
-    createBurstLog(1000, 'probe', emit).log('first detail');
-    expect(emit.mock.calls).toEqual([['first detail']]);
+    const budget = createBudgetLog({ windowMs: 1000, maxDetail: 3, emit });
+    budget.log('a', 'first');
+    budget.log('b', 'second');
+    budget.log('a', 'third');
+    expect(emit.mock.calls).toEqual([['first'], ['second'], ['third']]);
   });
 
-  it('counts the rest of the interval and emits one summary line when it ends', () => {
+  it('counts events past the budget and ends the window with one summary listing the count per kind', () => {
     const emit = vi.fn();
-    const burst = createBurstLog(1000, 'probe', emit);
-    for (let i = 0; i < 50; i++) burst.log(`event ${i}`);
-    expect(emit.mock.calls).toEqual([['event 0']]);
+    const budget = createBudgetLog({ windowMs: 1000, maxDetail: 2, emit });
+    budget.log('a', 'a1');
+    budget.log('b', 'b1');
+    budget.log('a', 'a2');
+    budget.log('b', 'b2');
+    budget.log('b', 'b3');
+    expect(emit.mock.calls).toEqual([['a1'], ['b1']]);
     vi.advanceTimersByTime(999);
-    expect(emit).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(1);
-    expect(emit.mock.calls).toEqual([['event 0'], ['49 more probe events suppressed']]);
-  });
-
-  it('says nothing more when nothing was suppressed, and the next event after the interval is emitted at once', () => {
-    const emit = vi.fn();
-    const burst = createBurstLog(1000, 'probe', emit);
-    burst.log('a');
-    vi.advanceTimersByTime(1000);
-    expect(emit.mock.calls).toEqual([['a']]);
-    burst.log('b');
-    expect(emit.mock.calls).toEqual([['a'], ['b']]);
-  });
-
-  it('counts, without logging, in the interval after a hot one, and makes that interval twice as long', () => {
-    const emit = vi.fn();
-    const burst = createBurstLog(1000, 'probe', emit);
-    burst.log('a');
-    burst.log('b');
-    vi.advanceTimersByTime(1000);
-    expect(emit.mock.calls).toEqual([['a'], ['1 more probe events suppressed']]);
-    burst.log('c');
-    burst.log('d');
-    burst.log('e');
-    vi.advanceTimersByTime(1999);
     expect(emit).toHaveBeenCalledTimes(2);
     vi.advanceTimersByTime(1);
-    expect(emit.mock.calls).toEqual([['a'], ['1 more probe events suppressed'], ['3 more probe events suppressed']]);
+    expect(emit.mock.calls).toEqual([['a1'], ['b1'], ['3 more events suppressed (1 a, 2 b)']]);
   });
 
-  it('doubles the interval while events keep coming, up to 60 times the base, with an exact count in each summary', () => {
-    const lines: string[] = [];
-    const stamps: number[] = [];
-    const burst = createBurstLog(1000, 'probe', (line) => {
-      lines.push(line);
-      stamps.push(Date.now());
-    });
-    const start = Date.now();
-    let events = 0;
-    for (let elapsed = 0; elapsed < 300_000; elapsed += 10) {
-      burst.log(`event ${events}`);
-      events++;
-      vi.advanceTimersByTime(10);
-    }
-
-    expect(lines[0]).toBe('event 0');
-    expect(stamps.slice(1).map((stamp) => stamp - start)).toEqual([1000, 3000, 7000, 15000, 31000, 63000, 123000, 183000, 243000]);
-    burst.stop();
-    expect(lines.length).toBeLessThanOrEqual(12);
-    expect(vi.getTimerCount()).toBe(0);
-    const counted = lines.slice(1).reduce((sum, line) => sum + Number(line.split(' ')[0]), 0);
-    expect(1 + counted).toBe(events);
-    expect(events).toBe(30_000);
-  });
-
-  it('goes back to the base interval after an interval with no events at all', () => {
+  it('goes idle after a window: no timer, no summary when nothing was suppressed', () => {
     const emit = vi.fn();
-    const burst = createBurstLog(1000, 'probe', emit);
-    burst.log('a');
-    burst.log('b');
-    vi.advanceTimersByTime(1000);
-    burst.log('c');
-    vi.advanceTimersByTime(2000);
-    expect(emit.mock.calls).toEqual([['a'], ['1 more probe events suppressed'], ['1 more probe events suppressed']]);
-    vi.advanceTimersByTime(4000);
-    expect(emit).toHaveBeenCalledTimes(3);
+    const budget = createBudgetLog({ windowMs: 1000, maxDetail: 3, emit });
     expect(vi.getTimerCount()).toBe(0);
-
-    burst.log('x');
-    burst.log('y');
-    expect(emit).toHaveBeenLastCalledWith('x');
-    vi.advanceTimersByTime(999);
-    expect(emit).toHaveBeenCalledTimes(4);
-    vi.advanceTimersByTime(1);
-    expect(emit).toHaveBeenLastCalledWith('1 more probe events suppressed');
-    expect(emit).toHaveBeenCalledTimes(5);
-  });
-
-  it('stop() during a longer interval flushes its count and clears the timer', () => {
-    const emit = vi.fn();
-    const burst = createBurstLog(1000, 'probe', emit);
-    burst.log('a');
-    burst.log('b');
-    vi.advanceTimersByTime(1000);
-    burst.log('c');
-    burst.log('d');
-    burst.stop();
-    expect(vi.getTimerCount()).toBe(0);
-    expect(emit.mock.calls).toEqual([['a'], ['1 more probe events suppressed'], ['2 more probe events suppressed']]);
-    vi.advanceTimersByTime(10_000);
-    expect(emit).toHaveBeenCalledTimes(3);
-  });
-
-  it('keeps no timer while idle', () => {
-    const burst = createBurstLog(1000, 'probe', vi.fn());
-    expect(vi.getTimerCount()).toBe(0);
-    burst.log('a');
+    budget.log('a', 'a1');
     expect(vi.getTimerCount()).toBe(1);
     vi.advanceTimersByTime(1000);
+    expect(emit.mock.calls).toEqual([['a1']]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('goes idle after a summary, and the next event opens a new window with a fresh budget', () => {
+    const emit = vi.fn();
+    const budget = createBudgetLog({ windowMs: 1000, maxDetail: 1, emit });
+    budget.log('a', 'a1');
+    budget.log('a', 'a2');
+    vi.advanceTimersByTime(1000);
+    expect(vi.getTimerCount()).toBe(0);
+    budget.log('a', 'a3');
+    budget.log('a', 'a4');
+    vi.advanceTimersByTime(1000);
+    expect(emit.mock.calls).toEqual([['a1'], ['1 more events suppressed (1 a)'], ['a3'], ['1 more events suppressed (1 a)']]);
+  });
+
+  it('logs a single event in full after a quiet gap longer than the window', () => {
+    const emit = vi.fn();
+    const budget = createBudgetLog({ windowMs: 1000, maxDetail: 1, emit });
+    for (let i = 0; i < 20; i++) budget.log('a', `burst ${i}`);
+    vi.advanceTimersByTime(10_000);
+    budget.log('a', 'after the gap');
+    expect(emit).toHaveBeenLastCalledWith('after the gap');
+    expect(emit).toHaveBeenCalledTimes(3);
+  });
+
+  it('shares one budget across kinds, so interleaved kinds cannot each draw their own', () => {
+    const emit = vi.fn();
+    const budget = createBudgetLog({ windowMs: 1000, maxDetail: 5, emit });
+    const kinds = ['a', 'b', 'c', 'd'];
+    for (let i = 0; i < 40; i++) budget.log(kinds[i % 4], `event ${i}`);
+    expect(emit.mock.calls.map(([line]) => line)).toEqual(['event 0', 'event 1', 'event 2', 'event 3', 'event 4']);
+    vi.advanceTimersByTime(1000);
+    expect(emit).toHaveBeenLastCalledWith('35 more events suppressed (9 b, 9 c, 9 d, 8 a)');
+    expect(emit).toHaveBeenCalledTimes(6);
+  });
+
+  it('bounds a peer that sends one event per interval forever: at most maxDetail + 1 lines per window, counts exact', () => {
+    const windowMs = 60_000;
+    const lines: string[] = [];
+    const budget = createBudgetLog({ windowMs, maxDetail: 5, emit: (line) => lines.push(line) });
+    const gap = windowMs / 50 + 1;
+    const kinds = ['unauthenticated close', 'approval request', 'blocked key', 'approval flood-drop'];
+    let events = 0;
+    for (let elapsed = 0; elapsed < 10 * windowMs; elapsed += gap) {
+      budget.log(kinds[events % kinds.length], `event ${events}`);
+      events++;
+      vi.advanceTimersByTime(gap);
+    }
+    budget.stop();
+
+    expect(events).toBeGreaterThan(450);
+    expect(lines.length).toBeLessThanOrEqual(70);
+    const groups: string[][] = [];
+    let current: string[] = [];
+    for (const line of lines) {
+      current.push(line);
+      if (isSummary(line)) {
+        groups.push(current);
+        current = [];
+      }
+    }
+    if (current.length > 0) groups.push(current);
+    expect(groups.length).toBeGreaterThanOrEqual(9);
+    for (const group of groups) expect(group.length).toBeLessThanOrEqual(6);
+    const counted = lines.filter(isSummary).flatMap(countsOf).reduce((sum, [, n]) => sum + n, 0);
+    expect(lines.filter((line) => !isSummary(line)).length + counted).toBe(events);
     expect(vi.getTimerCount()).toBe(0);
   });
 
   it('stop() clears the timer and emits the pending summary once', () => {
     const emit = vi.fn();
-    const burst = createBurstLog(1000, 'probe', emit);
-    burst.log('a');
-    burst.log('b');
-    burst.log('c');
-    burst.stop();
+    const budget = createBudgetLog({ windowMs: 1000, maxDetail: 1, emit });
+    budget.log('a', 'a1');
+    budget.log('a', 'a2');
+    budget.log('b', 'b1');
+    budget.stop();
     expect(vi.getTimerCount()).toBe(0);
-    expect(emit.mock.calls).toEqual([['a'], ['2 more probe events suppressed']]);
-    burst.stop();
+    expect(emit.mock.calls).toEqual([['a1'], ['2 more events suppressed (1 a, 1 b)']]);
+    budget.stop();
     vi.advanceTimersByTime(5000);
     expect(emit).toHaveBeenCalledTimes(2);
   });
 
   it('stop() with nothing suppressed emits nothing', () => {
     const emit = vi.fn();
-    const burst = createBurstLog(1000, 'probe', emit);
-    burst.log('a');
-    burst.stop();
-    expect(emit.mock.calls).toEqual([['a']]);
+    const budget = createBudgetLog({ windowMs: 1000, maxDetail: 3, emit });
+    budget.log('a', 'a1');
+    budget.stop();
+    expect(emit.mock.calls).toEqual([['a1']]);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('emits directly and starts no timer after stop()', () => {
     const emit = vi.fn();
-    const burst = createBurstLog(1000, 'probe', emit);
-    burst.stop();
-    burst.log('late');
-    burst.log('later');
+    const budget = createBudgetLog({ windowMs: 1000, maxDetail: 1, emit });
+    budget.stop();
+    budget.log('a', 'late');
+    budget.log('a', 'later');
     expect(emit.mock.calls).toEqual([['late'], ['later']]);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('does not let an emit that throws escape from the timer', () => {
-    const emit = vi.fn((line: string) => {
-      if (line.includes('suppressed')) throw new Error('subscriber failed');
+  it('keeps counting and closes the window when the detail emit throws, reporting the failure once per window', () => {
+    const emitted: string[] = [];
+    let failing = true;
+    const onError = vi.fn();
+    const budget = createBudgetLog({
+      windowMs: 1000,
+      maxDetail: 2,
+      emit: (line) => {
+        if (failing) throw new Error('subscriber failed');
+        emitted.push(line);
+      },
+      onError,
     });
-    const burst = createBurstLog(1000, 'probe', emit);
-    burst.log('a');
-    burst.log('b');
+
+    expect(() => {
+      for (let i = 0; i < 5; i++) budget.log('a', `event ${i}`);
+    }).not.toThrow();
+    expect(vi.getTimerCount()).toBe(1);
+    expect(onError).toHaveBeenCalledTimes(1);
     expect(() => vi.advanceTimersByTime(1000)).not.toThrow();
-    burst.log('c');
-    expect(() => vi.advanceTimersByTime(2000)).not.toThrow();
-    vi.advanceTimersByTime(4000);
-    burst.log('d');
-    expect(emit).toHaveBeenLastCalledWith('d');
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+
+    failing = false;
+    budget.log('a', 'next window');
+    expect(emitted).toEqual(['next window']);
+    vi.advanceTimersByTime(1000);
+
+    failing = true;
+    budget.log('a', 'failing again');
+    expect(onError).toHaveBeenCalledTimes(2);
+  });
+
+  it('survives a summary emit that throws and an error report that throws', () => {
+    const emit = vi.fn((line: string) => {
+      if (isSummary(line)) throw new Error('subscriber failed');
+    });
+    const budget = createBudgetLog({
+      windowMs: 1000,
+      maxDetail: 1,
+      emit,
+      onError: () => {
+        throw new Error('report failed');
+      },
+    });
+    budget.log('a', 'a1');
+    budget.log('a', 'a2');
+    expect(() => vi.advanceTimersByTime(1000)).not.toThrow();
+    expect(() => budget.stop()).not.toThrow();
+    budget.log('a', 'late');
+    expect(emit).toHaveBeenLastCalledWith('late');
   });
 });

@@ -1,59 +1,78 @@
-export interface BurstLog {
-  log(line: string): void;
+export interface BudgetLogOptions {
+  /** How long a window lasts, counted from the first event after idle. */
+  windowMs: number;
+  /** Detail lines allowed per window, across all kinds. */
+  maxDetail: number;
+  emit: (line: string) => void;
+  /** Told when `emit` throws, at most once per window. */
+  onError?: (error: unknown) => void;
+}
+
+export interface BudgetLog {
+  log(kind: string, detail: string): void;
   /** Clears the timer and emits any pending summary; later events are emitted directly. */
   stop(): void;
 }
 
-const MAX_BACKOFF_FACTOR = 60;
-
 /**
- * Emits the first event after a quiet period in full, counts the rest, and ends the interval with one
- * "N more <kind> events suppressed" line. While events keep arriving the next interval is twice as long, up to
- * 60 times the base, and its events are only counted; an interval with no events resets it.
+ * A log budget for lines a peer can provoke. A window opens on the first event after idle and lasts `windowMs`.
+ * At most `maxDetail` events are written in full per window, whatever their kind; the rest are only counted per
+ * kind. If anything was suppressed the window ends with one summary line, then the log goes idle, so the output
+ * is at most `maxDetail + 1` lines per window however the events are spread.
  */
-export function createBurstLog(intervalMs: number, kind: string, emit: (line: string) => void): BurstLog {
-  const longest = intervalMs * MAX_BACKOFF_FACTOR;
+export function createBudgetLog(options: BudgetLogOptions): BudgetLog {
+  const { windowMs, maxDetail, emit, onError } = options;
   let timer: NodeJS.Timeout | null = null;
-  let length = intervalMs;
-  let suppressed = 0;
+  let written = 0;
+  let reported = false;
   let stopped = false;
+  const suppressed = new Map<string, number>();
 
-  // A subscriber that throws must not take the process down from a timer or from stop().
-  const summarise = () => {
-    const count = suppressed;
-    suppressed = 0;
-    if (count === 0) return;
+  // A subscriber that throws must not skip arming or closing a window, or take the process down from a timer.
+  const write = (line: string) => {
     try {
-      emit(`${count} more ${kind} events suppressed`);
-    } catch {
-      /* logging itself failed; nothing left to report it to */
+      emit(line);
+    } catch (error) {
+      if (reported) return;
+      reported = true;
+      try {
+        onError?.(error);
+      } catch {
+        /* the report failed too; nothing left to tell */
+      }
     }
   };
 
-  const arm = () => {
-    timer = setTimeout(() => {
-      timer = null;
-      const hot = suppressed > 0;
-      summarise();
-      if (hot) {
-        length = Math.min(length * 2, longest);
-        arm();
-      } else {
-        length = intervalMs;
-      }
-    }, length);
-    timer.unref?.();
+  const summarise = () => {
+    if (suppressed.size === 0) return;
+    let total = 0;
+    const parts: string[] = [];
+    for (const [kind, count] of suppressed) {
+      total += count;
+      parts.push(`${count} ${kind}`);
+    }
+    suppressed.clear();
+    write(`${total} more events suppressed (${parts.join(', ')})`);
   };
 
   return {
-    log(line) {
-      if (stopped) return emit(line);
-      if (timer) {
-        suppressed++;
-        return;
+    log(kind, detail) {
+      if (stopped) return write(detail);
+      if (!timer) {
+        written = 0;
+        reported = false;
+        timer = setTimeout(() => {
+          timer = null;
+          summarise();
+        }, windowMs);
+        timer.unref?.();
       }
-      emit(line);
-      arm();
+      if (written < maxDetail) {
+        written++;
+        write(detail);
+      } else {
+        suppressed.set(kind, (suppressed.get(kind) ?? 0) + 1);
+      }
     },
     stop() {
       stopped = true;
