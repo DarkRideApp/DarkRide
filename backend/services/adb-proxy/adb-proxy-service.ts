@@ -92,6 +92,7 @@ export class AdbProxyService {
   private readonly trusted = new WeakSet<Session>();
   private readonly capped = new WeakSet<Session>();
   private readonly capLogs = new Map<string, (line: string) => void>();
+  private allocating: Promise<void> = Promise.resolve();
   private readonly banners = new Map<string, { banner: Promise<string>; expires: number | null }>();
   // Held ports are retried every tick; their failure is logged once per interval per device.
   private readonly listenFailureLogs = new Map<string, (line: string) => void>();
@@ -420,10 +421,19 @@ export class AdbProxyService {
   }
 
   /** The device's port row; when the range is full, the port of the stalest offline device is taken back first. */
-  private async ensureRow(deviceId: string): Promise<ReturnType<PortAllocator['ensure']>> {
+  private ensureRow(deviceId: string): Promise<ReturnType<PortAllocator['ensure']>> {
+    // One allocation at a time: a port being handed over is still bound until its old listener stops, and another
+    // device's ensure() must not pick it up in between.
+    const run = this.allocating.then(() => this.ensureRowNow(deviceId));
+    this.allocating = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async ensureRowNow(deviceId: string): Promise<ReturnType<PortAllocator['ensure']>> {
     const row = this.ports.ensure(deviceId);
     if (!('error' in row)) return row;
-    const reclaimed = this.ports.reclaimStalest(new Set(this.online));
+    // A device that is being started waits on this chain, so stopping it here would never finish.
+    const reclaimed = this.ports.reclaimStalest(new Set([...this.online, ...this.starts.keys()]));
     if (!reclaimed) return row;
     log(`gave port ${reclaimed.port} of offline device ${reclaimed.deviceId} to ${deviceId}: the port range is full`);
     // Its listener outlives the device going offline and would still hold the port.

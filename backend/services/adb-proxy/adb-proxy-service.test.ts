@@ -902,6 +902,26 @@ describe('AdbProxyService full port range', () => {
     expect(rowOf(h, 'DEV2')).toBeUndefined();
   });
 
+  it('hands two reclaimed ports to two devices started together, with no port-in-use and no stranded device', async () => {
+    const h = await setup({ portCount: 2, extraDevices: ['DEV3', 'DEV4'], online: ['DEV1', 'DEV2'] });
+    h.directory.goOffline('DEV1');
+    h.directory.goOffline('DEV2');
+    // Both offline devices keep their listeners bound, so a handed-over port is still held until its listener stops.
+    const service = h.service as any;
+    for (const id of ['DEV3', 'DEV4']) {
+      h.directory.online.add(id);
+      service.online.add(id);
+    }
+
+    await service.serialised(() => service.startAll());
+
+    const snap = h.service.snapshot().devices.filter((d) => d.online);
+    expect(snap.map((d) => [d.deviceId, d.state])).toEqual([['DEV3', 'listening'], ['DEV4', 'listening']]);
+    expect(snap.map((d) => d.port).sort()).toEqual([h.base, h.base + 1]);
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).startsWith('cannot listen'))).toEqual([]);
+    expect(reclaimLines()).toHaveLength(2);
+  });
+
   it('never takes the port of an online device: with every row online the range stays full', async () => {
     const h = await setup({ portCount: 2, extraDevices: ['DEV3'] });
     expect(stateOf(h, 'DEV3')).toBe('range-full');
