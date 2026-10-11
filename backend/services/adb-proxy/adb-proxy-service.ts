@@ -74,6 +74,7 @@ export class AdbProxyService {
   private readonly backend: BackendConnector;
   private readonly logBackendFailure = onceEvery(30_000, (message: string) => logError(message));
   private readonly logPresenceFailure = onceEvery(30_000, (message: string) => logError(message));
+  private readonly logBroadcastFailure = onceEvery(30_000, (message: string) => logError(message));
   // The log buffer is shared by the whole server. Lines a peer without an approved key can provoke draw on one
   // budget; refusals need an authenticated session, so they have a budget of their own.
   private readonly peerLog: BudgetLog;
@@ -543,7 +544,7 @@ export class AdbProxyService {
       try {
         this.deps.broadcast!({ type: 'adb-proxy', ...this.snapshot() });
       } catch (e: any) {
-        logError(`broadcast failed: ${e?.message ?? e}`);
+        this.logBroadcastFailure(`broadcast failed: ${e?.message ?? e}`);
       }
     }, NOTIFY_DELAY_MS);
     this.notifyTimer.unref?.();

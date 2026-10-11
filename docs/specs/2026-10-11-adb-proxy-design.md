@@ -178,7 +178,7 @@ REST under `/v1/adb-proxy`, also reachable over the WS `restapi` action like the
 
 | Method and path | Scope | Purpose |
 |---|---|---|
-| `GET /status` | read | enabled, bind, range, per-device state and port, advertised host, live connections, pending requests, counters |
+| `GET /status` | read | enabled, bind, range, per-device state and port, advertised host, live connections, pending requests, approved/denied/revoked keys, counters |
 | `PUT /settings` | manage | enabled, bind host, port range (validated) |
 | `PATCH /devices/:id` | manage | `enabled`, `port` (rejects ports in use or out of range) |
 | `GET /keys` | read | approved, denied and revoked keys |
@@ -286,3 +286,4 @@ Made on 2026-10-11 while grounding the implementation plan in the code. None cha
 - **E2E** runs under its own Playwright config with a fake ADB server, and the conformance lane runs once per client in `ADB_BINS`.
 - **Risk 5** added: the real client's patience with a long-held `unauthorized` transport is unverified.
 - **Security fix: possession of the offered key is proven first.** Found by the Task 8 review while the session code was still only a plan. The first draft passed any offered public key to the gate, and an already-approved key went straight to `CNXN`, so a copied public blob was enough to connect. The session now keeps the signatures a client sends and requires one to verify under the offered key before the gate is asked.
+- **Status snapshot includes keys**, so the page renders from one message.

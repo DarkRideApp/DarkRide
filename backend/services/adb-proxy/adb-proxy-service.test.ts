@@ -54,6 +54,8 @@ interface SetupOptions {
   bindHost?: string;
   logWindowMs?: number;
   logMaxDetail?: number;
+  /** Replaces the callback that records each broadcast. */
+  broadcast?: (message: Record<string, unknown>) => void;
   /** False leaves the service unstarted. */
   start?: boolean;
   /** Runs against the database before the service starts. */
@@ -82,7 +84,7 @@ async function setup(opts: SetupOptions = {}) {
   const directory = new StubDirectory(opts.online ?? ['DEV1', 'DEV2']);
   const broadcasts: Array<Record<string, any>> = [];
   const service = new AdbProxyService({
-    db, directory, backend, broadcast: (m) => broadcasts.push(m), advertisedHost: () => '192.168.1.10', pending: opts.pending,
+    db, directory, backend, broadcast: opts.broadcast ?? ((m) => broadcasts.push(m)), advertisedHost: () => '192.168.1.10', pending: opts.pending,
     reconcileMs: opts.reconcileMs, logWindowMs: opts.logWindowMs, logMaxDetail: opts.logMaxDetail,
   });
   if (opts.start !== false) await service.start();
@@ -154,6 +156,26 @@ describe('AdbProxyService startup', () => {
     const snap = h.service.snapshot();
     expect(snap.enabled).toBe(false);
     expect(snap.devices.map((d) => [d.deviceId, d.state, d.port])).toEqual([['DEV1', 'off', null], ['DEV2', 'off', null]]);
+  });
+
+  it('binds nothing and allocates no port under the shipped defaults, with no settings stored', async () => {
+    const deviceListen = vi.spyOn(DeviceListener.prototype, 'listen');
+    const serverListen = vi.spyOn(net.Server.prototype, 'listen');
+    const db = createTestDb([users, deviceInstances, devices, settings, adbProxyKeys, adbProxyDevices], { foreignKeys: true });
+    db.insert(devices).values({ id: 'DEV1', name: 'Phone 1' }).run();
+    const service = new AdbProxyService({
+      db, directory: new StubDirectory(['DEV1']), backend: new HostClient({ host: '127.0.0.1', port: 1 }, 100),
+    });
+    cleanups.push(() => service.stop());
+
+    await service.start();
+
+    const snap = service.snapshot();
+    expect(snap).toMatchObject({ enabled: false, bindHost: '0.0.0.0', portStart: 6500, portEnd: 6599 });
+    expect(snap.devices.map((d) => [d.deviceId, d.state, d.port])).toEqual([['DEV1', 'off', null]]);
+    expect(deviceListen).not.toHaveBeenCalled();
+    expect(serverListen).not.toHaveBeenCalled();
+    expect(db.select().from(adbProxyDevices).all()).toEqual([]);
   });
 
   it('allocates the lowest free ports and listens for every online device once enabled', async () => {
@@ -737,6 +759,22 @@ describe('AdbProxyService limits and reporting', () => {
     const last = h.broadcasts.at(-1)!;
     expect(last.advertisedHost).toBe('192.168.1.10');
     expect(last.devices).toHaveLength(2);
+  });
+
+  it('logs a broadcast callback that always throws once, however many connect and close cycles re-arm the notify timer', async () => {
+    const attempts = vi.fn(() => {
+      throw new Error('socket gone');
+    });
+    const h = await setup({ broadcast: attempts });
+    await vi.waitFor(() => expect(attempts).toHaveBeenCalled());
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      const before = attempts.mock.calls.length;
+      (await h.connect()).close();
+      await vi.waitFor(() => expect(attempts.mock.calls.length).toBeGreaterThan(before));
+    }
+    const failures = errorSpy.mock.calls.map((c) => String(c[0])).filter((line) => line.includes('broadcast failed'));
+    expect(attempts.mock.calls.length).toBeGreaterThanOrEqual(5);
+    expect(failures).toEqual(['broadcast failed: socket gone']);
   });
 
   it('destroys a socket that has no remote address without giving it a pre-auth slot or counting it', async () => {
