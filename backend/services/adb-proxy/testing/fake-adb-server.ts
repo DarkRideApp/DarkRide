@@ -19,6 +19,8 @@ function hex4(n: number): string {
 export class FakeAdbServer {
   /** Every request string received, in order, across all connections. */
   readonly requests: string[] = [];
+  /** Files pushed over `sync:` (path to contents). */
+  readonly files = new Map<string, Buffer>();
   private readonly devices = new Map<string, Entry>();
   private readonly sockets = new Set<net.Socket>();
   private readonly deviceSockets = new Map<string, Set<net.Socket>>();
@@ -177,15 +179,19 @@ export class FakeAdbServer {
     const set = this.deviceSockets.get(serial) ?? new Set<net.Socket>();
     set.add(socket);
     this.deviceSockets.set(serial, set);
-    if (service.startsWith('shell:')) {
+    if (service.startsWith('shell:') || service.startsWith('exec:')) {
       okay();
-      socket.write(this.shell(serial, service.slice('shell:'.length)));
+      socket.write(this.shell(serial, service.slice(service.indexOf(':') + 1)));
       socket.end();
       return { raw: () => {} };
     }
-    if (service === 'echo:') {
+    if (service === 'echo:' || service.startsWith('tcp:')) {
       okay();
       return { raw: (chunk) => socket.write(chunk) };
+    }
+    if (service === 'sync:') {
+      okay();
+      return { raw: this.syncHandler(socket) };
     }
     if (service === 'hold:') {
       okay();
@@ -198,6 +204,63 @@ export class FakeAdbServer {
       return { raw: () => {} };
     }
     return fail('unknown service');
+  }
+
+  /** The device side of the adb sync v1 protocol: STAT, SEND (with DATA and DONE), RECV and QUIT. */
+  private syncHandler(socket: net.Socket): (chunk: Buffer) => void {
+    let buf = Buffer.alloc(0);
+    let sending: { path: string; chunks: Buffer[] } | null = null;
+    const u32 = (n: number) => {
+      const b = Buffer.alloc(4);
+      b.writeUInt32LE(n >>> 0);
+      return b;
+    };
+    return (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      for (;;) {
+        if (buf.length < 8) return;
+        const id = buf.toString('ascii', 0, 4);
+        const len = buf.readUInt32LE(4);
+        if (id === 'DONE') {
+          // The length field carries the mtime; no body follows.
+          if (sending) {
+            this.files.set(sending.path, Buffer.concat(sending.chunks));
+            sending = null;
+            socket.write(Buffer.concat([Buffer.from('OKAY'), u32(0)]));
+          }
+          buf = buf.subarray(8);
+          continue;
+        }
+        if (id === 'QUIT') {
+          socket.end();
+          return;
+        }
+        if (buf.length < 8 + len) return;
+        const body = Buffer.from(buf.subarray(8, 8 + len));
+        buf = buf.subarray(8 + len);
+        if (id === 'STAT') {
+          const file = this.files.get(body.toString());
+          socket.write(Buffer.concat([Buffer.from('STAT'), u32(file ? 0x81a4 : 0), u32(file?.length ?? 0), u32(file ? 1 : 0)]));
+        } else if (id === 'RECV') {
+          const file = this.files.get(body.toString());
+          if (!file) {
+            const msg = Buffer.from('No such file');
+            socket.write(Buffer.concat([Buffer.from('FAIL'), u32(msg.length), msg]));
+            continue;
+          }
+          for (let off = 0; off < file.length; off += 65536) {
+            const piece = file.subarray(off, off + 65536);
+            socket.write(Buffer.concat([Buffer.from('DATA'), u32(piece.length), piece]));
+          }
+          socket.write(Buffer.concat([Buffer.from('DONE'), u32(0)]));
+        } else if (id === 'SEND') {
+          const spec = body.toString();
+          sending = { path: spec.slice(0, spec.lastIndexOf(',')), chunks: [] };
+        } else if (id === 'DATA' && sending) {
+          sending.chunks.push(body);
+        }
+      }
+    };
   }
 
   private flood(socket: net.Socket, total: number): void {

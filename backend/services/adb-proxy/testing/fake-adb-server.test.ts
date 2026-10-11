@@ -155,3 +155,81 @@ describe('FakeAdbServer', () => {
     client.destroy();
   });
 });
+
+function recorder(socket: net.Socket) {
+  let all = Buffer.alloc(0);
+  socket.on('data', (c: Buffer) => { all = Buffer.concat([all, c]); });
+  return {
+    get data() { return all; },
+    async until(predicate: (b: Buffer) => boolean) {
+      const end = Date.now() + 2000;
+      while (!predicate(all)) {
+        if (Date.now() > end) throw new Error('timed out, got ' + all.toString('latin1'));
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    },
+  };
+}
+
+const u32 = (n: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+const sync = (id: string, body: Buffer) => Buffer.concat([Buffer.from(id), u32(body.length), body]);
+
+describe('FakeAdbServer extra services', () => {
+  let fake: FakeAdbServer;
+  let port: number;
+
+  beforeEach(async () => {
+    fake = new FakeAdbServer([{ serial: 'SER1' }]);
+    port = (await fake.start()).port;
+  });
+  afterEach(async () => { await fake.stop(); });
+
+  async function bound(service: string) {
+    const client = net.connect(port, '127.0.0.1');
+    const rec = recorder(client);
+    client.write(frame('host:transport:SER1'));
+    client.write(frame(service));
+    await rec.until((b) => b.toString('latin1').startsWith('OKAYOKAY'));
+    return { client, rec };
+  }
+
+  it('runs exec: like shell:', async () => {
+    const { client, rec } = await bound('exec:id');
+    await rec.until((b) => b.toString().includes('ran: id'));
+    client.destroy();
+  });
+
+  it('echoes on tcp:<port>', async () => {
+    const { client, rec } = await bound('tcp:9999');
+    client.write('ping');
+    await rec.until((b) => b.length >= 12);
+    expect(rec.data.subarray(8).toString()).toBe('ping');
+    client.destroy();
+  });
+
+  it('stores a pushed file and serves it back over sync v1', async () => {
+    const { client, rec } = await bound('sync:');
+    const payload = Buffer.from('hello sync');
+    client.write(sync('STAT', Buffer.from('/data/x')));
+    await rec.until((b) => b.length >= 8 + 16);
+    expect(rec.data.subarray(8, 12).toString()).toBe('STAT');
+    expect(rec.data.readUInt32LE(12)).toBe(0);
+
+    client.write(Buffer.concat([sync('SEND', Buffer.from('/data/x,33188')), sync('DATA', payload), Buffer.concat([Buffer.from('DONE'), u32(1)])]));
+    await rec.until((b) => b.length >= 8 + 16 + 8);
+    expect(rec.data.subarray(24, 28).toString()).toBe('OKAY');
+    expect(fake.files.get('/data/x')?.toString()).toBe('hello sync');
+
+    client.write(sync('STAT', Buffer.from('/data/x')));
+    await rec.until((b) => b.length >= 8 + 16 + 8 + 16);
+    expect(rec.data.readUInt32LE(8 + 16 + 8 + 8)).toBe(payload.length);
+
+    client.write(sync('RECV', Buffer.from('/data/x')));
+    await rec.until((b) => b.toString('latin1').endsWith('DONE\0\0\0\0'));
+    expect(rec.data.toString('latin1')).toContain('hello sync');
+
+    client.write(sync('RECV', Buffer.from('/data/missing')));
+    await rec.until((b) => b.toString('latin1').includes('FAIL'));
+    client.destroy();
+  });
+});
