@@ -105,6 +105,7 @@ import { JobRegistry } from './services/job-registry';
 import { registerJobEndpoints } from './api/jobs';
 import { registerAiPipelineEndpoints } from './api/ai-pipelines';
 import { APK_ANALYZER_AI_SCOPES, buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, seedApkAnalysisPipeline } from './services/ai-jobs/apk-analysis-pipeline';
+import { HookTriggerDispatcher } from './services/ai-jobs/hook-trigger-dispatcher';
 import { isPipelinesEnabled, resetRunningPipelineRuns } from './services/ai-jobs/run-executor';
 import { PluginManager } from './plugins/plugin-manager';
 import { computeLoadOrder } from './plugins/load-order';
@@ -837,10 +838,25 @@ aiFactory.registerCoreIdentity('apk-diff-engine', {
 apkDiffEngine.setAiFactory(aiFactory);
 
 // The AI Job Pipelines REST surface. `aiFactory` must already exist (just above).
+const aiPipelineExecutors = buildApkAnalysisExecutors();
+const buildAiPipelineCtx = (identity: { type: 'core-service' } | { type: 'user'; userId: number }, input: Record<string, unknown>) =>
+  buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number });
+
+const hookTriggerDispatcher = new HookTriggerDispatcher({
+  db,
+  executors: aiPipelineExecutors,
+  // An event payload has no "identity" the way a manual run does — every event-fired run
+  // executes as the apk-analyzer core-service identity, same as apk-analyzer.ts's own existing
+  // auto-trigger path does today (buildApkAnalysisExecutionCtx's `identity` param).
+  buildCtx: (payload) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity: { type: 'core-service' }, versionId: payload.apkVersionId as number }),
+});
+
 registerAiPipelineEndpoints({
   db,
-  executors: buildApkAnalysisExecutors(),
-  buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }),
+  executors: aiPipelineExecutors,
+  buildCtx: buildAiPipelineCtx,
+  getHookCatalog: () => pluginManager!.getHookBus().getDefinedHooks(),
+  onPublish: () => hookTriggerDispatcher.refresh(),
 });
 
 // Wire notification service to broadcast events not handled by direct service hooks
@@ -1240,6 +1256,8 @@ httpServer.listen(PORT, HOST, () => {
   deviceManager.setHookBus(pluginManager.getHookBus());
   captureManager.setHookBus(pluginManager.getHookBus());
   runner.setHookBus(pluginManager.getHookBus());
+  hookTriggerDispatcher.attach(pluginManager.getHookBus());
+  hookTriggerDispatcher.refresh(); // covers a published version that existed before this feature shipped
 
   // Wire AiAgentFactory into each plugin context (Task 14).
   // Tasks 15+ will call aiFactory.registerCoreIdentity for core services.
