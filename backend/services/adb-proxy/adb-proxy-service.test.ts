@@ -743,6 +743,30 @@ describe('AdbProxyService device presence reconciliation', () => {
     await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('listening'), { timeout: 3000 });
   });
 
+  it.each([
+    ['a range change', (h: Harness) => h.service.updateSettings({ portEnd: h.base + 10 })],
+    ['turning the proxy off and on', async (h: Harness) => {
+      await h.service.updateSettings({ enabled: false });
+      await h.service.updateSettings({ enabled: true });
+    }],
+  ])('leaves a forgotten online device quiet, not in error, through %s, and listens once its device row is back', async (_name, change) => {
+    const h = await setup({ reconcileMs: 20 });
+    const port = h.portOf('DEV1');
+    h.db.transaction((tx) => {
+      tx.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, 'DEV1')).run();
+      tx.delete(devices).where(eq(devices.id, 'DEV1')).run();
+    });
+    await vi.waitFor(() => expectPortFree(port), { timeout: 3000 });
+
+    await change(h);
+
+    await sleep(100);
+    expect(stateOf(h, 'DEV1')).not.toBe('error');
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).includes('DEV1'))).toEqual([]);
+    h.db.insert(devices).values({ id: 'DEV1', name: 'Phone 1' }).run();
+    await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('listening'), { timeout: 3000 });
+  });
+
   it('gives a device that hit the orphaned port a listener once the orphan is released, without a manual toggle', async () => {
     const h = await setup({ online: ['DEV1', 'DEV2'], extraDevices: ['DEV3'], reconcileMs: 20 });
     const orphanPort = h.portOf('DEV1');

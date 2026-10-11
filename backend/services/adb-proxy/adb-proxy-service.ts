@@ -443,6 +443,11 @@ export class AdbProxyService {
 
   private async listenFor(deviceId: string): Promise<void> {
     try {
+      // A forgotten device has no device row until the next device poll; the presence tick starts it then.
+      if (!this.ports.get(deviceId) && !this.deps.db.select({ id: devices.id }).from(devices).where(eq(devices.id, deviceId)).get()) {
+        this.deviceErrors.delete(deviceId);
+        return;
+      }
       const row = await this.ensureRow(deviceId);
       if ('error' in row) {
         this.deviceErrors.set(deviceId, 'range-full');
