@@ -6,7 +6,13 @@ export const A_CLSE = 0x45534c43;
 export const A_WRTE = 0x45545257;
 
 export const A_VERSION = 0x01000001;
+/** The largest payload current ADB clients and devices advertise in their CNXN. */
 export const MAX_DATA = 1024 * 1024;
+/**
+ * The largest payload the proxy advertises and accepts once a session is ready. Each stream can hold one unacknowledged
+ * client WRTE in the backend's write buffer, so this bounds that memory; clients use the smaller of the two maximums.
+ */
+export const PROXY_MAX_PAYLOAD = 256 * 1024;
 export const PREAUTH_MAX_PAYLOAD = 4096;
 export const HEADER_SIZE = 24;
 

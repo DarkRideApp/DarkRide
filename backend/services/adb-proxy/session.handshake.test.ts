@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { parseAdbPublicKey } from './adb-key';
-import { A_AUTH, A_CNXN, A_OPEN, A_VERSION, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN, MAX_DATA, encodePacket } from './packet';
+import {
+  A_AUTH, A_CNXN, A_OPEN, A_VERSION, A_WRTE, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN, MAX_DATA, PROXY_MAX_PAYLOAD, encodePacket,
+} from './packet';
 import { Session, type SessionEvent } from './session';
 import { makeTestAdbKey } from './testing/test-keys';
 import { StubGate } from './testing/stub-gate';
@@ -82,7 +84,8 @@ describe('Session handshake', () => {
     const reply = await client.authenticate(h.key);
     expect(reply.command).toBe(A_CNXN);
     expect(reply.arg0).toBe(A_VERSION);
-    expect(reply.arg1).toBe(MAX_DATA);
+    expect(reply.arg1).toBe(256 * 1024);
+    expect(PROXY_MAX_PAYLOAD).toBe(256 * 1024);
     expect(reply.data.toString()).toBe(BANNER);
     expect(h.gate.authenticatedCalls).toEqual([{ deviceId: 'DEV1', keyId: h.key.keyId, peerIp: '10.0.0.5' }]);
     expect(h.server.sessions[0].state).toBe('ready');
@@ -405,6 +408,20 @@ describe('Session handshake', () => {
     expect(await client.quiet(150)).toBe(true);
     expect(client.closed).toBe(false);
     expect(h.server.sessions[0].isClosed).toBe(false);
+  });
+
+  it('takes a packet of exactly the advertised maximum from a client that advertised 1 MiB, and closes on one byte more', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    expect((await client.authenticate(h.key, MAX_DATA)).command).toBe(A_CNXN);
+    client.socket.write(encodePacket({ command: A_WRTE, arg0: 1, arg1: 99, data: Buffer.alloc(PROXY_MAX_PAYLOAD) }));
+    expect(await client.quiet(150)).toBe(true);
+    expect(client.closed).toBe(false);
+
+    client.socket.write(encodePacket({ command: A_WRTE, arg0: 1, arg1: 99, data: Buffer.alloc(PROXY_MAX_PAYLOAD + 1) }).subarray(0, 24));
+
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: `payload too large: ${PROXY_MAX_PAYLOAD + 1}` });
   });
 
   it('closes when the gate fails to record an authentication straight after a signature', async () => {

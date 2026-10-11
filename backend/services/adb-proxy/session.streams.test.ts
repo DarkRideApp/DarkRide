@@ -4,7 +4,7 @@ import { Duplex } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseAdbPublicKey } from './adb-key';
 import {
-  A_AUTH, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_VERSION, A_WRTE, AUTH_SIGNATURE, MAX_DATA,
+  A_AUTH, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_VERSION, A_WRTE, AUTH_SIGNATURE, MAX_DATA, PROXY_MAX_PAYLOAD,
   PacketParser, encodePacket, type Packet,
 } from './packet';
 import { HostClient } from './host-client';
@@ -229,7 +229,7 @@ describe('Session streams', () => {
     await new Promise((r) => setTimeout(r, 200));
     const writes = h.client.packets.filter((p) => p.command === A_WRTE && p.arg0 === localId);
     expect(writes).toHaveLength(1);
-    expect(writes[0].data.length).toBeLessThanOrEqual(MAX_DATA);
+    expect(writes[0].data.length).toBeLessThanOrEqual(PROXY_MAX_PAYLOAD);
     const all = await h.client.collectStream(1, localId, 'close');
     expect(all.length).toBe(300000);
   });
@@ -671,13 +671,13 @@ describe('Session streams, bounded buffering', () => {
 });
 
 describe('Session streams, chunking and limits', () => {
-  it('splits backend data into WRTEs of at most MAX_DATA and releases the next only after the client OKAY', async () => {
-    const { h, sock } = await setupWithFake();
+  it('splits backend data into WRTEs of at most the proxy maximum for a client that advertised 1 MiB, and releases the next only after the client OKAY', async () => {
+    const { h, sock } = await setupWithFake(() => {}, { clientMaxData: MAX_DATA });
     const { localId } = await h.client.open('fake:', 1);
-    sock.emit('data', Buffer.alloc(MAX_DATA + 1, 'a'));
+    sock.emit('data', Buffer.alloc(PROXY_MAX_PAYLOAD + 1, 'a'));
     const first = await h.client.next();
     expect(first.command).toBe(A_WRTE);
-    expect(first.data.length).toBe(MAX_DATA);
+    expect(first.data.length).toBe(PROXY_MAX_PAYLOAD);
     expect(await h.client.quiet(100)).toBe(true);
     h.client.send(A_OKAY, 1, localId);
     const second = await h.client.next();

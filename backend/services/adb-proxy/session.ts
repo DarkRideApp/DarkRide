@@ -5,7 +5,7 @@ import { parseAdbPublicKey, verifyAuthSignature, type ParsedAdbKey } from './adb
 import { DeviceUnavailableError } from './host-client';
 import {
   A_AUTH, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_VERSION, A_WRTE, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN,
-  MAX_DATA, PREAUTH_MAX_PAYLOAD, PacketError, PacketParser, commandName, encodePacket, type Packet,
+  PREAUTH_MAX_PAYLOAD, PROXY_MAX_PAYLOAD, PacketError, PacketParser, commandName, encodePacket, type Packet,
 } from './packet';
 
 const { error: logError } = createLoggers('adb-proxy');
@@ -39,7 +39,7 @@ export function checkService(service: string): { allowed: true } | { allowed: fa
 
 /** The service string of an OPEN payload without its one trailing NUL, or null when malformed. */
 function parseService(data: Buffer): string | null {
-  // Bound the work before decoding: the ready-state payload cap is 1 MiB.
+  // Bound the work before decoding: the ready-state payload cap is PROXY_MAX_PAYLOAD.
   if (data.length > MAX_SERVICE_LENGTH + 1) return null;
   const raw = data.length > 0 && data[data.length - 1] === 0 ? data.subarray(0, data.length - 1) : data;
   if (raw.length === 0) return null;
@@ -128,7 +128,7 @@ export class Session {
   private closed = false;
   private readonly streams = new Map<number, Stream>();
   private nextLocalId = 1;
-  private peerMaxData = MAX_DATA;
+  private peerMaxData = PROXY_MAX_PAYLOAD;
   private readsPaused = false;
   /** The device is restarting: the session closes once the last CLSE is flushed and takes no new packets meanwhile. */
   private restarting = false;
@@ -202,7 +202,7 @@ export class Session {
   private onCnxn(p: Packet): void {
     if (p.command !== A_CNXN) return this.close('expected CNXN');
     if (!this.opts.isDeviceOnline()) return this.close('device offline');
-    this.peerMaxData = Math.min(MAX_DATA, Math.max(MIN_PEER_MAX_DATA, p.arg1));
+    this.peerMaxData = Math.min(PROXY_MAX_PAYLOAD, Math.max(MIN_PEER_MAX_DATA, p.arg1));
     this.sendToken();
     this.state = 'await-auth';
   }
@@ -303,8 +303,8 @@ export class Session {
     // The slot and the pre-auth timer cover the banner fetch, so connections in this stage stay capped.
     this.leavePreAuth();
     // No terminator: clients split the banner on commas and a trailing NUL makes them drop the last feature.
-    this.send(A_CNXN, A_VERSION, MAX_DATA, Buffer.from(banner, 'utf8'));
-    this.parser.setMaxPayload(MAX_DATA);
+    this.send(A_CNXN, A_VERSION, PROXY_MAX_PAYLOAD, Buffer.from(banner, 'utf8'));
+    this.parser.setMaxPayload(PROXY_MAX_PAYLOAD);
     this.state = 'ready';
     this.emit({ kind: 'authenticated', session: this });
   }
