@@ -54,6 +54,7 @@ const MAX_READY_PER_KEY = 32;
 const SESSION_CAP_LOG_MS = 60_000;
 // Each banner fetch runs a shell on the phone, so a reconnect storm shares one.
 const BANNER_CACHE_MS = 5000;
+const LISTEN_FAILURE_LOG_MS = 5 * 60_000;
 const short = (keyId: string) => keyId.slice(0, 12);
 // The service string comes from the client: keep printable ASCII only so it cannot forge or hide log lines.
 const printable = (text: string) => text.slice(0, REFUSAL_LOG_LENGTH).replace(/[^\x20-\x7e]/g, '?');
@@ -89,6 +90,8 @@ export class AdbProxyService {
   private readonly capped = new WeakSet<Session>();
   private readonly capLogs = new Map<string, (line: string) => void>();
   private readonly banners = new Map<string, { banner: Promise<string>; expires: number | null }>();
+  // Held ports are retried every tick; their failure is logged once per interval per device.
+  private readonly listenFailureLogs = new Map<string, (line: string) => void>();
 
   constructor(private readonly deps: AdbProxyServiceDeps) {
     const budget = () => createBudgetLog({
@@ -388,9 +391,11 @@ export class AdbProxyService {
     const running = this.starts.get(deviceId);
     if (running) return running;
     if (!this.started || !this.settings.enabled || this.listeners.has(deviceId)) return Promise.resolve();
+    const before = this.deviceErrors.get(deviceId);
     const run = this.listenFor(deviceId).finally(() => {
       this.starts.delete(deviceId);
-      this.notifyChanged();
+      // A retry that failed the same way changed nothing anyone can see.
+      if (this.listeners.has(deviceId) || this.deviceErrors.get(deviceId) !== before) this.notifyChanged();
     });
     this.starts.set(deviceId, run);
     return run;
@@ -415,10 +420,14 @@ export class AdbProxyService {
       try {
         await listener.listen();
       } catch (e: any) {
-        this.deviceErrors.set(deviceId, e instanceof ListenError && e.code === 'EADDRINUSE' ? 'port-in-use' : 'error');
-        logError(`cannot listen for ${deviceId} on port ${row.port}: ${e?.message ?? e}`);
+        const inUse = e instanceof ListenError && e.code === 'EADDRINUSE';
+        this.deviceErrors.set(deviceId, inUse ? 'port-in-use' : 'error');
+        const line = `cannot listen for ${deviceId} on port ${row.port}: ${e?.message ?? e}`;
+        if (inUse) this.listenFailureLog(deviceId)(line);
+        else logError(line);
         return;
       }
+      this.listenFailureLogs.delete(deviceId);
       if (!this.started || !this.settings.enabled) {
         await listener.close();
         return;
@@ -456,6 +465,7 @@ export class AdbProxyService {
   private deviceOffline(deviceId: string): void {
     if (!this.online.delete(deviceId)) return;
     this.banners.delete(deviceId);
+    this.listenFailureLogs.delete(deviceId);
     this.closeSessions((s) => s.deviceId === deviceId, 'device offline');
     this.notifyChanged();
   }
@@ -474,26 +484,52 @@ export class AdbProxyService {
     this.retryBlocked();
   }
 
-  /** Only a full range is retried: other failures log on every attempt. A tick with nothing to do schedules nothing, so a range that stays full is silent. */
+  /** A tick with nothing to do schedules nothing; a retry that fails the same way again changes no state, so it broadcasts nothing. */
   private retryBlocked(): void {
     if (!this.started || !this.settings.enabled) return;
     try {
-      if (this.orphanedListeners().length === 0 && this.starvedDevices().length === 0) return;
+      if (this.orphanedListeners().length === 0 && this.unlisted().length === 0 && this.starvedDevices().length === 0 && this.portBlocked().length === 0) return;
       void this.serialised(async () => {
         for (const id of this.orphanedListeners()) await this.stopDevice(id);
+        for (const id of this.unlisted()) await this.startDevice(id);
         for (const id of this.starvedDevices()) await this.startDevice(id);
+        for (const id of this.portBlocked()) await this.startDevice(id);
       }).catch((e: any) => this.logPresenceFailure(`port retry failed: ${e?.message ?? e}`));
     } catch (e: any) {
       this.logPresenceFailure(`port retry failed: ${e?.message ?? e}`);
     }
   }
 
-  /** A forgotten device has no port row but, if it went offline while the service ran, its listener still holds the port. */
+  /** A forgotten device has no port row, but its listener still holds the port whether the device is online or not. */
   private orphanedListeners(): string[] {
-    const offline = [...this.listeners.keys()].filter((id) => !this.online.has(id));
-    if (offline.length === 0) return [];
+    if (this.listeners.size === 0) return [];
     const withRow = new Set(this.ports.all().map((r) => r.deviceId));
-    return offline.filter((id) => !withRow.has(id));
+    return [...this.listeners.keys()].filter((id) => !withRow.has(id));
+  }
+
+  /** Online devices with no listener, no failure and no port row: a forgotten device whose listener was released. */
+  private unlisted(): string[] {
+    const idle = [...this.online].filter((id) => !this.listeners.has(id) && !this.starts.has(id) && !this.deviceErrors.has(id));
+    if (idle.length === 0) return [];
+    const withRow = new Set(this.ports.all().map((r) => r.deviceId));
+    const candidates = idle.filter((id) => !withRow.has(id));
+    if (candidates.length === 0) return [];
+    // A port row needs the device row, which comes back on the next device poll after a forget.
+    const known = new Set(this.deps.db.select({ id: devices.id }).from(devices).where(inArray(devices.id, candidates)).all().map((r) => r.id));
+    return candidates.filter((id) => known.has(id));
+  }
+
+  private listenFailureLog(deviceId: string): (line: string) => void {
+    let logLine = this.listenFailureLogs.get(deviceId);
+    if (!logLine) {
+      logLine = onceEvery(LISTEN_FAILURE_LOG_MS, (line: string) => logError(line));
+      this.listenFailureLogs.set(deviceId, logLine);
+    }
+    return logLine;
+  }
+
+  private portBlocked(): string[] {
+    return [...this.online].filter((id) => this.deviceErrors.get(id) === 'port-in-use');
   }
 
   private starvedDevices(): string[] {

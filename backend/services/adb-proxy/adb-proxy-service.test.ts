@@ -81,10 +81,12 @@ async function setup(opts: SetupOptions = {}) {
     portStart: base,
     portEnd: base + (opts.portCount ?? 10) - 1,
   });
+  let blocker: net.Server | null = null;
   if (opts.blockFirstPort) {
-    const blocker = net.createServer();
-    await new Promise<void>((resolve) => blocker.listen(base, '127.0.0.1', () => resolve()));
-    cleanups.push(() => new Promise<void>((resolve) => blocker.close(() => resolve())));
+    const server = net.createServer();
+    blocker = server;
+    await new Promise<void>((resolve) => server.listen(base, '127.0.0.1', () => resolve()));
+    cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
   }
   opts.seed?.(db, base);
   const directory = new StubDirectory(opts.online ?? ['DEV1', 'DEV2', ...extra]);
@@ -102,7 +104,7 @@ async function setup(opts: SetupOptions = {}) {
     return c;
   };
   cleanups.push(() => fake.stop(), () => service.stop(), () => clients.forEach((c) => c.close()));
-  return { fake, db, base, backend, directory, service, broadcasts, connect, portOf };
+  return { fake, db, base, backend, directory, service, broadcasts, connect, portOf, blocker };
 }
 type Harness = Awaited<ReturnType<typeof setup>>;
 
@@ -673,16 +675,82 @@ describe('AdbProxyService device presence reconciliation', () => {
     expect(JSON.stringify(h.service.snapshot())).toBe(snapshot);
   });
 
-  it('does not retry a device whose port is held by another process, which would log on every tick', async () => {
+  it('retries a device whose port is held by another process quietly: no log line, no broadcast, no state change per tick', async () => {
     const h = await setup({ blockFirstPort: true, reconcileMs: 20 });
     expect(stateOf(h, 'DEV1')).toBe('port-in-use');
     await sleep(200);
+    const listen = vi.spyOn(DeviceListener.prototype, 'listen');
     const before = { logs: logSpy.mock.calls.length, errors: errorSpy.mock.calls.length, broadcasts: h.broadcasts.length };
 
     await sleep(400);
 
+    expect(listen.mock.calls.length).toBeGreaterThanOrEqual(3);
     expect({ logs: logSpy.mock.calls.length, errors: errorSpy.mock.calls.length, broadcasts: h.broadcasts.length }).toEqual(before);
+    // The one line is from the first attempt at startup.
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).startsWith('cannot listen for DEV1'))).toHaveLength(1);
     expect(stateOf(h, 'DEV1')).toBe('port-in-use');
+  });
+
+  it('logs a port that stays held at most once per 5 minutes, and listens as soon as it is free', async () => {
+    const h = await setup({ online: ['DEV1'], blockFirstPort: true, reconcileMs: 20 });
+    expect(stateOf(h, 'DEV1')).toBe('port-in-use');
+    await sleep(300);
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).startsWith('cannot listen for DEV1'))).toHaveLength(1);
+
+    await new Promise<void>((resolve) => h.blocker!.close(() => resolve()));
+
+    await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('listening'), { timeout: 3000 });
+    expect(h.portOf('DEV1')).toBe(h.base);
+  });
+
+  it('releases the listener of an online device whose port row was forgotten, and listens for it again on a fresh row', async () => {
+    const h = await setup({ reconcileMs: 20 });
+    const key = makeTestAdbKey();
+    await approveKey(h, key);
+    const live = await h.connect();
+    expect((await live.authenticate(key)).command).toBe(A_CNXN);
+
+    h.db.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, 'DEV1')).run();
+
+    expect(await live.waitClosed(3000)).toBe(true);
+    await vi.waitFor(() => expect(h.service.snapshot().devices.find((d) => d.deviceId === 'DEV1')).toMatchObject({ state: 'listening', port: expect.any(Number) }), { timeout: 3000 });
+    const back = await h.connect();
+    expect((await back.authenticate(key)).command).toBe(A_CNXN);
+  });
+
+  it('frees the port of an online device that was forgotten entirely, and proxies it again once the device row returns', async () => {
+    const h = await setup({ reconcileMs: 20 });
+    const port = h.portOf('DEV1');
+
+    // What forgetting a device does to the two tables the proxy reads.
+    h.db.transaction((tx) => {
+      tx.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, 'DEV1')).run();
+      tx.delete(devices).where(eq(devices.id, 'DEV1')).run();
+    });
+
+    await vi.waitFor(() => expectPortFree(port), { timeout: 3000 });
+    expect(h.service.snapshot().devices.find((d) => d.deviceId === 'DEV1')).toMatchObject({ port: null, online: true });
+    expect(stateOf(h, 'DEV1')).not.toBe('listening');
+    await sleep(100);
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).includes('DEV1'))).toEqual([]);
+
+    h.db.insert(devices).values({ id: 'DEV1', name: 'Phone 1' }).run();
+
+    await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('listening'), { timeout: 3000 });
+  });
+
+  it('gives a device that hit the orphaned port a listener once the orphan is released, without a manual toggle', async () => {
+    const h = await setup({ online: ['DEV1', 'DEV2'], extraDevices: ['DEV3'], reconcileMs: 20 });
+    const orphanPort = h.portOf('DEV1');
+
+    h.db.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, 'DEV1')).run();
+    h.directory.goOnline('DEV3');
+
+    await vi.waitFor(() => expect(h.service.snapshot().devices.find((d) => d.deviceId === 'DEV3')).toMatchObject({ state: 'listening', port: orphanPort }), { timeout: 3000 });
+    await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('listening'), { timeout: 3000 });
+    const ports = h.service.snapshot().devices.map((d) => d.port);
+    expect(new Set(ports).size).toBe(3);
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).startsWith('cannot listen for DEV3'))).toHaveLength(1);
   });
 
   it('stops polling the directory once the service has stopped', async () => {
