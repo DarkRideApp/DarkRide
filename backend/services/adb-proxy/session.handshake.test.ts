@@ -315,8 +315,10 @@ describe('Session handshake', () => {
     const h = await setup({ preAuthTimeoutMs: 200 });
     let approve!: (d: 'approved' | 'denied') => void;
     h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise((r) => { approve = r; }), cancel: vi.fn() };
+    // Key generation can take longer than the 200 ms budget on a busy machine, so it happens before the clock starts.
+    const key = makeTestAdbKey();
     const client = await h.connect();
-    await client.offerKey(makeTestAdbKey());
+    await client.offerKey(key);
     await new Promise((r) => setTimeout(r, 500));
     expect(client.closed).toBe(false);
     approve('approved');
