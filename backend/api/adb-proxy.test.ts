@@ -55,6 +55,9 @@ function appBehindAuth(service: ReturnType<typeof makeService>) {
 
 const READ = ['core.adb-proxy:read'];
 const MANAGE = ['core.adb-proxy:read', 'core.adb-proxy:manage'];
+// An approved key gets a shell on every proxied phone, so approving needs shell access as well.
+const APPROVE = [...MANAGE, 'core.devices:shell'];
+const APPROVE_ROUTE: [Method, string] = ['post', '/v1/adb-proxy/requests/r1/approve'];
 
 type Method = 'get' | 'put' | 'post' | 'patch' | 'delete';
 const READS: Array<[Method, string]> = [
@@ -93,6 +96,9 @@ describe('ADB proxy API', () => {
       ...rows('a user with an unrelated scope', ['core.devices:read'], [...READS, ...WRITES]),
       ...rows('a manage-only user', ['core.adb-proxy:manage'], READS),
       ...rows('a read-only user', READ, WRITES),
+      ...rows('a read and manage user without shell access', MANAGE, [APPROVE_ROUTE]),
+      ...rows('a user with every ADB proxy scope but no shell access', ['core.adb-proxy:*'], [APPROVE_ROUTE]),
+      ...rows('a user with shell access but no manage scope', ['core.adb-proxy:read', 'core.devices:shell'], [APPROVE_ROUTE]),
     ];
 
     it.each(refused)('refuses %s on %s %s with 403 and never reaches the service', async (_who, method, path, scopes) => {
@@ -105,6 +111,30 @@ describe('ADB proxy API', () => {
     it.each(READS)('lets a read-only user through on %s %s', async (method, path) => {
       expect((await send(appFor(service, READ), method, path)).status).toBe(200);
     });
+
+    it('names both scopes approve requires in its 403', async () => {
+      const res = await send(appFor(service, MANAGE), ...APPROVE_ROUTE);
+      expect(res.body.required).toEqual(['core.adb-proxy:manage', 'core.devices:shell']);
+      expect(res.body.missing).toEqual(['core.devices:shell']);
+    });
+
+    it.each([
+      ['read, manage and shell access', APPROVE],
+      ['core.admin:*', ['core.admin:*']],
+    ])('lets a user with %s approve', async (_who, scopes) => {
+      expect((await send(appFor(service, scopes), ...APPROVE_ROUTE)).status).toBe(200);
+      expect(service.approveRequest).toHaveBeenCalledWith('r1', 7);
+    });
+
+    it.each(WRITES.filter(([, path]) => !path.endsWith('/approve')))(
+      'needs only manage, not shell access, on %s %s',
+      async (method, path) => {
+        const body = path.endsWith('/settings') ? { enabled: true }
+          : path.includes('/devices/') ? { enabled: true }
+          : method === 'patch' ? { deviceIds: null } : {};
+        expect((await send(appFor(service, MANAGE), method, path, body)).status).toBe(200);
+      },
+    );
   });
 
   describe('a request with no authenticated user', () => {
@@ -135,6 +165,23 @@ describe('ADB proxy API', () => {
       expect((await ask('/v1/adb-proxy/requests/r1/approve', { userId: 7, effectiveScopes: new Set(READ) })).status).toBe(403);
       expectServiceUntouched(service);
     });
+  });
+
+  it('requires shell access to approve over the WebSocket REST path too', async () => {
+    appFor(service);
+    const socket = { send: vi.fn() };
+    const ask = async (scopes: string[]) => {
+      socket.send.mockClear();
+      await handleWebSocketRestApi('POST', '/v1/adb-proxy/requests/r1/approve', {}, 'req-1', socket as any, { userId: 7, effectiveScopes: new Set(scopes) } as any);
+      return JSON.parse(socket.send.mock.calls[0][0]);
+    };
+    const refused = await ask(MANAGE);
+    expect(refused.status).toBe(403);
+    expect(refused.body.missing).toEqual(['core.devices:shell']);
+    expect((await ask(['core.adb-proxy:*'])).status).toBe(403);
+    expectServiceUntouched(service);
+    expect((await ask(APPROVE)).status).toBe(200);
+    expect(service.approveRequest).toHaveBeenCalledWith('r1', 7);
   });
 
   it('GET /status returns the snapshot', async () => {
@@ -226,7 +273,7 @@ describe('ADB proxy API', () => {
 
   describe('requests and keys', () => {
     it('approve and deny pass the request id and the acting user', async () => {
-      const app = appFor(service, MANAGE);
+      const app = appFor(service, APPROVE);
       expect((await request(app).post('/v1/adb-proxy/requests/r1/approve')).status).toBe(200);
       expect(service.approveRequest).toHaveBeenCalledWith('r1', 7);
       expect((await request(app).post('/v1/adb-proxy/requests/r2/deny')).status).toBe(200);
@@ -235,7 +282,7 @@ describe('ADB proxy API', () => {
 
     it('answers 404 when the request is gone', async () => {
       service = makeService({ approveRequest: vi.fn().mockReturnValue({ ok: false, error: 'not-found' }) });
-      const res = await request(appFor(service, MANAGE)).post('/v1/adb-proxy/requests/r1/approve');
+      const res = await request(appFor(service, APPROVE)).post('/v1/adb-proxy/requests/r1/approve');
       expect(res.status).toBe(404);
     });
 
@@ -286,7 +333,7 @@ describe('ADB proxy API', () => {
       ['approve', 'post', (id: string) => `/v1/adb-proxy/requests/${id}/approve`, 'approveRequest'],
       ['deny', 'post', (id: string) => `/v1/adb-proxy/requests/${id}/deny`, 'denyRequest'],
     ] as const)('refuses a %s request id over 128 characters with 400 and takes 128', async (_name, method, pathOf, call) => {
-      const app = appFor(service, MANAGE);
+      const app = appFor(service, APPROVE);
       expect((await send(app, method, pathOf(at(129)))).status).toBe(400);
       expect(service[call]).not.toHaveBeenCalled();
       expect((await send(app, method, pathOf(at(128)))).status).toBe(200);

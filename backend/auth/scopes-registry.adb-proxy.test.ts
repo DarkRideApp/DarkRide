@@ -6,4 +6,9 @@ describe('ADB proxy scopes', () => {
     expect(isSupportedScope(key)).toBe(true);
     expect(getScopeMetadata(key)?.category).toBe('Devices');
   });
+
+  it('says that approving a machine also needs device shell access', () => {
+    expect(getScopeMetadata('core.adb-proxy:manage')?.description).toContain('Approving a machine also needs Device shell access');
+    expect(getScopeMetadata('core.devices:shell')?.label).toBe('Device shell access');
+  });
 });

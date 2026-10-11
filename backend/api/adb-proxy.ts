@@ -8,6 +8,8 @@ export const ADB_PROXY_CHANNEL = 'adb-proxy';
 
 const READ = ['core.adb-proxy:read'];
 const MANAGE = ['core.adb-proxy:manage'];
+// An approved key gets a shell on every proxied phone.
+const APPROVE = ['core.adb-proxy:manage', 'core.devices:shell'];
 
 const MAX_PARAM_LENGTH = 128;
 const MAX_KEY_DEVICES = 1000;
@@ -120,7 +122,7 @@ export function registerAdbProxyEndpoints(service: AdbProxyService): void {
     res.json({ success: true, data: service.snapshot() });
   });
 
-  route('POST', '/v1/adb-proxy/requests/:requestId/approve', MANAGE, (req, res, userId) => {
+  route('POST', '/v1/adb-proxy/requests/:requestId/approve', APPROVE,(req, res, userId) => {
     const requestId = textParam(req, res, 'requestId');
     if (requestId === null) return;
     const result = service.approveRequest(requestId, userId);
