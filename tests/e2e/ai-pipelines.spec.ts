@@ -52,10 +52,66 @@ test.describe('AI job pipelines', () => {
     // reachable underneath whatever's currently open.
     await page.getByRole('button', { name: /close/i }).click();
 
-    // Click the Report node, confirm its ordered section list shows all seven, in order.
+    // Click the Report node, confirm its ordered section list shows all seven, in order. Each
+    // row's title now lives in an editable <input> (Report became a real editor, not a read-only
+    // list) — an input's value is not part of its textContent, so assert the value directly.
     await page.getByText('report', { exact: true }).click();
     const sectionRows = page.getByTestId('report-section-row');
     await expect(sectionRows).toHaveCount(7);
-    await expect(sectionRows.nth(6)).toContainText('Bypass Script');
+    await expect(sectionRows.nth(6).locator('input')).toHaveValue('Bypass Script');
+  });
+
+  test('creating a pipeline, adding nodes, drag-connecting them, and publishing works end to end', async ({ page }) => {
+    await loginAsAdmin(page);
+    await waitForBackend(page.request);
+    await page.goto('/ui/pipelines');
+    await expect(page.getByText('agent-overview', { exact: true })).toBeVisible({ timeout: 15_000 });
+
+    // A brand-new pipeline, unrelated to the seeded apk-analysis one — additive against the
+    // shared e2e DB, so it can't affect this file's read-only test above or any other spec.
+    await page.getByRole('button', { name: '+ New pipeline' }).click();
+    await page.getByLabel('New pipeline name').fill('E2E Editor Pipeline');
+    await page.getByLabel('New pipeline job kind').fill('e2e-editor-test');
+    await page.getByRole('button', { name: 'Create' }).click();
+    await expect(page.locator('select[aria-label="Pipeline"] option:checked')).toHaveText(/E2E Editor Pipeline/);
+
+    // Add a Trigger node and configure its expand function.
+    await page.getByLabel('Node kind to add').selectOption('Trigger');
+    await page.getByRole('button', { name: '+ Add node' }).click();
+    const triggerPanel = page.getByRole('dialog');
+    await expect(triggerPanel).toBeVisible();
+    await triggerPanel.locator('input').first().fill('e2e/expand');
+    await page.getByRole('button', { name: /close/i }).click();
+
+    // Add an AgentCall node.
+    await page.getByLabel('Node kind to add').selectOption('AgentCall');
+    await page.getByRole('button', { name: '+ Add node' }).click();
+    await page.getByRole('button', { name: /close/i }).click();
+    await expect(page.locator('.react-flow__node')).toHaveCount(2);
+
+    // Drag-connect the Trigger's bottom handle to the AgentCall's top handle — real pointer
+    // events against the real canvas, not a simulated event dispatch.
+    const triggerNode = page.locator('[data-id^="trigger-"]').first();
+    const agentNode = page.locator('[data-id^="agent-"]').first();
+    const triggerBox = (await triggerNode.boundingBox())!;
+    const agentBox = (await agentNode.boundingBox())!;
+    await page.mouse.move(triggerBox.x + triggerBox.width / 2, triggerBox.y + triggerBox.height);
+    await page.mouse.down();
+    await page.mouse.move(agentBox.x + agentBox.width / 2, agentBox.y, { steps: 10 });
+    await page.mouse.up();
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1);
+
+    // Save, then publish — a graph with its one Trigger properly connected to its one AgentCall
+    // passes validateGraph, so this must succeed against the real backend, not a mock.
+    await page.getByRole('button', { name: 'Save Draft' }).click();
+    await expect(page.getByRole('status')).toHaveText(/draft saved/i);
+    await page.getByRole('button', { name: 'Publish' }).click();
+    await expect(page.getByRole('status')).toHaveText(/^Published\.$/);
+
+    // Delete the AgentCall node via the side panel, confirm the canvas and edge both reflect it.
+    await agentNode.click();
+    await page.getByRole('button', { name: /delete node/i }).click();
+    await expect(page.locator('.react-flow__node')).toHaveCount(1);
+    await expect(page.locator('.react-flow__edge')).toHaveCount(0);
   });
 });

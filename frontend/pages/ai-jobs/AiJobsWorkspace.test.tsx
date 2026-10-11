@@ -163,6 +163,112 @@ describe('AiJobsWorkspace', () => {
     const mapsAgain = await screen.findByRole('dialog', { name: 'agent-maps details' });
     expect((mapsAgain.querySelector('textarea') as HTMLTextAreaElement).value).toBe('maps prompt edited');
   });
+
+  it('lists every pipeline in the switcher and switching renders the chosen one\'s graph', async () => {
+    const otherGraph: PipelineGraph = {
+      nodes: [{ id: 'trigger-x', config: { kind: 'Trigger', expandFn: 'custom/expand', outputSchema: [] } }],
+      edges: [],
+    };
+    const ws = createMockWs({
+      pipelines: [
+        { id: 1, name: 'Astérix APK analysis', jobKind: 'apk-analysis', pipelineVersionId: 1, graph: mockPipelineVersion().graph },
+        { id: 2, name: 'My New Pipeline', jobKind: 'custom', pipelineVersionId: 2, graph: otherGraph },
+      ],
+    });
+    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+
+    const picker = screen.getByLabelText('Pipeline') as HTMLSelectElement;
+    const optionTexts = Array.from(picker.options).map(o => o.textContent);
+    expect(optionTexts.some(t => t?.includes('Astérix APK analysis'))).toBe(true);
+    expect(optionTexts.some(t => t?.includes('My New Pipeline'))).toBe(true);
+
+    fireEvent.change(picker, { target: { value: '2' } });
+    // "trigger-x" appears twice once switched — the canvas node label AND the Entry point
+    // picker's option for that pipeline's one Trigger — so assert presence via getAllByText.
+    await waitFor(() => expect(screen.getAllByText('trigger-x').length).toBeGreaterThan(0));
+    expect(screen.queryByText('Overview')).not.toBeInTheDocument();
+  });
+
+  it('creating a new pipeline POSTs it with an empty graph and selects it', async () => {
+    const ws = createMockWs({ routes: { 'POST /v1/ai-pipelines': () => ({ success: true, data: { id: 9 } }) } });
+    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /new pipeline/i }));
+    fireEvent.change(screen.getByLabelText('New pipeline name'), { target: { value: 'My Pipeline' } });
+    fireEvent.change(screen.getByLabelText('New pipeline job kind'), { target: { value: 'custom-thing' } });
+    fireEvent.click(screen.getByRole('button', { name: /^create$/i }));
+
+    await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines'));
+    expect(postBody(ws, 'POST /v1/ai-pipelines')).toEqual({ name: 'My Pipeline', jobKind: 'custom-thing', graph: { nodes: [], edges: [] } });
+    await waitFor(() => expect((screen.getByLabelText('Pipeline') as HTMLSelectElement).value).toBe('9'));
+    // A brand new pipeline has an empty graph (zero nodes) but is still open for editing —
+    // the old pipeline's nodes are gone (Canvas resyncs its internal state in its own effect,
+    // one tick behind the graph prop) and the node-adding controls are present.
+    await waitFor(() => expect(screen.queryByText('Overview')).not.toBeInTheDocument());
+    expect(screen.getByLabelText('Node kind to add')).toBeInTheDocument();
+  });
+
+  it('adding a node inserts it into the graph and opens its side panel', async () => {
+    const ws = createMockWs();
+    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText('Node kind to add'), { target: { value: 'AgentCall' } });
+    fireEvent.click(screen.getByRole('button', { name: /add node/i }));
+
+    await screen.findByRole('dialog', { name: /agent-\d+ details/ });
+  });
+
+  it('deleting the selected node removes it from the graph and closes the panel', async () => {
+    const ws = createMockWs();
+    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('agent-overview')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('agent-overview'));
+    await screen.findByRole('dialog', { name: 'agent-overview details' });
+    fireEvent.click(screen.getByRole('button', { name: /delete node/i }));
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByText('agent-overview')).not.toBeInTheDocument();
+  });
+
+  it('Save Draft POSTs the current graph as a new version', async () => {
+    const ws = createMockWs({ routes: { 'POST /v1/ai-pipelines/1/versions': () => ({ success: true, data: { version: 2 } }) } });
+    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /save draft/i }));
+    await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines/1/versions'));
+    expect(postBody(ws, 'POST /v1/ai-pipelines/1/versions').graph.nodes.length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/draft saved/i));
+  });
+
+  it('Publish POSTs to the publish endpoint and reports success', async () => {
+    const ws = createMockWs({ routes: { 'POST /v1/ai-pipelines/1/publish': () => ({ success: true }) } });
+    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /^publish$/i }));
+    await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines/1/publish'));
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/published/i));
+  });
+
+  it('Publish reports validation errors from an invalid graph instead of a generic failure', async () => {
+    const ws = createMockWs({
+      routes: {
+        'POST /v1/ai-pipelines/1/publish': () => ({
+          success: false, error: 'Invalid graph', errors: [{ message: 'Node "x" is not reachable from any Trigger.' }],
+        }),
+      },
+    });
+    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /^publish$/i }));
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/not reachable from any Trigger/));
+  });
 });
 
 function postBody(ws: WebSocketContextValue, key: string): any {

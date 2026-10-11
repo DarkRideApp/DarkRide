@@ -85,8 +85,14 @@ export function mockPipelineVersion(): { graph: PipelineGraph } {
   return { graph: ASTERIX_PATTERN_GRAPH_FIXTURE };
 }
 
+/** A row as GET /v1/ai-pipelines really returns it (backend/api/ai-pipelines.ts). */
+export interface PipelineRowFixture { id: number; name?: string; jobKind: string; pipelineVersionId: number | null; graph: PipelineGraph | null }
+
 export interface MockApiState {
   pipelineVersion: { graph: PipelineGraph };
+  /** The full GET /v1/ai-pipelines list. Defaults to one apk-analysis row (id 1) carrying
+   *  `pipelineVersion.graph` — every pre-existing test keeps working unchanged. */
+  pipelines?: PipelineRowFixture[];
   /** Make a path answer with a failure. Keyed `${method} ${path}`. */
   failing: Set<string>;
   /** Override a response. Keyed `${method} ${path}`; may be async. */
@@ -115,10 +121,8 @@ export function createMockWs(over: Partial<MockApiState> = {}): WebSocketContext
     if (key === 'GET /v1/ai-pipelines') {
       // Matches backend/api/ai-pipelines.ts's real GET handler: an array under `data`, each
       // row carrying jobKind, pipelineVersionId and the published version's graph inlined.
-      return envelope({
-        success: true,
-        data: [{ id: 1, jobKind: 'apk-analysis', pipelineVersionId: 1, graph: state.pipelineVersion.graph }],
-      });
+      const pipelines = state.pipelines ?? [{ id: 1, jobKind: 'apk-analysis', pipelineVersionId: 1, graph: state.pipelineVersion.graph }];
+      return envelope({ success: true, data: pipelines });
     }
     if (key === 'GET /v1/apps/recent') {
       return envelope({ success: true, data: RECENT_VERSIONS_FIXTURE });

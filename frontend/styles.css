@@ -8544,6 +8544,24 @@ body.live-log-open .ai-chat-fab {
   padding: 6px 10px;
   font-size: 13px;
 }
+.ai-jobs-toolbar-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-right: 16px;
+  border-right: 1px solid var(--border-color);
+}
+.ai-jobs-toolbar-group:last-child {
+  border-right: none;
+  padding-right: 0;
+}
+.ai-jobs-toolbar-group .form-input {
+  width: auto;
+  min-width: 120px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
 .ai-jobs-status {
   font-size: 13px;
   color: var(--text-secondary);
@@ -8576,6 +8594,12 @@ body.live-log-open .ai-chat-fab {
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+}
+.ai-jobs-side-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 .ai-jobs-side-panel-title {
   font-size: 14px;
@@ -8623,4 +8647,22 @@ body.live-log-open .ai-chat-fab {
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: var(--radius);
+}
+.ai-jobs-list-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+.ai-jobs-list-row .form-input,
+.ai-jobs-list-row .form-select {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.ai-jobs-list-row-index {
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
 }

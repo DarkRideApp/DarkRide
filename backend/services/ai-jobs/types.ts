@@ -77,6 +77,10 @@ export type NodeConfig =
 export interface PipelineNode {
   id: string;
   config: NodeConfig;
+  /** Canvas position, set once a user drags the node. Absent on nodes never moved — the
+   *  frontend falls back to a placeholder grid layout for those. Purely a presentation
+   *  concern: never read by the executor or the graph validator. */
+  position?: { x: number; y: number };
 }
 
 export interface PipelineEdge {
