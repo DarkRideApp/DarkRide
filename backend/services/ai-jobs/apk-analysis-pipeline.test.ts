@@ -14,6 +14,7 @@ import {
   buildApkAnalysisExecutionCtx,
   seedApkAnalysisPipeline,
 } from './apk-analysis-pipeline';
+import { TRIGGER_SCHEMAS } from './nodes/trigger';
 import type { AiAgentFactory } from '../ai-agent-factory';
 import type { AppDatabase } from '../../db/index';
 import { aiPipelines, aiPipelineVersions } from '../../db/schema';
@@ -42,6 +43,21 @@ function makeDb(): AppDatabase {
 describe('ASTERIX_PATTERN_GRAPH', () => {
   it('passes graph validation — two disjoint Trigger zones, consistent schema, valid Report sections', () => {
     expect(validateGraph(ASTERIX_PATTERN_GRAPH)).toEqual([]);
+  });
+
+  // Regression guard for the bug Cube hit live: both Triggers used to carry their own
+  // hand-copied APK_TRIGGER_INPUT_SCHEMA/APK_CONTEXT_SCHEMA constants, kept in sync with
+  // apk-analysis/apk-context's real contract by nothing but a code comment. They now come
+  // straight from TRIGGER_SCHEMAS (nodes/trigger.ts), so this seed can never drift from what
+  // the function underneath actually reads and returns.
+  it("both Triggers' schemas come from TRIGGER_SCHEMAS, not a hand-maintained copy", () => {
+    const triggers = ASTERIX_PATTERN_GRAPH.nodes.filter(n => n.config.kind === 'Trigger');
+    expect(triggers).toHaveLength(2);
+    for (const t of triggers) {
+      const config = t.config as { expandFn: string; inputSchema?: unknown; outputSchema: unknown };
+      expect(config.inputSchema).toEqual(TRIGGER_SCHEMAS[config.expandFn].inputSchema);
+      expect(config.outputSchema).toEqual(TRIGGER_SCHEMAS[config.expandFn].outputSchema);
+    }
   });
 
   it('has exactly two Triggers, eight AgentCalls (seven Group-A/B feeding the Report, plus the separate diff AgentCall), one Report, two Sinks', () => {

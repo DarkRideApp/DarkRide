@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { describe, it, expect } from 'vitest';
 import * as schema from '../../../db/schema';
-import { TRIGGER_REGISTRY, TRIGGER_DESCRIPTIONS } from './trigger';
+import { TRIGGER_REGISTRY, TRIGGER_DESCRIPTIONS, TRIGGER_SCHEMAS } from './trigger';
 
 function makeDb() {
   const sqlite = new Database(':memory:');
@@ -58,5 +58,27 @@ describe('apk-analysis/apk-context trigger', () => {
 
   it('describes every registered expand function', () => {
     expect(TRIGGER_DESCRIPTIONS['apk-analysis/apk-context']).toBeTruthy();
+  });
+
+  // Regression guard for the bug Cube hit live: the editor's "Starts from" picker populates a
+  // node's Run Parameters/Output Schema from this registry, not from a hand-maintained copy —
+  // so a registered function's real requirements (what rawInput it reads, what it returns) can
+  // never drift out of sync with what the editor shows, the way APK_TRIGGER_INPUT_SCHEMA/
+  // APK_CONTEXT_SCHEMA in apk-analysis-pipeline.ts used to.
+  it('declares the exact run parameters and output fields apk-analysis/apk-context actually reads and returns', () => {
+    expect(TRIGGER_SCHEMAS['apk-analysis/apk-context']).toEqual({
+      inputSchema: [
+        { field: 'versionId', type: 'apk-version', description: 'Which analyzed APK version to run against' },
+      ],
+      outputSchema: [
+        { field: 'appName', type: 'string', description: 'Display name' },
+        { field: 'packageName', type: 'string', description: 'Reverse-DNS package name' },
+        { field: 'versionName', type: 'string', description: 'Human version string' },
+        { field: 'versionCode', type: 'number', description: 'Numeric version code' },
+        { field: 'fileSizeBytes', type: 'number', description: 'APK file size in bytes' },
+        { field: 'downloadedAt', type: 'string', description: 'ISO timestamp' },
+        { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
+      ],
+    });
   });
 });

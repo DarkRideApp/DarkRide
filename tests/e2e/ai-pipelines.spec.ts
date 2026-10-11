@@ -205,6 +205,10 @@ test.describe('AI job pipelines', () => {
     const triggerPanel = page.getByRole('dialog');
     await expect(triggerPanel).toBeVisible();
     await triggerPanel.getByLabel('Starts from').selectOption('apk-analysis/apk-context');
+    // Regression guard for the bug Cube hit live: picking a known function must fill in its real
+    // Run Parameters, not leave the editor showing nothing while the function silently requires
+    // a versionId underneath.
+    await expect(triggerPanel.getByTestId('trigger-input-field-row').getByPlaceholder('name')).toHaveValue('versionId');
     await page.getByRole('button', { name: /close/i }).click();
 
     await page.getByRole('button', { name: '+ Add node' }).click();

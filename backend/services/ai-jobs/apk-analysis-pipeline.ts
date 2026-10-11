@@ -1,7 +1,7 @@
 import { eq } from 'drizzle-orm';
 import type { PipelineGraph, Envelope } from './types';
 import type { NodeExecutors, ExecutionCtx } from './pipeline-runner';
-import { TRIGGER_REGISTRY } from './nodes/trigger';
+import { TRIGGER_REGISTRY, TRIGGER_SCHEMAS } from './nodes/trigger';
 import { runAgentCall } from './nodes/agent-call';
 import { runTransform } from './nodes/transform';
 import { runBranch } from './nodes/branch';
@@ -15,22 +15,11 @@ import { aiPipelines, aiPipelineVersions } from '../../db/schema';
 const PIPELINE_NAME = 'APK Analysis';
 const PIPELINE_JOB_KIND = 'apk-analysis';
 
-const APK_CONTEXT_SCHEMA = [
-  { field: 'appName', type: 'string', description: 'Display name' },
-  { field: 'packageName', type: 'string', description: 'Reverse-DNS package name' },
-  { field: 'versionName', type: 'string', description: 'Human version string' },
-  { field: 'versionCode', type: 'number', description: 'Numeric version code' },
-  { field: 'fileSizeBytes', type: 'number', description: 'APK file size in bytes' },
-  { field: 'downloadedAt', type: 'string', description: 'ISO timestamp' },
-  { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
-];
-
-// 'apk-version' is a type the run form specifically recognizes — it renders as a picker over
-// recently analyzed APK versions instead of a plain text field. See nodes/trigger.ts's
-// 'apk-analysis/apk-context' expander, which reads this same rawInput.versionId.
-const APK_TRIGGER_INPUT_SCHEMA = [
-  { field: 'versionId', type: 'apk-version', description: 'Which analyzed APK version to run against' },
-];
+// Both Triggers below pull their inputSchema/outputSchema straight from TRIGGER_SCHEMAS
+// (nodes/trigger.ts) — the one place apk-analysis/apk-context's real contract is declared —
+// instead of a hand-copied literal that could drift from what the function actually reads
+// and returns.
+const { inputSchema: APK_TRIGGER_INPUT_SCHEMA, outputSchema: APK_CONTEXT_SCHEMA } = TRIGGER_SCHEMAS['apk-analysis/apk-context'];
 
 /**
  * The AI scopes the `apk-analyzer` core-service identity is registered with (backend/index.ts) —

@@ -130,6 +130,43 @@ describe('SidePanel — Trigger', () => {
     expect(onSave).toHaveBeenCalledWith('trigger-full', { expandFn: '' });
   });
 
+  // Regression guard for the bug Cube hit live: a brand-new Trigger picking a known function from
+  // "Starts from" used to leave Run Parameters/Output Schema untouched (empty), so nothing on
+  // screen ever said the function needed anything — it just failed at run time with a cryptic
+  // backend error. Selecting a known function must fill both in from its real, registered contract.
+  it('selecting a known expand function fills in its real Run Parameters and Output Schema, not just the name', () => {
+    const onSave = vi.fn();
+    const freshNode = { id: 'trigger-full', config: { kind: 'Trigger' as const, expandFn: '', inputSchema: [], outputSchema: [] } };
+    render(<SidePanel node={freshNode} graph={{ nodes: [freshNode], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: 'apk-analysis/apk-context' } });
+    expect(onSave).toHaveBeenCalledWith('trigger-full', {
+      expandFn: 'apk-analysis/apk-context',
+      inputSchema: [{ field: 'versionId', type: 'apk-version', description: 'Which analyzed APK version to run against' }],
+      outputSchema: [
+        { field: 'appName', type: 'string', description: 'Display name' },
+        { field: 'packageName', type: 'string', description: 'Reverse-DNS package name' },
+        { field: 'versionName', type: 'string', description: 'Human version string' },
+        { field: 'versionCode', type: 'number', description: 'Numeric version code' },
+        { field: 'fileSizeBytes', type: 'number', description: 'APK file size in bytes' },
+        { field: 'downloadedAt', type: 'string', description: 'ISO timestamp' },
+        { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
+      ],
+    });
+  });
+
+  it('switching from one known function to another overwrites the stale schema from the previous one', () => {
+    const onSave = vi.fn();
+    const staleNode = {
+      id: 'trigger-full',
+      config: { kind: 'Trigger' as const, expandFn: '', inputSchema: [{ field: 'stale', type: 'string', description: 'leftover from a previous pick' }], outputSchema: [] },
+    };
+    render(<SidePanel node={staleNode} graph={{ nodes: [staleNode], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: 'apk-analysis/apk-context' } });
+    const call = onSave.mock.calls[0][1] as { inputSchema: Array<{ field: string }> };
+    expect(call.inputSchema).not.toContainEqual(expect.objectContaining({ field: 'stale' }));
+    expect(call.inputSchema).toContainEqual(expect.objectContaining({ field: 'versionId' }));
+  });
+
   it('an unrecognized expand function shows as Custom with its own editable text field', () => {
     const onSave = vi.fn();
     const customNode = { id: 'trigger-full', config: { ...triggerNode.config, expandFn: 'my-plugin/my-trigger' } };

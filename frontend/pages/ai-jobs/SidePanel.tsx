@@ -172,11 +172,28 @@ const RUN_PARAM_TYPES: TypeOption[] = [
   { value: 'apk-version', label: 'APK version (picker)' },
 ];
 
-// Duplicated from backend/services/ai-jobs/nodes/trigger.ts's TRIGGER_DESCRIPTIONS — the
-// frontend can't import that module at runtime (it pulls in better-sqlite3).
-const KNOWN_TRIGGER_EXPAND_FNS: Array<{ value: string; description: string }> = [
-  { value: 'apk-analysis/apk-context',
-    description: 'Looks up a tracked APK version by id and expands it into app name, package, version, size, and source fields.' },
+// Duplicated from backend/services/ai-jobs/nodes/trigger.ts's TRIGGER_DESCRIPTIONS/TRIGGER_SCHEMAS
+// — the frontend can't import that module at runtime (it pulls in better-sqlite3). inputSchema/
+// outputSchema here are the function's REAL contract, not a suggestion: picking this function
+// fills a node's Run Parameters/Output Schema from these, so the editor can never again show a
+// Trigger with no indication of what it actually requires.
+const KNOWN_TRIGGER_EXPAND_FNS: Array<{ value: string; description: string; inputSchema: SchemaField[]; outputSchema: SchemaField[] }> = [
+  {
+    value: 'apk-analysis/apk-context',
+    description: 'Looks up a tracked APK version by id and expands it into app name, package, version, size, and source fields.',
+    inputSchema: [
+      { field: 'versionId', type: 'apk-version', description: 'Which analyzed APK version to run against' },
+    ],
+    outputSchema: [
+      { field: 'appName', type: 'string', description: 'Display name' },
+      { field: 'packageName', type: 'string', description: 'Reverse-DNS package name' },
+      { field: 'versionName', type: 'string', description: 'Human version string' },
+      { field: 'versionCode', type: 'number', description: 'Numeric version code' },
+      { field: 'fileSizeBytes', type: 'number', description: 'APK file size in bytes' },
+      { field: 'downloadedAt', type: 'string', description: 'ISO timestamp' },
+      { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
+    ],
+  },
 ];
 
 function SchemaFieldListEditor({ label, fieldNoun, help, fields, typeOptions, onChange, testId }: {
@@ -234,7 +251,16 @@ function TriggerBody({ node, onSave, recentVersions, onRun }: {
           onChange={(e) => {
             const isCustom = e.target.value === '__custom__';
             setForceCustom(isCustom);
-            onSave(node.id, { expandFn: isCustom ? '' : e.target.value });
+            if (isCustom) {
+              onSave(node.id, { expandFn: '' });
+              return;
+            }
+            // A known function's schema is its real contract, not a suggestion — overwrite
+            // whatever was there (stale fields from a previously selected function, or nothing
+            // at all) so the editor can never again show this Trigger with no indication of
+            // what the function it's wired to actually requires.
+            const picked = KNOWN_TRIGGER_EXPAND_FNS.find(f => f.value === e.target.value)!;
+            onSave(node.id, { expandFn: picked.value, inputSchema: picked.inputSchema, outputSchema: picked.outputSchema });
           }}>
           <option value="">— choose —</option>
           {KNOWN_TRIGGER_EXPAND_FNS.map(fn => <option key={fn.value} value={fn.value}>{fn.value}</option>)}
