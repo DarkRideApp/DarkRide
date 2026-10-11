@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { eq } from 'drizzle-orm';
 import { createTestDb } from '../../test-utils/create-test-db';
 import { adbProxyDevices, deviceInstances, devices } from '../../db/schema';
 import { PortAllocator, PortError } from './port-allocator';
@@ -43,6 +44,21 @@ describe('PortAllocator', () => {
     ctx.alloc.ensure('A'); ctx.alloc.ensure('B'); ctx.alloc.ensure('C');
     expect(ctx.alloc.ensure('D')).toEqual({ error: 'range-full' });
     expect(ctx.alloc.get('D')).toBeUndefined();
+  });
+
+  it('hasFree is false only while every port in range is taken, and allocates nothing', () => {
+    expect(ctx.alloc.hasFree()).toBe(true);
+    ctx.alloc.ensure('A'); ctx.alloc.ensure('B'); ctx.alloc.ensure('C');
+    expect(ctx.alloc.hasFree()).toBe(false);
+    ctx.db.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, 'B')).run();
+    expect(ctx.alloc.hasFree()).toBe(true);
+    expect(ctx.alloc.all().map((r) => r.deviceId)).toEqual(['A', 'C']);
+  });
+
+  it('hasFree ignores a port held outside the range', () => {
+    ctx.alloc.ensure('A'); ctx.alloc.ensure('B'); ctx.alloc.ensure('C');
+    ctx.setRange({ start: 7000, end: 7000 });
+    expect(ctx.alloc.hasFree()).toBe(true);
   });
 
   it('throws for a device that is not in the devices table', () => {

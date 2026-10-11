@@ -26,6 +26,14 @@ export class PortAllocator {
     return this.db.select().from(adbProxyDevices).orderBy(asc(adbProxyDevices.createdAt), asc(adbProxyDevices.port)).all();
   }
 
+  /** Whether `ensure` would find a port for a new device; allocates nothing. */
+  hasFree(): boolean {
+    const { start, end } = this.range();
+    const used = new Set(this.all().map((r) => r.port));
+    for (let port = start; port <= end; port++) if (!used.has(port)) return true;
+    return false;
+  }
+
   /** The device's row, created with the lowest free port in range if it has none; the device must already exist in `devices` (the foreign key throws otherwise). */
   ensure(deviceId: string): ProxyDeviceRow | { error: 'range-full' } {
     const existing = this.get(deviceId);

@@ -466,6 +466,34 @@ export class AdbProxyService {
     }
     for (const id of [...this.online]) if (!present.has(id)) this.deviceOffline(id);
     for (const id of present) if (!this.online.has(id)) void this.deviceOnline(id);
+    this.retryBlocked();
+  }
+
+  /** Only a full range is retried: other failures log on every attempt. A tick with nothing to do schedules nothing, so a range that stays full is silent. */
+  private retryBlocked(): void {
+    if (!this.started || !this.settings.enabled) return;
+    try {
+      if (this.orphanedListeners().length === 0 && this.starvedDevices().length === 0) return;
+      void this.serialised(async () => {
+        for (const id of this.orphanedListeners()) await this.stopDevice(id);
+        for (const id of this.starvedDevices()) await this.startDevice(id);
+      }).catch((e: any) => this.logPresenceFailure(`port retry failed: ${e?.message ?? e}`));
+    } catch (e: any) {
+      this.logPresenceFailure(`port retry failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /** A forgotten device has no port row but, if it went offline while the service ran, its listener still holds the port. */
+  private orphanedListeners(): string[] {
+    const offline = [...this.listeners.keys()].filter((id) => !this.online.has(id));
+    if (offline.length === 0) return [];
+    const withRow = new Set(this.ports.all().map((r) => r.deviceId));
+    return offline.filter((id) => !withRow.has(id));
+  }
+
+  private starvedDevices(): string[] {
+    const stuck = [...this.online].filter((id) => this.deviceErrors.get(id) === 'range-full');
+    return stuck.length > 0 && this.ports.hasFree() ? stuck : [];
   }
 
   private closeSessions(match: (s: Session) => boolean, reason: string): void {

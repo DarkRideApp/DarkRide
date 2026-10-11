@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import net from 'node:net';
 import os from 'node:os';
+import { eq } from 'drizzle-orm';
 import { createTestDb } from '../../test-utils/create-test-db';
 import { adbProxyDevices, adbProxyKeys, deviceInstances, devices, settings, users } from '../../db/schema';
 import { AdbProxyService } from './adb-proxy-service';
@@ -619,6 +620,64 @@ describe('AdbProxyService device presence reconciliation', () => {
 
     h.directory.online.delete('DEV2');
     await vi.waitFor(() => expect(stateOf(h, 'DEV2')).toBe('device-offline'), { timeout: 3000 });
+  });
+
+  it('gives a device that found the range full a port once a stale device is forgotten', async () => {
+    const h = await setup({
+      online: ['DEV2'], portCount: 1, reconcileMs: 20,
+      seed: (db, base) => db.insert(adbProxyDevices).values({ deviceId: 'DEV1', port: base, enabled: true, createdAt: new Date() }).run(),
+    });
+    expect(stateOf(h, 'DEV2')).toBe('range-full');
+
+    h.db.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, 'DEV1')).run();
+
+    await vi.waitFor(
+      () => expect(h.service.snapshot().devices.find((d) => d.deviceId === 'DEV2')).toMatchObject({ state: 'listening', port: h.base }),
+      { timeout: 3000 },
+    );
+    const client = await h.connect('DEV2');
+    expect(await client.waitClosed(100)).toBe(false);
+  });
+
+  it('releases the port of a device that went offline and was then forgotten, so a waiting device can use it', async () => {
+    const h = await setup({ portCount: 1, reconcileMs: 20 });
+    expect(stateOf(h, 'DEV1')).toBe('listening');
+    expect(stateOf(h, 'DEV2')).toBe('range-full');
+    h.directory.online.delete('DEV1');
+    await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('device-offline'), { timeout: 3000 });
+
+    h.db.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, 'DEV1')).run();
+
+    await vi.waitFor(
+      () => expect(h.service.snapshot().devices.find((d) => d.deviceId === 'DEV2')).toMatchObject({ state: 'listening', port: h.base }),
+      { timeout: 3000 },
+    );
+    expect(h.service.snapshot().devices.map((d) => d.deviceId)).toEqual(['DEV2']);
+  });
+
+  it('stays quiet while the range is still full: no log line, no broadcast, no state change per tick', async () => {
+    const h = await setup({ portCount: 1, reconcileMs: 20 });
+    expect(stateOf(h, 'DEV2')).toBe('range-full');
+    await sleep(200);
+    const before = { logs: logSpy.mock.calls.length, errors: errorSpy.mock.calls.length, broadcasts: h.broadcasts.length };
+    const snapshot = JSON.stringify(h.service.snapshot());
+
+    await sleep(400);
+
+    expect({ logs: logSpy.mock.calls.length, errors: errorSpy.mock.calls.length, broadcasts: h.broadcasts.length }).toEqual(before);
+    expect(JSON.stringify(h.service.snapshot())).toBe(snapshot);
+  });
+
+  it('does not retry a device whose port is held by another process, which would log on every tick', async () => {
+    const h = await setup({ blockFirstPort: true, reconcileMs: 20 });
+    expect(stateOf(h, 'DEV1')).toBe('port-in-use');
+    await sleep(200);
+    const before = { logs: logSpy.mock.calls.length, errors: errorSpy.mock.calls.length, broadcasts: h.broadcasts.length };
+
+    await sleep(400);
+
+    expect({ logs: logSpy.mock.calls.length, errors: errorSpy.mock.calls.length, broadcasts: h.broadcasts.length }).toEqual(before);
+    expect(stateOf(h, 'DEV1')).toBe('port-in-use');
   });
 
   it('stops polling the directory once the service has stopped', async () => {
