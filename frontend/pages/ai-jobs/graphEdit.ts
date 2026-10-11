@@ -21,7 +21,7 @@ export function nextNodeId(graph: PipelineGraph, kind: NodeKind): string {
 
 export function defaultConfigFor(kind: NodeKind): NodeConfig {
   switch (kind) {
-    case 'Trigger': return { kind, expandFn: '', outputSchema: [] };
+    case 'Trigger': return { kind, source: 'function', expandFn: '', outputSchema: [] };
     case 'AgentCall': return { kind, tier: 'High', instructionTemplate: '', toolAllowlist: [] };
     case 'Transform': return { kind, fn: '' };
     case 'Branch': return { kind, predicate: '', edges: [] };

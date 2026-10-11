@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { resolvePreview } from './templatePreview';
 import { nodeKindLabel } from './nodeKindLabels';
 import { runStatusMessage, displayRunStatus } from './runStatus';
+import { KnownOptionPicker } from './KnownOptionPicker';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
 interface SchemaField { field: string; type: string; description: string }
@@ -235,43 +236,22 @@ function TriggerBody({ node, onSave, recentVersions, onRun }: {
   const expandFn: string = node.config.expandFn;
   const inputSchema: SchemaField[] = node.config.inputSchema ?? [];
   const outputSchema: SchemaField[] = node.config.outputSchema;
-  const known = KNOWN_TRIGGER_EXPAND_FNS.find(f => f.value === expandFn);
-  // Selecting "Custom…" saves expandFn as '' until the user types something, so "known" can't be
-  // derived from expandFn alone — an empty value is ambiguous between "unset" and "mid-typing
-  // custom." A bit of local state remembers which one, reset whenever SidePanel remounts for a
-  // different node (see AiJobsWorkspace.tsx's `key={selected}` on SidePanel).
-  const [forceCustom, setForceCustom] = useState(false);
-  const isKnownFn = !forceCustom && (expandFn === '' || known !== undefined);
 
   return (
     <>
-      <div className="form-group">
-        <label htmlFor="trigger-expand-fn">Starts from</label>
-        <select id="trigger-expand-fn" className="form-select" value={isKnownFn ? expandFn : '__custom__'}
-          onChange={(e) => {
-            const isCustom = e.target.value === '__custom__';
-            setForceCustom(isCustom);
-            if (isCustom) {
-              onSave(node.id, { expandFn: '' });
-              return;
-            }
-            // A known function's schema is its real contract, not a suggestion — overwrite
-            // whatever was there (stale fields from a previously selected function, or nothing
-            // at all) so the editor can never again show this Trigger with no indication of
-            // what the function it's wired to actually requires.
-            const picked = KNOWN_TRIGGER_EXPAND_FNS.find(f => f.value === e.target.value)!;
-            onSave(node.id, { expandFn: picked.value, inputSchema: picked.inputSchema, outputSchema: picked.outputSchema });
-          }}>
-          <option value="">— choose —</option>
-          {KNOWN_TRIGGER_EXPAND_FNS.map(fn => <option key={fn.value} value={fn.value}>{fn.value}</option>)}
-          <option value="__custom__">Custom (registered in code)…</option>
-        </select>
-        {!isKnownFn && (
-          <input className="form-input" value={expandFn} placeholder="custom expand function name"
-            onChange={(e) => onSave(node.id, { expandFn: e.target.value })} />
-        )}
-        <div className="form-help">{known ? known.description : 'Name of a function registered in backend/services/ai-jobs/nodes/trigger.ts.'}</div>
-      </div>
+      <KnownOptionPicker
+        id="trigger-expand-fn" label="Starts from"
+        options={KNOWN_TRIGGER_EXPAND_FNS}
+        value={expandFn}
+        onPick={(picked) => {
+          if (picked === '') { onSave(node.id, { expandFn: '' }); return; }
+          const chosen = KNOWN_TRIGGER_EXPAND_FNS.find(f => f.value === picked)!;
+          onSave(node.id, { expandFn: chosen.value, inputSchema: chosen.inputSchema, outputSchema: chosen.outputSchema });
+        }}
+        onCustomType={(typed) => onSave(node.id, { expandFn: typed })}
+        help="Name of a function registered in backend/services/ai-jobs/nodes/trigger.ts."
+        customPlaceholder="custom expand function name"
+      />
       <SchemaFieldListEditor
         label="Run parameters" fieldNoun="parameter" testId="trigger-input-field-row" typeOptions={RUN_PARAM_TYPES}
         help="A Trigger has no incoming wire on the canvas — these are the values the Run form below asks for each time someone runs it, not data from another node."
@@ -370,31 +350,18 @@ function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGrap
   const from: string | undefined = node.config.from;
   const section: string = node.config.section ?? '';
   const known = KNOWN_SINK_WRITE_FNS.find(f => f.value === writeFn);
-  // See TriggerBody's identical forceCustom for why: an empty writeFn is ambiguous between
-  // "unset" and "mid-typing custom" right after picking Custom…, so local state breaks the tie.
-  const [forceCustom, setForceCustom] = useState(false);
-  const isKnownFn = !forceCustom && (writeFn === '' || known !== undefined);
 
   return (
     <>
-      <div className="form-group">
-        <label htmlFor="sink-write-fn">Write function</label>
-        <select id="sink-write-fn" aria-label="Write function" className="form-select" value={isKnownFn ? writeFn : '__custom__'}
-          onChange={(e) => {
-            const isCustom = e.target.value === '__custom__';
-            setForceCustom(isCustom);
-            onSave(node.id, { writeFn: isCustom ? '' : e.target.value });
-          }}>
-          <option value="">— choose —</option>
-          {KNOWN_SINK_WRITE_FNS.map(fn => <option key={fn.value} value={fn.value}>{fn.value}</option>)}
-          <option value="__custom__">Custom (registered in code)…</option>
-        </select>
-        {!isKnownFn && (
-          <input className="form-input" value={writeFn} placeholder="custom writeFn name"
-            onChange={(e) => onSave(node.id, { writeFn: e.target.value })} />
-        )}
-        <div className="form-help">{known ? known.description : 'Name of a function registered in backend/services/ai-jobs/nodes/sink.ts.'}</div>
-      </div>
+      <KnownOptionPicker
+        id="sink-write-fn" label="Write function"
+        options={KNOWN_SINK_WRITE_FNS}
+        value={writeFn}
+        onPick={(picked) => onSave(node.id, { writeFn: picked })}
+        onCustomType={(typed) => onSave(node.id, { writeFn: typed })}
+        help="Name of a function registered in backend/services/ai-jobs/nodes/sink.ts."
+        customPlaceholder="custom writeFn name"
+      />
       <div className="form-group">
         <label>Input</label>
         <WiredFrom graph={graph} from={from} />

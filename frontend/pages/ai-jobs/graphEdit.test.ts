@@ -31,7 +31,7 @@ describe('nextNodeId', () => {
 
 describe('defaultConfigFor', () => {
   it('returns a blank, valid-shaped config per kind', () => {
-    expect(defaultConfigFor('Trigger')).toEqual({ kind: 'Trigger', expandFn: '', outputSchema: [] });
+    expect(defaultConfigFor('Trigger')).toEqual({ kind: 'Trigger', source: 'function', expandFn: '', outputSchema: [] });
     expect(defaultConfigFor('AgentCall')).toEqual({ kind: 'AgentCall', tier: 'High', instructionTemplate: '', toolAllowlist: [] });
     expect(defaultConfigFor('Transform')).toEqual({ kind: 'Transform', fn: '' });
     expect(defaultConfigFor('Branch')).toEqual({ kind: 'Branch', predicate: '', edges: [] });
