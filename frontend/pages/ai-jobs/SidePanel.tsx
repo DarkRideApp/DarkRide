@@ -198,6 +198,24 @@ const KNOWN_TRIGGER_EXPAND_FNS: Array<{ value: string; description: string; inpu
   },
 ];
 
+/** Plain, non-interactive rendering of a schema field list — for a Trigger's output schema when
+ *  it's event-sourced: the shape comes from the live hook catalog, not something to author. */
+function SchemaFieldListReadOnly({ label, fields, help }: { label: string; fields: SchemaField[]; help: string }) {
+  return (
+    <div className="form-group">
+      <label>{label}</label>
+      {fields.map((f, i) => (
+        <div key={i} className="ai-jobs-list-row ai-jobs-list-row-readonly" data-testid="schema-field-row-readonly">
+          <span>{f.field}</span>
+          <span>{f.type}</span>
+          <span>{f.description}</span>
+        </div>
+      ))}
+      <div className="form-help">{help}</div>
+    </div>
+  );
+}
+
 function SchemaFieldListEditor({ label, fieldNoun, help, fields, typeOptions, onChange, testId }: {
   label: string; fieldNoun: string; help: string; fields: SchemaField[]; typeOptions: TypeOption[];
   onChange: (next: SchemaField[]) => void; testId: string;
@@ -292,16 +310,26 @@ function TriggerBody({ node, onSave, recentVersions, onRun, hookCatalog }: {
           {known ? known.description : 'A registered function (see nodes/trigger.ts) or a typed event this Trigger fires on.'}
         </div>
       </div>
-      <SchemaFieldListEditor
-        label="Run parameters" fieldNoun="parameter" testId="trigger-input-field-row" typeOptions={RUN_PARAM_TYPES}
-        help="A Trigger has no incoming wire on the canvas — these are the values the Run form below asks for each time someone runs it, not data from another node."
-        fields={inputSchema} onChange={(next) => onSave(node.id, { inputSchema: next })}
-      />
-      <SchemaFieldListEditor
-        label="Output schema" fieldNoun="output field" testId="schema-field-row" typeOptions={OUTPUT_FIELD_TYPES}
-        help="What this Trigger hands downstream nodes, as {{trigger.field}}."
-        fields={outputSchema} onChange={(next) => onSave(node.id, { outputSchema: next })}
-      />
+      {source === 'function' && (
+        <SchemaFieldListEditor
+          label="Run parameters" fieldNoun="parameter" testId="trigger-input-field-row" typeOptions={RUN_PARAM_TYPES}
+          help="A Trigger has no incoming wire on the canvas — these are the values the Run form below asks for each time someone runs it, not data from another node."
+          fields={inputSchema} onChange={(next) => onSave(node.id, { inputSchema: next })}
+        />
+      )}
+      {source === 'event' ? (
+        <SchemaFieldListReadOnly
+          label="Output schema"
+          help="What this event hands downstream nodes, as {{trigger.field}} — defined by the event, not editable here."
+          fields={hookCatalog.find(h => h.name === eventName)?.schema ?? outputSchema}
+        />
+      ) : (
+        <SchemaFieldListEditor
+          label="Output schema" fieldNoun="output field" testId="schema-field-row" typeOptions={OUTPUT_FIELD_TYPES}
+          help="What this Trigger hands downstream nodes, as {{trigger.field}}."
+          fields={outputSchema} onChange={(next) => onSave(node.id, { outputSchema: next })}
+        />
+      )}
       {source === 'event' ? (
         <div className="form-group ai-jobs-run-section">
           <label>Run</label>

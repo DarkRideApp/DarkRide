@@ -269,9 +269,13 @@ test.describe('AI job pipelines', () => {
     await triggerPanel.getByLabel('Starts from').selectOption('apk:analyzed');
 
     // Output schema auto-filled from the real, boot-registered apk:analyzed event schema — proves
-    // the hook-catalog endpoint, not a mock, actually served this.
-    const outputRows = triggerPanel.getByTestId('schema-field-row');
-    await expect(outputRows.first().getByPlaceholder('name')).toHaveValue('apkVersionId');
+    // the hook-catalog endpoint, not a mock, actually served this. Read-only: an event-sourced
+    // Trigger's schema is defined by the event, not something to author in the UI.
+    const outputRows = triggerPanel.getByTestId('schema-field-row-readonly');
+    await expect(outputRows.first()).toContainText('apkVersionId');
+    await expect(triggerPanel.getByTestId('schema-field-row')).toHaveCount(0);
+    await expect(triggerPanel.getByRole('button', { name: /remove output field/i })).toHaveCount(0);
+    await expect(triggerPanel.getByRole('button', { name: /add output field/i })).toHaveCount(0);
 
     // No Run form for an event-sourced Trigger — nothing to click, the dispatcher starts these.
     await expect(triggerPanel.getByText(/fires automatically when "apk:analyzed"/i)).toBeVisible();

@@ -294,6 +294,29 @@ describe('SidePanel — Trigger', () => {
     expect(screen.queryByRole('button', { name: /^run$/i })).not.toBeInTheDocument();
   });
 
+  // An event-sourced Trigger's output schema is what the event actually carries, not something
+  // to author — it must not be addable/removable/editable, or it silently drifts from the real
+  // payload while run-time still only ever emits the raw event.
+  it("an event-sourced Trigger's output schema has no add/remove/edit controls", () => {
+    const eventNode = { id: 'trigger-full', config: { kind: 'Trigger' as const, source: 'event' as const, eventName: 'apk:analyzed', outputSchema: [{ field: 'apkVersionId', type: 'number', description: 'x' }] } };
+    const hookCatalog = [{ name: 'apk:analyzed', schema: [{ field: 'apkVersionId', type: 'number', description: 'x' }], description: 'y' }];
+    render(<SidePanel node={eventNode} graph={{ nodes: [eventNode], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} hookCatalog={hookCatalog} />);
+    expect(screen.queryByRole('button', { name: /remove output field/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /add output field/i })).not.toBeInTheDocument();
+    expect(screen.getByText('apkVersionId')).toBeInTheDocument();
+  });
+
+  // The displayed schema must track the LIVE hook catalog, not whatever was snapshotted into
+  // the node's stored config at pick-time — otherwise a Trigger configured before the event's
+  // definition changed silently shows a stale shape instead of what actually fires today.
+  it("an event-sourced Trigger's output schema reflects the live hook catalog, not a stale stored snapshot", () => {
+    const eventNode = { id: 'trigger-full', config: { kind: 'Trigger' as const, source: 'event' as const, eventName: 'apk:analyzed', outputSchema: [{ field: 'oldField', type: 'string', description: 'stale' }] } };
+    const hookCatalog = [{ name: 'apk:analyzed', schema: [{ field: 'newField', type: 'number', description: 'current' }], description: 'y' }];
+    render(<SidePanel node={eventNode} graph={{ nodes: [eventNode], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} hookCatalog={hookCatalog} />);
+    expect(screen.getByText('newField')).toBeInTheDocument();
+    expect(screen.queryByText('oldField')).not.toBeInTheDocument();
+  });
+
   it('picking a function after being event-sourced clears eventName', () => {
     const onSave = vi.fn();
     const eventNode = { id: 'trigger-full', config: { kind: 'Trigger' as const, source: 'event' as const, eventName: 'apk:analyzed', outputSchema: [] } };
