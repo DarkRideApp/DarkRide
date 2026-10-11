@@ -458,6 +458,12 @@ describe('AdbProxyPage', () => {
   });
 
   describe('guidance and confirmation text', () => {
+    it('says the default bind address listens on every IPv4 interface, not every interface', async () => {
+      mount();
+      expect(await screen.findByText('0.0.0.0 listens on every IPv4 interface.')).toBeInTheDocument();
+      expect(document.body.textContent).not.toMatch(/listens on every interface/i);
+    });
+
     it('says the machine name is not proof and what the fingerprint is for', async () => {
       mount({ snapshot: snapshot({ pending: [pendingReq()] }) });
       await screen.findByTestId('adb-proxy-request');

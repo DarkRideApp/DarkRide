@@ -394,7 +394,7 @@ function AdbProxyContent({ canManage }: { canManage: boolean }) {
                 />
               )}
             </FieldRow>
-            <div className="form-hint">0.0.0.0 listens on every interface.</div>
+            <div className="form-hint">0.0.0.0 listens on every IPv4 interface.</div>
           </SectionCard>
 
           <SectionHeading>Waiting for approval ({status.pending.length})</SectionHeading>

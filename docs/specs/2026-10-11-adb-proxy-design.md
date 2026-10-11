@@ -1,7 +1,7 @@
 # ADB proxy: design
 
 Date: 2026-10-11
-Status: **Implemented**. Approved 2026-10-11, revised the same day while writing the implementation plan (see "Revisions after approval" at the end). Approach, auth model, hosting and grant scope were decided with Cube in the design discussion.
+Status: **Implemented**. Approved 2026-10-11, revised the same day while writing the implementation plan (see "Revisions after approval" at the end). Approach, auth model, hosting and grant scope were decided in the design discussion.
 
 ## The problem
 
@@ -208,7 +208,7 @@ A settings page at `settings/adb-proxy` (`frontend/pages/settings/AdbProxyPage.t
 | Client disappears | The session owns its backend sockets and destroys them. TCP keepalive (30 s) reaps half-open peers. |
 | Local ADB server down | New streams get `CLSE`; sessions stay; the error is logged once per interval, not per packet. |
 | Bad magic, oversize length, unknown pre-auth command | Close with no reply. Post-auth unknown commands are ignored. |
-| Port range full, or a persisted port taken by another process | The device shows the error. A port is never silently reassigned, because client scripts depend on it. Change it by hand. |
+| Port range full, or a persisted port taken by another process | The device shows the error. A device with no free port is retried by the presence check (every 5 s) and starts once a port frees up, for example after a stale device is forgotten. A port taken by another process is not retried and a port is never silently reassigned, because client scripts depend on it. Change it by hand. |
 | Backend restart | Pending entries are dropped; held clients retry and re-request. Approved keys persist. |
 | Key revoked while a stream is mid-transfer | Session closed at once; the client sees a reset. |
 
@@ -277,7 +277,7 @@ A throwaway probe played the proxy's side of the handshake on loopback. On `CNXN
 
 ## Revisions after approval
 
-Made on 2026-10-11 while grounding the implementation plan in the code. None changes a decision Cube made.
+Made on 2026-10-11 while grounding the implementation plan in the code. None changes a decision made in the design discussion.
 
 - **Security fix: every service starting with `host` is refused.** The first draft said host services were unreachable by construction because the transport is bound first. The ADB server dispatches `host…` requests on any connection, including a bound one, so a remote client could have sent `host:kill`. The Services policy and "How it works" now say so, and the gate tests assert the fake ADB server never sees a `host…` request from a remote stream.
 - **Live updates** use a filtered WebSocket channel with a scope requirement instead of an unfiltered broadcast, so pending fingerprints and IPs only reach clients holding `core.adb-proxy:read`.

@@ -6371,7 +6371,7 @@ import { defineConfig } from 'vitest/config';
 // Opt-in lane that drives the real `adb` binary at the proxy. The default vitest.config.ts excludes
 // `tests/conformance/**`; run this on purpose with `npm run test:adb-proxy-conformance`.
 // ADB_BINS is a comma-separated list of clients to test, for example:
-//   ADB_BINS=adb,/home/me/android-sdk/platform-tools/adb npm run test:adb-proxy-conformance
+//   ADB_BINS=adb,/path/to/other/adb npm run test:adb-proxy-conformance
 export default defineConfig({
   test: {
     globals: true,
