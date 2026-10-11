@@ -29,10 +29,12 @@ interface SetupOptions {
   shell?: (serial: string, command: string) => string;
   /** Wraps the real backend so a test can inject faults. */
   backend?: (real: HostClient) => BackendConnector;
+  /** The fake device answers root: and unroot: like a production build, without restarting adbd. */
+  productionBuild?: boolean;
 }
 
 async function setup(opts: SetupOptions = {}) {
-  const fake = new FakeAdbServer([{ serial: 'DEV1' }], { shell: opts.shell });
+  const fake = new FakeAdbServer([{ serial: 'DEV1' }], { shell: opts.shell, productionBuild: opts.productionBuild });
   const real = new HostClient(await fake.start(), 2000);
   const backend = opts.backend ? opts.backend(real) : real;
   const key = makeTestAdbKey();
@@ -433,6 +435,31 @@ describe('Session streams', () => {
         if (service === 'root:') expect(output.toString()).toBe('restarting adbd as root\n');
       },
     );
+
+    it.each([
+      ['root:', 'adbd cannot run as root in production builds\n'],
+      ['unroot:', 'adbd not running as root\n'],
+    ])('keeps the session and its other streams when %s answers without restarting adbd', async (service, answer) => {
+      const h = await setup({ productionBuild: true });
+      const echo = await h.client.open('echo:', 1);
+      const { localId } = await h.client.open(service, 2);
+      expect((await h.client.collectStream(2, localId, 'close')).toString()).toBe(answer);
+
+      expect(await h.client.quiet(150)).toBe(true);
+      expect(h.client.closed).toBe(false);
+      expect(closeReasons(h)).toEqual([]);
+      h.client.send(A_WRTE, 1, echo.localId, Buffer.from('still here'));
+      expect((await h.client.collectStream(1, echo.localId, 10)).toString()).toBe('still here');
+    });
+
+    it('closes the session after root: on a build where adbd restarts, with another stream open', async () => {
+      const h = await setup();
+      await h.client.open('echo:', 1);
+      const { localId } = await h.client.open('root:', 2);
+      await h.client.collectStream(2, localId, 'close');
+      expect(await h.client.waitClosed()).toBe(true);
+      expect(closeReasons(h)).toEqual(['device restarting']);
+    });
 
     it('keeps the session after an ordinary shell stream ends', async () => {
       const h = await setup();

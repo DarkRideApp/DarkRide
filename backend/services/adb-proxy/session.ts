@@ -23,8 +23,21 @@ const REFUSED_PREFIXES = ['host', 'reverse:', 'tcpip:', 'usb:'];
 // These services separate their arguments with NULs; adbd splits them back out.
 const NUL_SEPARATED_PREFIXES = ['abb_exec:', 'abb:'];
 const MALFORMED_SERVICE = '<malformed>';
-// adbd restarts or the phone reboots after these, so the client waits for the transport to drop as it would on a real one.
-const DEVICE_RESTART_PREFIXES = ['root:', 'unroot:', 'reboot'];
+// The phone always reboots after these, so the client waits for the transport to drop as it would on a real one.
+const DEVICE_REBOOT_PREFIXES = ['reboot'];
+// adbd restarts after these only when it says so; a production build refuses root and keeps running.
+const ADBD_RESTART_SERVICES = ['root:', 'unroot:'];
+const ADBD_RESTART_ANNOUNCEMENT = 'restarting';
+// The announcement is the first line of output, so only this much of it is kept.
+const RESTART_OUTPUT_LIMIT = 256;
+
+type RestartRule = 'never' | 'always' | 'if-announced';
+
+function restartRuleFor(service: string): RestartRule {
+  if (DEVICE_REBOOT_PREFIXES.some((p) => service.startsWith(p))) return 'always';
+  if (ADBD_RESTART_SERVICES.includes(service)) return 'if-announced';
+  return 'never';
+}
 
 export function checkService(service: string): { allowed: true } | { allowed: false; reason: string } {
   if (service.length === 0) return { allowed: false, reason: 'empty service' };
@@ -56,7 +69,9 @@ interface Stream {
   backendEnded: boolean;
   /** A client WRTE is written to the backend but not yet acknowledged. */
   ackPending: boolean;
-  restartsDevice: boolean;
+  restart: RestartRule;
+  /** The start of the device's output, kept only for a service whose restart depends on what it says. */
+  head: Buffer;
 }
 
 export type SessionState = 'await-cnxn' | 'await-auth' | 'pending' | 'finishing' | 'ready' | 'closed';
@@ -342,7 +357,7 @@ export class Session {
     if (duplicate || this.streams.size >= (this.opts.maxStreams ?? DEFAULT_MAX_STREAMS)) return this.refuse(remoteId);
     const stream: Stream = {
       localId: this.nextLocalId++, remoteId, backend: null, windowOpen: false, outQueue: [], backendEnded: false, ackPending: false,
-      restartsDevice: DEVICE_RESTART_PREFIXES.some((p) => service.startsWith(p)),
+      restart: restartRuleFor(service), head: Buffer.alloc(0),
     };
     this.streams.set(stream.localId, stream);
     let opening: Promise<net.Socket>;
@@ -376,6 +391,9 @@ export class Session {
     this.send(A_OKAY, stream.localId, stream.remoteId);
     // The socket arrives paused and may already have ended; listen now, in the same tick, or its end is never seen.
     sock.on('data', (chunk: Buffer) => this.guardStream(stream, 'data', () => {
+      if (stream.restart === 'if-announced' && stream.head.length < RESTART_OUTPUT_LIMIT) {
+        stream.head = Buffer.concat([stream.head, chunk.subarray(0, RESTART_OUTPUT_LIMIT - stream.head.length)]);
+      }
       stream.outQueue.push(chunk);
       sock.pause();
       this.pump(stream);
@@ -453,7 +471,8 @@ export class Session {
   private closeStream(stream: Stream, notify: boolean): void {
     if (!this.streams.delete(stream.localId)) return;
     this.destroyBackend(stream);
-    const restarting = stream.restartsDevice && stream.backend !== null;
+    const restarting = stream.backend !== null && (stream.restart === 'always'
+      || (stream.restart === 'if-announced' && stream.head.toString('latin1').includes(ADBD_RESTART_ANNOUNCEMENT)));
     if (restarting && !this.restarting) {
       this.restarting = true;
       this.emit({ kind: 'device-restarting', session: this });

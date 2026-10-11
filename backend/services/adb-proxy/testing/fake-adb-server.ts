@@ -29,8 +29,10 @@ export class FakeAdbServer {
   private readonly trackers = new Set<{ socket: net.Socket; long: boolean }>();
   private readonly server: net.Server;
   private readonly shell: (serial: string, command: string) => string;
+  private readonly productionBuild: boolean;
 
-  constructor(devices: FakeDevice[], opts: { shell?: (serial: string, command: string) => string } = {}) {
+  constructor(devices: FakeDevice[], opts: { shell?: (serial: string, command: string) => string; productionBuild?: boolean } = {}) {
+    this.productionBuild = opts.productionBuild ?? false;
     for (const d of devices) {
       this.devices.set(d.serial, {
         serial: d.serial,
@@ -196,10 +198,13 @@ export class FakeAdbServer {
       okay();
       return { raw: this.syncHandler(socket) };
     }
-    // A real adbd prints a line and then restarts or reboots, dropping the transport.
+    // A real adbd prints a line and then restarts or reboots, dropping the transport; a production build refuses root.
     if (service === 'root:' || service === 'unroot:' || service.startsWith('reboot')) {
       okay();
-      socket.end(service.startsWith('reboot') ? '' : `restarting adbd as ${service === 'root:' ? 'root' : 'non root'}\n`);
+      let answer = '';
+      if (service === 'root:') answer = this.productionBuild ? 'adbd cannot run as root in production builds\n' : 'restarting adbd as root\n';
+      if (service === 'unroot:') answer = this.productionBuild ? 'adbd not running as root\n' : 'restarting adbd as non root\n';
+      socket.end(answer);
       return { raw: () => {} };
     }
     if (service === 'hold:') {

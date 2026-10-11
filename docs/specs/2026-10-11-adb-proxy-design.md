@@ -126,7 +126,7 @@ A small adapter (`device-directory.ts`) implements it over `DeviceManager`, whic
 - `tcpip:*` and `usb:`, because they flip the phone's `adbd` between USB and network and can strand it where DarkRide cannot reach it;
 - any service with a NUL inside it, except `abb_exec:` and `abb:`. Those two separate their arguments with NULs (`adb install` sends `abb_exec:package\0install\0-S\0<size>`), so interior NULs are allowed for them and only for them. A payload that is not valid UTF-8, is empty or is over 4096 bytes is refused too, and logged as a refused service under the placeholder `<malformed>`.
 
-Everything else passes through, including `root:`, `remount:` and `reboot:`. Approval is full trust in the device, which is what was asked for. After a `root:`, `unroot:` or `reboot…` stream that reached the device ends, the proxy closes the session once the stream's `CLSE` has been written, because a real device drops its connection there too. Packets that arrive in between are ignored, and the client has to connect again once the device is back.
+Everything else passes through, including `root:`, `remount:` and `reboot:`. Approval is full trust in the device, which is what was asked for. After a `reboot…` stream that reached the device ends, and after a `root:` or `unroot:` stream whose output (the first 256 bytes are kept) says adbd is `restarting`, the proxy closes the session once the stream's `CLSE` has been written, because a real device drops its connection there too. A production build answers `root:` without restarting adbd, and then the session and its other streams stay open. Packets that arrive in between are ignored, and the client has to connect again once the device is back.
 
 ## Security model
 
@@ -213,7 +213,7 @@ A settings page at `settings/adb-proxy` (`frontend/pages/settings/AdbProxyPage.t
 | The ADB server refuses the transport for the device | A refused `host:transport:<serial>` (the device is offline or unknown to it) closes the session, once, however often the client re-sends `OPEN`. |
 | Client disappears | The session owns its backend sockets and destroys them. TCP keepalive (30 s) reaps half-open peers. |
 | Local ADB server down | New streams get `CLSE`; sessions stay; the error is logged once per interval, not per packet. |
-| `root:`, `unroot:` or `reboot…` ends | The session closes after the stream's `CLSE` is written; the client has to connect again once the device is back. |
+| `reboot…` ends, or `root:` or `unroot:` ends after announcing that adbd is restarting | The session closes after the stream's `CLSE` is written; the client has to connect again once the device is back. A `root:` refused by a production build leaves the session open. |
 | Bad magic, oversize length, unknown pre-auth command | Close with no reply. Post-auth unknown commands are ignored. |
 | A persisted port taken by another process | The device shows Port in use. The presence check (every 5 s, only while the proxy is on) retries it, so the device starts listening once the port is free, and the failure is logged at most once every 5 minutes. The port is never changed for it; change it by hand if the other process stays. |
 | Port range full | A device without a port is retried by the same check and starts once a port is free, for example after a stale device is forgotten. Ports are otherwise stable because client scripts depend on them. The one exception is on demand: when a device without a port needs one (it comes online, or its port or Proxy setting is changed) and the range is full, the port of the offline device whose port was assigned longest ago is deleted and given to it, with a log line. A device with proxying disabled is never chosen. The periodic retry of a device already showing No free port uses only a free port, so a phone that is merely rebooting does not lose its port to it. The device that lost its port gets a new one when it returns. If nothing is reclaimable the device shows No free port. |
@@ -307,7 +307,7 @@ Made on 2026-10-11 after the pull request was reviewed. Each is reflected in the
 
 - **Approving needs `core.devices:shell` as well as `core.adb-proxy:manage`**, and the page asks for confirmation that states what the machine gets.
 - **Max data lowered from 1 MiB to 256 KiB**, which cuts the worst-case memory of a session from about 132 MiB to about 36 MiB.
-- **A session closes when the ADB server refuses the transport for its device**, and after `root:`, `unroot:` and `reboot…` streams end, instead of staying open until the next presence check.
+- **A session closes when the ADB server refuses the transport for its device**, after `reboot…` streams end, and after `root:` and `unroot:` streams that announce an adbd restart, instead of staying open until the next presence check.
 - **A forgotten device that is still online** has its listener released and is listened for again; a port held by another process is retried every 5 seconds.
 - **A port is reclaimed on demand.** When the range is full and a device without a port needs one, the port of the offline device whose port was assigned longest ago is reused. This replaces "a port is never silently reassigned". Disabled devices are never reclaimed.
 - **The proxy ignores its own endpoints** among the devices the ADB server lists, and the connect command names the bind address when it is a specific one.
