@@ -52,6 +52,9 @@ interface SetupOptions {
   blockFirstPort?: boolean;
   reconcileMs?: number;
   bindHost?: string;
+  logIntervalMs?: number;
+  /** False leaves the service unstarted. */
+  start?: boolean;
   /** Runs against the database before the service starts. */
   seed?: (db: ReturnType<typeof createTestDb>, base: number) => void;
 }
@@ -79,9 +82,9 @@ async function setup(opts: SetupOptions = {}) {
   const broadcasts: Array<Record<string, any>> = [];
   const service = new AdbProxyService({
     db, directory, backend, broadcast: (m) => broadcasts.push(m), advertisedHost: () => '192.168.1.10', pending: opts.pending,
-    reconcileMs: opts.reconcileMs,
+    reconcileMs: opts.reconcileMs, logIntervalMs: opts.logIntervalMs,
   });
-  await service.start();
+  if (opts.start !== false) await service.start();
   const clients: WireClient[] = [];
   const portOf = (deviceId: string) => service.snapshot().devices.find((d) => d.deviceId === deviceId)!.port!;
   const connect = async (deviceId = 'DEV1') => {
@@ -121,7 +124,9 @@ async function expectPortFree(port: number) {
 }
 
 const stateOf = (h: Harness, id: string) => h.service.snapshot().devices.find((d) => d.deviceId === id)?.state;
-const refusalLines = () => logSpy.mock.calls.map((c) => String(c[0])).filter((line) => line.includes('refused service'));
+const logged = () => logSpy.mock.calls.map((c) => String(c[0]));
+const refusalLines = () => logged().filter((line) => line.includes('refused service "'));
+const closeLines = () => logged().filter((line) => /^session \d+ closed/.test(line));
 
 describe('AdbProxyService startup', () => {
   it('listens on nothing while disabled', async () => {
@@ -161,6 +166,19 @@ describe('AdbProxyService startup', () => {
     expect(h.service.snapshot().devices.map((d) => [d.deviceId, d.state, d.online, d.port])).toEqual([
       ['DEV1', 'listening', true, h.base], ['DEV2', 'device-offline', false, h.base + 3],
     ]);
+  });
+
+  it('gives a second start() the in-flight promise, which settles only once the listeners are up', async () => {
+    const h = await setup({ start: false });
+    const listen = vi.spyOn(DeviceListener.prototype, 'listen');
+
+    const first = h.service.start();
+    const second = h.service.start();
+    expect(second).toBe(first);
+    await second;
+
+    expect(h.service.snapshot().devices.map((d) => d.state)).toEqual(['listening', 'listening']);
+    expect(listen).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -355,6 +373,55 @@ describe('AdbProxyService settled decisions', () => {
     expect(await client.waitClosed()).toBe(true);
     expect(h.service.listKeys()[0].status).toBe('denied');
   });
+
+  it('closes the live sessions of an approved key when a deny goes through for it', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    const waiting = await requestApproval(h, key);
+    const [req] = h.service.snapshot().pending;
+    seedRecord(h, key, 'approved', null);
+    const live = await h.connect('DEV2');
+    expect((await live.authenticate(key)).command).toBe(A_CNXN);
+
+    expect(h.service.denyRequest(req.requestId, 1)).toEqual({ ok: true });
+
+    expect(await waiting.waitClosed()).toBe(true);
+    expect(await live.waitClosed()).toBe(true);
+    expect(h.service.listKeys()[0].status).toBe('denied');
+  });
+
+  it('releases only the waiting entries inside the allow-list of an approved record and denies the rest', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    const inside = await requestApproval(h, key, 'DEV1');
+    const outside = await requestApproval(h, key, 'DEV2');
+    seedRecord(h, key, 'approved', ['DEV1']);
+    const req = h.service.snapshot().pending.find((p) => p.deviceId === 'DEV1')!;
+
+    expect(h.service.approveRequest(req.requestId, 1)).toEqual({ ok: true });
+
+    expect((await inside.next()).command).toBe(A_CNXN);
+    expect(await outside.waitClosed()).toBe(true);
+    expect(outside.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    expect(h.service.snapshot().pending).toEqual([]);
+  });
+
+  it('refuses to approve an entry outside the allow-list of an approved record, and still releases the one inside', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    const inside = await requestApproval(h, key, 'DEV1');
+    const outside = await requestApproval(h, key, 'DEV2');
+    seedRecord(h, key, 'approved', ['DEV1']);
+    const req = h.service.snapshot().pending.find((p) => p.deviceId === 'DEV2')!;
+
+    expect(h.service.approveRequest(req.requestId, 1)).toEqual({ ok: false, error: 'not-found' });
+
+    expect(await outside.waitClosed()).toBe(true);
+    expect(outside.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    expect((await inside.next()).command).toBe(A_CNXN);
+    expect(h.service.listKeys()[0]).toMatchObject({ status: 'approved', comment: 'earlier decision', deviceIds: ['DEV1'] });
+    expect(h.service.snapshot().counters.approvals).toBe(0);
+  });
 });
 
 describe('AdbProxyService device lifecycle', () => {
@@ -400,17 +467,23 @@ describe('AdbProxyService device lifecycle', () => {
     expect(errorSpy.mock.calls.filter((c) => String(c[0]).includes('ADB server request failed'))).toHaveLength(1);
   });
 
-  it('treats repeated online and offline events as no-ops', async () => {
+  it('treats an online event for a listening device and a repeated offline event as no-ops that change nothing and broadcast nothing', async () => {
     const h = await setup();
     const port = h.portOf('DEV1');
+    const client = await h.connect();
+    h.directory.goOffline('DEV2');
+    await sleep(120);
+    const settled = h.broadcasts.length;
+    expect(stateOf(h, 'DEV2')).toBe('device-offline');
+
     h.directory.goOnline('DEV1');
     h.directory.goOffline('DEV2');
-    h.directory.goOffline('DEV2');
-    await sleep(50);
+    await sleep(120);
+
+    expect(h.broadcasts.length).toBe(settled);
     expect(stateOf(h, 'DEV1')).toBe('listening');
     expect(h.portOf('DEV1')).toBe(port);
     expect(stateOf(h, 'DEV2')).toBe('device-offline');
-    const client = await h.connect();
     expect(await client.waitClosed(100)).toBe(false);
   });
 });
@@ -575,6 +648,43 @@ describe('AdbProxyService settings and device options', () => {
     moved.close();
     await expectPortFree(h.base);
   });
+
+  it('applies a disable and an enable fired back to back in order, ending on the original ports', async () => {
+    const h = await setup();
+    const ports = [h.portOf('DEV1'), h.portOf('DEV2')];
+
+    const off = h.service.updateSettings({ enabled: false });
+    const on = h.service.updateSettings({ enabled: true });
+    await Promise.all([off, on]);
+
+    expect(h.service.snapshot().devices.map((d) => [d.deviceId, d.state, d.port])).toEqual([
+      ['DEV1', 'listening', ports[0]], ['DEV2', 'listening', ports[1]],
+    ]);
+    const client = await WireClient.connect(ports[0]);
+    client.close();
+  });
+
+  it('runs later changes after an earlier one failed', async () => {
+    const h = await setup();
+    const bad = h.service.updateSettings({ bindHost: 'nope' });
+    const good = h.service.updateSettings({ enabled: false });
+    await expect(bad).rejects.toBeInstanceOf(SettingsError);
+    await good;
+    expect(h.service.snapshot().devices.map((d) => d.state)).toEqual(['off', 'off']);
+  });
+
+  it('stops without waiting for queued changes and leaves no port bound once they have run', async () => {
+    const h = await setup({ enabled: false });
+    const queued = [
+      h.service.updateSettings({ enabled: true }),
+      h.service.updateSettings({ enabled: false }),
+      h.service.updateSettings({ enabled: true }),
+    ];
+    await h.service.stop();
+    await Promise.allSettled(queued);
+    await expectPortFree(h.base);
+    await expectPortFree(h.base + 1);
+  });
 });
 
 describe('AdbProxyService limits and reporting', () => {
@@ -609,6 +719,18 @@ describe('AdbProxyService limits and reporting', () => {
     expect(last.devices).toHaveLength(2);
   });
 
+  it('destroys a socket that has no remote address without giving it a pre-auth slot or counting it', async () => {
+    const h = await setup();
+    const reset = new net.Socket();
+
+    (h.service as any).accept('DEV1', reset);
+
+    expect(reset.destroyed).toBe(true);
+    const snap = h.service.snapshot();
+    expect(snap.connections).toEqual([]);
+    expect(snap.counters).toMatchObject({ connections: 0, floodDrops: 0 });
+  });
+
   it.skipIf(!Object.values(os.networkInterfaces()).flat().some((i) => i?.address === '::1'))(
     'records the IPv4 address of a peer that reaches a dual-stack listener',
     async () => {
@@ -638,8 +760,8 @@ describe('AdbProxyService refusal logging', () => {
     return live;
   };
 
-  it('logs one line for a burst of refused services and nothing from the session', async () => {
-    const h = await setup();
+  it('logs one line for a burst of refused services, counts the rest, and nothing comes from the session', async () => {
+    const h = await setup({ logIntervalMs: 60_000 });
     const live = await approvedLiveClient(h);
     await sleep(100);
     logSpy.mockClear();
@@ -653,6 +775,8 @@ describe('AdbProxyService refusal logging', () => {
     expect(errorSpy).not.toHaveBeenCalled();
     await sleep(100);
     expect(h.broadcasts.length).toBe(broadcastsBefore);
+    await h.service.stop();
+    expect(logged()).toContain('19 more refused service events suppressed');
   });
 
   it('strips control characters and caps the length of a hostile service string', async () => {
@@ -671,6 +795,114 @@ describe('AdbProxyService refusal logging', () => {
     expect(shown).toBe(`tcpip:??[2Kfake?tail${'x'.repeat(40)}`);
     expect(shown.length).toBeLessThanOrEqual(60);
     expect(shown).toMatch(/^[\x20-\x7e]*$/);
+  });
+});
+
+describe('AdbProxyService log flooding by peers without an approved key', () => {
+  /** Opens and drops `total` bare connections in batches that stay under the per-peer pre-auth cap. */
+  const bareCycles = async (h: Harness, total: number) => {
+    const port = h.portOf('DEV1');
+    for (let done = 0; done < total; done += 5) {
+      const size = Math.min(5, total - done);
+      const batch = await Promise.all(Array.from({ length: size }, () => WireClient.connect(port)));
+      await vi.waitFor(() => expect(h.service.snapshot().counters.connections).toBe(done + size), { interval: 5, timeout: 3000 });
+      batch.forEach((c) => c.close());
+      await vi.waitFor(() => expect(h.service.snapshot().connections).toEqual([]), { interval: 5, timeout: 3000 });
+    }
+  };
+
+  it('logs the first bare connection close in full and counts the other 49, leaving the counters alone', async () => {
+    const h = await setup({ logIntervalMs: 60_000 });
+
+    await bareCycles(h, 50);
+
+    expect(closeLines()).toHaveLength(1);
+    expect(h.service.snapshot().counters).toEqual({ connections: 50, approvals: 0, denials: 0, authFailures: 0, floodDrops: 0 });
+    await h.service.stop();
+    expect(logged().filter((line) => line.includes('events suppressed'))).toEqual(['49 more unauthenticated close events suppressed']);
+  });
+
+  it('logs the first blocked offer in full and counts the other nine', async () => {
+    const h = await setup({ logIntervalMs: 60_000 });
+    const key = makeTestAdbKey();
+    const first = await requestApproval(h, key);
+    expect(h.service.denyRequest(h.service.snapshot().pending[0].requestId, 1)).toEqual({ ok: true });
+    expect(await first.waitClosed()).toBe(true);
+    logSpy.mockClear();
+
+    for (let i = 0; i < 10; i++) {
+      const client = await h.connect();
+      await client.offerKey(key);
+      expect(await client.waitClosed()).toBe(true);
+    }
+
+    expect(logged().filter((line) => line.startsWith('blocked key '))).toHaveLength(1);
+    await h.service.stop();
+    expect(logged()).toContain('9 more blocked key events suppressed');
+  });
+
+  it('logs the first approval request of a looping peer in full and counts the rest, closes included', async () => {
+    const h = await setup({ logIntervalMs: 60_000 });
+    const key = makeTestAdbKey();
+    let previous = '';
+    for (let i = 0; i < 10; i++) {
+      const client = await h.connect();
+      await client.offerKey(key);
+      await vi.waitFor(() => expect(h.service.snapshot().pending[0]?.requestId ?? previous).not.toBe(previous), { interval: 5, timeout: 3000 });
+      previous = h.service.snapshot().pending[0].requestId;
+    }
+
+    await vi.waitFor(() => expect(closeLines()).toHaveLength(1), { interval: 5, timeout: 3000 });
+    expect(logged().filter((line) => line.includes('is waiting for approval'))).toHaveLength(1);
+    await h.service.stop();
+    expect(logged()).toContain('9 more approval request events suppressed');
+    expect(closeLines()).toHaveLength(1);
+  });
+
+  it('logs the first approval request flood drop in full and counts the rest', async () => {
+    const h = await setup({ logIntervalMs: 60_000, pending: { perIpPerMinute: 1 } });
+    const first = await requestApproval(h, makeTestAdbKey());
+    logSpy.mockClear();
+
+    for (let i = 0; i < 6; i++) {
+      const client = await h.connect();
+      await client.offerKey(makeTestAdbKey());
+      expect(await client.waitClosed()).toBe(true);
+    }
+
+    expect(logged().filter((line) => line.startsWith('dropped an approval request'))).toHaveLength(1);
+    expect(h.service.snapshot().counters.floodDrops).toBe(6);
+    await h.service.stop();
+    expect(logged()).toContain('5 more approval flood-drop events suppressed');
+    first.close();
+  });
+
+  it('still logs the close of a session that authenticated while bare closes are being suppressed', async () => {
+    const h = await setup({ logIntervalMs: 60_000 });
+    await bareCycles(h, 3);
+    const key = makeTestAdbKey();
+    await approveKey(h, key);
+    const live = await h.connect();
+    await live.authenticate(key);
+    live.close();
+
+    await vi.waitFor(() => expect(closeLines().filter((line) => !line.includes('key=-'))).toHaveLength(2), { interval: 5, timeout: 3000 });
+    expect(closeLines().filter((line) => line.includes('key=-'))).toHaveLength(1);
+  });
+
+  it('keeps the admin audit lines while the peer lines are suppressed', async () => {
+    const h = await setup({ logIntervalMs: 60_000 });
+    await bareCycles(h, 10);
+    await approveKey(h, makeTestAdbKey());
+    const first = h.service.listKeys()[0];
+    expect(h.service.revokeKey(first.id, 1)).toEqual({ ok: true });
+    const waiting = await requestApproval(h, makeTestAdbKey());
+    expect(h.service.denyRequest(h.service.snapshot().pending[0].requestId, 1)).toEqual({ ok: true });
+    await waiting.waitClosed();
+
+    for (const prefix of ['approved key ', 'revoked key ', 'denied key ']) {
+      expect(logged().some((line) => line.startsWith(prefix))).toBe(true);
+    }
   });
 });
 

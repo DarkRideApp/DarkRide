@@ -17,7 +17,7 @@ import { PendingRegistry, type PendingOptions } from './pending';
 import { PortAllocator, PortError } from './port-allocator';
 import { Session, type BackendConnector, type SessionEvent } from './session';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings, type AdbProxySettings } from './settings';
-import { onceEvery } from './throttle';
+import { createBurstLog, onceEvery, type BurstLog } from './throttle';
 
 const { log, error: logError } = createLoggers('adb-proxy');
 
@@ -34,6 +34,8 @@ export interface AdbProxyServiceDeps {
   pending?: PendingOptions;
   /** How often the online device list is compared with the service's own view; default 5000. */
   reconcileMs?: number;
+  /** Length of one log interval for lines a peer without an approved key can provoke; default 1000. */
+  logIntervalMs?: number;
 }
 
 type Failure<E extends string> = { ok: false; error: E };
@@ -41,7 +43,7 @@ type Done = { ok: true };
 
 const NOTIFY_DELAY_MS = 50;
 const DEFAULT_RECONCILE_MS = 5000;
-const REFUSAL_LOG_INTERVAL_MS = 1000;
+const DEFAULT_LOG_INTERVAL_MS = 1000;
 const REFUSAL_LOG_LENGTH = 60;
 const short = (keyId: string) => keyId.slice(0, 12);
 // The service string comes from the client: keep printable ASCII only so it cannot forge or hide log lines.
@@ -62,14 +64,28 @@ export class AdbProxyService {
   private readonly counters: Counters = { connections: 0, approvals: 0, denials: 0, authFailures: 0, floodDrops: 0 };
   private started = false;
   private stopped = false;
+  private startPromise: Promise<void> | null = null;
+  private tail: Promise<void> | null = null;
   private notifyTimer: NodeJS.Timeout | null = null;
   private reconcileTimer: NodeJS.Timeout | null = null;
   private readonly backend: BackendConnector;
   private readonly logBackendFailure = onceEvery(30_000, (message: string) => logError(message));
   private readonly logPresenceFailure = onceEvery(30_000, (message: string) => logError(message));
-  private readonly logRefusal = onceEvery(REFUSAL_LOG_INTERVAL_MS, (line: string) => log(line));
+  // The log buffer is shared by the whole server, so lines a peer without an approved key can provoke are rate limited.
+  private readonly logRefusal: BurstLog;
+  private readonly logUnauthenticatedClose: BurstLog;
+  private readonly logBlocked: BurstLog;
+  private readonly logFloodDrop: BurstLog;
+  private readonly logRequested: BurstLog;
+  private readonly trusted = new WeakSet<Session>();
 
   constructor(private readonly deps: AdbProxyServiceDeps) {
+    const burst = (kind: string) => createBurstLog(deps.logIntervalMs ?? DEFAULT_LOG_INTERVAL_MS, kind, (line) => log(line));
+    this.logRefusal = burst('refused service');
+    this.logUnauthenticatedClose = burst('unauthenticated close');
+    this.logBlocked = burst('blocked key');
+    this.logFloodDrop = burst('approval flood-drop');
+    this.logRequested = burst('approval request');
     // A dead host ADB server is logged once per interval, not once per stream.
     this.backend = {
       openService: async (serial, service) => {
@@ -95,10 +111,17 @@ export class AdbProxyService {
     this.gate = new KeyAuthGate(this.keys, this.pending, (e) => this.onGateEvent(e));
   }
 
-  /** Call once per process: the directory has no way to unsubscribe, so a stopped instance cannot start again. */
-  async start(): Promise<void> {
-    if (this.stopped) throw new Error('AdbProxyService was stopped; create a new instance');
-    if (this.started) return;
+  /** Call once per process: the directory has no way to unsubscribe, so a stopped instance cannot start again. A second call gets the first call's promise. */
+  start(): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error('AdbProxyService was stopped; create a new instance'));
+    this.startPromise ??= this.begin().catch((e) => {
+      this.startPromise = null;
+      throw e;
+    });
+    return this.startPromise;
+  }
+
+  private async begin(): Promise<void> {
     const settings = loadSettings(this.deps.db);
     const present = this.deps.directory.listOnlineAndroid();
     this.started = true;
@@ -109,9 +132,10 @@ export class AdbProxyService {
     // Events alone miss a device that flips to offline or unauthorized, so presence is also polled.
     this.reconcileTimer = setInterval(() => this.reconcile(), this.deps.reconcileMs ?? DEFAULT_RECONCILE_MS);
     this.reconcileTimer.unref?.();
-    if (this.settings.enabled) await this.startAll();
+    if (this.settings.enabled) await this.serialised(() => this.startAll());
   }
 
+  /** Does not queue behind pending changes: those find the service stopped and bind nothing. */
   async stop(): Promise<void> {
     this.started = false;
     this.stopped = true;
@@ -121,8 +145,20 @@ export class AdbProxyService {
     this.reconcileTimer = null;
     for (const s of [...this.sessions]) s.destroy('service stopping');
     await this.stopAllDevices();
+    for (const burst of [this.logRefusal, this.logUnauthenticatedClose, this.logBlocked, this.logFloodDrop, this.logRequested]) burst.stop();
     // Last, so each session's cancel() above ran against a live registry.
     this.pending.stop();
+  }
+
+  /** Runs lifecycle changes one at a time, in call order. A step that fails does not stop the ones after it. */
+  private serialised<T>(step: () => Promise<T>): Promise<T> {
+    const run = this.tail ? this.tail.then(step) : step();
+    const settled = run.then(() => undefined, () => undefined);
+    this.tail = settled;
+    void settled.then(() => {
+      if (this.tail === settled) this.tail = null;
+    });
+    return run;
   }
 
   snapshot(): StatusSnapshot {
@@ -173,49 +209,53 @@ export class AdbProxyService {
     }));
   }
 
-  async updateSettings(patch: Partial<AdbProxySettings>): Promise<StatusSnapshot> {
-    const before = this.settings;
-    const after = saveSettings(this.deps.db, patch);
-    this.settings = after;
-    if (before.enabled && !after.enabled) {
-      await this.stopAllDevices();
-    } else if (!before.enabled && after.enabled) {
-      await this.startAll();
-    } else if (after.enabled && before.bindHost !== after.bindHost) {
-      await this.stopAllDevices();
-      await this.startAll();
-    } else if (after.enabled && (before.portStart !== after.portStart || before.portEnd !== after.portEnd)) {
-      // Devices that found the range full get another try; listening ones are left alone.
-      await this.startAll();
-    }
-    this.notifyChanged();
-    return this.snapshot();
+  updateSettings(patch: Partial<AdbProxySettings>): Promise<StatusSnapshot> {
+    return this.serialised(async () => {
+      const before = this.settings;
+      const after = saveSettings(this.deps.db, patch);
+      this.settings = after;
+      if (before.enabled && !after.enabled) {
+        await this.stopAllDevices();
+      } else if (!before.enabled && after.enabled) {
+        await this.startAll();
+      } else if (after.enabled && before.bindHost !== after.bindHost) {
+        await this.stopAllDevices();
+        await this.startAll();
+      } else if (after.enabled && (before.portStart !== after.portStart || before.portEnd !== after.portEnd)) {
+        // Devices that found the range full get another try; listening ones are left alone.
+        await this.startAll();
+      }
+      this.notifyChanged();
+      return this.snapshot();
+    });
   }
 
-  async setDevice(
+  setDevice(
     deviceId: string,
     patch: { enabled?: boolean; port?: number },
   ): Promise<Done | Failure<'unknown-device' | 'range-full' | 'out-of-range' | 'in-use'>> {
-    const known = this.deps.db.select({ id: devices.id }).from(devices).where(eq(devices.id, deviceId)).get();
-    if (!known) return { ok: false, error: 'unknown-device' };
-    const row = this.ports.ensure(deviceId);
-    if ('error' in row) return { ok: false, error: 'range-full' };
-    try {
-      if (patch.port !== undefined && patch.port !== row.port) {
-        if (!this.ports.setPort(deviceId, patch.port)) return { ok: false, error: 'unknown-device' };
-        await this.stopDevice(deviceId);
+    return this.serialised(async () => {
+      const known = this.deps.db.select({ id: devices.id }).from(devices).where(eq(devices.id, deviceId)).get();
+      if (!known) return { ok: false, error: 'unknown-device' } as const;
+      const row = this.ports.ensure(deviceId);
+      if ('error' in row) return { ok: false, error: 'range-full' } as const;
+      try {
+        if (patch.port !== undefined && patch.port !== row.port) {
+          if (!this.ports.setPort(deviceId, patch.port)) return { ok: false, error: 'unknown-device' } as const;
+          await this.stopDevice(deviceId);
+        }
+        if (patch.enabled !== undefined) {
+          this.ports.setEnabled(deviceId, patch.enabled);
+          if (!patch.enabled) await this.stopDevice(deviceId);
+        }
+      } catch (e) {
+        if (e instanceof PortError) return { ok: false, error: e.code } as const;
+        throw e;
       }
-      if (patch.enabled !== undefined) {
-        this.ports.setEnabled(deviceId, patch.enabled);
-        if (!patch.enabled) await this.stopDevice(deviceId);
-      }
-    } catch (e) {
-      if (e instanceof PortError) return { ok: false, error: e.code };
-      throw e;
-    }
-    await this.startDevice(deviceId);
-    this.notifyChanged();
-    return { ok: true };
+      await this.startDevice(deviceId);
+      this.notifyChanged();
+      return { ok: true } as const;
+    });
   }
 
   approveRequest(requestId: string, userId: number | null): Done | Failure<'not-found'> {
@@ -235,12 +275,22 @@ export class AdbProxyService {
       this.pending.resolveKey(entry.keyId, 'denied');
       return { ok: false, error: 'not-found' };
     }
-    this.keys.upsertDecision({
-      keyId: entry.keyId, publicKey: entry.publicKey, comment: entry.comment, status,
-      ip: entry.peerIp, deviceId: entry.deviceId, userId,
-    });
-    this.gate.invalidate(entry.keyId);
-    this.pending.resolveKey(entry.keyId, status);
+    // An approved record's allow-list still binds the clients waiting on it.
+    const permitted = (deviceId: string) =>
+      status === 'approved' && !(existing?.deviceIds?.length && !existing.deviceIds.includes(deviceId));
+    const refused = status === 'approved' && !permitted(entry.deviceId);
+    if (!refused) {
+      this.keys.upsertDecision({
+        keyId: entry.keyId, publicKey: entry.publicKey, comment: entry.comment, status,
+        ip: entry.peerIp, deviceId: entry.deviceId, userId,
+      });
+      this.gate.invalidate(entry.keyId);
+    }
+    for (const waiting of this.pending.list()) {
+      if (waiting.keyId === entry.keyId) this.pending.resolve(waiting.requestId, permitted(waiting.deviceId) ? 'approved' : 'denied');
+    }
+    if (refused) return { ok: false, error: 'not-found' };
+    if (status === 'denied' && existing) this.closeSessions((s) => s.keyId === entry.keyId, 'key denied');
     if (status === 'approved') {
       this.counters.approvals++;
       log(`approved key ${short(entry.keyId)} (${entry.comment}) first seen from ${entry.peerIp}`);
@@ -369,7 +419,7 @@ export class AdbProxyService {
   }
 
   private async stopDevice(deviceId: string): Promise<void> {
-    // A bind in flight registers its listener first, so the close below cannot miss it.
+    // Waits for a bind in flight, which either registers its listener or has already closed it.
     await this.starts.get(deviceId);
     this.closeSessions((s) => s.deviceId === deviceId, 'listener stopped');
     const listener = this.listeners.get(deviceId);
@@ -379,10 +429,13 @@ export class AdbProxyService {
     this.notifyChanged();
   }
 
-  private async deviceOnline(deviceId: string): Promise<void> {
+  private deviceOnline(deviceId: string): Promise<void> {
+    const known = this.online.has(deviceId);
     this.online.add(deviceId);
-    await this.startDevice(deviceId);
-    this.notifyChanged();
+    return this.serialised(async () => {
+      await this.startDevice(deviceId);
+      if (!known) this.notifyChanged();
+    });
   }
 
   private deviceOffline(deviceId: string): void {
@@ -409,11 +462,12 @@ export class AdbProxyService {
   }
 
   private accept(deviceId: string, socket: net.Socket): void {
-    const ip = foldMappedV4(socket.remoteAddress);
-    if (!this.started || !this.online.has(deviceId)) {
+    // A socket with no remote address was already reset, and must not share one pre-auth bucket with the others.
+    if (!this.started || !socket.remoteAddress || !this.online.has(deviceId)) {
       socket.destroy();
       return;
     }
+    const ip = foldMappedV4(socket.remoteAddress);
     const release = this.limiter.acquire(ip);
     if (!release) {
       this.counters.floodDrops++;
@@ -443,9 +497,18 @@ export class AdbProxyService {
     const who = `device=${e.session.deviceId} ip=${e.session.peerIp} key=${e.session.keyId ? short(e.session.keyId) : '-'}`;
     switch (e.kind) {
       case 'auth-failed': this.counters.authFailures++; return;
-      case 'authenticated': log(`session ${e.session.id} authenticated ${who}`); break;
-      case 'refused-service': this.logRefusal(`session ${e.session.id} refused service "${printable(e.service)}" ${who}`); return;
-      case 'closed': log(`session ${e.session.id} closed (${e.reason}) ${who}`); break;
+      case 'authenticated':
+        this.trusted.add(e.session);
+        log(`session ${e.session.id} authenticated ${who}`);
+        break;
+      case 'refused-service': this.logRefusal.log(`session ${e.session.id} refused service "${printable(e.service)}" ${who}`); return;
+      case 'closed': {
+        // Anyone can open and drop connections, so only a session that authenticated gets a line of its own.
+        const line = `session ${e.session.id} closed (${e.reason}) ${who}`;
+        if (this.trusted.has(e.session)) log(line);
+        else this.logUnauthenticatedClose.log(line);
+        break;
+      }
       default: break;
     }
     this.notifyChanged();
@@ -454,14 +517,14 @@ export class AdbProxyService {
   private onGateEvent(e: GateEvent): void {
     switch (e.kind) {
       case 'requested':
-        log(`key ${short(e.entry.keyId)} (${e.entry.comment}) is waiting for approval for device=${e.entry.deviceId} ip=${e.entry.peerIp}`);
+        this.logRequested.log(`key ${short(e.entry.keyId)} (${e.entry.comment}) is waiting for approval for device=${e.entry.deviceId} ip=${e.entry.peerIp}`);
         break;
       case 'blocked':
-        log(`blocked key ${short(e.keyId)} (${e.reason}) device=${e.deviceId} ip=${e.peerIp}`);
+        this.logBlocked.log(`blocked key ${short(e.keyId)} (${e.reason}) device=${e.deviceId} ip=${e.peerIp}`);
         break;
       case 'flood-drop':
         this.counters.floodDrops++;
-        log(`dropped an approval request (${e.reason} limit) device=${e.deviceId} ip=${e.peerIp}`);
+        this.logFloodDrop.log(`dropped an approval request (${e.reason} limit) device=${e.deviceId} ip=${e.peerIp}`);
         break;
     }
   }
