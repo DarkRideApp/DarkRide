@@ -29,13 +29,17 @@ const APK_CONTEXT_SCHEMA = [
   { field: 'source', type: 'string', description: "'device' | 'playstore' | 'qq' | 'upload'" },
 ];
 
+const APK_TRIGGER_INPUT_SCHEMA = [
+  { field: 'versionId', type: 'apk-version', description: 'Which analyzed APK version to run against' },
+];
+
 const GROUP_A_TOOLS = ['get_apk_overview', 'get_apk_strings', 'list_apk_assets', 'get_app_versions', 'search_apk_code', 'find_api_endpoints'];
 const GROUP_B_TOOLS = ['search_apk_code', 'get_apk_strings', 'find_api_endpoints', 'detect_ssl_pinning'];
 
 const ASTERIX_PATTERN_GRAPH_FIXTURE: PipelineGraph = {
   nodes: [
-    { id: 'trigger-full', label: 'Full Analysis', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
-    { id: 'trigger-rescan', label: 'Quick Rescan', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-full', label: 'Full Analysis', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', inputSchema: APK_TRIGGER_INPUT_SCHEMA, outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-rescan', label: 'Quick Rescan', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', inputSchema: APK_TRIGGER_INPUT_SCHEMA, outputSchema: APK_CONTEXT_SCHEMA } },
 
     { id: 'agent-overview', label: 'App Overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}. Summarize purpose, framework, permissions and notable SDKs.' } },
     { id: 'agent-wait-times', label: 'Wait Times Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} fetches ride wait times. Search for queue, wait and attraction-status endpoints.' } },

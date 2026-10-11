@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Canvas } from './Canvas';
+import { Canvas, toFlowEdges, toFlowNodes } from './Canvas';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
 // @xyflow/react's <ReactFlow> observes its pane with a ResizeObserver, which jsdom does not
@@ -63,5 +63,129 @@ describe('Canvas', () => {
     render(<Canvas graph={graph} onSelectNode={() => {}} />);
     expect(screen.getByText('Agent Call')).toBeInTheDocument();
     expect(screen.getByText('Trigger')).toBeInTheDocument();
+  });
+
+  it('a Report node with multiple sections renders one target handle per section, each labeled by its title', () => {
+    const reportGraph: PipelineGraph = {
+      nodes: [
+        { id: 'agent-overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+        { id: 'report', config: { kind: 'Report', sections: [{ title: 'Overview', from: 'agent-overview' }, { title: 'Maps', from: '' }] } },
+      ],
+      edges: [{ from: 'agent-overview', to: 'report' }],
+    };
+    render(<Canvas graph={reportGraph} onSelectNode={() => {}} />);
+    const reportNode = screen.getByText('report').closest('.react-flow__node') as HTMLElement;
+    expect(reportNode.querySelectorAll('[data-handleid="section-0"]')).toHaveLength(1);
+    expect(reportNode.querySelectorAll('[data-handleid="section-1"]')).toHaveLength(1);
+    expect(reportNode.querySelectorAll('[data-handleid="out"]')).toHaveLength(1);
+    expect(screen.getByText('Overview')).toBeInTheDocument();
+    expect(screen.getByText('Maps')).toBeInTheDocument();
+    // Sanity: these are real React Flow handles, not just text — exactly 3 on this one node.
+    expect(reportNode.querySelectorAll('.react-flow__handle')).toHaveLength(3);
+  });
+
+  it('a Branch node renders one source handle per declared edge label, and none when it has no edges declared', () => {
+    const branchGraph: PipelineGraph = {
+      nodes: [{ id: 'branch-1', config: { kind: 'Branch', predicate: 'x', edges: ['yes', 'no'] } }],
+      edges: [],
+    };
+    render(<Canvas graph={branchGraph} onSelectNode={() => {}} />);
+    const branchNode = screen.getByText('branch-1').closest('.react-flow__node') as HTMLElement;
+    expect(branchNode.querySelectorAll('[data-handleid="yes"]')).toHaveLength(1);
+    expect(branchNode.querySelectorAll('[data-handleid="no"]')).toHaveLength(1);
+    expect(screen.getByText('yes')).toBeInTheDocument();
+    expect(screen.getByText('no')).toBeInTheDocument();
+  });
+});
+
+describe('toFlowNodes', () => {
+  it('widens the placeholder grid columns to clear the widest node in the graph — a wide Report must not overlap its row-neighbor', () => {
+    const g: PipelineGraph = {
+      nodes: [
+        { id: 'report', config: { kind: 'Report', sections: Array.from({ length: 7 }, (_, i) => ({ title: `Section ${i}`, from: '' })) } },
+        { id: 'agent-1', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+      ],
+      edges: [],
+    };
+    const nodes = toFlowNodes(g);
+    const report = nodes.find(n => n.id === 'report')!;
+    const agent = nodes.find(n => n.id === 'agent-1')!;
+    const reportWidth = Number(report.style!.width);
+    // agent-1 lands in the next grid column (index 1) — its x must clear report's full width.
+    expect((agent.position.x as number) - (report.position.x as number)).toBeGreaterThanOrEqual(reportWidth);
+  });
+
+  it('gives a single-pin node a width unaffected by other nodes in the graph', () => {
+    const g: PipelineGraph = {
+      nodes: [{ id: 'agent-1', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } }],
+      edges: [],
+    };
+    const [node] = toFlowNodes(g);
+    expect(node.style!.width).toBe(200);
+  });
+});
+
+describe('toFlowEdges', () => {
+  it('renders one edge per Report section that has a source, skipping unwired sections', () => {
+    const g: PipelineGraph = {
+      nodes: [
+        { id: 'a', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+        { id: 'report', config: { kind: 'Report', sections: [{ title: 'Overview', from: 'a' }, { title: 'Maps', from: '' }] } },
+      ],
+      edges: [{ from: 'a', to: 'report' }],
+    };
+    const edges = toFlowEdges(g);
+    expect(edges).toHaveLength(1);
+    expect(edges[0]).toMatchObject({ source: 'a', target: 'report', targetHandle: 'section-0' });
+  });
+
+  it('gives two sections of the same Report fed by the same source two distinct edges', () => {
+    const g: PipelineGraph = {
+      nodes: [
+        { id: 'a', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+        { id: 'report', config: { kind: 'Report', sections: [{ title: 'One', from: 'a' }, { title: 'Two', from: 'a' }] } },
+      ],
+      edges: [{ from: 'a', to: 'report' }],
+    };
+    const edges = toFlowEdges(g);
+    expect(edges).toHaveLength(2);
+    expect(edges.map(e => e.targetHandle).sort()).toEqual(['section-0', 'section-1']);
+    expect(edges.every(e => e.source === 'a' && e.target === 'report')).toBe(true);
+  });
+
+  it('renders a Sink\'s edge from its `from` config, not from a raw graph edge, and nothing when unwired', () => {
+    const wired: PipelineGraph = {
+      nodes: [
+        { id: 'a', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+        { id: 'sink-1', config: { kind: 'Sink', writeFn: 'x', from: 'a' } },
+      ],
+      edges: [{ from: 'a', to: 'sink-1' }],
+    };
+    expect(toFlowEdges(wired)).toEqual([{ id: 'sink-1-in', source: 'a', sourceHandle: 'out', target: 'sink-1', targetHandle: 'in', animated: false }]);
+
+    const unwired: PipelineGraph = { nodes: [wired.nodes[0], { id: 'sink-1', config: { kind: 'Sink', writeFn: 'x' } }], edges: [] };
+    expect(toFlowEdges(unwired)).toEqual([]);
+  });
+
+  it('uses a generic edge\'s own label as the source handle (a Branch\'s named output) for non-Report/Sink targets', () => {
+    const g: PipelineGraph = {
+      nodes: [
+        { id: 'branch-1', config: { kind: 'Branch', predicate: 'x', edges: ['yes', 'no'] } },
+        { id: 'agent-a', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+      ],
+      edges: [{ from: 'branch-1', to: 'agent-a', label: 'yes' }],
+    };
+    expect(toFlowEdges(g)).toEqual([{ id: 'e0', source: 'branch-1', sourceHandle: 'yes', target: 'agent-a', targetHandle: 'in', animated: false }]);
+  });
+
+  it('defaults to the \'out\' source handle for a generic edge with no label', () => {
+    const g: PipelineGraph = {
+      nodes: [
+        { id: 'trigger-1', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+        { id: 'agent-a', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+      ],
+      edges: [{ from: 'trigger-1', to: 'agent-a' }],
+    };
+    expect(toFlowEdges(g)).toEqual([{ id: 'e0', source: 'trigger-1', sourceHandle: 'out', target: 'agent-a', targetHandle: 'in', animated: false }]);
   });
 });

@@ -5,12 +5,23 @@ import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
 interface SchemaField { field: string; type: string; description: string }
 interface NodeLike { id: string; label?: string; config: Record<string, any> & { kind: string } }
+interface RecentVersion { id: number; appName: string | null; packageName: string; versionName: string | null }
 
-function predecessorsOf(graph: PipelineGraph, nodeId: string): string[] {
-  return graph.edges.filter(e => e.to === nodeId).map(e => e.from);
+function nodeDisplayName(graph: PipelineGraph, nodeId: string): string {
+  const n = graph.nodes.find(x => x.id === nodeId);
+  return n?.label ?? nodeId;
 }
 
-export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDeleteNode, onRename }: {
+/** Read-only confirmation of what a pin is wired from — wiring itself happens by dragging on the canvas, not here. */
+function WiredFrom({ graph, from }: { graph: PipelineGraph; from?: string }) {
+  return (
+    <div className="form-help ai-jobs-wired-from">
+      {from ? <>Wired from <strong>{nodeDisplayName(graph, from)}</strong></> : 'Not wired yet — drag a connection onto this pin on the canvas.'}
+    </div>
+  );
+}
+
+export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDeleteNode, onRename, recentVersions, onRun }: {
   node: NodeLike;
   graph: PipelineGraph;
   triggerSchema: SchemaField[];
@@ -18,6 +29,8 @@ export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDelet
   onSave: (nodeId: string, patch: Record<string, unknown>) => void;
   onDeleteNode?: (nodeId: string) => void;
   onRename?: (nodeId: string, label: string) => void;
+  recentVersions?: RecentVersion[];
+  onRun?: (input: Record<string, unknown>, reuseUnchanged: boolean) => Promise<unknown>;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const [name, setName] = useState(node.label ?? nodeKindLabel(node.config.kind));
@@ -64,7 +77,7 @@ export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDelet
       {node.config.kind === 'AgentCall' ? (
         <AgentCallBody node={node} triggerSchema={triggerSchema} onSave={onSave} />
       ) : node.config.kind === 'Trigger' ? (
-        <TriggerBody node={node} onSave={onSave} />
+        <TriggerBody node={node} onSave={onSave} recentVersions={recentVersions ?? []} onRun={onRun} />
       ) : node.config.kind === 'Sink' ? (
         <SinkBody node={node} graph={graph} onSave={onSave} />
       ) : node.config.kind === 'Report' ? (
@@ -122,34 +135,122 @@ function AgentCallBody({ node, triggerSchema, onSave }: {
   );
 }
 
-function TriggerBody({ node, onSave }: { node: NodeLike; onSave: (nodeId: string, patch: Record<string, unknown>) => void }) {
-  const expandFn: string = node.config.expandFn;
-  const outputSchema: SchemaField[] = node.config.outputSchema;
+function SchemaFieldListEditor({ label, help, fields, onChange, testId }: {
+  label: string; help: string; fields: SchemaField[]; onChange: (next: SchemaField[]) => void; testId: string;
+}) {
+  return (
+    <div className="form-group">
+      <label>{label}</label>
+      {fields.map((f, i) => (
+        <div key={i} className="ai-jobs-list-row" data-testid={testId}>
+          <input className="form-input" placeholder="field" value={f.field} onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, field: e.target.value } : s))} />
+          <input className="form-input" placeholder="type" value={f.type} onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, type: e.target.value } : s))} />
+          <input className="form-input" placeholder="description" value={f.description} onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, description: e.target.value } : s))} />
+          <button type="button" className="btn btn-danger-ghost btn-sm" aria-label={`Remove ${label.toLowerCase()} field`} onClick={() => onChange(fields.filter((_, j) => j !== i))}>×</button>
+        </div>
+      ))}
+      <button type="button" className="btn btn-ghost btn-sm" onClick={() => onChange([...fields, { field: '', type: '', description: '' }])}>+ Add {label.toLowerCase()} field</button>
+      <div className="form-help">{help}</div>
+    </div>
+  );
+}
 
-  function save(nextExpandFn: string, nextSchema: SchemaField[]) {
-    onSave(node.id, { expandFn: nextExpandFn, outputSchema: nextSchema });
-  }
+function TriggerBody({ node, onSave, recentVersions, onRun }: {
+  node: NodeLike; onSave: (nodeId: string, patch: Record<string, unknown>) => void;
+  recentVersions: RecentVersion[]; onRun?: (input: Record<string, unknown>, reuseUnchanged: boolean) => Promise<unknown>;
+}) {
+  const expandFn: string = node.config.expandFn;
+  const inputSchema: SchemaField[] = node.config.inputSchema ?? [];
+  const outputSchema: SchemaField[] = node.config.outputSchema;
 
   return (
     <>
       <div className="form-group">
         <label>Expand function</label>
-        <input className="form-input" aria-label="Expand function" value={expandFn} onChange={(e) => save(e.target.value, outputSchema)} />
+        <input className="form-input" aria-label="Expand function" value={expandFn} onChange={(e) => onSave(node.id, { expandFn: e.target.value })} />
         <div className="form-help">Name of a function registered in backend/services/ai-jobs/nodes/trigger.ts.</div>
       </div>
-      <div className="form-group">
-        <label>Output schema</label>
-        {outputSchema.map((f, i) => (
-          <div key={i} className="ai-jobs-list-row" data-testid="schema-field-row">
-            <input className="form-input" placeholder="field" value={f.field} onChange={(e) => save(expandFn, outputSchema.map((s, j) => j === i ? { ...s, field: e.target.value } : s))} />
-            <input className="form-input" placeholder="type" value={f.type} onChange={(e) => save(expandFn, outputSchema.map((s, j) => j === i ? { ...s, type: e.target.value } : s))} />
-            <input className="form-input" placeholder="description" value={f.description} onChange={(e) => save(expandFn, outputSchema.map((s, j) => j === i ? { ...s, description: e.target.value } : s))} />
-            <button type="button" className="btn btn-danger-ghost btn-sm" aria-label="Remove field" onClick={() => save(expandFn, outputSchema.filter((_, j) => j !== i))}>×</button>
-          </div>
-        ))}
-        <button type="button" className="btn btn-ghost btn-sm" onClick={() => save(expandFn, [...outputSchema, { field: '', type: '', description: '' }])}>+ Add field</button>
-      </div>
+      <SchemaFieldListEditor
+        label="Input schema" testId="trigger-input-field-row"
+        help="What a run must supply to start this Trigger — drives the Run form below. An unrecognized type renders as plain text; 'apk-version' renders as a picker over recent APK versions."
+        fields={inputSchema} onChange={(next) => onSave(node.id, { inputSchema: next })}
+      />
+      <SchemaFieldListEditor
+        label="Output schema" testId="schema-field-row"
+        help="What this Trigger hands downstream nodes, as {{trigger.field}}."
+        fields={outputSchema} onChange={(next) => onSave(node.id, { outputSchema: next })}
+      />
+      {onRun && <TriggerRunSection inputSchema={inputSchema} recentVersions={recentVersions} onRun={onRun} />}
     </>
+  );
+}
+
+function SchemaFieldInput({ field, value, onChange, recentVersions }: {
+  field: SchemaField; value: unknown; onChange: (next: unknown) => void; recentVersions: RecentVersion[];
+}) {
+  if (field.type === 'apk-version') {
+    return (
+      <select className="form-select" aria-label={field.field} value={value == null ? '' : String(value)}
+        onChange={(e) => onChange(e.target.value === '' ? undefined : Number(e.target.value))}>
+        <option value="">{recentVersions.length === 0 ? 'No analyzed APK versions yet' : '— choose —'}</option>
+        {recentVersions.map(v => (
+          <option key={v.id} value={v.id}>{v.appName ?? v.packageName} v{v.versionName ?? '?'} (#{v.id})</option>
+        ))}
+      </select>
+    );
+  }
+  if (field.type === 'boolean') {
+    return <input type="checkbox" aria-label={field.field} checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />;
+  }
+  if (field.type === 'number') {
+    return <input type="number" className="form-input" aria-label={field.field} value={value == null ? '' : String(value)}
+      onChange={(e) => onChange(e.target.value === '' ? undefined : Number(e.target.value))} />;
+  }
+  return <input type="text" className="form-input" aria-label={field.field} value={value == null ? '' : String(value)}
+    onChange={(e) => onChange(e.target.value)} />;
+}
+
+/** Run form for one Trigger, built from its own declared inputSchema — no job-kind-specific UI here. */
+function TriggerRunSection({ inputSchema, recentVersions, onRun }: {
+  inputSchema: SchemaField[]; recentVersions: RecentVersion[]; onRun: (input: Record<string, unknown>, reuseUnchanged: boolean) => Promise<unknown>;
+}) {
+  const [values, setValues] = useState<Record<string, unknown>>({});
+  const [reuseUnchanged, setReuseUnchanged] = useState(false);
+  const [running, setRunning] = useState(false);
+
+  function setField(field: string, value: unknown) {
+    setValues(v => ({ ...v, [field]: value }));
+  }
+
+  async function handleRun() {
+    setRunning(true);
+    try {
+      await onRun(values, reuseUnchanged);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="form-group ai-jobs-run-section">
+      <label>Run</label>
+      {inputSchema.length === 0 ? (
+        <div className="form-help">This Trigger declares no input fields — Run will start it with an empty input.</div>
+      ) : (
+        inputSchema.map(f => (
+          <div key={f.field} className="form-group">
+            <label htmlFor={`run-input-${f.field}`}>{f.field}</label>
+            <SchemaFieldInput field={f} value={values[f.field]} onChange={(v) => setField(f.field, v)} recentVersions={recentVersions} />
+            {f.description && <div className="form-help">{f.description}</div>}
+          </div>
+        ))
+      )}
+      <label className="form-checkbox-label">
+        <input type="checkbox" aria-label="Reuse unchanged nodes" checked={reuseUnchanged} onChange={(e) => setReuseUnchanged(e.target.checked)} />
+        Reuse unchanged nodes
+      </label>
+      <button type="button" className="btn btn-primary btn-sm" onClick={handleRun} disabled={running}>{running ? 'Running…' : 'Run'}</button>
+    </div>
   );
 }
 
@@ -164,9 +265,8 @@ const KNOWN_SINK_WRITE_FNS: Array<{ value: string; description: string; usesSect
 
 function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGraph; onSave: (nodeId: string, patch: Record<string, unknown>) => void }) {
   const writeFn: string = node.config.writeFn;
-  const from: string = node.config.from ?? '';
+  const from: string | undefined = node.config.from;
   const section: string = node.config.section ?? '';
-  const predecessors = predecessorsOf(graph, node.id);
   const known = KNOWN_SINK_WRITE_FNS.find(f => f.value === writeFn);
   const isKnownFn = writeFn === '' || known !== undefined;
 
@@ -187,12 +287,8 @@ function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGrap
         <div className="form-help">{known ? known.description : 'Name of a function registered in backend/services/ai-jobs/nodes/sink.ts.'}</div>
       </div>
       <div className="form-group">
-        <label htmlFor="sink-from">From (predecessor)</label>
-        <select id="sink-from" aria-label="From (predecessor)" className="form-select" value={from}
-          onChange={(e) => onSave(node.id, { from: e.target.value || undefined })}>
-          <option value="">— none —</option>
-          {predecessors.map(id => <option key={id} value={id}>{id}</option>)}
-        </select>
+        <label>Input</label>
+        <WiredFrom graph={graph} from={from} />
       </div>
       {known?.usesSection && (
         <div className="form-group">
@@ -206,7 +302,6 @@ function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGrap
 
 function ReportBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGraph; onSave: (nodeId: string, patch: Record<string, unknown>) => void }) {
   const sections: Array<{ title: string; from: string }> = node.config.sections;
-  const predecessors = predecessorsOf(graph, node.id);
 
   function save(next: Array<{ title: string; from: string }>) {
     onSave(node.id, { sections: next });
@@ -215,18 +310,17 @@ function ReportBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGr
   return (
     <div className="ai-jobs-report-sections">
       {sections.map((s, i) => (
-        <div key={i} className="ai-jobs-list-row" data-testid="report-section-row">
-          <span className="ai-jobs-list-row-index">{i + 1}.</span>
-          <input className="form-input" placeholder="Section title" value={s.title}
-            onChange={(e) => save(sections.map((row, j) => j === i ? { ...row, title: e.target.value } : row))} />
-          <select className="form-select" aria-label={`Section ${i + 1} source`} value={s.from}
-            onChange={(e) => save(sections.map((row, j) => j === i ? { ...row, from: e.target.value } : row))}>
-            {predecessors.map(id => <option key={id} value={id}>{id}</option>)}
-          </select>
-          <button type="button" className="btn btn-danger-ghost btn-sm" aria-label="Remove section" onClick={() => save(sections.filter((_, j) => j !== i))}>×</button>
+        <div key={i} data-testid="report-section-row">
+          <div className="ai-jobs-list-row">
+            <span className="ai-jobs-list-row-index">{i + 1}.</span>
+            <input className="form-input" placeholder="Section title" value={s.title}
+              onChange={(e) => save(sections.map((row, j) => j === i ? { ...row, title: e.target.value } : row))} />
+            <button type="button" className="btn btn-danger-ghost btn-sm" aria-label="Remove section" onClick={() => save(sections.filter((_, j) => j !== i))}>×</button>
+          </div>
+          <WiredFrom graph={graph} from={s.from || undefined} />
         </div>
       ))}
-      <button type="button" className="btn btn-ghost btn-sm" onClick={() => save([...sections, { title: '', from: predecessors[0] ?? '' }])}>+ Add section</button>
+      <button type="button" className="btn btn-ghost btn-sm" onClick={() => save([...sections, { title: '', from: '' }])}>+ Add section</button>
     </div>
   );
 }

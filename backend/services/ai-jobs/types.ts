@@ -58,11 +58,15 @@ export interface SinkConfig {
   section?: string;
 }
 
+export interface SchemaField { field: string; type: string; description: string }
+
 export interface TriggerConfig {
   /** Name of a pre-registered expand function — see nodes/trigger.ts's registry. */
   expandFn: string;
+  /** What the run caller must supply to start this Trigger — drives the generic run form; a type the UI doesn't recognize falls back to a plain text field. */
+  inputSchema?: SchemaField[];
   /** Declared output schema, shared across every Trigger in one pipeline (validator-enforced). */
-  outputSchema: Array<{ field: string; type: string; description: string }>;
+  outputSchema: SchemaField[];
 }
 
 export type NodeConfig =

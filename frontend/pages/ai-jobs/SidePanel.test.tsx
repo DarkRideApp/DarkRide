@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { SidePanel } from './SidePanel';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
@@ -90,15 +90,14 @@ describe('SidePanel — Trigger', () => {
     render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
     const input = screen.getByDisplayValue('apk-analysis/apk-context');
     fireEvent.change(input, { target: { value: 'custom/expand' } });
-    expect(onSave).toHaveBeenCalledWith('trigger-full', { expandFn: 'custom/expand', outputSchema: triggerNode.config.outputSchema });
+    expect(onSave).toHaveBeenCalledWith('trigger-full', { expandFn: 'custom/expand' });
   });
 
   it('adds a new output schema field', () => {
     const onSave = vi.fn();
     render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    fireEvent.click(screen.getByRole('button', { name: /add field/i }));
+    fireEvent.click(screen.getByRole('button', { name: /add output schema field/i }));
     expect(onSave).toHaveBeenCalledWith('trigger-full', {
-      expandFn: 'apk-analysis/apk-context',
       outputSchema: [...triggerNode.config.outputSchema, { field: '', type: '', description: '' }],
     });
   });
@@ -106,8 +105,50 @@ describe('SidePanel — Trigger', () => {
   it('removes an output schema field', () => {
     const onSave = vi.fn();
     render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    fireEvent.click(screen.getByRole('button', { name: /remove field/i }));
-    expect(onSave).toHaveBeenCalledWith('trigger-full', { expandFn: 'apk-analysis/apk-context', outputSchema: [] });
+    fireEvent.click(screen.getByRole('button', { name: /remove output schema field/i }));
+    expect(onSave).toHaveBeenCalledWith('trigger-full', { outputSchema: [] });
+  });
+
+  it('declares an input schema field, which the run form then uses', () => {
+    const onSave = vi.fn();
+    render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
+    fireEvent.click(screen.getByRole('button', { name: /add input schema field/i }));
+    expect(onSave).toHaveBeenCalledWith('trigger-full', {
+      inputSchema: [{ field: '', type: '', description: '' }],
+    });
+  });
+
+  it('defaults to no run fields and an empty-input note when the Trigger declares no inputSchema', () => {
+    render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} onRun={vi.fn()} />);
+    expect(screen.getByText(/declares no input fields/i)).toBeInTheDocument();
+  });
+
+  it('Run form renders a recent-APK-version picker for an apk-version field, and calls onRun with the chosen value', async () => {
+    const node = {
+      id: 'trigger-full',
+      config: { kind: 'Trigger' as const, expandFn: 'apk-analysis/apk-context', inputSchema: [{ field: 'versionId', type: 'apk-version', description: 'Which APK version' }], outputSchema: [] },
+    };
+    const onRun = vi.fn().mockResolvedValue(undefined);
+    const recentVersions = [{ id: 41, appName: 'Parc Astérix', packageName: 'com.parcasterix.app', versionName: '11.0' }];
+    render(<SidePanel node={node} graph={{ nodes: [node], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} onRun={onRun} recentVersions={recentVersions} />);
+
+    fireEvent.change(screen.getByLabelText('versionId'), { target: { value: '41' } });
+    fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledWith({ versionId: 41 }, false));
+  });
+
+  it('Run form renders a plain text field for an unrecognized type, and the reuse toggle flows through', async () => {
+    const node = {
+      id: 'trigger-full',
+      config: { kind: 'Trigger' as const, expandFn: 'custom/expand', inputSchema: [{ field: 'url', type: 'string', description: 'Target URL' }], outputSchema: [] },
+    };
+    const onRun = vi.fn().mockResolvedValue(undefined);
+    render(<SidePanel node={node} graph={{ nodes: [node], edges: [] }} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} onRun={onRun} recentVersions={[]} />);
+
+    fireEvent.change(screen.getByLabelText('url'), { target: { value: 'https://example.com' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: /reuse unchanged/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledWith({ url: 'https://example.com' }, true));
   });
 });
 
@@ -126,11 +167,16 @@ describe('SidePanel — Sink', () => {
     expect(screen.getByLabelText(/write function/i)).toHaveValue('apk-analysis/write-full-document');
   });
 
-  it('offers only direct predecessors as the from option', () => {
+  it('shows what it\'s wired from as read-only — wiring itself happens on the canvas, not here', () => {
     render(<SidePanel node={sinkNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
-    const fromSelect = screen.getByLabelText(/^from/i) as HTMLSelectElement;
-    expect(Array.from(fromSelect.options).map(o => o.value)).toEqual(['', 'report']);
-    expect(fromSelect.value).toBe('report');
+    expect(screen.getByText(/wired from/i)).toBeInTheDocument();
+    expect(screen.getByText('report')).toBeInTheDocument();
+  });
+
+  it('shows a "not wired yet" hint when from is unset', () => {
+    const unwired = { id: 'sink-report', config: { kind: 'Sink' as const, writeFn: 'apk-analysis/write-full-document' } };
+    render(<SidePanel node={unwired} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getByText(/not wired yet/i)).toBeInTheDocument();
   });
 
   it('switching write function to write-section calls onSave with the new writeFn', () => {
@@ -189,12 +235,12 @@ describe('SidePanel — Report (editable)', () => {
     });
   });
 
-  it('adding a section appends a blank row defaulting to the first predecessor', () => {
+  it('adding a section appends a blank, unwired row — wiring happens by dragging on the canvas', () => {
     const onSave = vi.fn();
     render(<SidePanel node={reportNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
     fireEvent.click(screen.getByRole('button', { name: /add section/i }));
     expect(onSave).toHaveBeenCalledWith('report', {
-      sections: [...reportNode.config.sections, { title: '', from: 'agent-overview' }],
+      sections: [...reportNode.config.sections, { title: '', from: '' }],
     });
   });
 
@@ -203,6 +249,13 @@ describe('SidePanel — Report (editable)', () => {
     render(<SidePanel node={reportNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
     fireEvent.click(screen.getAllByRole('button', { name: /remove section/i })[0]);
     expect(onSave).toHaveBeenCalledWith('report', { sections: [{ title: 'Bypass Script', from: 'agent-bypass' }] });
+  });
+
+  it('shows what each section is wired from as read-only text', () => {
+    render(<SidePanel node={reportNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getAllByText(/wired from/i)).toHaveLength(2);
+    expect(screen.getByText('agent-overview')).toBeInTheDocument();
+    expect(screen.getByText('agent-bypass')).toBeInTheDocument();
   });
 });
 

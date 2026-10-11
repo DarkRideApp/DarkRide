@@ -3,8 +3,10 @@ import { Link } from 'react-router-dom';
 import { useWebSocket, useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Canvas } from './Canvas';
 import { SidePanel } from './SidePanel';
-import { RunControls } from './RunControls';
-import { addNode, deleteNode, addEdge, deleteEdge, moveNode, renameNode } from './graphEdit';
+import {
+  addNode, deleteNode, addEdge, deleteEdge, moveNode, renameNode,
+  connectReportSection, disconnectReportSection, connectSinkInput, disconnectSinkInput,
+} from './graphEdit';
 import { nodeKindLabel } from './nodeKindLabels';
 import type { NodeKind, PipelineGraph, PipelineNode, TriggerConfig } from '../../../backend/services/ai-jobs/types';
 
@@ -63,7 +65,6 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
   const [selected, setSelected] = useState<string | null>(null);
   const [nodeStatuses, setNodeStatuses] = useState<Record<string, { status: string; wasMemoized?: boolean }>>({});
   const [recentVersions, setRecentVersions] = useState<RecentVersion[]>([]);
-  const [selectedVersionId, setSelectedVersionId] = useState<number | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   useDocumentTitle(pipelineName ? `Pipeline: ${pipelineName}` : 'Pipeline');
@@ -83,13 +84,11 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
       setPipelineName(row?.name ?? row?.jobKind ?? null);
       setGraph(row?.graph ?? EMPTY_GRAPH);
     });
-    // The pipeline's Trigger expands `input.versionId` into the APK context, so the run picker
-    // needs a real APK version to run against.
+    // Feeds the Run form's 'apk-version' field renderer (SidePanel.tsx) for any Trigger whose
+    // declared inputSchema asks for one — not every pipeline's Trigger does.
     sendRestApi('GET', '/v1/apps/recent').then((res: any) => {
       if (cancelled) return;
-      const list: RecentVersion[] = res.body?.data ?? [];
-      setRecentVersions(list);
-      if (list.length > 0) setSelectedVersionId(list[0].id);
+      setRecentVersions(res.body?.data ?? []);
     });
     return () => { cancelled = true; };
   }, [sendRestApi, pipelineId]);
@@ -147,12 +146,33 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
     setGraph(g => g && moveNode(g, nodeId, position));
   }
 
-  function handleConnectNodes(from: string, to: string) {
-    setGraph(g => g && addEdge(g, from, to));
+  /** Section pins are ids `section-${i}` — see nodePins.ts and Canvas.tsx's toFlowEdges/PinRow. */
+  function sectionIndexFromHandle(handle: string | null): number | null {
+    if (!handle?.startsWith('section-')) return null;
+    const i = Number(handle.slice('section-'.length));
+    return Number.isNaN(i) ? null : i;
   }
 
-  function handleDeleteEdge(from: string, to: string) {
-    setGraph(g => g && deleteEdge(g, from, to));
+  function handleConnectNodes(from: string, to: string, sourceHandle: string | null, targetHandle: string | null) {
+    setGraph(g => {
+      if (!g) return g;
+      const target = g.nodes.find(n => n.id === to);
+      const sectionIndex = sectionIndexFromHandle(targetHandle);
+      if (target?.config.kind === 'Report' && sectionIndex !== null) return connectReportSection(g, to, sectionIndex, from);
+      if (target?.config.kind === 'Sink') return connectSinkInput(g, to, from);
+      return addEdge(g, from, to, sourceHandle && sourceHandle !== 'out' ? sourceHandle : undefined);
+    });
+  }
+
+  function handleDeleteEdge(from: string, to: string, targetHandle: string | null) {
+    setGraph(g => {
+      if (!g) return g;
+      const target = g.nodes.find(n => n.id === to);
+      const sectionIndex = sectionIndexFromHandle(targetHandle);
+      if (target?.config.kind === 'Report' && sectionIndex !== null) return disconnectReportSection(g, to, sectionIndex);
+      if (target?.config.kind === 'Sink') return disconnectSinkInput(g, to);
+      return deleteEdge(g, from, to);
+    });
   }
 
   function handleRenameNode(nodeId: string, label: string) {
@@ -181,7 +201,7 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
   }
 
   /**
-   * Kicks off a run via `POST /v1/ai-pipelines/:id/run` against the selected APK version, then
+   * Kicks off a run via `POST /v1/ai-pipelines/:id/run` with the given Trigger's input, then
    * polls `GET /v1/ai-pipelines/runs/:runId` every `pollIntervalMs` until the run leaves
    * 'running', and applies its per-node results. `/run` answers as soon as the run is recorded
    * (backend/services/ai-jobs/run-executor.ts) — a real multi-AgentCall run takes minutes, far
@@ -190,14 +210,10 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
    * only once the whole run settles. Polling gives up after `MAX_POLL_ATTEMPTS`; the run may
    * still be going server-side, and the message says so.
    */
-  async function handleRun(triggerNodeId: string, reuseUnchanged: boolean) {
-    if (selectedVersionId == null) {
-      setStatusMessage('Select an APK version to run against first.');
-      return;
-    }
+  async function handleRun(triggerNodeId: string, input: Record<string, unknown>, reuseUnchanged: boolean) {
     setStatusMessage(null);
     const runRes: any = await sendRestApi('POST', `/v1/ai-pipelines/${pipelineId}/run`, {
-      triggerNodeId, input: { versionId: selectedVersionId }, reuseUnchanged,
+      triggerNodeId, input, reuseUnchanged,
     });
     const runId = runRes.body?.data?.runId;
     if (runId == null) {
@@ -222,8 +238,6 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
     setStatusMessage(`Run ${runId} is still running on the server. Check back later.`);
   }
 
-  const triggerNodes = graph ? graph.nodes.filter(isTriggerNode).map(n => ({ id: n.id, label: n.label ?? n.id })) : [];
-
   return (
     <div className="ai-jobs-root page-full-bleed">
       <div className="ai-jobs-toolbar">
@@ -234,24 +248,6 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
 
         {graph && (
           <>
-            <div className="ai-jobs-toolbar-group">
-              <label className="ai-jobs-toolbar-field">
-                APK version to run against
-                <select
-                  className="form-select"
-                  aria-label="APK version"
-                  value={selectedVersionId ?? ''}
-                  onChange={(e) => setSelectedVersionId(Number(e.target.value))}
-                >
-                  {recentVersions.length === 0 && <option value="">No analyzed APK versions yet</option>}
-                  {recentVersions.map(v => (
-                    <option key={v.id} value={v.id}>{v.appName ?? v.packageName} v{v.versionName ?? '?'} (#{v.id})</option>
-                  ))}
-                </select>
-              </label>
-              <RunControls triggers={triggerNodes} onRun={handleRun} />
-            </div>
-
             <div className="ai-jobs-toolbar-group">
               <select
                 className="form-select"
@@ -298,6 +294,8 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
                 }}
                 onDeleteNode={handleDeleteNode}
                 onRename={handleRenameNode}
+                recentVersions={recentVersions}
+                onRun={(input, reuseUnchanged) => handleRun(selected, input, reuseUnchanged)}
               />
             )}
           </>

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { addNode, deleteNode, addEdge, deleteEdge, moveNode, renameNode, defaultConfigFor, nextNodeId } from './graphEdit';
+import {
+  addNode, deleteNode, addEdge, deleteEdge, moveNode, renameNode, defaultConfigFor, nextNodeId,
+  connectReportSection, disconnectReportSection, connectSinkInput, disconnectSinkInput,
+} from './graphEdit';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
 const baseGraph: PipelineGraph = {
@@ -73,6 +76,15 @@ describe('deleteNode', () => {
     const graph = deleteNode(baseGraph, 'does-not-exist');
     expect(graph).toEqual(baseGraph);
   });
+
+  it('also clears a Sink\'s `from` when it pointed at the deleted node', () => {
+    const graph: PipelineGraph = {
+      nodes: [...baseGraph.nodes, { id: 'sink-1', config: { kind: 'Sink', writeFn: 'x', from: 'report' } }],
+      edges: [...baseGraph.edges, { from: 'report', to: 'sink-1' }],
+    };
+    const next = deleteNode(graph, 'report');
+    expect((next.nodes.find(n => n.id === 'sink-1')!.config as any).from).toBeUndefined();
+  });
 });
 
 describe('addEdge', () => {
@@ -90,6 +102,16 @@ describe('addEdge', () => {
   it('refuses a self-loop', () => {
     const graph = addEdge(baseGraph, 'agent-overview', 'agent-overview');
     expect(graph.edges).toHaveLength(2);
+  });
+
+  it('sets a label on a brand new edge (a Branch output\'s name)', () => {
+    const graph = addEdge(baseGraph, 'trigger-full', 'report', 'yes');
+    expect(graph.edges).toContainEqual({ from: 'trigger-full', to: 'report', label: 'yes' });
+  });
+
+  it('leaves an already-existing edge untouched, including its label, even if a different label is passed', () => {
+    const graph = addEdge(baseGraph, 'trigger-full', 'agent-overview', 'yes');
+    expect(graph.edges).toContainEqual({ from: 'trigger-full', to: 'agent-overview' });
   });
 });
 
@@ -132,5 +154,88 @@ describe('renameNode', () => {
   it('is a no-op on an id that does not exist', () => {
     const graph = renameNode(baseGraph, 'does-not-exist', 'Whatever');
     expect(graph.nodes).toEqual(baseGraph.nodes);
+  });
+});
+
+const reportGraph: PipelineGraph = {
+  nodes: [
+    { id: 'trigger-full', config: { kind: 'Trigger', expandFn: 'x', outputSchema: [] } },
+    { id: 'agent-overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+    { id: 'agent-maps', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+    { id: 'report', config: { kind: 'Report', sections: [{ title: 'Overview', from: 'agent-overview' }, { title: 'Maps', from: '' }] } },
+  ],
+  edges: [
+    { from: 'trigger-full', to: 'agent-overview' },
+    { from: 'trigger-full', to: 'agent-maps' },
+    { from: 'agent-overview', to: 'report' },
+  ],
+};
+
+describe('connectReportSection', () => {
+  it('points the section at the source and adds the edge when none existed', () => {
+    const graph = connectReportSection(reportGraph, 'report', 1, 'agent-maps');
+    expect((graph.nodes.find(n => n.id === 'report')!.config as any).sections[1].from).toBe('agent-maps');
+    expect(graph.edges).toContainEqual({ from: 'agent-maps', to: 'report' });
+  });
+
+  it('reuses the existing edge when the source already feeds this Report (another section)', () => {
+    const graph = connectReportSection(reportGraph, 'report', 1, 'agent-overview');
+    expect((graph.nodes.find(n => n.id === 'report')!.config as any).sections[1].from).toBe('agent-overview');
+    expect(graph.edges.filter(e => e.from === 'agent-overview' && e.to === 'report')).toHaveLength(1);
+  });
+});
+
+describe('disconnectReportSection', () => {
+  it('clears the section\'s from and drops the edge when no other section still uses that source', () => {
+    const graph = disconnectReportSection(reportGraph, 'report', 0);
+    expect((graph.nodes.find(n => n.id === 'report')!.config as any).sections[0].from).toBe('');
+    expect(graph.edges).not.toContainEqual({ from: 'agent-overview', to: 'report' });
+  });
+
+  it('keeps the edge when another section of the same Report still points at that source', () => {
+    const bothFromOverview: PipelineGraph = {
+      ...reportGraph,
+      nodes: reportGraph.nodes.map(n => n.id === 'report'
+        ? { ...n, config: { kind: 'Report' as const, sections: [{ title: 'Overview', from: 'agent-overview' }, { title: 'Also overview', from: 'agent-overview' }] } }
+        : n),
+    };
+    const graph = disconnectReportSection(bothFromOverview, 'report', 0);
+    expect((graph.nodes.find(n => n.id === 'report')!.config as any).sections[0].from).toBe('');
+    expect(graph.edges).toContainEqual({ from: 'agent-overview', to: 'report' });
+  });
+
+  it('is a no-op on a node that is not a Report', () => {
+    const graph = disconnectReportSection(reportGraph, 'agent-overview', 0);
+    expect(graph).toEqual(reportGraph);
+  });
+});
+
+const sinkGraph: PipelineGraph = {
+  nodes: [
+    { id: 'report', config: { kind: 'Report', sections: [] } },
+    { id: 'agent-overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: '' } },
+    { id: 'sink-1', config: { kind: 'Sink', writeFn: 'x', from: 'report' } },
+  ],
+  edges: [{ from: 'report', to: 'sink-1' }],
+};
+
+describe('connectSinkInput', () => {
+  it('points `from` at the source and adds the edge', () => {
+    const graph = connectSinkInput(sinkGraph, 'sink-1', 'agent-overview');
+    expect((graph.nodes.find(n => n.id === 'sink-1')!.config as any).from).toBe('agent-overview');
+    expect(graph.edges).toContainEqual({ from: 'agent-overview', to: 'sink-1' });
+  });
+});
+
+describe('disconnectSinkInput', () => {
+  it('clears `from` and removes the edge', () => {
+    const graph = disconnectSinkInput(sinkGraph, 'sink-1');
+    expect((graph.nodes.find(n => n.id === 'sink-1')!.config as any).from).toBeUndefined();
+    expect(graph.edges).toEqual([]);
+  });
+
+  it('is a no-op on a node that is not a Sink', () => {
+    const graph = disconnectSinkInput(sinkGraph, 'report');
+    expect(graph).toEqual(sinkGraph);
   });
 });

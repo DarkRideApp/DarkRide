@@ -38,7 +38,7 @@ describe('AiJobsWorkspace', () => {
     expect(screen.getAllByText('Agent Call').length).toBeGreaterThanOrEqual(7);
   });
 
-  it('Run POSTs .../run with the selected APK versionId, polls GET .../runs/:runId until it settles, and applies node status styling', async () => {
+  it('Run (from the Trigger\'s own side panel) POSTs with its input, polls GET .../runs/:runId until it settles, and applies node status styling', async () => {
     // POST .../run answers { runId, status: 'running' } as soon as the run is recorded — it never
     // carries per-node results — so the workspace polls GET .../runs/:runId (shape { run, nodes })
     // until run.status leaves 'running'. The first poll here still says 'running', to prove the
@@ -68,8 +68,10 @@ describe('AiJobsWorkspace', () => {
     render(<AiJobsWorkspace pipelineId={1} pollIntervalMs={0} />, { wrapper: withProviders(ws) });
 
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
-    await waitFor(() => expect((screen.getByLabelText('APK version') as HTMLSelectElement).value).toBe(String(RECENT_VERSIONS_FIXTURE[0].id)));
-    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    fireEvent.click(screen.getByText('Full Analysis'));
+    await screen.findByRole('dialog', { name: 'trigger-full details' });
+    fireEvent.change(screen.getByLabelText('versionId'), { target: { value: String(RECENT_VERSIONS_FIXTURE[0].id) } });
+    fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
 
     await waitFor(() => expect(polls).toBe(2));
     const paths = calledPaths(ws);
@@ -93,10 +95,10 @@ describe('AiJobsWorkspace', () => {
       expect(mapsNode.style.outline).toContain(STATUS_COLOR.skipped);
     });
     expect(screen.getByRole('status')).toHaveTextContent('Run 7 finished: partial');
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Run' })).not.toBeDisabled());
+    await waitFor(() => expect(screen.getByRole('button', { name: /^run$/i })).not.toBeDisabled());
   });
 
-  it('runs against whichever APK version the picker has selected', async () => {
+  it('runs against whichever APK version was picked in the panel', async () => {
     const ws = createMockWs({
       routes: {
         'POST /v1/ai-pipelines/1/run': () => ({ success: true, data: { runId: 8, status: 'running' } }),
@@ -105,9 +107,12 @@ describe('AiJobsWorkspace', () => {
     });
     render(<AiJobsWorkspace pipelineId={1} pollIntervalMs={0} />, { wrapper: withProviders(ws) });
 
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Full Analysis'));
+    await screen.findByRole('dialog', { name: 'trigger-full details' });
     await waitFor(() => expect(screen.getByRole('option', { name: /v11\.0 \(#41\)/ })).toBeInTheDocument());
-    fireEvent.change(screen.getByLabelText('APK version'), { target: { value: '41' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    fireEvent.change(screen.getByLabelText('versionId'), { target: { value: '41' } });
+    fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
 
     await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines/1/run'));
     expect(postBody(ws, 'POST /v1/ai-pipelines/1/run').input).toEqual({ versionId: 41 });
@@ -122,22 +127,34 @@ describe('AiJobsWorkspace', () => {
     });
     render(<AiJobsWorkspace pipelineId={1} pollIntervalMs={0} />, { wrapper: withProviders(ws) });
 
-    await waitFor(() => expect((screen.getByLabelText('APK version') as HTMLSelectElement).value).toBe('42'));
-    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Full Analysis'));
+    await screen.findByRole('dialog', { name: 'trigger-full details' });
+    fireEvent.change(screen.getByLabelText('versionId'), { target: { value: '42' } });
+    fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
 
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/already running/));
     expect(calledPaths(ws).some(p => p.startsWith('GET /v1/ai-pipelines/runs/'))).toBe(false);
   });
 
-  it('does not POST a run when there is no APK version to run against', async () => {
-    const ws = createMockWs({ routes: { 'GET /v1/apps/recent': () => ({ success: true, data: [] }) } });
+  it('no longer blocks Run client-side when nothing was picked — the backend is the one source of truth for what a Trigger requires', async () => {
+    const ws = createMockWs({
+      routes: {
+        'GET /v1/apps/recent': () => ({ success: true, data: [] }),
+        'POST /v1/ai-pipelines/1/run': () => ({ success: false, error: 'apk-analysis/apk-context Trigger requires a numeric "versionId"' }),
+      },
+    });
     render(<AiJobsWorkspace pipelineId={1} pollIntervalMs={0} />, { wrapper: withProviders(ws) });
 
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Full Analysis'));
+    await screen.findByRole('dialog', { name: 'trigger-full details' });
     await waitFor(() => expect(screen.getByRole('option', { name: 'No analyzed APK versions yet' })).toBeInTheDocument());
-    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
 
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/select an apk version/i));
-    expect(calledPaths(ws)).not.toContain('POST /v1/ai-pipelines/1/run');
+    await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines/1/run'));
+    expect(postBody(ws, 'POST /v1/ai-pipelines/1/run').input).toEqual({});
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/requires a numeric/i));
   });
 
   it('switching to a different node shows that node\'s own prompt, not the previous one (I7)', async () => {

@@ -8583,6 +8583,17 @@ body.live-log-open .ai-chat-fab {
   font-size: 11px;
   color: var(--text-secondary);
 }
+.ai-jobs-node-content {
+  padding: 6px 0;
+}
+.ai-jobs-pin-label {
+  position: absolute;
+  transform: translateX(-50%);
+  font-size: 9px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  pointer-events: none;
+}
 .ai-jobs-canvas-wrap {
   flex: 1;
   min-height: 0;
