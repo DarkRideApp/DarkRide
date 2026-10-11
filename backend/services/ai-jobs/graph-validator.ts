@@ -1,15 +1,8 @@
-import type { PipelineGraph, PipelineNode } from './types';
+import type { PipelineGraph } from './types';
 
 export interface ValidationError {
   nodeId?: string;
   message: string;
-}
-
-function schemasMatch(a: PipelineNode['config'], b: PipelineNode['config']): boolean {
-  if (a.kind !== 'Trigger' || b.kind !== 'Trigger') return true;
-  const norm = (schema: typeof a.outputSchema) =>
-    [...schema].sort((x, y) => x.field.localeCompare(y.field)).map(f => `${f.field}:${f.type}`).join(',');
-  return norm(a.outputSchema) === norm(b.outputSchema);
 }
 
 export function validateGraph(graph: PipelineGraph): ValidationError[] {
@@ -19,15 +12,6 @@ export function validateGraph(graph: PipelineGraph): ValidationError[] {
   if (triggers.length === 0) {
     errors.push({ message: 'A pipeline needs at least one Trigger node.' });
     return errors; // nothing else to check meaningfully without a root
-  }
-
-  for (let i = 1; i < triggers.length; i++) {
-    if (!schemasMatch(triggers[0].config, triggers[i].config)) {
-      errors.push({
-        nodeId: triggers[i].id,
-        message: `Trigger "${triggers[i].id}" does not declare the same output schema as Trigger "${triggers[0].id}" — every Trigger in a pipeline must.`,
-      });
-    }
   }
 
   for (const t of triggers) {

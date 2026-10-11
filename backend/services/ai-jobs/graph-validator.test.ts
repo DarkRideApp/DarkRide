@@ -27,16 +27,20 @@ describe('validateGraph', () => {
     expect(errors.some(e => /at least one Trigger/i.test(e.message))).toBe(true);
   });
 
-  it('rejects two Triggers with different output schemas', () => {
+  // Each Trigger owns its own disjoint zone (enforced separately below) — a downstream node
+  // can never be reached by more than one Trigger, so {{trigger.field}} inside one zone can
+  // never see another Trigger's shape. Requiring every Trigger graph-wide to share one output
+  // schema gave zero safety benefit and blocked legitimate graphs mixing e.g. a manual
+  // function-sourced Trigger with an event-sourced one with an unrelated payload shape.
+  it('allows two Triggers with different output schemas, as long as their zones stay disjoint', () => {
     const graph: PipelineGraph = {
       nodes: [
         node('t1', { kind: 'Trigger', expandFn: 'a', outputSchema: triggerSchema }),
-        node('t2', { kind: 'Trigger', expandFn: 'b', outputSchema: [{ field: 'different', type: 'string', description: 'x' }] }),
+        node('t2', { kind: 'Trigger', source: 'event', eventName: 'apk:analyzed', outputSchema: [{ field: 'different', type: 'string', description: 'x' }] }),
       ],
       edges: [],
     };
-    const errors = validateGraph(graph);
-    expect(errors.some(e => /same output schema/i.test(e.message))).toBe(true);
+    expect(validateGraph(graph)).toEqual([]);
   });
 
   it('rejects a node reachable from two different Triggers', () => {

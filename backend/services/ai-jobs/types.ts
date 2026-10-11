@@ -71,7 +71,10 @@ export interface TriggerConfig {
    *  supplies everything. Drives the generic run form; a type the UI doesn't recognize falls
    *  back to a plain text field. */
   inputSchema?: SchemaField[];
-  /** Declared output schema, shared across every Trigger in one pipeline (validator-enforced). */
+  /** What this Trigger hands downstream nodes as `{{trigger.field}}`. Each Trigger in a pipeline
+   *  owns its own disjoint zone (validator-enforced), so different Triggers in the same graph may
+   *  declare entirely different output schemas — only nodes within one Trigger's own zone ever see
+   *  its shape. */
   outputSchema: SchemaField[];
 }
 
