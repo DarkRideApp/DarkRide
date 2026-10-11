@@ -308,11 +308,13 @@ describe('Session handshake', () => {
   });
 
   it('drops a client that stalls after the first packet', async () => {
-    const h = await setup({ preAuthTimeoutMs: 200 });
+    // Wide enough that a slow runner still gets the token before the deadline.
+    const h = await setup({ preAuthTimeoutMs: 1000 });
     const client = await h.connect();
     client.sendHostCnxn();
     await client.next();
-    expect(await client.waitClosed(1500)).toBe(true);
+    expect(await client.waitClosed(5000)).toBe(true);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'pre-auth timeout' });
     expect(h.state.leaves).toBe(1);
   });
 

@@ -122,7 +122,7 @@ export function registerAdbProxyEndpoints(service: AdbProxyService): void {
     res.json({ success: true, data: service.snapshot() });
   });
 
-  route('POST', '/v1/adb-proxy/requests/:requestId/approve', APPROVE,(req, res, userId) => {
+  route('POST', '/v1/adb-proxy/requests/:requestId/approve', APPROVE, (req, res, userId) => {
     const requestId = textParam(req, res, 'requestId');
     if (requestId === null) return;
     const result = service.approveRequest(requestId, userId);
