@@ -1,4 +1,5 @@
 import type net from 'node:net';
+import os from 'node:os';
 import { eq, inArray } from 'drizzle-orm';
 import { devices } from '../../db/schema';
 import type { AppDatabase } from '../../db/index';
@@ -12,6 +13,7 @@ import type { DeviceDirectory } from './device-directory';
 import { PreAuthLimiter } from './limits';
 import { KeyStore } from './key-store';
 import { DeviceListener, ListenError } from './listener';
+import { advertisedHostFor, isOwnEndpoint, isWildcard } from './own-endpoint';
 import { foldMappedV4 } from './peer-key';
 import { PendingRegistry, type PendingOptions } from './pending';
 import { PortAllocator, PortError } from './port-allocator';
@@ -135,8 +137,9 @@ export class AdbProxyService {
     const present = this.deps.directory.listOnlineAndroid();
     this.started = true;
     this.settings = settings;
-    for (const d of present) this.online.add(d.id);
-    this.deps.directory.onOnline((id) => { if (this.started) void this.deviceOnline(id); });
+    const own = this.ownEndpoints();
+    for (const d of present) if (!own(d.id)) this.online.add(d.id);
+    this.deps.directory.onOnline((id) => { if (this.started && !this.ownEndpoints()(id)) void this.deviceOnline(id); });
     this.deps.directory.onOffline((id) => { if (this.started) this.deviceOffline(id); });
     // Events alone miss a device that flips to offline or unauthorized, so presence is also polled.
     this.reconcileTimer = setInterval(() => this.reconcile(), this.deps.reconcileMs ?? DEFAULT_RECONCILE_MS);
@@ -184,7 +187,7 @@ export class AdbProxyService {
       bindHost: this.settings.bindHost,
       portStart: this.settings.portStart,
       portEnd: this.settings.portEnd,
-      advertisedHost: this.deps.advertisedHost?.() ?? '',
+      advertisedHost: advertisedHostFor(this.settings.bindHost, this.deps.advertisedHost),
       devices: ids.map((id) => {
         const row = rows.find((r) => r.deviceId === id);
         const online = this.online.has(id);
@@ -355,6 +358,19 @@ export class AdbProxyService {
     return { ok: true };
   }
 
+  /** Matches the serial a device gets when someone on this machine runs `adb connect` to the proxy itself. */
+  private ownEndpoints(): (deviceId: string) => boolean {
+    const { portStart, portEnd, bindHost } = this.settings;
+    const ctx = {
+      portStart, portEnd, bindHost,
+      advertisedHost: advertisedHostFor(bindHost, this.deps.advertisedHost),
+      localAddresses: isWildcard(bindHost)
+        ? Object.values(os.networkInterfaces()).flatMap((list) => (list ?? []).map((i) => i.address))
+        : [],
+    };
+    return (deviceId) => isOwnEndpoint(deviceId, ctx);
+  }
+
   private stateFor(id: string, enabled: boolean | undefined, online: boolean): DeviceProxyState {
     if (!this.settings.enabled) return 'off';
     if (enabled === false) return 'disabled';
@@ -486,7 +502,8 @@ export class AdbProxyService {
     if (!this.started) return;
     let present: Set<string>;
     try {
-      present = new Set(this.deps.directory.listOnlineAndroid().map((d) => d.id));
+      const own = this.ownEndpoints();
+      present = new Set(this.deps.directory.listOnlineAndroid().map((d) => d.id).filter((id) => !own(id)));
     } catch (e: any) {
       this.logPresenceFailure(`presence check failed: ${e?.message ?? e}`);
       return;

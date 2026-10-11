@@ -193,7 +193,8 @@ describe('AdbProxyService startup', () => {
       ['DEV1', 'listening', h.base], ['DEV2', 'listening', h.base + 1],
     ]);
     expect(snap.devices[0].name).toBe('Phone 1');
-    expect(snap.advertisedHost).toBe('192.168.1.10');
+    // Bound to one address, so the connect command names that address.
+    expect(snap.advertisedHost).toBe('127.0.0.1');
   });
 
   it('reports a port held by another process without disturbing the other devices', async () => {
@@ -768,6 +769,56 @@ describe('AdbProxyService device presence reconciliation', () => {
   });
 });
 
+describe('AdbProxyService own endpoints and connect address', () => {
+  it('never proxies a serial that names one of its own listeners, whether listed at start, announced, or found by the presence poll', async () => {
+    let own: string[] = [];
+    let proxied: string[] = [];
+    const h = await setup({
+      start: false, reconcileMs: 20, online: ['DEV1'],
+      seed: (db, base) => {
+        own = [`127.0.0.1:${base + 5}`, `localhost:${base + 6}`, `[::1]:${base + 7}`];
+        proxied = ['192.168.50.20:5555', `203.0.113.5:${base + 3}`];
+        db.insert(devices).values([...own, ...proxied].map((id) => ({ id }))).run();
+      },
+    });
+    h.directory.online.add(own[0]);
+    h.directory.online.add(proxied[0]);
+    await h.service.start();
+
+    h.directory.goOnline(own[1]);
+    h.directory.goOnline(proxied[1]);
+    h.directory.online.add(own[2]);
+
+    await vi.waitFor(() => expect(stateOf(h, proxied[1])).toBe('listening'), { timeout: 3000 });
+    expect(stateOf(h, proxied[0])).toBe('listening');
+    await sleep(150);
+    const listed = h.service.snapshot().devices.map((d) => d.deviceId);
+    for (const id of own) expect(listed).not.toContain(id);
+    const rows = h.db.select().from(adbProxyDevices).all().map((r) => r.deviceId);
+    expect(rows.sort()).toEqual(['DEV1', ...proxied].sort());
+  });
+
+  it.each([
+    ['the wildcard 0.0.0.0', '0.0.0.0', '192.168.1.10'],
+    ['the wildcard ::', '::', '192.168.1.10'],
+    ['a specific IPv4 address', '10.8.0.2', '10.8.0.2'],
+  ])('names the detected address or the bind address in the connect command when bound to %s', async (_name, bindHost, expected) => {
+    const h = await setup({ enabled: false });
+    await h.service.updateSettings({ bindHost });
+    expect(h.service.snapshot().advertisedHost).toBe(expected);
+  });
+
+  it('names the detected address under the shipped defaults', async () => {
+    const db = createTestDb([users, deviceInstances, devices, settings, adbProxyKeys, adbProxyDevices], { foreignKeys: true });
+    const service = new AdbProxyService({
+      db, directory: new StubDirectory([]), backend: new HostClient({ host: '127.0.0.1', port: 1 }, 100), advertisedHost: () => '192.168.1.10',
+    });
+    cleanups.push(() => service.stop());
+    await service.start();
+    expect(service.snapshot()).toMatchObject({ bindHost: '0.0.0.0', advertisedHost: '192.168.1.10' });
+  });
+});
+
 describe('AdbProxyService full port range', () => {
   const rowOf = (h: Harness, id: string) => h.db.select().from(adbProxyDevices).where(eq(adbProxyDevices.deviceId, id)).get();
   const reclaimLines = () => logged().filter((line) => line.includes('the port range is full'));
@@ -997,7 +1048,7 @@ describe('AdbProxyService limits and reporting', () => {
     await requestApproval(h, makeTestAdbKey());
     await vi.waitFor(() => expect(h.broadcasts.some((m) => m.type === 'adb-proxy' && m.pending.length === 1)).toBe(true));
     const last = h.broadcasts.at(-1)!;
-    expect(last.advertisedHost).toBe('192.168.1.10');
+    expect(last.advertisedHost).toBe('127.0.0.1');
     expect(last.devices).toHaveLength(2);
   });
 
