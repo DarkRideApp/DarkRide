@@ -1,0 +1,341 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import { parseAdbPublicKey } from './adb-key';
+import { A_AUTH, A_CNXN, A_OPEN, A_VERSION, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN, MAX_DATA, encodePacket } from './packet';
+import { Session, type SessionEvent } from './session';
+import { makeTestAdbKey } from './testing/test-keys';
+import { StubGate } from './testing/stub-gate';
+import { startSessionServer, type SessionServer } from './testing/session-server';
+import { WireClient } from './testing/wire-client';
+
+const BANNER = 'device::ro.product.name=t;features=cmd';
+const open: Array<{ close(): void | Promise<unknown> }> = [];
+
+async function setup(opts: { preAuthTimeoutMs?: number; deviceOnline?: boolean; banner?: () => Promise<string> } = {}) {
+  const gate = new StubGate();
+  const key = makeTestAdbKey();
+  gate.approved = [{ keyId: key.keyId, key: parseAdbPublicKey(key.publicKeyText).key }];
+  const events: SessionEvent[] = [];
+  const closed: Session[] = [];
+  const state = { online: opts.deviceOnline ?? true, leaves: 0 };
+  const backend = { openService: vi.fn(), deviceBanner: vi.fn(opts.banner ?? (async () => BANNER)) };
+  const server: SessionServer = await startSessionServer((socket) =>
+    new Session({
+      socket, deviceId: 'DEV1', peerIp: '10.0.0.5', gate, backend,
+      isDeviceOnline: () => state.online,
+      onEvent: (e) => events.push(e),
+      onClose: (s) => closed.push(s),
+      onLeavePreAuth: () => { state.leaves++; },
+      preAuthTimeoutMs: opts.preAuthTimeoutMs ?? 5000,
+    }),
+  );
+  open.push(server);
+  const connect = async () => {
+    const c = await WireClient.connect(server.port);
+    open.push(c);
+    return c;
+  };
+  return { gate, key, events, closed, state, backend, server, connect };
+}
+
+afterEach(async () => {
+  for (const o of open.splice(0)) await o.close();
+});
+
+describe('Session handshake', () => {
+  it('accepts a client whose signature matches an approved key and answers with the device banner', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    const reply = await client.authenticate(h.key);
+    expect(reply.command).toBe(A_CNXN);
+    expect(reply.arg0).toBe(A_VERSION);
+    expect(reply.arg1).toBe(MAX_DATA);
+    expect(reply.data.toString()).toBe(BANNER + '\0');
+    expect(h.gate.authenticatedCalls).toEqual([{ deviceId: 'DEV1', keyId: h.key.keyId, peerIp: '10.0.0.5' }]);
+    expect(h.server.sessions[0].state).toBe('ready');
+    expect(h.server.sessions[0].keyId).toBe(h.key.keyId);
+    expect(h.state.leaves).toBe(1);
+    expect(h.events.map((e) => e.kind)).toContain('authenticated');
+  });
+
+  it('closes without a banner when the device is offline', async () => {
+    const h = await setup({ deviceOnline: false });
+    const client = await h.connect();
+    client.sendHostCnxn();
+    expect(await client.waitClosed()).toBe(true);
+    expect(client.packets).toHaveLength(0);
+  });
+
+  it('sends a fresh token after each unknown signature and drops the fourth attempt', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const tokens = [await client.next()];
+    for (let i = 0; i < 3; i++) {
+      client.send(A_AUTH, AUTH_SIGNATURE, 0, randomBytes(256));
+      tokens.push(await client.next());
+    }
+    expect(tokens.every((t) => t.command === A_AUTH && t.arg0 === AUTH_TOKEN)).toBe(true);
+    expect(new Set(tokens.map((t) => t.data.toString('hex'))).size).toBe(4);
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, randomBytes(256));
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.events.filter((e) => e.kind === 'auth-failed')).toHaveLength(3);
+  });
+
+  it('holds an unknown key as pending and sends CNXN on the same connection once approved', async () => {
+    const h = await setup();
+    let approve!: (d: 'approved' | 'denied') => void;
+    const decision = new Promise<'approved' | 'denied'>((r) => { approve = r; });
+    h.gate.outcome = { kind: 'pending', requestId: 'r1', decision, cancel: vi.fn() };
+    const other = makeTestAdbKey('someone@else');
+    const client = await h.connect();
+    await client.offerKey(other);
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    expect(h.gate.offers[0]).toEqual({ deviceId: 'DEV1', keyId: other.keyId, peerIp: '10.0.0.5' });
+    expect(await client.quiet(100)).toBe(true);
+    expect(h.server.sessions[0].state).toBe('pending');
+    expect(h.server.sessions[0].keyComment).toBe('someone@else');
+    expect(h.state.leaves).toBe(1);
+    approve('approved');
+    const reply = await client.next();
+    expect(reply.command).toBe(A_CNXN);
+    expect(h.server.sessions[0].state).toBe('ready');
+    expect(h.gate.authenticatedCalls[0].keyId).toBe(other.keyId);
+  });
+
+  it('closes a pending connection that is denied', async () => {
+    const h = await setup();
+    let decide!: (d: 'approved' | 'denied') => void;
+    h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise((r) => { decide = r; }), cancel: vi.fn() };
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    decide('denied');
+    expect(await client.waitClosed()).toBe(true);
+  });
+
+  it('closes when the gate blocks the key', async () => {
+    const h = await setup();
+    h.gate.outcome = { kind: 'blocked' };
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.events.map((e) => e.kind)).toContain('blocked');
+  });
+
+  it('continues straight to CNXN when the gate reports the key as already approved', async () => {
+    const h = await setup();
+    h.gate.outcome = { kind: 'approved' };
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    expect((await client.next()).command).toBe(A_CNXN);
+  });
+
+  it('refuses an offered key the client never signed with, without asking the gate', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    await client.offerKeyWithoutProof(makeTestAdbKey());
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.gate.offers).toHaveLength(0);
+    expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+  });
+
+  it('does not let a copied approved public key through (no authentication by public key alone)', async () => {
+    const h = await setup();
+    h.gate.outcome = { kind: 'approved' };
+    const client = await h.connect();
+    await client.offerKeyWithoutProof(h.key);
+    expect(await client.waitClosed()).toBe(true);
+    expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    expect(h.gate.authenticatedCalls).toEqual([]);
+  });
+
+  it('refuses a key whose signature was made by a different key', async () => {
+    const h = await setup();
+    const offered = makeTestAdbKey();
+    const other = makeTestAdbKey();
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const token = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, other.sign(token.data));
+    await client.next();
+    client.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, offered.publicKeyText);
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.gate.offers).toHaveLength(0);
+  });
+
+  it('refuses a signature made over a token this connection never issued', async () => {
+    const h = await setup();
+    const offered = makeTestAdbKey();
+    const client = await h.connect();
+    client.sendHostCnxn();
+    await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, offered.sign(randomBytes(20)));
+    await client.next();
+    client.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, offered.publicKeyText);
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.gate.offers).toHaveLength(0);
+  });
+
+  it('accepts the offer when one of several signatures came from the offered key', async () => {
+    const h = await setup();
+    const offered = makeTestAdbKey();
+    const other = makeTestAdbKey();
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const first = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, other.sign(first.data));
+    const second = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, offered.sign(second.data));
+    await client.next();
+    client.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, offered.publicKeyText);
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    expect(h.gate.offers[0].keyId).toBe(offered.keyId);
+  });
+
+  it('cancels the pending request when the client disconnects', async () => {
+    const h = await setup();
+    const cancel = vi.fn();
+    h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise(() => {}), cancel };
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    client.close();
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
+  });
+
+  it('drops a client that connects and sends nothing, and gives its pre-auth slot back', async () => {
+    const h = await setup({ preAuthTimeoutMs: 50 });
+    const client = await h.connect();
+    expect(await client.waitClosed(1000)).toBe(true);
+    expect(h.closed).toHaveLength(1);
+    expect(h.state.leaves).toBe(1);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'pre-auth timeout' });
+  });
+
+  it('drops a client that stalls after the first packet', async () => {
+    const h = await setup({ preAuthTimeoutMs: 200 });
+    const client = await h.connect();
+    client.sendHostCnxn();
+    await client.next();
+    expect(await client.waitClosed(1500)).toBe(true);
+    expect(h.state.leaves).toBe(1);
+  });
+
+  it('does not apply the pre-auth timeout to a held pending connection', async () => {
+    const h = await setup({ preAuthTimeoutMs: 200 });
+    let approve!: (d: 'approved' | 'denied') => void;
+    h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise((r) => { approve = r; }), cancel: vi.fn() };
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    await new Promise((r) => setTimeout(r, 500));
+    expect(client.closed).toBe(false);
+    approve('approved');
+    expect((await client.next()).command).toBe(A_CNXN);
+  });
+
+  it('ignores packets that arrive while pending', async () => {
+    const h = await setup();
+    let approve!: (d: 'approved' | 'denied') => void;
+    h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise((r) => { approve = r; }), cancel: vi.fn() };
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    client.send(A_OPEN, 1, 0, 'shell:id\0');
+    expect(await client.quiet(100)).toBe(true);
+    expect(client.closed).toBe(false);
+    approve('approved');
+    expect((await client.next()).command).toBe(A_CNXN);
+  });
+
+  it('closes on a payload larger than the pre-auth cap', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    client.socket.write(encodePacket({ command: A_CNXN, arg0: A_VERSION, arg1: MAX_DATA, data: Buffer.alloc(5000) }));
+    expect(await client.waitClosed()).toBe(true);
+  });
+
+  it('closes on a bad magic', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    client.socket.write(Buffer.alloc(24));
+    expect(await client.waitClosed()).toBe(true);
+  });
+
+  it('closes when the first packet is not CNXN', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    client.send(A_OPEN, 1, 0, 'shell:id\0');
+    expect(await client.waitClosed()).toBe(true);
+  });
+
+  it('closes without CNXN when the banner cannot be fetched', async () => {
+    const h = await setup({ banner: async () => { throw new Error('backend down'); } });
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const token = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, h.key.sign(token.data));
+    expect(await client.waitClosed()).toBe(true);
+    expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+  });
+
+  it('destroy() closes the connection and reports the reason once', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    await client.authenticate(h.key);
+    h.server.sessions[0].destroy('revoked');
+    h.server.sessions[0].destroy('again');
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.events.filter((e) => e.kind === 'closed')).toHaveLength(1);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'revoked' });
+    expect(h.closed).toHaveLength(1);
+  });
+
+  it('keeps the pre-auth payload cap while the banner is still being fetched', async () => {
+    const h = await setup({ banner: () => new Promise<string>(() => {}) });
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const token = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, h.key.sign(token.data));
+    await vi.waitFor(() => expect(h.server.sessions[0].state).toBe('finishing'));
+    client.socket.write(encodePacket({ command: A_OPEN, arg0: 1, arg1: 0, data: Buffer.alloc(5000) }).subarray(0, 24));
+    expect(await client.waitClosed()).toBe(true);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'payload too large: 5000' });
+  });
+
+  it('allows payloads up to the advertised maximum once the CNXN reply has gone out', async () => {
+    const h = await setup();
+    const client = await h.connect();
+    expect((await client.authenticate(h.key)).command).toBe(A_CNXN);
+    client.socket.write(encodePacket({ command: A_OPEN, arg0: 1, arg1: 0, data: Buffer.alloc(5000) }).subarray(0, 24));
+    expect(await client.quiet(150)).toBe(true);
+    expect(client.closed).toBe(false);
+    expect(h.server.sessions[0].isClosed).toBe(false);
+  });
+
+  it('closes when the gate fails to record an authentication straight after a signature', async () => {
+    const h = await setup();
+    h.gate.authenticated = () => { throw new Error('store down'); };
+    const client = await h.connect();
+    client.sendHostCnxn();
+    const token = await client.next();
+    client.send(A_AUTH, AUTH_SIGNATURE, 0, h.key.sign(token.data));
+    expect(await client.waitClosed()).toBe(true);
+    expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'handler error' });
+  });
+
+  it('closes a pending connection when the gate fails to record its approval', async () => {
+    const h = await setup();
+    let approve!: (d: 'approved' | 'denied') => void;
+    h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise((r) => { approve = r; }), cancel: vi.fn() };
+    h.gate.authenticated = () => { throw new Error('store down'); };
+    const client = await h.connect();
+    await client.offerKey(makeTestAdbKey());
+    await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+    approve('approved');
+    expect(await client.waitClosed()).toBe(true);
+    expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'handler error' });
+  });
+});
