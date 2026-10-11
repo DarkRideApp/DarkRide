@@ -77,6 +77,15 @@ describe('parseAdbPublicKey rejects malformed input', () => {
     expect(() => parseAdbPublicKey('not base64 !!!')).toThrow(AdbKeyError);
   });
 
+  it('rejects an invalid base64 character even when the decoded blob would still be valid', () => {
+    expect(() => parseAdbPublicKey(`${fixtureB64.slice(0, 10)}!${fixtureB64.slice(10)} x@y`)).toThrow(AdbKeyError);
+    expect(() => parseAdbPublicKey(`${fixtureB64.slice(0, 10)}!${fixtureB64.slice(11)} x@y`)).toThrow(AdbKeyError);
+  });
+
+  it('rejects key text over the length cap even when the key itself is valid', () => {
+    expect(() => parseAdbPublicKey(`${fixtureB64} ${'x'.repeat(3000)}`)).toThrow(AdbKeyError);
+  });
+
   it('rejects a blob of the wrong size', () => {
     expect(() => parseAdbPublicKey(asText(good.subarray(0, 100)))).toThrow(AdbKeyError);
   });
@@ -103,12 +112,66 @@ describe('parseAdbPublicKey rejects malformed input', () => {
   });
 });
 
+describe('parseAdbPublicKey bounds its work on hostile input', () => {
+  it('rejects a long NUL run followed by one byte quickly', () => {
+    const buf = Buffer.concat([Buffer.alloc(65536), Buffer.from('a')]);
+    const start = performance.now();
+    expect(() => parseAdbPublicKey(buf)).toThrow(AdbKeyError);
+    expect(performance.now() - start).toBeLessThan(250);
+  });
+
+  it('rejects a NUL run inside the length cap followed by one byte quickly', () => {
+    const buf = Buffer.concat([Buffer.alloc(1000), Buffer.from('a')]);
+    const start = performance.now();
+    expect(() => parseAdbPublicKey(buf)).toThrow(AdbKeyError);
+    expect(performance.now() - start).toBeLessThan(250);
+  });
+});
+
+describe('canonical key identity', () => {
+  const good = Buffer.from(fixtureB64, 'base64');
+  const asText = (blob: Buffer) => `${blob.toString('base64')} x@y`;
+
+  it('accepts the fixture key and a generated key', () => {
+    expect(() => parseAdbPublicKey(fixture.publicKeyText)).not.toThrow();
+    expect(() => parseAdbPublicKey(makeTestAdbKey().publicKeyText)).not.toThrow();
+  });
+
+  it('rejects a blob whose n0inv does not match its modulus', () => {
+    const bad = Buffer.from(good);
+    bad[4] ^= 0x01;
+    expect(() => parseAdbPublicKey(asText(bad))).toThrow(AdbKeyError);
+  });
+
+  it('rejects a blob whose rr does not match its modulus', () => {
+    const bad = Buffer.from(good);
+    bad[264] ^= 0x01;
+    expect(() => parseAdbPublicKey(asText(bad))).toThrow(AdbKeyError);
+  });
+});
+
 describe('comment handling', () => {
   it('strips control characters and caps the length at 128', () => {
     const cleaned = sanitiseComment('a\u0000b\nc\u0007d' + 'x'.repeat(200));
     expect(cleaned).toMatch(/^abcd/);
     expect(cleaned.length).toBe(128);
     expect(/[\u0000-\u001f\u007f-\u009f]/.test(cleaned)).toBe(false);
+  });
+
+  it('strips C1 controls and DEL, and keeps interior spaces', () => {
+    expect(sanitiseComment('a\u0000b\u001fc\u0085d\u007fe')).toBe('abcde');
+    expect(sanitiseComment('a b c\u0085d\u007fe')).toBe('a b cde');
+  });
+
+  it('strips Unicode format characters such as bidi overrides, zero-width spaces and the BOM', () => {
+    expect(sanitiseComment('a\u202Eb\u200Bc\uFEFFd')).toBe('abcd');
+  });
+
+  it('truncates by code point so a surrogate pair is never cut in half', () => {
+    const cleaned = sanitiseComment('a'.repeat(127) + '\u{1F600}' + 'b');
+    expect(Array.from(cleaned).length).toBe(128);
+    expect(cleaned.endsWith('\u{1F600}')).toBe(true);
+    expect(Buffer.from(cleaned, 'utf8').toString('utf8')).toBe(cleaned);
   });
 
   it('keeps markup as plain text for the UI to escape', () => {

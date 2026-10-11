@@ -27,8 +27,31 @@ export interface ParsedAdbKey {
   key: KeyObject;
 }
 
+/** The comment is attacker text shown on an approval screen: strip controls, line separators and format characters. */
 export function sanitiseComment(raw: string): string {
-  return raw.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, '').trim().slice(0, MAX_COMMENT);
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\p{Cf}]/gu, '').trim();
+  return Array.from(cleaned).slice(0, MAX_COMMENT).join('');
+}
+
+function modInverse(a: bigint, m: bigint): bigint {
+  let [oldR, r] = [a % m, m];
+  let [oldS, s] = [1n, 0n];
+  while (r !== 0n) {
+    const q = oldR / r;
+    [oldR, r] = [r, oldR - q * r];
+    [oldS, s] = [s, oldS - q * s];
+  }
+  return ((oldS % m) + m) % m;
+}
+
+function littleEndianToBigInt(bytes: Uint8Array): bigint {
+  return BigInt('0x' + Buffer.from(bytes).reverse().toString('hex'));
+}
+
+function stripTrailingNuls(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0) end--;
+  return text.slice(0, end);
 }
 
 export function keyIdOf(blob: Buffer): string {
@@ -41,8 +64,10 @@ export function fingerprintOf(blob: Buffer): string {
 
 /** Parse the text adb sends in AUTH(RSAPUBLICKEY): base64 blob, optional `user@host`, optional NULs. */
 export function parseAdbPublicKey(input: Buffer | string): ParsedAdbKey {
-  const text = (typeof input === 'string' ? input : input.toString('utf8')).replace(/\0+$/, '').trim();
-  if (text.length === 0 || text.length > MAX_KEY_TEXT) throw new AdbKeyError('empty or oversize key');
+  // The raw length bounds the decoded length, so check it before doing any work on attacker bytes.
+  if (input.length > MAX_KEY_TEXT) throw new AdbKeyError('oversize key');
+  const text = stripTrailingNuls(typeof input === 'string' ? input : input.toString('utf8')).trim();
+  if (text.length === 0) throw new AdbKeyError('empty key');
   const space = text.search(/\s/);
   const b64 = space === -1 ? text : text.slice(0, space);
   const comment = space === -1 ? '' : sanitiseComment(text.slice(space + 1));
@@ -54,6 +79,13 @@ export function parseAdbPublicKey(input: Buffer | string): ParsedAdbKey {
   const modulus = Buffer.from(blob.subarray(8, 8 + MODULUS_BYTES)).reverse();
   if ((modulus[0] & 0x80) === 0 || (modulus[modulus.length - 1] & 1) === 0) {
     throw new AdbKeyError('modulus is not an odd 2048-bit number');
+  }
+  // keyId hashes the whole blob, so n0inv and rr must be the values derived from the modulus or one key gets many ids.
+  const n = BigInt('0x' + modulus.toString('hex'));
+  const n0inv = Number((-modInverse(n & 0xffffffffn, 1n << 32n)) & 0xffffffffn) >>> 0;
+  const rr = (1n << 4096n) % n;
+  if (blob.readUInt32LE(4) !== n0inv || littleEndianToBigInt(blob.subarray(8 + MODULUS_BYTES, EXPONENT_OFFSET)) !== rr) {
+    throw new AdbKeyError('key blob is not canonical');
   }
   const key = createPublicKey({
     key: { kty: 'RSA', n: modulus.toString('base64url'), e: Buffer.from([0x01, 0x00, 0x01]).toString('base64url') },
