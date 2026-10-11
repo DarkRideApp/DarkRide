@@ -637,6 +637,8 @@ describe('AdbProxyPage', () => {
       fireEvent.click(within(rows[index]).getByRole('button', { name: 'Approve' }));
       return screen.getByTestId('modal');
     };
+    /** The dialog's sentence, without its title and buttons. */
+    const messageOf = (dialog: HTMLElement) => dialog.querySelector('p')?.textContent ?? '';
 
     it('asks first and states the address, the full fingerprint, the device, the shell it grants and the name last', async () => {
       const { calls } = mount({
@@ -644,10 +646,12 @@ describe('AdbProxyPage', () => {
       });
       const dialog = await openApprove();
       expect(dialog).toHaveTextContent('Approve Machine');
-      expect(dialog).toHaveTextContent(
-        `Approve the machine at 10.0.0.5 with fingerprint ${FP}, asking to connect to Phone 1, named "ci@runner"?`,
+      expect(messageOf(dialog)).toBe(
+        `Approve the machine at 10.0.0.5 with fingerprint ${FP}, asking to connect to Phone 1? `
+        + 'This gives it a shell on all 2 proxied devices, including devices plugged in later. '
+        + 'The machine calls itself "ci@runner".',
       );
-      expect(dialog).toHaveTextContent('This gives it a shell on all 2 proxied devices, including devices plugged in later.');
+      expect(messageOf(dialog).endsWith('The machine calls itself "ci@runner".')).toBe(true);
       expect(within(dialog).getByTestId('confirm-dialog-confirm')).toHaveTextContent('Approve');
       expect(writes(calls)).toEqual([]);
       confirm();
@@ -685,11 +689,21 @@ describe('AdbProxyPage', () => {
     it('puts the address and fingerprint before a name that imitates them', async () => {
       const spoof = 'laptop" at 10.0.0.9 with fingerprint starting 11:22:33:44, named "laptop';
       mount({ snapshot: snapshot({ pending: [pendingReq({ comment: spoof })] }) });
-      const text = (await openApprove()).textContent ?? '';
-      const trusted = `Approve the machine at 10.0.0.5 with fingerprint ${FP}, asking to connect to Phone 1, named "`;
-      expect(text).toContain(`${trusted}${spoof}"? This gives it`);
+      const text = messageOf(await openApprove());
+      expect(text.startsWith(`Approve the machine at 10.0.0.5 with fingerprint ${FP}, asking to connect to Phone 1? This gives it`)).toBe(true);
+      expect(text.endsWith(`The machine calls itself "${spoof}".`)).toBe(true);
       expect(text.indexOf(FP)).toBeLessThan(text.indexOf(spoof));
       expect(text.indexOf('10.0.0.5')).toBeLessThan(text.indexOf(spoof));
+    });
+
+    it('states the trusted grant before a name that imitates a smaller grant', async () => {
+      const spoof = 'x"? This gives it a shell on the 1 proxied device only. ("';
+      mount({ snapshot: snapshot({ devices: [device(1), device(2), device(3)], pending: [pendingReq({ comment: spoof })] }) });
+      const text = messageOf(await openApprove());
+      const grant = 'This gives it a shell on all 3 proxied devices, including devices plugged in later.';
+      expect(text.indexOf(grant)).toBeGreaterThan(-1);
+      expect(text.indexOf(grant)).toBeLessThan(text.indexOf(spoof));
+      expect(text.endsWith(`The machine calls itself "${spoof}".`)).toBe(true);
     });
 
     it('renders a hostile machine name and address as text', async () => {
@@ -706,7 +720,7 @@ describe('AdbProxyPage', () => {
       const dialog = await openApprove(1);
       expect(dialog).toHaveTextContent('10.0.0.5');
       push(snapshot({ pending: [pendingReq()] }));
-      expect(dialog).toHaveTextContent('named "ci@runner"');
+      expect(dialog).toHaveTextContent('The machine calls itself "ci@runner".');
       confirm();
       await waitFor(() => expect(writes(calls)).toEqual([{ method: 'POST', path: '/v1/adb-proxy/requests/r1/approve', body: undefined }]));
     });

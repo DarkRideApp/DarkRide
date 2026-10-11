@@ -62,10 +62,6 @@ const describeKey = (k: KeyView) =>
 
 const isWhole = (text: string) => /^\d+$/.test(text.trim()) && Number.isSafeInteger(Number(text));
 
-// Same order as describeKey: address and fingerprint, then the device, then the name the machine chose.
-const describeRequest = (p: PendingView, deviceName: string) =>
-  `the machine at ${p.peerIp} with fingerprint ${p.fingerprint}, asking to connect to ${deviceName}, named "${machine(p.comment)}"`;
-
 const shellGrant = (devices: number) => {
   if (devices === 0) return 'a shell on every proxied device, including devices plugged in later; none is proxied now';
   if (devices === 1) return 'a shell on the 1 proxied device, including devices plugged in later';
@@ -213,7 +209,10 @@ function AdbProxyContent({ canManage, canApprove }: { canManage: boolean; canApp
 
   const confirmMessage = (c: Confirmation) => {
     if (c.action === 'approve') {
-      return `Approve ${describeRequest(c.request, deviceName(c.request.deviceId))}? This gives it ${shellGrant(proxiedDevices)}.`;
+      // The name is chosen by the machine, so it comes last, after everything it could imitate, the grant included.
+      const r = c.request;
+      return `Approve the machine at ${r.peerIp} with fingerprint ${r.fingerprint}, asking to connect to ${deviceName(r.deviceId)}? `
+        + `This gives it ${shellGrant(proxiedDevices)}. The machine calls itself "${machine(r.comment)}".`;
     }
     if (c.action === 'revoke') return `Revoke access for ${describeKey(c.key)}? Its open connections close now and it can no longer connect.`;
     return `Forget ${describeKey(c.key)}? It is removed from this list. If it connects again, it waits for approval like a new machine.`;
