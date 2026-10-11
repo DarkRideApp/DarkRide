@@ -1,5 +1,7 @@
 # ADB Proxy Implementation Plan
 
+Written before implementation; where it differs from the code or from the design document, those two win.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let remote machines run stock `adb connect <host>:<port>` against Android devices attached to the DarkRide host, with each client's adb key approved in the DarkRide UI before it can reach a device.
@@ -157,7 +159,7 @@ net.createServer((sock) => {
   const send = (c, a0, a1, d) => sock.write(encode(CMD[c], a0, a1, d));
   const ready = () => {
     say('send CNXN');
-    send('CNXN', 0x01000001, 1048576, Buffer.from('device::ro.product.name=spike;ro.product.model=spike;ro.product.device=spike;features=cmd,stat_v2,ls_v2\0'));
+    send('CNXN', 0x01000001, 1048576, Buffer.from('device::ro.product.name=spike;ro.product.model=spike;ro.product.device=spike;features=cmd,stat_v2,ls_v2'));
   };
   sock.on('data', (chunk) => {
     buf = Buffer.concat([buf, chunk]);
@@ -3172,7 +3174,7 @@ describe('Session handshake', () => {
     expect(reply.command).toBe(A_CNXN);
     expect(reply.arg0).toBe(A_VERSION);
     expect(reply.arg1).toBe(MAX_DATA);
-    expect(reply.data.toString()).toBe(BANNER + '\0');
+    expect(reply.data.toString()).toBe(BANNER);
     expect(h.gate.authenticatedCalls).toEqual([{ deviceId: 'DEV1', keyId: h.key.keyId, peerIp: '10.0.0.5' }]);
     expect(h.server.sessions[0].state).toBe('ready');
     expect(h.server.sessions[0].keyId).toBe(h.key.keyId);
@@ -3638,7 +3640,7 @@ export class Session {
       return this.close('banner failed');
     }
     if (this.closed) return;
-    this.send(A_CNXN, A_VERSION, MAX_DATA, Buffer.from(banner + '\0', 'utf8'));
+    this.send(A_CNXN, A_VERSION, MAX_DATA, Buffer.from(banner, 'utf8'));
     this.parser.setMaxPayload(MAX_DATA);
     this.state = 'ready';
     this.emit({ kind: 'authenticated', session: this });

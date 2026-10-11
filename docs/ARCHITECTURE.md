@@ -86,6 +86,18 @@ On first connect (or version change), the device goes through setup:
 4. Install mitmproxy CA certificate (if rooted)
 5. Generate WireGuard keypair and tunnel config
 
+## ADB Proxy
+
+`AdbProxyService` (`backend/services/adb-proxy/`) lets other machines run `adb connect` against Android devices attached to this host. It is off by default.
+
+- **One port per device.** Each online Android device gets a persistent TCP port from a configurable range (default 6500 to 6599), stored in `adb_proxy_devices`. The port speaks the ADB wire protocol as a device would, one connection per client. The service follows `DeviceManager` through a small `DeviceDirectory` interface (`device-directory.ts`) and also compares its own device list with it every 5 seconds.
+- **Authentication.** A client must prove it holds its adb key by signing a token issued on that connection. A key it offers is honoured only when a signature it already sent on this connection verifies under that key, so a public key alone never authenticates and never creates a request. A proven key that is approved gets in. A denied or revoked key is closed. An unknown key becomes an in-memory pending request, shown live in Settings → ADB Proxy and held for up to 5 minutes, and the client stays `unauthorized` meanwhile. An admin with `core.adb-proxy:manage` approves or denies it, and decisions are stored in `adb_proxy_keys`.
+- **Forwarding.** Each client stream becomes a fresh connection to the host's ADB server (`ANDROID_ADB_SERVER_ADDRESS` and `ANDROID_ADB_SERVER_PORT`, default `127.0.0.1:5037`): `host:transport:<serial>`, then the service string. Services starting with `host`, and `reverse:`, `tcpip:` and `usb:`, are refused with `CLSE`.
+- **Abuse limits.** Unauthenticated sockets are capped per source address and in total, and pending requests are capped and rate limited per source address. Log lines that a peer without an approved key can provoke share one rate-limited budget. The numbers are in the user guide.
+- **Live updates.** The service pushes its full status snapshot as an `adb-proxy` message on a filtered WebSocket channel. Only clients that subscribed and held `core.adb-proxy:read` at that moment receive it.
+
+REST endpoints live in `backend/api/adb-proxy.ts` and the page in `frontend/pages/settings/AdbProxyPage.tsx`. User guide: [`adb-proxy.md`](adb-proxy.md). Design: [`specs/2026-10-11-adb-proxy-design.md`](specs/2026-10-11-adb-proxy-design.md).
+
 ## Python Bridge
 
 Each device gets its own Python process running `python/bridge.py`. Communication is via JSON-RPC over HTTP (localhost:PORT/rpc).

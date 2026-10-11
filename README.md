@@ -144,6 +144,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full breakdown, and [do
 
 - [REST API](docs/api.md) — endpoint listing for scripting against DarkRide
 - [AI providers](docs/ai-providers.md): supported providers, Base URL rules, model fallback, adding a provider
+- [ADB proxy](docs/adb-proxy.md): letting other machines run `adb` against the devices on this host, approving machines, limits, troubleshooting
 - [Architecture](docs/ARCHITECTURE.md) — high-level design, data flow, plugin model
 - [Video streaming reliability](docs/video-streaming-reliability.md) — design notes for the H.264 pipeline
 

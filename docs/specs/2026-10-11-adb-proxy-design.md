@@ -1,7 +1,7 @@
 # ADB proxy: design
 
 Date: 2026-10-11
-Status: **Approved 2026-10-11**, revised the same day while writing the implementation plan (see "Revisions after approval" at the end). Approach, auth model, hosting and grant scope were decided with Cube in the design discussion.
+Status: **Implemented**. Approved 2026-10-11, revised the same day while writing the implementation plan (see "Revisions after approval" at the end). Approach, auth model, hosting and grant scope were decided with Cube in the design discussion.
 
 ## The problem
 
