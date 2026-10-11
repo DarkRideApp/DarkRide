@@ -263,6 +263,43 @@ describe('AdbProxyService approval flow', () => {
     expect(connections.find((c) => c.keyId === null)).toMatchObject({ comment: null });
   });
 
+  it('shows the name a session carries over the stored name when the two differ', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey('ci@runner');
+    const waiting = await requestApproval(h, key);
+    const [req] = h.service.snapshot().pending;
+    expect(h.service.approveRequest(req.requestId, 1)).toEqual({ ok: true });
+    expect((await waiting.next()).command).toBe(A_CNXN);
+    h.db.update(adbProxyKeys).set({ comment: 'renamed@box' }).run();
+
+    const snap = h.service.snapshot();
+    expect(snap.keys[0].comment).toBe('renamed@box');
+    expect(snap.connections).toHaveLength(1);
+    expect(snap.connections[0]).toMatchObject({ state: 'ready', keyId: key.keyId, comment: 'ci@runner' });
+  });
+
+  it('does not throw for a connection whose key record is gone, and keeps only the name the session itself carries', async () => {
+    const h = await setup();
+    const returning = makeTestAdbKey('ci@runner');
+    const fresh = makeTestAdbKey('lab@bench');
+    await approveKey(h, returning);
+    await vi.waitFor(() => expect(h.service.snapshot().connections).toEqual([]));
+    const waiting = await requestApproval(h, fresh);
+    const request = h.service.snapshot().pending.find((p) => p.keyId === fresh.keyId)!;
+    expect(h.service.approveRequest(request.requestId, 1)).toEqual({ ok: true });
+    expect((await waiting.next()).command).toBe(A_CNXN);
+    const live = await h.connect();
+    expect((await live.authenticate(returning)).command).toBe(A_CNXN);
+    await vi.waitFor(() => expect(h.service.snapshot().connections.filter((c) => c.state === 'ready')).toHaveLength(2));
+
+    h.db.delete(adbProxyKeys).run();
+
+    const snap = h.service.snapshot();
+    expect(snap.keys).toEqual([]);
+    expect(snap.connections.find((c) => c.keyId === returning.keyId)).toMatchObject({ state: 'ready', comment: null });
+    expect(snap.connections.find((c) => c.keyId === fresh.keyId)).toMatchObject({ state: 'ready', comment: 'lab@bench' });
+  });
+
   it('denies a request, closes the client, and then ignores the key without a new request', async () => {
     const h = await setup();
     const key = makeTestAdbKey();

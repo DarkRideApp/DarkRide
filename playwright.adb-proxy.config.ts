@@ -40,7 +40,10 @@ export default defineConfig({
         DARKRIDE_BOOTSTRAP_ADMIN_PASSWORD: 'e2e-test-password-123',
         PORT: '3199',
         WEBSOCKET_ALLOWED_ORIGINS: 'http://localhost:5199',
+        // Pin every adb setting (adb prefers ADB_SERVER_SOCKET, the backend reads the address) so the developer's shell cannot redirect it.
+        ANDROID_ADB_SERVER_ADDRESS: '127.0.0.1',
         ANDROID_ADB_SERVER_PORT: FAKE_ADB_PORT,
+        ADB_SERVER_SOCKET: `tcp:127.0.0.1:${FAKE_ADB_PORT}`,
       },
     },
   ],

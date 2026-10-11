@@ -7,6 +7,8 @@ import {
 } from '../packet';
 import type { TestAdbKey } from './test-keys';
 
+const DEFAULT_WAIT_MS = 2000;
+
 /** A minimal ADB client over the wire protocol, for driving the proxy in tests. */
 export class WireClient {
   /** Every packet received, in order. */
@@ -60,7 +62,7 @@ export class WireClient {
   }
 
   /** The next unread packet; rejects on timeout or when the socket closed with nothing left. */
-  async next(timeoutMs = 2000): Promise<Packet> {
+  async next(timeoutMs = DEFAULT_WAIT_MS): Promise<Packet> {
     const deadline = Date.now() + timeoutMs;
     while (this.cursor >= this.packets.length) {
       if (this.closed) throw new Error('socket closed');
@@ -102,21 +104,21 @@ export class WireClient {
   }
 
   /** CNXN (advertising `maxData`), then answer the AUTH token with a signature from `key`. Returns the proxy's next packet. */
-  async authenticate(key: TestAdbKey, maxData: number = MAX_DATA): Promise<Packet> {
+  async authenticate(key: TestAdbKey, maxData: number = MAX_DATA, timeoutMs = DEFAULT_WAIT_MS): Promise<Packet> {
     this.sendHostCnxn(maxData);
-    const token = await this.next();
+    const token = await this.next(timeoutMs);
     if (token.command !== A_AUTH || token.arg0 !== AUTH_TOKEN) throw new Error('expected an AUTH token');
     this.send(A_AUTH, AUTH_SIGNATURE, 0, key.sign(token.data));
-    return this.next();
+    return this.next(timeoutMs);
   }
 
   /** CNXN, a signature over the token made with `key` (a real client signs first), then offer the public key. */
-  async offerKey(key: TestAdbKey): Promise<void> {
+  async offerKey(key: TestAdbKey, timeoutMs = DEFAULT_WAIT_MS): Promise<void> {
     this.sendHostCnxn();
-    const token = await this.next();
+    const token = await this.next(timeoutMs);
     if (token.command !== A_AUTH || token.arg0 !== AUTH_TOKEN) throw new Error('expected an AUTH token');
     this.send(A_AUTH, AUTH_SIGNATURE, 0, key.sign(token.data));
-    const again = await this.next();
+    const again = await this.next(timeoutMs);
     if (again.command !== A_AUTH || again.arg0 !== AUTH_TOKEN) throw new Error('expected a second AUTH token');
     this.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, key.publicKeyText);
   }
@@ -132,13 +134,13 @@ export class WireClient {
     this.send(A_AUTH, AUTH_RSAPUBLICKEY, 0, key.publicKeyText);
   }
 
-  async openRaw(service: string, remoteId: number): Promise<Packet> {
+  async openRaw(service: string, remoteId: number, timeoutMs = DEFAULT_WAIT_MS): Promise<Packet> {
     this.send(A_OPEN, remoteId, 0, service + '\0');
-    return this.next();
+    return this.next(timeoutMs);
   }
 
-  async open(service: string, remoteId = 1): Promise<{ localId: number }> {
-    const reply = await this.openRaw(service, remoteId);
+  async open(service: string, remoteId = 1, timeoutMs = DEFAULT_WAIT_MS): Promise<{ localId: number }> {
+    const reply = await this.openRaw(service, remoteId, timeoutMs);
     if (reply.command !== A_OKAY) throw new Error(`open ${service} was refused`);
     return { localId: reply.arg0 };
   }
