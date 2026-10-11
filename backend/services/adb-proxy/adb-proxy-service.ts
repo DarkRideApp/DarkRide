@@ -48,6 +48,10 @@ const DEFAULT_RECONCILE_MS = 5000;
 const DEFAULT_LOG_WINDOW_MS = 60_000;
 const DEFAULT_LOG_MAX_DETAIL = 5;
 const REFUSAL_LOG_LENGTH = 60;
+// Each ready session can buffer several MiB, so an approved key may not open them without limit.
+const MAX_READY_PER_KEY_DEVICE = 8;
+const MAX_READY_PER_KEY = 32;
+const SESSION_CAP_LOG_MS = 60_000;
 const short = (keyId: string) => keyId.slice(0, 12);
 // The service string comes from the client: keep printable ASCII only so it cannot forge or hide log lines.
 const printable = (text: string) => text.slice(0, REFUSAL_LOG_LENGTH).replace(/[^\x20-\x7e]/g, '?');
@@ -80,6 +84,8 @@ export class AdbProxyService {
   private readonly peerLog: BudgetLog;
   private readonly refusalLog: BudgetLog;
   private readonly trusted = new WeakSet<Session>();
+  private readonly capped = new WeakSet<Session>();
+  private readonly capLogs = new Map<string, (line: string) => void>();
 
   constructor(private readonly deps: AdbProxyServiceDeps) {
     const budget = () => createBudgetLog({
@@ -496,6 +502,30 @@ export class AdbProxyService {
     return stuck.length > 0 && this.ports.hasFree() ? stuck : [];
   }
 
+  /** Closes a session that just became ready when its key already has as many ready sessions as allowed. */
+  private overSessionCap(session: Session): boolean {
+    const keyId = session.keyId;
+    if (!keyId) return false;
+    let perKey = 0;
+    let perDevice = 0;
+    for (const s of this.sessions) {
+      if (s.state !== 'ready' || s.keyId !== keyId) continue;
+      perKey++;
+      if (s.deviceId === session.deviceId) perDevice++;
+    }
+    if (perDevice <= MAX_READY_PER_KEY_DEVICE && perKey <= MAX_READY_PER_KEY) return false;
+    const scope = perDevice > MAX_READY_PER_KEY_DEVICE ? `${MAX_READY_PER_KEY_DEVICE} on device ${session.deviceId}` : `${MAX_READY_PER_KEY} in total`;
+    let logCap = this.capLogs.get(keyId);
+    if (!logCap) {
+      logCap = onceEvery(SESSION_CAP_LOG_MS, (line: string) => log(line));
+      this.capLogs.set(keyId, logCap);
+    }
+    logCap(`too many sessions for this key: key ${short(keyId)} already has ${scope}; refused a session from ip=${session.peerIp} (logged once a minute per key)`);
+    this.capped.add(session);
+    session.destroy('too many sessions for this key');
+    return true;
+  }
+
   private closeSessions(match: (s: Session) => boolean, reason: string): void {
     for (const s of [...this.sessions]) if (match(s)) s.destroy(reason);
   }
@@ -537,6 +567,7 @@ export class AdbProxyService {
     switch (e.kind) {
       case 'auth-failed': this.counters.authFailures++; return;
       case 'authenticated':
+        if (this.overSessionCap(e.session)) return;
         this.trusted.add(e.session);
         log(`session ${e.session.id} authenticated ${who}`);
         break;
@@ -544,6 +575,7 @@ export class AdbProxyService {
         this.refusalLog.log('refused service', `session ${e.session.id} refused service "${printable(e.service)}" ${who}`);
         return;
       case 'closed': {
+        if (this.capped.has(e.session)) break;
         // Anyone can open and drop connections, so only a session that authenticated gets a line of its own.
         const line = `session ${e.session.id} closed (${e.reason}) ${who}`;
         if (this.trusted.has(e.session)) log(line);

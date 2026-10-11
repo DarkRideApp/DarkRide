@@ -69,6 +69,7 @@ Viewing needs the scope `core.adb-proxy:read`. Approving, denying, revoking, for
 - At most 20 requests wait at once, and a source address can create 3 new ones per minute. A machine that asks again for a device it already has a waiting request for does not use that allowance. Extra requests are dropped. Each dropped request is logged, within the log rate limit, and counted in `counters.floodDrops` in the response of `GET /v1/adb-proxy/status`. Connections refused at the unauthenticated limit are counted in the same counter but not logged individually. The page does not show the count.
 - A waiting request is held for at most 5 minutes.
 - At most 128 streams may be open on one connection. Further streams are refused.
+- One key may have at most 8 authenticated connections to one device and 32 across all devices. A connection beyond either limit is closed as soon as it authenticates, and the existing ones keep working. The refusal is logged at most once a minute per key. Each `adb` client normally holds one connection per device, so only scripts that run many separate adb servers with the same key reach this.
 - A key's machine name has control characters and invisible format characters (such as zero-width and text-direction marks) removed, and is cut to 128 characters.
 
 ## Troubleshooting

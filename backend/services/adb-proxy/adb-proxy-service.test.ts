@@ -61,14 +61,17 @@ interface SetupOptions {
   start?: boolean;
   /** Runs against the database before the service starts. */
   seed?: (db: ReturnType<typeof createTestDb>, base: number) => void;
+  /** Devices beyond DEV1 and DEV2, known to the fake and the database. */
+  extraDevices?: string[];
 }
 
 async function setup(opts: SetupOptions = {}) {
-  const fake = new FakeAdbServer([{ serial: 'DEV1' }, { serial: 'DEV2' }]);
+  const extra = opts.extraDevices ?? [];
+  const fake = new FakeAdbServer([{ serial: 'DEV1' }, { serial: 'DEV2' }, ...extra.map((serial) => ({ serial }))]);
   const backend = new HostClient(await fake.start(), 2000);
   const db = createTestDb([users, deviceInstances, devices, settings, adbProxyKeys, adbProxyDevices], { foreignKeys: true });
   db.insert(users).values({ username: 'admin', providerId: 'local', createdAt: new Date(), updatedAt: new Date() }).run();
-  db.insert(devices).values([{ id: 'DEV1', name: 'Phone 1' }, { id: 'DEV2', model: 'Pixel' }]).run();
+  db.insert(devices).values([{ id: 'DEV1', name: 'Phone 1' }, { id: 'DEV2', model: 'Pixel' }, ...extra.map((id) => ({ id }))]).run();
   const base = await freePortBase();
   saveSettings(db, {
     enabled: opts.enabled ?? true,
@@ -82,7 +85,7 @@ async function setup(opts: SetupOptions = {}) {
     cleanups.push(() => new Promise<void>((resolve) => blocker.close(() => resolve())));
   }
   opts.seed?.(db, base);
-  const directory = new StubDirectory(opts.online ?? ['DEV1', 'DEV2']);
+  const directory = new StubDirectory(opts.online ?? ['DEV1', 'DEV2', ...extra]);
   const broadcasts: Array<Record<string, any>> = [];
   const service = new AdbProxyService({
     db, directory, backend, broadcast: opts.broadcast ?? ((m) => broadcasts.push(m)), advertisedHost: () => '192.168.1.10', pending: opts.pending,
@@ -919,6 +922,84 @@ describe('AdbProxyService limits and reporting', () => {
     expect(await client.waitClosed()).toBe(true);
     await expectPortFree(port);
   });
+});
+
+describe('AdbProxyService ready-session caps', () => {
+  const capLines = () => logged().filter((line) => line.includes('too many sessions for this key'));
+  const readyFor = (h: Harness, keyId: string) => h.service.snapshot().connections.filter((c) => c.keyId === keyId && c.state === 'ready');
+
+  /** A new connection that has received the device banner. */
+  const session = async (h: Harness, key: TestAdbKey, deviceId = 'DEV1') => {
+    const c = await h.connect(deviceId);
+    expect((await c.authenticate(key)).command).toBe(A_CNXN);
+    return c;
+  };
+  const expectRefused = async (h: Harness, key: TestAdbKey, deviceId = 'DEV1') => {
+    expect(await (await session(h, key, deviceId)).waitClosed()).toBe(true);
+  };
+  const expectAllOpen = async (clients: WireClient[]) => {
+    await sleep(100);
+    expect(clients.filter((c) => c.closed)).toHaveLength(0);
+  };
+
+  it('closes the ninth ready session for one key and device, keeps the first eight, and logs the refusal once', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    await approveKey(h, key);
+    const first: WireClient[] = [];
+    for (let i = 0; i < 8; i++) first.push(await session(h, key));
+    await expectAllOpen(first);
+    await expectRefused(h, key);
+    await expectRefused(h, key);
+
+    await expectAllOpen(first);
+    expect(readyFor(h, key.keyId)).toHaveLength(8);
+    expect((await first[7].open('hold:', 1)).localId).toBeGreaterThan(0);
+    expect(capLines()).toHaveLength(1);
+    expect(capLines()[0]).toContain(key.keyId.slice(0, 12));
+    // A refused session gets no line of its own, so an approved key cannot flood the log this way.
+    expect(logged().filter((line) => line.includes('closed (too many sessions'))).toEqual([]);
+  });
+
+  it('does not count another device or another key against the per-device cap', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    const other = makeTestAdbKey();
+    await approveKey(h, key);
+    await approveKey(h, other);
+    const clients: WireClient[] = [];
+    for (let i = 0; i < 8; i++) clients.push(await session(h, key));
+    clients.push(await session(h, key, 'DEV2'), await session(h, other));
+    await expectAllOpen(clients);
+  });
+
+  it('frees a slot when a ready session closes', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    await approveKey(h, key);
+    const first: WireClient[] = [];
+    for (let i = 0; i < 8; i++) first.push(await session(h, key));
+    await expectRefused(h, key);
+    first[0].close();
+    await vi.waitFor(() => expect(readyFor(h, key.keyId)).toHaveLength(7));
+    await expectAllOpen([await session(h, key)]);
+    expect(readyFor(h, key.keyId)).toHaveLength(8);
+  });
+
+  it('closes the 33rd ready session for one key across devices', async () => {
+    const h = await setup({ extraDevices: ['DEV3', 'DEV4', 'DEV5'] });
+    const key = makeTestAdbKey();
+    await approveKey(h, key);
+    const clients: WireClient[] = [];
+    for (const deviceId of ['DEV1', 'DEV2', 'DEV3', 'DEV4']) {
+      for (let i = 0; i < 8; i++) clients.push(await session(h, key, deviceId));
+    }
+    await expectAllOpen(clients);
+    await expectRefused(h, key, 'DEV5');
+    await expectAllOpen(clients);
+    expect(readyFor(h, key.keyId)).toHaveLength(32);
+    expect(capLines()).toHaveLength(1);
+  }, 15_000);
 });
 
 describe('AdbProxyService refusal logging', () => {
