@@ -167,6 +167,10 @@ describe('comment handling', () => {
     expect(sanitiseComment('a\u202Eb\u200Bc\uFEFFd')).toBe('abcd');
   });
 
+  it('strips the line and paragraph separators', () => {
+    expect(sanitiseComment('a\u2028b\u2029c')).toBe('abc');
+  });
+
   it('truncates by code point so a surrogate pair is never cut in half', () => {
     const cleaned = sanitiseComment('a'.repeat(127) + '\u{1F600}' + 'b');
     expect(Array.from(cleaned).length).toBe(128);
