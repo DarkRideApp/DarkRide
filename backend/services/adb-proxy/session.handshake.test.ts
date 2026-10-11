@@ -317,14 +317,15 @@ describe('Session handshake', () => {
   });
 
   it('does not apply the pre-auth timeout to a held pending connection', async () => {
-    const h = await setup({ preAuthTimeoutMs: 200 });
+    // The budget must cover connect, CNXN, token, the RSA signature and the offer, so a slow runner needs a wide one.
+    const h = await setup({ preAuthTimeoutMs: 1000 });
     let approve!: (d: 'approved' | 'denied') => void;
     h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise((r) => { approve = r; }), cancel: vi.fn() };
-    // Key generation can take longer than the 200 ms budget on a busy machine, so it happens before the clock starts.
+    // Key generation can take longer than the budget on a busy machine, so it happens before the clock starts.
     const key = makeTestAdbKey();
     const client = await h.connect();
     await client.offerKey(key);
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, 2000));
     expect(client.closed).toBe(false);
     approve('approved');
     expect((await client.next()).command).toBe(A_CNXN);

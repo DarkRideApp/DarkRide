@@ -201,7 +201,7 @@ describe('HostClient', () => {
   it('hands back a socket that is already closed when the service ends right after OKAY', async () => {
     // Characterizes the paused-socket hazard: with no data pending, a paused socket still sees the peer's FIN and destroys itself.
     const socket = await client.openService('SER1', 'shell:true');
-    await new Promise((r) => setTimeout(r, 50));
+    await waitFor(() => socket.destroyed);
     expect(socket.destroyed).toBe(true);
   });
 

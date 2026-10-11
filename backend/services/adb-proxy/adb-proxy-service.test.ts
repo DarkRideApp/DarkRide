@@ -1098,11 +1098,14 @@ describe('AdbProxyService limits and reporting', () => {
     const ninth = await open();
     await ninth.closed;
     expect(h.service.snapshot().counters.floodDrops).toBe(1);
+    expect(h.service.snapshot().connections).toHaveLength(8);
     first[0].s.destroy();
-    await new Promise((r) => setTimeout(r, 100));
+    // A closed session has already given its pre-auth slot back, so seven sessions left means the slot is free.
+    await vi.waitFor(() => expect(h.service.snapshot().connections).toHaveLength(7));
     const again = await open();
-    await new Promise((r) => setTimeout(r, 100));
+    await vi.waitFor(() => expect(h.service.snapshot().connections).toHaveLength(8));
     expect(again.s.destroyed).toBe(false);
+    expect(h.service.snapshot().counters.floodDrops).toBe(1);
   });
 
   it('broadcasts a snapshot message after a change', async () => {

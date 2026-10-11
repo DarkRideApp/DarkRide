@@ -130,6 +130,7 @@ for (const bin of adbBins()) {
       if (work) rmSync(work, { recursive: true, force: true });
     });
 
+    // The cases after the first reuse the pending request and the approval made by the earlier ones, so a `-t` filtered run fails.
     it('shows unauthorized and files an approval request that carries the client key', async () => {
       // The text `adb connect` prints for an unknown key differs between client versions; `adb devices` is the truth.
       await adb.run(['connect', serial]);
