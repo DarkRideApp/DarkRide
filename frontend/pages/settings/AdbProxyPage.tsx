@@ -56,9 +56,9 @@ function duration(ms: number): string {
 
 const machine = (comment: string | null) => comment || '(no name)';
 
-// The name is chosen by the connecting machine, so the dialogs also show the address and the start of the fingerprint.
+// The name is chosen by the connecting machine, so it comes last, after the address and fingerprint it could imitate.
 const describeKey = (k: KeyView) =>
-  `"${machine(k.comment)}" (${k.lastSeenIp ? `from ${k.lastSeenIp}, ` : ''}fingerprint starting ${k.fingerprint.slice(0, 11)})`;
+  `the machine ${k.lastSeenIp ? `at ${k.lastSeenIp} ` : ''}with fingerprint starting ${k.fingerprint.slice(0, 11)}, named "${machine(k.comment)}"`;
 
 const isWhole = (text: string) => /^\d+$/.test(text.trim()) && Number.isSafeInteger(Number(text));
 

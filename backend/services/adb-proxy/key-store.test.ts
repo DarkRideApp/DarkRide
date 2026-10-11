@@ -39,6 +39,14 @@ describe('KeyStore', () => {
     expect(ctx.store.list()).toHaveLength(1);
   });
 
+  it('keeps the allow-list when a key is decided again', () => {
+    const rec = ctx.store.upsertDecision({ ...base, status: 'approved', userId: ctx.userId });
+    ctx.store.setDeviceIds(rec.id, ['DEV1', 'DEV2']);
+    ctx.store.setStatus(rec.id, 'revoked', ctx.userId);
+    expect(ctx.store.upsertDecision({ ...base, status: 'approved', userId: ctx.userId }).deviceIds).toEqual(['DEV1', 'DEV2']);
+    expect(ctx.store.upsertDecision({ ...base, status: 'denied', userId: ctx.userId }).deviceIds).toEqual(['DEV1', 'DEV2']);
+  });
+
   it('finds by key id and by row id, and lists in insertion order', () => {
     const a = ctx.store.upsertDecision({ ...base, keyId: 'a', status: 'approved', userId: null });
     const b = ctx.store.upsertDecision({ ...base, keyId: 'b', status: 'denied', userId: null });

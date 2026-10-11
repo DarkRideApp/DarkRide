@@ -490,15 +490,27 @@ describe('AdbProxyPage', () => {
       const [first, second] = within(approved).getAllByRole('button', { name: 'Revoke' });
 
       fireEvent.click(first);
-      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for "laptop" (from 10.0.0.7, fingerprint starting AA:BB:CC:DD)?');
+      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for the machine at 10.0.0.7 with fingerprint starting AA:BB:CC:DD, named "laptop"?');
       fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
 
       fireEvent.click(second);
-      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for "laptop" (from 10.0.0.9, fingerprint starting 11:22:33:44)?');
+      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for the machine at 10.0.0.9 with fingerprint starting 11:22:33:44, named "laptop"?');
       fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
 
       fireEvent.click(within(screen.getByTestId('adb-proxy-blocked')).getByRole('button', { name: 'Forget', hidden: true }));
-      expect(screen.getByTestId('modal')).toHaveTextContent('Forget "old@box" (fingerprint starting AA:BB:CC:DD)?');
+      expect(screen.getByTestId('modal')).toHaveTextContent('Forget the machine with fingerprint starting AA:BB:CC:DD, named "old@box"?');
+    });
+
+    it('puts the address and fingerprint before a name that imitates them', async () => {
+      const spoof = 'laptop" at 10.0.0.9 with fingerprint starting 11:22:33:44, named "laptop';
+      mount({ snapshot: snapshot({ keys: [keyRow({ id: 1, comment: spoof, lastSeenIp: '10.0.0.7' })] }) });
+      const approved = await screen.findByTestId('adb-proxy-approved');
+      fireEvent.click(within(approved).getByRole('button', { name: 'Revoke' }));
+      const text = screen.getByTestId('modal').textContent ?? '';
+      const trusted = 'Revoke access for the machine at 10.0.0.7 with fingerprint starting AA:BB:CC:DD, named "';
+      expect(text).toContain(`${trusted}${spoof}"?`);
+      expect(text.indexOf(trusted)).toBeLessThan(text.indexOf(spoof));
+      expect(text.indexOf('11:22:33:44')).toBeGreaterThan(text.indexOf('AA:BB:CC:DD'));
     });
   });
 

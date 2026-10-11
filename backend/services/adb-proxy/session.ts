@@ -250,8 +250,9 @@ export class Session {
       return;
     }
     this.state = 'pending';
-    this.leavePreAuth();
+    // Set before anything that can throw, so a close always withdraws the request.
     this.cancelPending = () => outcome.cancel();
+    this.leavePreAuth();
     this.emit({ kind: 'pending', session: this });
     outcome.decision.then(
       (decision) => {

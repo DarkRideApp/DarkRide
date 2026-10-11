@@ -516,6 +516,20 @@ describe('Session handshake', () => {
       await expectNothingEscaped();
     });
 
+    it('onLeavePreAuth throwing when the key goes pending still cancels the pending request', async () => {
+      const h = await setup({ onLeavePreAuth: () => { throw new Error('leave hook down'); } });
+      const cancel = vi.fn();
+      h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise(() => {}), cancel };
+      const key = makeTestAdbKey();
+      const client = await h.connect();
+      await client.offerKey(key);
+      expect(await client.waitClosed()).toBe(true);
+      expect(h.gate.offers).toHaveLength(1);
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'handler error' });
+      await expectNothingEscaped();
+    });
+
     it('isDeviceOnline throwing after the signature closes the session instead of leaking a rejection', async () => {
       let calls = 0;
       const h = await setup({ isDeviceOnline: () => { if (++calls === 2) throw new Error('registry down'); return true; } });
