@@ -26,7 +26,7 @@ export class PortAllocator {
     return this.db.select().from(adbProxyDevices).orderBy(asc(adbProxyDevices.createdAt), asc(adbProxyDevices.port)).all();
   }
 
-  /** The device's row, creating it with the lowest free port in range if it has none. */
+  /** The device's row, created with the lowest free port in range if it has none; the device must already exist in `devices` (the foreign key throws otherwise). */
   ensure(deviceId: string): ProxyDeviceRow | { error: 'range-full' } {
     const existing = this.get(deviceId);
     if (existing) return existing;
@@ -40,15 +40,17 @@ export class PortAllocator {
     return { error: 'range-full' };
   }
 
-  setPort(deviceId: string, port: number): ProxyDeviceRow {
+  /** Moves a device to a free in-range port; undefined when the device has no row yet. */
+  setPort(deviceId: string, port: number): ProxyDeviceRow | undefined {
     const { start, end } = this.range();
     if (!Number.isInteger(port) || port < start || port > end) {
       throw new PortError('out-of-range', `port must be between ${start} and ${end}`);
     }
     const holder = this.all().find((r) => r.port === port);
     if (holder && holder.deviceId !== deviceId) throw new PortError('in-use', `port ${port} is used by another device`);
+    if (!this.get(deviceId)) return undefined;
     this.db.update(adbProxyDevices).set({ port }).where(eq(adbProxyDevices.deviceId, deviceId)).run();
-    return this.get(deviceId)!;
+    return this.get(deviceId);
   }
 
   setEnabled(deviceId: string, enabled: boolean): ProxyDeviceRow | undefined {

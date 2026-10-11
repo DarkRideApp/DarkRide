@@ -11,6 +11,11 @@ function setup(range = { start: 6500, end: 6502 }) {
   return { db, alloc, setRange: (r: typeof range) => { current = r; } };
 }
 
+const codeOf = (fn: () => unknown) => {
+  try { fn(); } catch (e) { return e instanceof PortError ? e.code : 'other-error'; }
+  return 'no-throw';
+};
+
 describe('PortAllocator', () => {
   let ctx: ReturnType<typeof setup>;
   beforeEach(() => { ctx = setup(); });
@@ -19,6 +24,12 @@ describe('PortAllocator', () => {
     const a = ctx.alloc.ensure('A');
     expect(a).toMatchObject({ deviceId: 'A', port: 6500, enabled: true });
     expect(ctx.alloc.ensure('B')).toMatchObject({ port: 6501 });
+  });
+
+  it('reuses the lowest free port once an earlier one is vacated', () => {
+    ctx.alloc.ensure('A');
+    ctx.alloc.setPort('A', 6502);
+    expect(ctx.alloc.ensure('B')).toMatchObject({ port: 6500 });
   });
 
   it('returns the same port for the same device, including from a new allocator', () => {
@@ -34,6 +45,11 @@ describe('PortAllocator', () => {
     expect(ctx.alloc.get('D')).toBeUndefined();
   });
 
+  it('throws for a device that is not in the devices table', () => {
+    expect(() => ctx.alloc.ensure('NOPE')).toThrow(/FOREIGN KEY/);
+    expect(ctx.alloc.all()).toEqual([]);
+  });
+
   it('keeps existing ports when the range later changes', () => {
     ctx.alloc.ensure('A');
     ctx.setRange({ start: 7000, end: 7001 });
@@ -43,24 +59,37 @@ describe('PortAllocator', () => {
 
   it('setPort moves a device to a free in-range port', () => {
     ctx.alloc.ensure('A');
-    expect(ctx.alloc.setPort('A', 6502).port).toBe(6502);
+    expect(ctx.alloc.setPort('A', 6502)?.port).toBe(6502);
     expect(ctx.alloc.get('A')?.port).toBe(6502);
   });
 
   it('setPort accepts the device\'s own current port', () => {
     ctx.alloc.ensure('A');
-    expect(ctx.alloc.setPort('A', 6500).port).toBe(6500);
+    expect(ctx.alloc.setPort('A', 6500)?.port).toBe(6500);
   });
 
   it('setPort rejects a port outside the range and a port another device holds', () => {
     ctx.alloc.ensure('A'); ctx.alloc.ensure('B');
-    const codeOf = (fn: () => void) => {
-      try { fn(); } catch (e) { return e instanceof PortError ? e.code : 'other-error'; }
-      return 'no-throw';
-    };
     expect(codeOf(() => ctx.alloc.setPort('A', 6501))).toBe('in-use');
     expect(codeOf(() => ctx.alloc.setPort('A', 9000))).toBe('out-of-range');
     expect(ctx.alloc.get('A')?.port).toBe(6500);
+  });
+
+  it.each([[6500.5], [Number.NaN], [Number.POSITIVE_INFINITY]])('setPort rejects the non-integer port %s', (port) => {
+    ctx.alloc.ensure('A');
+    expect(codeOf(() => ctx.alloc.setPort('A', port))).toBe('out-of-range');
+    expect(ctx.alloc.get('A')?.port).toBe(6500);
+  });
+
+  it('setPort returns undefined and writes nothing for a device with no row', () => {
+    expect(ctx.alloc.setPort('D', 6501)).toBeUndefined();
+    expect(ctx.alloc.all()).toEqual([]);
+  });
+
+  it('setPort checks the range and ownership before it looks for the device row', () => {
+    ctx.alloc.ensure('A');
+    expect(codeOf(() => ctx.alloc.setPort('D', 9000))).toBe('out-of-range');
+    expect(codeOf(() => ctx.alloc.setPort('D', 6500))).toBe('in-use');
   });
 
   it('setEnabled flips the flag and returns undefined for an unknown device', () => {

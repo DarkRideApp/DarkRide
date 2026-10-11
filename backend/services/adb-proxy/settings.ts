@@ -33,12 +33,19 @@ export class SettingsError extends Error {
   }
 }
 
+function portRangeProblem(start: number, end: number): string | undefined {
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return 'ports must be whole numbers';
+  if (start < 1024 || end > 65535) return 'ports must be between 1024 and 65535';
+  if (start > end) return 'port range start must not exceed its end';
+  if (end - start + 1 > MAX_RANGE) return `port range may not exceed ${MAX_RANGE} ports`;
+  return undefined;
+}
+
 function validate(s: AdbProxySettings): void {
+  if (typeof s.enabled !== 'boolean') throw new SettingsError('enabled must be true or false');
   if (net.isIP(s.bindHost) === 0) throw new SettingsError('bind host must be an IP address');
-  if (!Number.isInteger(s.portStart) || !Number.isInteger(s.portEnd)) throw new SettingsError('ports must be whole numbers');
-  if (s.portStart < 1024 || s.portEnd > 65535) throw new SettingsError('ports must be between 1024 and 65535');
-  if (s.portStart > s.portEnd) throw new SettingsError('port range start must not exceed its end');
-  if (s.portEnd - s.portStart + 1 > MAX_RANGE) throw new SettingsError(`port range may not exceed ${MAX_RANGE} ports`);
+  const problem = portRangeProblem(s.portStart, s.portEnd);
+  if (problem) throw new SettingsError(problem);
 }
 
 function parseInt10(raw: string | undefined, fallback: number): number {
@@ -50,11 +57,14 @@ export function loadSettings(db: AppDatabase): AdbProxySettings {
   const byKey = new Map(rows.map((r) => [r.key, r.value]));
   const enabled = byKey.get(KEYS.enabled);
   const host = byKey.get(KEYS.bindHost);
+  const portStart = parseInt10(byKey.get(KEYS.portStart), DEFAULT_SETTINGS.portStart);
+  const portEnd = parseInt10(byKey.get(KEYS.portEnd), DEFAULT_SETTINGS.portEnd);
+  const rangeUsable = portRangeProblem(portStart, portEnd) === undefined;
   return {
     enabled: enabled === 'true' ? true : enabled === 'false' ? false : DEFAULT_SETTINGS.enabled,
     bindHost: host !== undefined && net.isIP(host) !== 0 ? host : DEFAULT_SETTINGS.bindHost,
-    portStart: parseInt10(byKey.get(KEYS.portStart), DEFAULT_SETTINGS.portStart),
-    portEnd: parseInt10(byKey.get(KEYS.portEnd), DEFAULT_SETTINGS.portEnd),
+    portStart: rangeUsable ? portStart : DEFAULT_SETTINGS.portStart,
+    portEnd: rangeUsable ? portEnd : DEFAULT_SETTINGS.portEnd,
   };
 }
 
@@ -68,8 +78,10 @@ export function saveSettings(db: AppDatabase, patch: Partial<AdbProxySettings>):
     [KEYS.portStart, String(next.portStart)],
     [KEYS.portEnd, String(next.portEnd)],
   ];
-  for (const [key, value] of values) {
-    db.insert(settings).values({ key, value }).onConflictDoUpdate({ target: settings.key, set: { value } }).run();
-  }
+  db.transaction((tx) => {
+    for (const [key, value] of values) {
+      tx.insert(settings).values({ key, value }).onConflictDoUpdate({ target: settings.key, set: { value } }).run();
+    }
+  });
   return next;
 }
