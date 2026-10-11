@@ -30,6 +30,7 @@ const ADBD_RESTART_SERVICES = ['root:', 'unroot:'];
 const ADBD_RESTART_ANNOUNCEMENT = 'restarting';
 // The announcement is the first line of output, so only this much of it is kept.
 const RESTART_OUTPUT_LIMIT = 256;
+const RESTART_CLOSE_MS = 2000;
 
 type RestartRule = 'never' | 'always' | 'if-announced';
 
@@ -149,6 +150,7 @@ export class Session {
   private readsPaused = false;
   /** The device is restarting: the session closes once the last CLSE is flushed and takes no new packets meanwhile. */
   private restarting = false;
+  private restartTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly opts: SessionOptions) {
     this.deviceId = opts.deviceId;
@@ -475,6 +477,9 @@ export class Session {
       || (stream.restart === 'if-announced' && stream.head.toString('latin1').includes(ADBD_RESTART_ANNOUNCEMENT)));
     if (restarting && !this.restarting) {
       this.restarting = true;
+      // A client that stopped reading never lets the CLSE flush.
+      this.restartTimer = setTimeout(() => this.close('device restarting'), RESTART_CLOSE_MS);
+      this.restartTimer.unref?.();
       this.emit({ kind: 'device-restarting', session: this });
     }
     if (notify) this.send(A_CLSE, stream.localId, stream.remoteId, undefined, restarting ? () => this.close('device restarting') : undefined);
@@ -551,6 +556,8 @@ export class Session {
     if (this.closed) return;
     this.closed = true;
     this.state = 'closed';
+    if (this.restartTimer) clearTimeout(this.restartTimer);
+    this.restartTimer = null;
     this.opts.socket.destroy();
     for (const s of this.streams.values()) this.destroyBackend(s);
     this.streams.clear();

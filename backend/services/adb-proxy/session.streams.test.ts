@@ -136,14 +136,16 @@ class StallableSocket extends Duplex {
 }
 
 /** A session on a StallableSocket, taken through the whole handshake to the ready state. */
-async function readySessionOnStallableSocket() {
+async function readySessionOnStallableSocket(openService: BackendConnector['openService'] = vi.fn()) {
   const sock = new StallableSocket();
   const key = makeTestAdbKey();
   const gate = new StubGate();
   gate.approved = [{ keyId: key.keyId, key: parseAdbPublicKey(key.publicKeyText).key }];
-  const backend: BackendConnector = { openService: vi.fn(), deviceBanner: async () => 'device::features=cmd' };
+  const backend: BackendConnector = { openService, deviceBanner: async () => 'device::features=cmd' };
+  const events: SessionEvent[] = [];
   const session = new Session({
     socket: sock as unknown as net.Socket, deviceId: 'DEV1', peerIp: '10.0.0.5', gate, backend, isDeviceOnline: () => true,
+    onEvent: (e) => events.push(e),
   });
   cleanups.push(() => session.destroy('test over'));
   sock.push(encodePacket({ command: A_CNXN, arg0: A_VERSION, arg1: MAX_DATA, data: Buffer.from('host::features=cmd\0') }));
@@ -151,7 +153,7 @@ async function readySessionOnStallableSocket() {
   const token = sock.sent.find((p) => p.command === A_AUTH)!;
   sock.push(encodePacket({ command: A_AUTH, arg0: AUTH_SIGNATURE, arg1: 0, data: key.sign(token.data) }));
   await vi.waitFor(() => expect(session.state).toBe('ready'));
-  return { sock, session };
+  return { sock, session, events };
 }
 
 /** Fails the test if an uncaught exception or unhandled rejection reached the process. */
@@ -459,6 +461,24 @@ describe('Session streams', () => {
       await h.client.collectStream(2, localId, 'close');
       expect(await h.client.waitClosed()).toBe(true);
       expect(closeReasons(h)).toEqual(['device restarting']);
+    });
+
+    it('closes a restarting session within about 2 seconds when the client never reads the CLSE', async () => {
+      const device = new FakeBackendSocket();
+      const { sock, session, events } = await readySessionOnStallableSocket(async () => device.asSocket());
+      sock.push(encodePacket({ command: A_OPEN, arg0: 1, arg1: 0, data: Buffer.from('reboot:\0') }));
+      await vi.waitFor(() => expect(sock.sent.some((p) => p.command === A_OKAY && p.arg1 === 1)).toBe(true));
+      sock.stalled = true;
+
+      device.emit('end');
+
+      await vi.waitFor(() => expect(sock.sent.some((p) => p.command === A_CLSE && p.arg1 === 1)).toBe(true));
+      const started = Date.now();
+      await new Promise((r) => setTimeout(r, 500));
+      expect(session.isClosed).toBe(false);
+      await vi.waitFor(() => expect(session.isClosed).toBe(true), { timeout: 4000, interval: 20 });
+      expect(Date.now() - started).toBeLessThan(3000);
+      expect(events.filter((e) => e.kind === 'closed')).toEqual([expect.objectContaining({ reason: 'device restarting' })]);
     });
 
     it('keeps the session after an ordinary shell stream ends', async () => {
