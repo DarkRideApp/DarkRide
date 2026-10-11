@@ -153,7 +153,7 @@ import { ensureConfigs, getDeviceLanIp, getServerIp } from './services/wireguard
 import { AdbProxyService } from './services/adb-proxy/adb-proxy-service';
 import { createDeviceDirectory } from './services/adb-proxy/device-directory';
 import { HostClient } from './services/adb-proxy/host-client';
-import { registerAdbProxyEndpoints } from './api/adb-proxy';
+import { adbProxyBroadcast, registerAdbProxyEndpoints } from './api/adb-proxy';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
 import { stopSpawnedInstances } from './services/stop-spawned-instances';
@@ -429,7 +429,7 @@ const adbProxyService = new AdbProxyService({
   db,
   directory: createDeviceDirectory(deviceManager, db),
   backend: new HostClient(),
-  broadcast: broadcastToAll,
+  broadcast: adbProxyBroadcast(broadcastToAll),
   advertisedHost: () => getServerIp(),
 });
 registerAdbProxyEndpoints(adbProxyService);

@@ -3,7 +3,7 @@ import { broadcastToAll, getConnectedClients } from './index';
 import { getWebsocketHandler } from './handlers';
 import { __resetChannelRegistryForTest } from './channel-registry';
 import { clearEndpoints } from '../api/api-service';
-import { ADB_PROXY_CHANNEL, registerAdbProxyEndpoints } from '../api/adb-proxy';
+import { ADB_PROXY_CHANNEL, adbProxyBroadcast, registerAdbProxyEndpoints } from '../api/adb-proxy';
 import { AdbProxyService } from '../services/adb-proxy/adb-proxy-service';
 import { KeyStore } from '../services/adb-proxy/key-store';
 import { StubDirectory } from '../services/adb-proxy/testing/stub-directory';
@@ -126,7 +126,7 @@ describe('ADB proxy live channel', () => {
       for (const c of cleanups.splice(0).reverse()) await c();
     });
 
-    async function startService() {
+    async function startService(registerChannel = true) {
       const db = createTestDb([users, deviceInstances, devices, settings, adbProxyKeys, adbProxyDevices], { foreignKeys: true });
       const key = makeTestAdbKey('laptop@home');
       new KeyStore(db).upsertDecision({
@@ -137,18 +137,33 @@ describe('ADB proxy live channel', () => {
         db,
         directory: new StubDirectory([]),
         backend: { openService: vi.fn(), deviceBanner: vi.fn() } as unknown as AdbProxyServiceDeps['backend'],
-        broadcast: broadcastToAll,
+        broadcast: adbProxyBroadcast(broadcastToAll),
         advertisedHost: () => '192.168.1.10',
       });
       clearEndpoints();
       __resetChannelRegistryForTest();
-      registerAdbProxyEndpoints(service);
+      if (registerChannel) registerAdbProxyEndpoints(service);
       await service.start();
       cleanups.push(() => service.stop());
       return service;
     }
 
-    it('reaches only the subscribed reader, and what it carries is what a reader must not leak', async () => {
+    it('sends nothing to any client, subscribed or not, while the channel is not registered', async () => {
+      const service = await startService(false);
+      const subscribed = connect(['core.adb-proxy:read']);
+      const other = connect(['core.devices:read']);
+      subscribe(subscribed);
+      const snapshot = vi.spyOn(service, 'snapshot');
+
+      await service.updateSettings({});
+      const afterUpdate = snapshot.mock.calls.length;
+      await vi.waitFor(() => expect(snapshot.mock.calls.length).toBeGreaterThan(afterUpdate));
+
+      expect(subscribed.sent).toEqual([]);
+      expect(other.sent).toEqual([]);
+    });
+
+    it('delivers the snapshot with its keys to the subscribed reader and to no other connected client', async () => {
       const service = await startService();
       const reader = connect(['core.adb-proxy:read']);
       const intruder = connect(['core.devices:read']);

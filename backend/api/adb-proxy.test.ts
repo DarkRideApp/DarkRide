@@ -7,7 +7,7 @@ import { createTestDb } from '../test-utils/create-test-db';
 import { __resetChannelRegistryForTest, getRequiredScopes, isFilteredChannel } from '../websocket/channel-registry';
 import { SettingsError } from '../services/adb-proxy/settings';
 import type { AdbProxyService } from '../services/adb-proxy/adb-proxy-service';
-import { ADB_PROXY_CHANNEL, registerAdbProxyEndpoints } from './adb-proxy';
+import { ADB_PROXY_CHANNEL, adbProxyBroadcast, registerAdbProxyEndpoints } from './adb-proxy';
 
 const SNAPSHOT = { enabled: true, devices: [], pending: [], keys: [], connections: [], counters: {} };
 
@@ -86,20 +86,24 @@ describe('ADB proxy API', () => {
   });
 
   describe('scope enforcement', () => {
-    it('lets a read-only user read and refuses every write with 403', async () => {
-      const app = appFor(service, READ);
-      expect((await request(app).get('/v1/adb-proxy/status')).status).toBe(200);
-      expect((await request(app).get('/v1/adb-proxy/keys')).status).toBe(200);
-      for (const [method, path] of WRITES) {
-        const res = await send(app, method, path);
-        expect(res.status, `${method} ${path}`).toBe(403);
-      }
-      expect(service.approveRequest).not.toHaveBeenCalled();
+    // Manage does not imply read, as with core.devices:read and core.devices:manage, so a manage-only user cannot read.
+    const rows = (who: string, scopes: string[], routes: Array<[Method, string]>): Array<[string, Method, string, string[]]> =>
+      routes.map(([method, path]) => [who, method, path, scopes]);
+    const refused = [
+      ...rows('a user with an unrelated scope', ['core.devices:read'], [...READS, ...WRITES]),
+      ...rows('a manage-only user', ['core.adb-proxy:manage'], READS),
+      ...rows('a read-only user', READ, WRITES),
+    ];
+
+    it.each(refused)('refuses %s on %s %s with 403 and never reaches the service', async (_who, method, path, scopes) => {
+      const res = await send(appFor(service, scopes), method, path);
+      expect(res.status).toBe(403);
+      expect(res.body.success).toBe(false);
+      expectServiceUntouched(service);
     });
 
-    it('refuses a user with no ADB proxy scope', async () => {
-      const app = appFor(service, ['core.devices:read']);
-      expect((await request(app).get('/v1/adb-proxy/status')).status).toBe(403);
+    it.each(READS)('lets a read-only user through on %s %s', async (method, path) => {
+      expect((await send(appFor(service, READ), method, path)).status).toBe(200);
     });
   });
 
@@ -295,6 +299,38 @@ describe('ADB proxy API', () => {
       expect(service.setDevice).not.toHaveBeenCalled();
       expect((await send(app, 'patch', `/v1/adb-proxy/devices/${at(128)}`, { enabled: true })).status).toBe(200);
       expect(service.setDevice).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('adbProxyBroadcast', () => {
+    beforeEach(() => {
+      clearEndpoints();
+      __resetChannelRegistryForTest();
+    });
+
+    it('drops the message while the channel is not registered, since an unregistered type reaches every client', () => {
+      const send = vi.fn();
+      adbProxyBroadcast(send)({ type: ADB_PROXY_CHANNEL, pending: [] });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('forwards the message untouched once the endpoints have registered the channel', () => {
+      const send = vi.fn();
+      const broadcast = adbProxyBroadcast(send);
+      registerAdbProxyEndpoints(service as unknown as AdbProxyService);
+      const message = { type: ADB_PROXY_CHANNEL, pending: [] };
+      broadcast(message);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0][0]).toBe(message);
+    });
+
+    it('drops again if the channel registration is lost', () => {
+      const send = vi.fn();
+      const broadcast = adbProxyBroadcast(send);
+      registerAdbProxyEndpoints(service as unknown as AdbProxyService);
+      __resetChannelRegistryForTest();
+      broadcast({ type: ADB_PROXY_CHANNEL });
+      expect(send).not.toHaveBeenCalled();
     });
   });
 });

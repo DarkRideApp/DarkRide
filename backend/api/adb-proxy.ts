@@ -1,6 +1,6 @@
 import type { Request, Response } from 'express';
 import { registerEndpoint } from './api-service';
-import { registerFilteredChannel } from '../websocket/channel-registry';
+import { isFilteredChannel, registerFilteredChannel } from '../websocket/channel-registry';
 import { SettingsError, type AdbProxySettings } from '../services/adb-proxy/settings';
 import type { AdbProxyService } from '../services/adb-proxy/adb-proxy-service';
 
@@ -65,6 +65,13 @@ function keyId(req: Request, res: Response): number | null {
 }
 
 type Handler = (req: Request, res: Response, userId: number) => void | Promise<void>;
+
+/** The broadcast handed to the service: a message whose channel is not registered would go to every client, so it is dropped. */
+export function adbProxyBroadcast(send: (message: Record<string, unknown>) => void): (message: Record<string, unknown>) => void {
+  return (message) => {
+    if (isFilteredChannel(ADB_PROXY_CHANNEL)) send(message);
+  };
+}
 
 export function registerAdbProxyEndpoints(service: AdbProxyService): void {
   registerFilteredChannel(ADB_PROXY_CHANNEL, { requires: READ });
