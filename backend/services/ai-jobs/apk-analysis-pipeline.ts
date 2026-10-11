@@ -1,4 +1,4 @@
-import { eq, and } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import type { PipelineGraph, Envelope } from './types';
 import type { NodeExecutors, ExecutionCtx } from './pipeline-runner';
 import { TRIGGER_REGISTRY } from './nodes/trigger';
@@ -12,7 +12,7 @@ import type { AiAgentFactory } from '../ai-agent-factory';
 import type { AppDatabase } from '../../db/index';
 import { aiPipelines, aiPipelineVersions } from '../../db/schema';
 
-const PIPELINE_NAME = 'Astérix pattern';
+const PIPELINE_NAME = 'APK Analysis';
 const PIPELINE_JOB_KIND = 'apk-analysis';
 
 const APK_CONTEXT_SCHEMA = [
@@ -56,18 +56,18 @@ const GROUP_B_TOOLS = ['search_apk_code', 'get_apk_strings', 'find_api_endpoints
  */
 export const ASTERIX_PATTERN_GRAPH: PipelineGraph = {
   nodes: [
-    { id: 'trigger-full', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
-    { id: 'trigger-rescan', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-full', label: 'Full Analysis', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-rescan', label: 'Quick Rescan', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
 
-    { id: 'agent-overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}. Summarize purpose, framework, permissions and notable SDKs.' } },
-    { id: 'agent-wait-times', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} fetches ride wait times. Search for queue, wait and attraction-status endpoints.' } },
-    { id: 'agent-opening-hours', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} v{{trigger.versionName}} fetches park opening hours and schedule data.' } },
-    { id: 'agent-maps', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Describe the map system in {{trigger.packageName}}: offline tiles, bounds, or a live tile provider.' } },
-    { id: 'agent-secrets', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Document every hardcoded secret, API key and token in {{trigger.packageName}} v{{trigger.versionName}}, with file location.' } },
-    { id: 'agent-curl', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: "Write runnable curl examples for {{trigger.appName}}'s discovered API endpoints, using the real extracted keys." } },
-    { id: 'agent-bypass', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Write a Frida script bypassing SSL pinning in {{trigger.packageName}} v{{trigger.versionName}}.' } },
+    { id: 'agent-overview', label: 'App Overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}. Summarize purpose, framework, permissions and notable SDKs.' } },
+    { id: 'agent-wait-times', label: 'Wait Times Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} fetches ride wait times. Search for queue, wait and attraction-status endpoints.' } },
+    { id: 'agent-opening-hours', label: 'Opening Hours Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} v{{trigger.versionName}} fetches park opening hours and schedule data.' } },
+    { id: 'agent-maps', label: 'Maps Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Describe the map system in {{trigger.packageName}}: offline tiles, bounds, or a live tile provider.' } },
+    { id: 'agent-secrets', label: 'Secrets Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Document every hardcoded secret, API key and token in {{trigger.packageName}} v{{trigger.versionName}}, with file location.' } },
+    { id: 'agent-curl', label: 'cURL Examples Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: "Write runnable curl examples for {{trigger.appName}}'s discovered API endpoints, using the real extracted keys." } },
+    { id: 'agent-bypass', label: 'SSL Bypass Script', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Write a Frida script bypassing SSL pinning in {{trigger.packageName}} v{{trigger.versionName}}.' } },
 
-    { id: 'report', config: { kind: 'Report', sections: [
+    { id: 'report', label: 'Full Report', config: { kind: 'Report', sections: [
       { title: 'Overview', from: 'agent-overview' },
       { title: 'Wait Times', from: 'agent-wait-times' },
       { title: 'Opening Hours', from: 'agent-opening-hours' },
@@ -77,12 +77,11 @@ export const ASTERIX_PATTERN_GRAPH: PipelineGraph = {
       { title: 'Bypass Script', from: 'agent-bypass' },
     ] } },
     // Both Sinks declare `from` — the executor wraps even a single predecessor's output by its
-    // node id (Tasks 13-17), so a write function needs to be told which key to unwrap. See the
-    // SDD pre-flight fix to SinkConfig (Task 2) and sink.ts (Task 11).
-    { id: 'sink-report', config: { kind: 'Sink', writeFn: 'apk-analysis/write-full-document', from: 'report' } },
+    // node id, so a write function needs to be told which key to unwrap.
+    { id: 'sink-report', label: 'Save Full Report', config: { kind: 'Sink', writeFn: 'apk-analysis/write-full-document', from: 'report' } },
 
-    { id: 'agent-diff', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: ['get_app_versions', 'search_apk_findings'], instructionTemplate: 'Compare {{trigger.appName}} v{{trigger.versionName}} against the previously analyzed version. Summarize what changed — new endpoints, new permissions, new SDKs.' } },
-    { id: 'sink-diff', config: { kind: 'Sink', writeFn: 'apk-analysis/write-section', from: 'agent-diff', section: 'Diff Summary' } },
+    { id: 'agent-diff', label: 'Version Diff', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: ['get_app_versions', 'search_apk_findings'], instructionTemplate: 'Compare {{trigger.appName}} v{{trigger.versionName}} against the previously analyzed version. Summarize what changed — new endpoints, new permissions, new SDKs.' } },
+    { id: 'sink-diff', label: 'Save Diff Summary', config: { kind: 'Sink', writeFn: 'apk-analysis/write-section', from: 'agent-diff', section: 'Diff Summary' } },
   ],
   edges: [
     ...['agent-overview', 'agent-wait-times', 'agent-opening-hours', 'agent-maps', 'agent-secrets', 'agent-curl', 'agent-bypass']
@@ -144,16 +143,17 @@ export function buildApkAnalysisExecutionCtx(
   };
 }
 
-/**
- * Seeds the Astérix pattern pipeline + its published version at server boot. Idempotent: checks
- * for an existing `aiPipelines` row with `jobKind: 'apk-analysis'` and name `'Astérix pattern'`
- * before inserting, so restarting the server never creates duplicate pipelines or versions.
- */
+/** Idempotent: matches the existing row by `jobKind` alone and patches `name` if it drifted, so restarts never duplicate it. */
 export function seedApkAnalysisPipeline(db: AppDatabase): void {
   const existing = db.select().from(aiPipelines)
-    .where(and(eq(aiPipelines.jobKind, PIPELINE_JOB_KIND), eq(aiPipelines.name, PIPELINE_NAME)))
+    .where(eq(aiPipelines.jobKind, PIPELINE_JOB_KIND))
     .all()[0];
-  if (existing) return;
+  if (existing) {
+    if (existing.name !== PIPELINE_NAME) {
+      db.update(aiPipelines).set({ name: PIPELINE_NAME }).where(eq(aiPipelines.id, existing.id)).run();
+    }
+    return;
+  }
 
   const now = new Date();
   const pipelineId = db.insert(aiPipelines).values({

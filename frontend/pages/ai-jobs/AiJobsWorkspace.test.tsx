@@ -27,15 +27,15 @@ afterEach(() => {
 describe('AiJobsWorkspace', () => {
   it('renders the Trigger, AgentCall, Report and Sink nodes from the fetched pipeline', async () => {
     const ws = createMockWs({ pipelineVersion: mockPipelineVersion() });
-    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
 
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
-    // The Report node's rendered section titles — from the real ASTERIX_PATTERN_GRAPH
-    // (Task 20), not an invented "Assemble notes" label (that string appears nowhere in the
-    // real pipeline; the Report node's id is `report` and its sections are titled
-    // Overview/Wait Times/Opening Hours/Maps/Secrets/cURL Examples/Bypass Script).
+    // The Report node's rendered section titles — from the real ASTERIX_PATTERN_GRAPH, not an
+    // invented "Assemble notes" label (that string appears nowhere in the real pipeline; the
+    // Report node's id is `report` and its sections are titled Overview/Wait Times/Opening
+    // Hours/Maps/Secrets/cURL Examples/Bypass Script).
     expect(screen.getByText('Wait Times')).toBeInTheDocument();
-    expect(screen.getAllByText(/AGENTCALL/i).length).toBeGreaterThanOrEqual(7);
+    expect(screen.getAllByText('Agent Call').length).toBeGreaterThanOrEqual(7);
   });
 
   it('Run POSTs .../run with the selected APK versionId, polls GET .../runs/:runId until it settles, and applies node status styling', async () => {
@@ -65,7 +65,7 @@ describe('AiJobsWorkspace', () => {
         },
       },
     });
-    render(<AiJobsWorkspace pollIntervalMs={0} />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} pollIntervalMs={0} />, { wrapper: withProviders(ws) });
 
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
     await waitFor(() => expect((screen.getByLabelText('APK version') as HTMLSelectElement).value).toBe(String(RECENT_VERSIONS_FIXTURE[0].id)));
@@ -103,7 +103,7 @@ describe('AiJobsWorkspace', () => {
         'GET /v1/ai-pipelines/runs/8': () => ({ success: true, data: { run: { id: 8, status: 'ok' }, nodes: [] } }),
       },
     });
-    render(<AiJobsWorkspace pollIntervalMs={0} />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} pollIntervalMs={0} />, { wrapper: withProviders(ws) });
 
     await waitFor(() => expect(screen.getByRole('option', { name: /v11\.0 \(#41\)/ })).toBeInTheDocument());
     fireEvent.change(screen.getByLabelText('APK version'), { target: { value: '41' } });
@@ -120,7 +120,7 @@ describe('AiJobsWorkspace', () => {
         'POST /v1/ai-pipelines/1/run': () => ({ success: false, error: 'A run is already running for this pipeline version (run 3)' }),
       },
     });
-    render(<AiJobsWorkspace pollIntervalMs={0} />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} pollIntervalMs={0} />, { wrapper: withProviders(ws) });
 
     await waitFor(() => expect((screen.getByLabelText('APK version') as HTMLSelectElement).value).toBe('42'));
     fireEvent.click(screen.getByRole('button', { name: 'Run' }));
@@ -131,7 +131,7 @@ describe('AiJobsWorkspace', () => {
 
   it('does not POST a run when there is no APK version to run against', async () => {
     const ws = createMockWs({ routes: { 'GET /v1/apps/recent': () => ({ success: true, data: [] }) } });
-    render(<AiJobsWorkspace pollIntervalMs={0} />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} pollIntervalMs={0} />, { wrapper: withProviders(ws) });
 
     await waitFor(() => expect(screen.getByRole('option', { name: 'No analyzed APK versions yet' })).toBeInTheDocument());
     fireEvent.click(screen.getByRole('button', { name: 'Run' }));
@@ -142,7 +142,7 @@ describe('AiJobsWorkspace', () => {
 
   it('switching to a different node shows that node\'s own prompt, not the previous one (I7)', async () => {
     const ws = createMockWs();
-    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('agent-overview')).toBeInTheDocument());
 
     fireEvent.click(screen.getByText('agent-overview'));
@@ -164,66 +164,38 @@ describe('AiJobsWorkspace', () => {
     expect((mapsAgain.querySelector('textarea') as HTMLTextAreaElement).value).toBe('maps prompt edited');
   });
 
-  it('lists every pipeline in the switcher and switching renders the chosen one\'s graph', async () => {
-    const otherGraph: PipelineGraph = {
-      nodes: [{ id: 'trigger-x', config: { kind: 'Trigger', expandFn: 'custom/expand', outputSchema: [] } }],
-      edges: [],
-    };
-    const ws = createMockWs({
-      pipelines: [
-        { id: 1, name: 'Astérix APK analysis', jobKind: 'apk-analysis', pipelineVersionId: 1, graph: mockPipelineVersion().graph },
-        { id: 2, name: 'My New Pipeline', jobKind: 'custom', pipelineVersionId: 2, graph: otherGraph },
-      ],
-    });
-    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
-    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
-
-    const picker = screen.getByLabelText('Pipeline') as HTMLSelectElement;
-    const optionTexts = Array.from(picker.options).map(o => o.textContent);
-    expect(optionTexts.some(t => t?.includes('Astérix APK analysis'))).toBe(true);
-    expect(optionTexts.some(t => t?.includes('My New Pipeline'))).toBe(true);
-
-    fireEvent.change(picker, { target: { value: '2' } });
-    // "trigger-x" appears twice once switched — the canvas node label AND the Entry point
-    // picker's option for that pipeline's one Trigger — so assert presence via getAllByText.
-    await waitFor(() => expect(screen.getAllByText('trigger-x').length).toBeGreaterThan(0));
-    expect(screen.queryByText('Overview')).not.toBeInTheDocument();
+  it('shows the pipeline\'s name in the toolbar, fetched from the single-pipeline endpoint', async () => {
+    const ws = createMockWs({ pipelines: [{ id: 1, name: 'My APK Pipeline', jobKind: 'apk-analysis', pipelineVersionId: 1, graph: mockPipelineVersion().graph }] });
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('My APK Pipeline')).toBeInTheDocument());
+    expect(calledPaths(ws)).toContain('GET /v1/ai-pipelines/1');
   });
 
-  it('creating a new pipeline POSTs it with an empty graph and selects it', async () => {
-    const ws = createMockWs({ routes: { 'POST /v1/ai-pipelines': () => ({ success: true, data: { id: 9 } }) } });
-    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
-    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole('button', { name: /new pipeline/i }));
-    fireEvent.change(screen.getByLabelText('New pipeline name'), { target: { value: 'My Pipeline' } });
-    fireEvent.change(screen.getByLabelText('New pipeline job kind'), { target: { value: 'custom-thing' } });
-    fireEvent.click(screen.getByRole('button', { name: /^create$/i }));
-
-    await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines'));
-    expect(postBody(ws, 'POST /v1/ai-pipelines')).toEqual({ name: 'My Pipeline', jobKind: 'custom-thing', graph: { nodes: [], edges: [] } });
-    await waitFor(() => expect((screen.getByLabelText('Pipeline') as HTMLSelectElement).value).toBe('9'));
-    // A brand new pipeline has an empty graph (zero nodes) but is still open for editing —
-    // the old pipeline's nodes are gone (Canvas resyncs its internal state in its own effect,
-    // one tick behind the graph prop) and the node-adding controls are present.
-    await waitFor(() => expect(screen.queryByText('Overview')).not.toBeInTheDocument());
-    expect(screen.getByLabelText('Node kind to add')).toBeInTheDocument();
-  });
-
-  it('adding a node inserts it into the graph and opens its side panel', async () => {
+  it('adding a node inserts it into the graph and opens its side panel, in one step', async () => {
     const ws = createMockWs();
-    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
-    fireEvent.change(screen.getByLabelText('Node kind to add'), { target: { value: 'AgentCall' } });
-    fireEvent.click(screen.getByRole('button', { name: /add node/i }));
+    fireEvent.change(screen.getByLabelText('Add node'), { target: { value: 'AgentCall' } });
 
     await screen.findByRole('dialog', { name: /agent-\d+ details/ });
   });
 
+  it('renaming a node updates its label on the canvas', async () => {
+    const ws = createMockWs();
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('agent-overview')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('agent-overview'));
+    await screen.findByRole('dialog', { name: 'agent-overview details' });
+    fireEvent.change(screen.getByLabelText(/node name/i), { target: { value: 'Overview Agent' } });
+
+    expect(screen.getByText('Overview Agent')).toBeInTheDocument();
+  });
+
   it('deleting the selected node removes it from the graph and closes the panel', async () => {
     const ws = createMockWs();
-    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('agent-overview')).toBeInTheDocument());
 
     fireEvent.click(screen.getByText('agent-overview'));
@@ -236,7 +208,7 @@ describe('AiJobsWorkspace', () => {
 
   it('Save Draft POSTs the current graph as a new version', async () => {
     const ws = createMockWs({ routes: { 'POST /v1/ai-pipelines/1/versions': () => ({ success: true, data: { version: 2 } }) } });
-    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole('button', { name: /save draft/i }));
@@ -247,7 +219,7 @@ describe('AiJobsWorkspace', () => {
 
   it('Publish POSTs to the publish endpoint and reports success', async () => {
     const ws = createMockWs({ routes: { 'POST /v1/ai-pipelines/1/publish': () => ({ success: true }) } });
-    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole('button', { name: /^publish$/i }));
@@ -263,11 +235,55 @@ describe('AiJobsWorkspace', () => {
         }),
       },
     });
-    render(<AiJobsWorkspace />, { wrapper: withProviders(ws) });
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole('button', { name: /^publish$/i }));
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/not reachable from any Trigger/));
+  });
+
+  it('shows "Unsaved changes" after an edit, and "All changes saved" once Save Draft completes', async () => {
+    const ws = createMockWs({ routes: { 'POST /v1/ai-pipelines/1/versions': () => ({ success: true, data: { version: 2 } }) } });
+    // Long debounce so the autosave timer can't fire during this test — Save Draft is the only thing clearing dirty here.
+    render(<AiJobsWorkspace pipelineId={1} autosaveDebounceMs={100000} />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+    expect(screen.getByText('All changes saved')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Add node'), { target: { value: 'AgentCall' } });
+    expect(screen.getByText('Unsaved changes…')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /save draft/i }));
+    await waitFor(() => expect(screen.getByText('All changes saved')).toBeInTheDocument());
+  });
+
+  it('autosaves a draft after edits settle, without clicking Save Draft', async () => {
+    const ws = createMockWs({ routes: { 'POST /v1/ai-pipelines/1/versions': () => ({ success: true, data: { version: 2 } }) } });
+    render(<AiJobsWorkspace pipelineId={1} autosaveDebounceMs={0} />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText('Add node'), { target: { value: 'AgentCall' } });
+
+    await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines/1/versions'));
+    await waitFor(() => expect(screen.getByText('All changes saved')).toBeInTheDocument());
+  });
+
+  it('Publish saves unsaved edits as a draft first, then publishes — "publish" always means the current graph', async () => {
+    const ws = createMockWs({
+      routes: {
+        'POST /v1/ai-pipelines/1/versions': () => ({ success: true, data: { version: 2 } }),
+        'POST /v1/ai-pipelines/1/publish': () => ({ success: true }),
+      },
+    });
+    render(<AiJobsWorkspace pipelineId={1} autosaveDebounceMs={100000} />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText('Add node'), { target: { value: 'AgentCall' } });
+    fireEvent.click(screen.getByRole('button', { name: /^publish$/i }));
+
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/published/i));
+    const paths = calledPaths(ws);
+    expect(paths).toContain('POST /v1/ai-pipelines/1/versions');
+    expect(paths.indexOf('POST /v1/ai-pipelines/1/versions')).toBeLessThan(paths.indexOf('POST /v1/ai-pipelines/1/publish'));
   });
 });
 

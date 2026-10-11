@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { describe, it, expect } from 'vitest';
 import * as schema from '../../../db/schema';
-import { runSink } from './sink';
+import { runSink, SINK_DESCRIPTIONS, SINK_USES_SECTION } from './sink';
 import { getNote, setNote } from '../../apk-notes';
 
 function makeDb() {
@@ -102,5 +102,14 @@ describe('runSink', () => {
     await runSink({ writeFn: 'apk-analysis/write-full-document' }, {}, { db, versionId: 431 });
     await runSink({ writeFn: 'apk-analysis/write-full-document', from: 'report' }, { report: { markdown: 'x' } }, { db, versionId: 431 });
     expect(getNote(db, 431)).toBe('## Diff Summary\nKeep me.\n');
+  });
+});
+
+describe('SINK_DESCRIPTIONS / SINK_USES_SECTION', () => {
+  it('describes every registered write function and flags which read config.section', () => {
+    expect(SINK_DESCRIPTIONS['apk-analysis/write-full-document']).toBeTruthy();
+    expect(SINK_DESCRIPTIONS['apk-analysis/write-section']).toBeTruthy();
+    expect(SINK_USES_SECTION['apk-analysis/write-full-document']).toBe(false);
+    expect(SINK_USES_SECTION['apk-analysis/write-section']).toBe(true);
   });
 });

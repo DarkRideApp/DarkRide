@@ -143,7 +143,7 @@ describe('GET /v1/ai-pipelines', () => {
     db = makeDb();
   });
 
-  it("includes each pipeline's published version graph inline, not just the bare pipeline row", async () => {
+  it("includes each pipeline's latest version graph inline, not just the bare pipeline row", async () => {
     const pipelineId = seedPipeline(db);
     const v1Graph = graphWithOneTrigger();
     const v2Graph = graphWithTwoTriggers();
@@ -161,7 +161,7 @@ describe('GET /v1/ai-pipelines', () => {
     expect(row.graph).toEqual(v2Graph);
   });
 
-  it('falls back to the latest draft version when no version is published', async () => {
+  it('returns the only version when nothing is published yet', async () => {
     const pipelineId = seedPipeline(db, 'Pipeline B');
     const v1Graph = graphWithOneTrigger();
     const v1Id = seedVersion(db, pipelineId, 1, v1Graph, 'draft');
@@ -173,6 +173,25 @@ describe('GET /v1/ai-pipelines', () => {
     const row = res.body.data.find((r: any) => r.id === pipelineId);
     expect(row.pipelineVersionId).toBe(v1Id);
     expect(row.graph).toEqual(v1Graph);
+  });
+
+  it('returns a newer unpublished draft over an older published version — a reload must never look like it discarded unsaved work', async () => {
+    // Regression guard: this endpoint used to prefer "published" over "latest," so editing a
+    // pipeline, autosaving a draft, then reloading the editor would show the stale published
+    // graph instead of the draft just saved — indistinguishable from the edit having been lost.
+    const pipelineId = seedPipeline(db, 'Pipeline D');
+    const publishedGraph = graphWithOneTrigger();
+    seedVersion(db, pipelineId, 1, publishedGraph, 'published');
+    const draftGraph = graphWithTwoTriggers();
+    const draftId = seedVersion(db, pipelineId, 2, draftGraph, 'draft');
+
+    const app = createApp(db, fakeExecutors());
+    const res = await request(app).get('/v1/ai-pipelines');
+
+    expect(res.status).toBe(200);
+    const row = res.body.data.find((r: any) => r.id === pipelineId);
+    expect(row.pipelineVersionId).toBe(draftId);
+    expect(row.graph).toEqual(draftGraph);
   });
 
   it('after publishing v2, returns v2\'s graph — not v1\'s — because publish demotes the prior published version', async () => {
@@ -202,6 +221,102 @@ describe('GET /v1/ai-pipelines', () => {
     // Exactly one version should be 'published' at a time.
     const versions = db.select().from(schema.aiPipelineVersions).where(eq(schema.aiPipelineVersions.pipelineId, pipelineId)).all();
     expect(versions.filter(v => v.status === 'published').length).toBe(1);
+  });
+});
+
+describe('GET /v1/ai-pipelines/:id', () => {
+  let db: Db;
+
+  beforeEach(() => {
+    db = makeDb();
+  });
+
+  it("returns the one pipeline's row with its latest version graph inlined", async () => {
+    const pipelineId = seedPipeline(db, 'Solo Pipeline');
+    const graph = graphWithOneTrigger();
+    const versionId = seedVersion(db, pipelineId, 1, graph, 'published');
+
+    const app = createApp(db, fakeExecutors());
+    const res = await request(app).get(`/v1/ai-pipelines/${pipelineId}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.id).toBe(pipelineId);
+    expect(res.body.data.name).toBe('Solo Pipeline');
+    expect(res.body.data.pipelineVersionId).toBe(versionId);
+    expect(res.body.data.graph).toEqual(graph);
+  });
+
+  it('returns a newer unpublished draft over an older published version, same as the list endpoint', async () => {
+    const pipelineId = seedPipeline(db, 'Solo Pipeline');
+    seedVersion(db, pipelineId, 1, graphWithOneTrigger(), 'published');
+    const draftGraph = graphWithTwoTriggers();
+    const draftId = seedVersion(db, pipelineId, 2, draftGraph, 'draft');
+
+    const app = createApp(db, fakeExecutors());
+    const res = await request(app).get(`/v1/ai-pipelines/${pipelineId}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.pipelineVersionId).toBe(draftId);
+    expect(res.body.data.graph).toEqual(draftGraph);
+  });
+
+  it('404s on an id with no pipeline', async () => {
+    const app = createApp(db, fakeExecutors());
+    const res = await request(app).get('/v1/ai-pipelines/999999');
+    expect(res.status).toBe(404);
+    expect(res.body.success).toBe(false);
+  });
+});
+
+describe('POST /v1/ai-pipelines/:id/versions', () => {
+  let db: Db;
+
+  beforeEach(() => {
+    db = makeDb();
+  });
+
+  it('creates version 1 when the pipeline has no versions yet', async () => {
+    const pipelineId = seedPipeline(db);
+    const app = createApp(db, fakeExecutors());
+
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/versions`).send({ graph: graphWithOneTrigger() });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.version).toBe(1);
+    const versions = db.select().from(schema.aiPipelineVersions).where(eq(schema.aiPipelineVersions.pipelineId, pipelineId)).all();
+    expect(versions).toHaveLength(1);
+    expect(versions[0].status).toBe('draft');
+  });
+
+  it('overwrites the latest version in place while it is still a draft, instead of inserting a new row', async () => {
+    const pipelineId = seedPipeline(db);
+    seedVersion(db, pipelineId, 1, graphWithOneTrigger(), 'draft');
+    const app = createApp(db, fakeExecutors());
+
+    const secondGraph = graphWithTwoTriggers();
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/versions`).send({ graph: secondGraph });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.version).toBe(1);
+    const versions = db.select().from(schema.aiPipelineVersions).where(eq(schema.aiPipelineVersions.pipelineId, pipelineId)).all();
+    expect(versions).toHaveLength(1);
+    expect(versions[0].graph).toEqual(secondGraph);
+  });
+
+  it('inserts a new version when the latest version is already published', async () => {
+    const pipelineId = seedPipeline(db);
+    seedVersion(db, pipelineId, 1, graphWithOneTrigger(), 'published');
+    const app = createApp(db, fakeExecutors());
+
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/versions`).send({ graph: graphWithTwoTriggers() });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.version).toBe(2);
+    const versions = db.select().from(schema.aiPipelineVersions).where(eq(schema.aiPipelineVersions.pipelineId, pipelineId)).all();
+    expect(versions).toHaveLength(2);
+    expect(versions.find(v => v.version === 1)!.status).toBe('published');
+    expect(versions.find(v => v.version === 2)!.status).toBe('draft');
   });
 });
 

@@ -10,14 +10,14 @@ import { WebSocketContext, ToastProvider } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
-// ── Fixture: the real Astérix pattern graph ─────────────────────────────────
+// ── Fixture: the real apk-analysis graph ────────────────────────────────────
 //
 // Copied verbatim from backend/services/ai-jobs/apk-analysis-pipeline.ts's
-// ASTERIX_PATTERN_GRAPH (Task 20) rather than inventing a smaller graph, so this
-// fixture — and every test built on it — exercises the real shape the backend
-// actually serves: 2 Trigger nodes, 8 AgentCall nodes, 1 Report node (7 sections),
-// 2 Sink nodes. Duplicated here (not imported) because this is frontend test
-// support and must not pull backend runtime code into the frontend test bundle.
+// ASTERIX_PATTERN_GRAPH rather than inventing a smaller graph, so this fixture —
+// and every test built on it — exercises the real shape the backend actually
+// serves: 2 Trigger nodes, 8 AgentCall nodes, 1 Report node (7 sections), 2 Sink
+// nodes. Duplicated here (not imported) because this is frontend test support
+// and must not pull backend runtime code into the frontend test bundle.
 
 const APK_CONTEXT_SCHEMA = [
   { field: 'appName', type: 'string', description: 'Display name' },
@@ -34,18 +34,18 @@ const GROUP_B_TOOLS = ['search_apk_code', 'get_apk_strings', 'find_api_endpoints
 
 const ASTERIX_PATTERN_GRAPH_FIXTURE: PipelineGraph = {
   nodes: [
-    { id: 'trigger-full', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
-    { id: 'trigger-rescan', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-full', label: 'Full Analysis', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
+    { id: 'trigger-rescan', label: 'Quick Rescan', config: { kind: 'Trigger', expandFn: 'apk-analysis/apk-context', outputSchema: APK_CONTEXT_SCHEMA } },
 
-    { id: 'agent-overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}. Summarize purpose, framework, permissions and notable SDKs.' } },
-    { id: 'agent-wait-times', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} fetches ride wait times. Search for queue, wait and attraction-status endpoints.' } },
-    { id: 'agent-opening-hours', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} v{{trigger.versionName}} fetches park opening hours and schedule data.' } },
-    { id: 'agent-maps', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Describe the map system in {{trigger.packageName}}: offline tiles, bounds, or a live tile provider.' } },
-    { id: 'agent-secrets', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Document every hardcoded secret, API key and token in {{trigger.packageName}} v{{trigger.versionName}}, with file location.' } },
-    { id: 'agent-curl', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: "Write runnable curl examples for {{trigger.appName}}'s discovered API endpoints, using the real extracted keys." } },
-    { id: 'agent-bypass', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Write a Frida script bypassing SSL pinning in {{trigger.packageName}} v{{trigger.versionName}}.' } },
+    { id: 'agent-overview', label: 'App Overview', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Analyze {{trigger.appName}} ({{trigger.packageName}}) version {{trigger.versionName}}. Summarize purpose, framework, permissions and notable SDKs.' } },
+    { id: 'agent-wait-times', label: 'Wait Times Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} fetches ride wait times. Search for queue, wait and attraction-status endpoints.' } },
+    { id: 'agent-opening-hours', label: 'Opening Hours Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Find how {{trigger.appName}} v{{trigger.versionName}} fetches park opening hours and schedule data.' } },
+    { id: 'agent-maps', label: 'Maps Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_A_TOOLS, instructionTemplate: 'Describe the map system in {{trigger.packageName}}: offline tiles, bounds, or a live tile provider.' } },
+    { id: 'agent-secrets', label: 'Secrets Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Document every hardcoded secret, API key and token in {{trigger.packageName}} v{{trigger.versionName}}, with file location.' } },
+    { id: 'agent-curl', label: 'cURL Examples Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: "Write runnable curl examples for {{trigger.appName}}'s discovered API endpoints, using the real extracted keys." } },
+    { id: 'agent-bypass', label: 'SSL Bypass Script', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: GROUP_B_TOOLS, instructionTemplate: 'Write a Frida script bypassing SSL pinning in {{trigger.packageName}} v{{trigger.versionName}}.' } },
 
-    { id: 'report', config: { kind: 'Report', sections: [
+    { id: 'report', label: 'Full Report', config: { kind: 'Report', sections: [
       { title: 'Overview', from: 'agent-overview' },
       { title: 'Wait Times', from: 'agent-wait-times' },
       { title: 'Opening Hours', from: 'agent-opening-hours' },
@@ -54,10 +54,10 @@ const ASTERIX_PATTERN_GRAPH_FIXTURE: PipelineGraph = {
       { title: 'cURL Examples', from: 'agent-curl' },
       { title: 'Bypass Script', from: 'agent-bypass' },
     ] } },
-    { id: 'sink-report', config: { kind: 'Sink', writeFn: 'apk-analysis/write-full-document', from: 'report' } },
+    { id: 'sink-report', label: 'Save Full Report', config: { kind: 'Sink', writeFn: 'apk-analysis/write-full-document', from: 'report' } },
 
-    { id: 'agent-diff', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: ['get_app_versions', 'search_apk_findings'], instructionTemplate: 'Compare {{trigger.appName}} v{{trigger.versionName}} against the previously analyzed version. Summarize what changed — new endpoints, new permissions, new SDKs.' } },
-    { id: 'sink-diff', config: { kind: 'Sink', writeFn: 'apk-analysis/write-section', from: 'agent-diff', section: 'Diff Summary' } },
+    { id: 'agent-diff', label: 'Version Diff', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: ['get_app_versions', 'search_apk_findings'], instructionTemplate: 'Compare {{trigger.appName}} v{{trigger.versionName}} against the previously analyzed version. Summarize what changed — new endpoints, new permissions, new SDKs.' } },
+    { id: 'sink-diff', label: 'Save Diff Summary', config: { kind: 'Sink', writeFn: 'apk-analysis/write-section', from: 'agent-diff', section: 'Diff Summary' } },
   ],
   edges: [
     ...['agent-overview', 'agent-wait-times', 'agent-opening-hours', 'agent-maps', 'agent-secrets', 'agent-curl', 'agent-bypass']
@@ -118,11 +118,17 @@ export function createMockWs(over: Partial<MockApiState> = {}): WebSocketContext
     const custom = state.routes[key];
     if (custom) return envelope(await custom(body));
 
+    const pipelines = state.pipelines ?? [{ id: 1, jobKind: 'apk-analysis', pipelineVersionId: 1, graph: state.pipelineVersion.graph }];
     if (key === 'GET /v1/ai-pipelines') {
       // Matches backend/api/ai-pipelines.ts's real GET handler: an array under `data`, each
       // row carrying jobKind, pipelineVersionId and the published version's graph inlined.
-      const pipelines = state.pipelines ?? [{ id: 1, jobKind: 'apk-analysis', pipelineVersionId: 1, graph: state.pipelineVersion.graph }];
       return envelope({ success: true, data: pipelines });
+    }
+    const singlePipelineMatch = key.match(/^GET \/v1\/ai-pipelines\/(\d+)$/);
+    if (singlePipelineMatch) {
+      const row = pipelines.find(p => p.id === Number(singlePipelineMatch[1]));
+      if (!row) return envelope({ success: false, error: `No pipeline with id ${singlePipelineMatch[1]}.` }, 404);
+      return envelope({ success: true, data: row });
     }
     if (key === 'GET /v1/apps/recent') {
       return envelope({ success: true, data: RECENT_VERSIONS_FIXTURE });

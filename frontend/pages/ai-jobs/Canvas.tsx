@@ -6,6 +6,7 @@ import {
 import '@xyflow/react/dist/style.css';
 // Type-only import — erased at build, no runtime coupling to backend code.
 import type { PipelineGraph, PipelineNode } from '../../../backend/services/ai-jobs/types';
+import { nodeKindLabel } from './nodeKindLabels';
 
 const KIND_COLOR: Record<string, string> = {
   Trigger: '#2dd4bf', AgentCall: '#4d8eff', Transform: '#a78bfa',
@@ -29,16 +30,17 @@ function statusFor(nodeId: string, nodeStatuses?: Record<string, { status: strin
 }
 
 /**
- * Node label content. Every node shows its kind + id. A Report node additionally lists its
- * section titles as separate lines, so a read-only viewer can see the report's outline without
- * opening an inspector — this is also what lets tests assert against the real section titles
- * (Overview, Wait Times, …) instead of an opaque node id.
+ * Node label content: the user-facing name first, then kind + id as muted metadata. A Report
+ * node additionally lists its section titles as separate lines, so a read-only viewer can see
+ * the report's outline without opening an inspector.
  */
 function NodeLabel({ node }: { node: PipelineNode }) {
+  const kind = nodeKindLabel(node.config.kind);
   return (
     <div>
-      <div>{node.config.kind}</div>
-      <div>{node.id}</div>
+      <div className="ai-jobs-node-label">{node.label ?? kind}</div>
+      {node.label && <div className="ai-jobs-node-meta">{kind}</div>}
+      <div className="ai-jobs-node-meta">{node.id}</div>
       {node.config.kind === 'Report' && node.config.sections.map((s) => (
         <div key={s.title}>{s.title}</div>
       ))}

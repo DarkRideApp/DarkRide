@@ -14,14 +14,14 @@ const emptyGraph: PipelineGraph = { nodes: [agentNode], edges: [] };
 describe('SidePanel — AgentCall', () => {
   it('shows the instruction template in an editable textarea', () => {
     render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
-    expect(screen.getByRole('textbox')).toHaveValue('Analyze {{trigger.appName}}.');
+    expect(screen.getByRole('textbox', { name: /instruction template/i })).toHaveValue('Analyze {{trigger.appName}}.');
   });
 
   it('inserting a variable chip with no prior focus appends it at the end, not the start', () => {
     const onSave = vi.fn();
     render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
     fireEvent.click(screen.getByRole('button', { name: /trigger\.appName/i }));
-    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+    const textarea = screen.getByRole('textbox', { name: /instruction template/i }) as HTMLTextAreaElement;
     expect(textarea.value).toBe('Analyze {{trigger.appName}}.{{trigger.appName}}');
     expect(onSave).toHaveBeenCalledWith('agent-overview', { instructionTemplate: 'Analyze {{trigger.appName}}.{{trigger.appName}}' });
   });
@@ -29,7 +29,7 @@ describe('SidePanel — AgentCall', () => {
   it('inserting a variable chip while the textarea is focused inserts at the real cursor position', () => {
     const onSave = vi.fn();
     render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+    const textarea = screen.getByRole('textbox', { name: /instruction template/i }) as HTMLTextAreaElement;
     textarea.focus();
     textarea.setSelectionRange(8, 8);
     fireEvent.click(screen.getByRole('button', { name: /trigger\.appName/i }));
@@ -56,6 +56,25 @@ describe('SidePanel — AgentCall', () => {
     render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} onDeleteNode={onDeleteNode} />);
     fireEvent.click(screen.getByRole('button', { name: /delete node/i }));
     expect(onDeleteNode).toHaveBeenCalledWith('agent-overview');
+  });
+
+  it('shows the node kind and id as metadata, and the name field defaulting to the kind label when unset', () => {
+    render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getByLabelText(/node name/i)).toHaveValue('Agent Call');
+    expect(screen.getByText(/agent-overview/)).toBeInTheDocument();
+  });
+
+  it('renaming calls onRename with the node id and new name', () => {
+    const onRename = vi.fn();
+    render(<SidePanel node={agentNode} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} onRename={onRename} />);
+    fireEvent.change(screen.getByLabelText(/node name/i), { target: { value: 'Overview Agent' } });
+    expect(onRename).toHaveBeenCalledWith('agent-overview', 'Overview Agent');
+  });
+
+  it('shows an existing label as the name field value instead of the kind default', () => {
+    const named = { ...agentNode, label: 'Overview Agent' };
+    render(<SidePanel node={named} graph={emptyGraph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getByLabelText(/node name/i)).toHaveValue('Overview Agent');
   });
 });
 
@@ -114,11 +133,28 @@ describe('SidePanel — Sink', () => {
     expect(fromSelect.value).toBe('report');
   });
 
-  it('switching write function to write-section reveals the section-title field', () => {
+  it('switching write function to write-section calls onSave with the new writeFn', () => {
     const onSave = vi.fn();
     render(<SidePanel node={sinkNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
     fireEvent.change(screen.getByLabelText(/write function/i), { target: { value: 'apk-analysis/write-section' } });
     expect(onSave).toHaveBeenCalledWith('sink-report', expect.objectContaining({ writeFn: 'apk-analysis/write-section' }));
+  });
+
+  it('hides the Section title field for write-full-document (it only reads from)', () => {
+    render(<SidePanel node={sinkNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.queryByLabelText(/section title/i)).not.toBeInTheDocument();
+  });
+
+  it('shows the Section title field for write-section, with a description of its destination', () => {
+    const diffNode = { id: 'sink-diff', config: { kind: 'Sink' as const, writeFn: 'apk-analysis/write-section', from: 'report', section: 'Diff Summary' } };
+    render(<SidePanel node={diffNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getByLabelText(/section title/i)).toHaveValue('Diff Summary');
+    expect(screen.getByText(/writes the connected step's output into one named section/i)).toBeInTheDocument();
+  });
+
+  it('describes where write-full-document\'s output lands', () => {
+    render(<SidePanel node={sinkNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getByText(/writes every section from the connected report/i)).toBeInTheDocument();
   });
 });
 
@@ -177,7 +213,7 @@ describe('SidePanel — Transform / Branch / ForEach (unregistered primitives)',
     const node = { id: 'transform-1', config: { kind: 'Transform' as const, fn: '' } };
     const onSave = vi.fn();
     render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'my/fn' } });
+    fireEvent.change(screen.getByRole('textbox', { name: /transform function/i }), { target: { value: 'my/fn' } });
     expect(onSave).toHaveBeenCalledWith('transform-1', { fn: 'my/fn' });
     expect(screen.getByText(/no transform functions are registered/i)).toBeInTheDocument();
   });
@@ -195,7 +231,7 @@ describe('SidePanel — Transform / Branch / ForEach (unregistered primitives)',
     const node = { id: 'foreach-1', config: { kind: 'ForEach' as const, itemFn: '' } };
     const onSave = vi.fn();
     render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'my/item-fn' } });
+    fireEvent.change(screen.getByRole('textbox', { name: /per-item function/i }), { target: { value: 'my/item-fn' } });
     expect(onSave).toHaveBeenCalledWith('foreach-1', { itemFn: 'my/item-fn' });
     expect(screen.getByText(/no foreach item functions are registered/i)).toBeInTheDocument();
   });

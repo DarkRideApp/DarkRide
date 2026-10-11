@@ -4,6 +4,7 @@
  * transitions are plain, fully unit-testable data transforms.
  */
 import type { NodeConfig, NodeKind, PipelineGraph, PipelineNode } from '../../../backend/services/ai-jobs/types';
+import { NODE_KIND_LABELS } from './nodeKindLabels';
 
 const ID_PREFIX: Record<NodeKind, string> = {
   Trigger: 'trigger', AgentCall: 'agent', Transform: 'transform',
@@ -36,8 +37,14 @@ export function addNode(
   position: { x: number; y: number },
 ): { graph: PipelineGraph; newNodeId: string } {
   const newNodeId = nextNodeId(graph, kind);
-  const node: PipelineNode = { id: newNodeId, config: defaultConfigFor(kind), position };
+  const node: PipelineNode = { id: newNodeId, config: defaultConfigFor(kind), position, label: NODE_KIND_LABELS[kind] };
   return { graph: { ...graph, nodes: [...graph.nodes, node] }, newNodeId };
+}
+
+/** Blank input clears the label back to the kind's default display. */
+export function renameNode(graph: PipelineGraph, nodeId: string, label: string): PipelineGraph {
+  const trimmed = label.trim();
+  return { ...graph, nodes: graph.nodes.map(n => n.id === nodeId ? { ...n, label: trimmed === '' ? undefined : trimmed } : n) };
 }
 
 export function deleteNode(graph: PipelineGraph, nodeId: string): PipelineGraph {

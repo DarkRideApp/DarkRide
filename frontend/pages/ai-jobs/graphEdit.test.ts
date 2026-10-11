@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { addNode, deleteNode, addEdge, deleteEdge, moveNode, defaultConfigFor, nextNodeId } from './graphEdit';
+import { addNode, deleteNode, addEdge, deleteEdge, moveNode, renameNode, defaultConfigFor, nextNodeId } from './graphEdit';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
 const baseGraph: PipelineGraph = {
@@ -48,6 +48,11 @@ describe('addNode', () => {
     expect(added.position).toEqual({ x: 10, y: 20 });
     // Original untouched (pure function).
     expect(baseGraph.nodes).toHaveLength(3);
+  });
+
+  it('defaults the new node label to its kind\'s display name, not its id', () => {
+    const { graph, newNodeId } = addNode(baseGraph, 'AgentCall', { x: 0, y: 0 });
+    expect(graph.nodes.find(n => n.id === newNodeId)!.label).toBe('Agent Call');
   });
 });
 
@@ -101,5 +106,31 @@ describe('moveNode', () => {
     const moved = graph.nodes.find(n => n.id === 'agent-overview')!;
     expect(moved.position).toEqual({ x: 99, y: 100 });
     expect(graph.nodes.find(n => n.id === 'trigger-full')!.position).toBeUndefined();
+  });
+});
+
+describe('renameNode', () => {
+  it('sets the node label, leaving everything else untouched', () => {
+    const graph = renameNode(baseGraph, 'agent-overview', 'App Overview');
+    const renamed = graph.nodes.find(n => n.id === 'agent-overview')!;
+    expect(renamed.label).toBe('App Overview');
+    expect(renamed.id).toBe('agent-overview');
+    expect(graph.nodes.find(n => n.id === 'trigger-full')!.label).toBeUndefined();
+  });
+
+  it('trims surrounding whitespace', () => {
+    const graph = renameNode(baseGraph, 'agent-overview', '  App Overview  ');
+    expect(graph.nodes.find(n => n.id === 'agent-overview')!.label).toBe('App Overview');
+  });
+
+  it('clears the label back to undefined when set to blank', () => {
+    const withLabel = renameNode(baseGraph, 'agent-overview', 'App Overview');
+    const cleared = renameNode(withLabel, 'agent-overview', '   ');
+    expect(cleared.nodes.find(n => n.id === 'agent-overview')!.label).toBeUndefined();
+  });
+
+  it('is a no-op on an id that does not exist', () => {
+    const graph = renameNode(baseGraph, 'does-not-exist', 'Whatever');
+    expect(graph.nodes).toEqual(baseGraph.nodes);
   });
 });

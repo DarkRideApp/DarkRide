@@ -19,22 +19,35 @@ export interface AiPipelineDeps {
   getPipelinesEnabled?: (db: AppDatabase) => boolean;
 }
 
+/**
+ * A pipeline row with its latest version inlined — latest by version number, not "published
+ * over draft": this is what the editor and the list page load, and it must show whatever was
+ * last saved (including an unpublished draft), or a reload would look like it discarded work
+ * still sitting in a draft. `/run` resolves the published version on its own, separately, since
+ * a run must never execute an unpublished, unvalidated draft.
+ */
+function rowWithGraph(db: AppDatabase, row: typeof aiPipelines.$inferSelect) {
+  const version = db.select().from(aiPipelineVersions).where(eq(aiPipelineVersions.pipelineId, row.id))
+    .orderBy(aiPipelineVersions.version).all().at(-1);
+  return { ...row, pipelineVersionId: version?.id ?? null, graph: version?.graph ?? null };
+}
+
 export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
   const { db } = deps;
 
   registerEndpoint('GET', '/v1/ai-pipelines', (req, res) => {
-    // Task 22's frontend reads `apkPipeline.graph` straight off a row from this endpoint — there
-    // is no sibling "get one pipeline" endpoint in this plan, so the canvas needs the graph
-    // inlined here. Fold each pipeline's published version (falling back to its latest draft if
-    // none is published yet) in here instead of adding a second round-trip.
     const rows = db.select().from(aiPipelines).all();
-    const data = rows.map((row) => {
-      const versions = db.select().from(aiPipelineVersions).where(eq(aiPipelineVersions.pipelineId, row.id))
-        .orderBy(aiPipelineVersions.version).all();
-      const version = versions.find(v => v.status === 'published') ?? versions.at(-1);
-      return { ...row, pipelineVersionId: version?.id ?? null, graph: version?.graph ?? null };
-    });
-    res.json({ success: true, data });
+    res.json({ success: true, data: rows.map(row => rowWithGraph(db, row)) });
+  }, { requires: ['core.apk:read'] });
+
+  registerEndpoint('GET', '/v1/ai-pipelines/:id', (req, res) => {
+    const pipelineId = Number(req.params.id);
+    const row = db.select().from(aiPipelines).where(eq(aiPipelines.id, pipelineId)).all()[0];
+    if (!row) {
+      res.status(404).json({ success: false, error: `No pipeline with id ${pipelineId}.` });
+      return;
+    }
+    res.json({ success: true, data: rowWithGraph(db, row) });
   }, { requires: ['core.apk:read'] });
 
   registerEndpoint('POST', '/v1/ai-pipelines', (req, res) => {
@@ -50,6 +63,14 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
     const { graph } = req.body as { graph: PipelineGraph };
     const latest = db.select().from(aiPipelineVersions).where(eq(aiPipelineVersions.pipelineId, pipelineId))
       .orderBy(aiPipelineVersions.version).all().pop();
+    // Overwrites the latest version in place while it's still a draft — the editor autosaves on
+    // every pause, and inserting a new row per autosave would turn "version 7" into "the 400th
+    // edit," not a meaningful checkpoint. A version becomes a fixed point once /publish locks it.
+    if (latest && latest.status === 'draft') {
+      db.update(aiPipelineVersions).set({ graph: graph as any }).where(eq(aiPipelineVersions.id, latest.id)).run();
+      res.json({ success: true, data: { version: latest.version } });
+      return;
+    }
     const nextVersion = (latest?.version ?? 0) + 1;
     db.insert(aiPipelineVersions).values({ pipelineId, version: nextVersion, graph: graph as any, status: 'draft', createdAt: new Date() }).run();
     res.json({ success: true, data: { version: nextVersion } });

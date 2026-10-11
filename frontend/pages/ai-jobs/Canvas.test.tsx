@@ -47,4 +47,21 @@ describe('Canvas', () => {
     const node = screen.getByText('trigger-full').closest('.react-flow__node') as HTMLElement;
     expect(node.style.transform).toContain('0px');
   });
+
+  it('shows a node\'s label as its primary text, kind + id as secondary, when a label is set', () => {
+    const labeled: PipelineGraph = {
+      nodes: [{ id: 'agent-1', label: 'Overview Agent', config: { kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: 'x' } }],
+      edges: [],
+    };
+    render(<Canvas graph={labeled} onSelectNode={() => {}} />);
+    expect(screen.getByText('Overview Agent')).toBeInTheDocument();
+    expect(screen.getByText('agent-1')).toBeInTheDocument();
+    expect(screen.getByText('Agent Call')).toBeInTheDocument();
+  });
+
+  it('falls back to the kind\'s display label when a node has no label', () => {
+    render(<Canvas graph={graph} onSelectNode={() => {}} />);
+    expect(screen.getByText('Agent Call')).toBeInTheDocument();
+    expect(screen.getByText('Trigger')).toBeInTheDocument();
+  });
 });

@@ -1,23 +1,26 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { resolvePreview } from './templatePreview';
+import { nodeKindLabel } from './nodeKindLabels';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
 interface SchemaField { field: string; type: string; description: string }
-interface NodeLike { id: string; config: Record<string, any> & { kind: string } }
+interface NodeLike { id: string; label?: string; config: Record<string, any> & { kind: string } }
 
 function predecessorsOf(graph: PipelineGraph, nodeId: string): string[] {
   return graph.edges.filter(e => e.to === nodeId).map(e => e.from);
 }
 
-export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDeleteNode }: {
+export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDeleteNode, onRename }: {
   node: NodeLike;
   graph: PipelineGraph;
   triggerSchema: SchemaField[];
   onClose: () => void;
   onSave: (nodeId: string, patch: Record<string, unknown>) => void;
   onDeleteNode?: (nodeId: string) => void;
+  onRename?: (nodeId: string, label: string) => void;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
+  const [name, setName] = useState(node.label ?? nodeKindLabel(node.config.kind));
 
   // Move focus into the panel on open, hand it back to whatever opened it on close.
   // Verbatim pattern from frontend/pages/plugins/PluginDrawer.tsx:105-113.
@@ -42,7 +45,15 @@ export function SidePanel({ node, graph, triggerSchema, onClose, onSave, onDelet
   return (
     <aside className="ai-jobs-side-panel" role="dialog" aria-label={`${node.id} details`}>
       <div className="ai-jobs-side-panel-header">
-        <span className="ai-jobs-side-panel-title">{node.config.kind}: {node.id}</span>
+        <div className="ai-jobs-side-panel-title">
+          <input
+            className="form-input ai-jobs-node-name-input"
+            aria-label="Node name"
+            value={name}
+            onChange={(e) => { setName(e.target.value); onRename?.(node.id, e.target.value); }}
+          />
+          <span className="ai-jobs-side-panel-kind">{nodeKindLabel(node.config.kind)} · {node.id}</span>
+        </div>
         <div className="ai-jobs-side-panel-actions">
           {onDeleteNode && (
             <button type="button" className="btn btn-danger-ghost btn-sm" aria-label="Delete node" onClick={() => onDeleteNode(node.id)}>Delete</button>
@@ -97,6 +108,7 @@ function AgentCallBody({ node, triggerSchema, onSave }: {
       <textarea
         ref={taRef}
         className="form-textarea"
+        aria-label="Instruction template"
         value={template}
         onChange={(e) => { setTemplate(e.target.value); onSave(node.id, { instructionTemplate: e.target.value }); }}
       />
@@ -122,7 +134,7 @@ function TriggerBody({ node, onSave }: { node: NodeLike; onSave: (nodeId: string
     <>
       <div className="form-group">
         <label>Expand function</label>
-        <input className="form-input" value={expandFn} onChange={(e) => save(e.target.value, outputSchema)} />
+        <input className="form-input" aria-label="Expand function" value={expandFn} onChange={(e) => save(e.target.value, outputSchema)} />
         <div className="form-help">Name of a function registered in backend/services/ai-jobs/nodes/trigger.ts.</div>
       </div>
       <div className="form-group">
@@ -141,14 +153,22 @@ function TriggerBody({ node, onSave }: { node: NodeLike; onSave: (nodeId: string
   );
 }
 
-const KNOWN_SINK_WRITE_FNS = ['apk-analysis/write-full-document', 'apk-analysis/write-section'];
+// Duplicated from backend/services/ai-jobs/nodes/sink.ts's SINK_DESCRIPTIONS/SINK_USES_SECTION —
+// the frontend can't import that module at runtime (it pulls in better-sqlite3).
+const KNOWN_SINK_WRITE_FNS: Array<{ value: string; description: string; usesSection: boolean }> = [
+  { value: 'apk-analysis/write-full-document', usesSection: false,
+    description: "Writes every section from the connected Report into this APK version's analysis notes." },
+  { value: 'apk-analysis/write-section', usesSection: true,
+    description: "Writes the connected step's output into one named section of this APK version's analysis notes." },
+];
 
 function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGraph; onSave: (nodeId: string, patch: Record<string, unknown>) => void }) {
   const writeFn: string = node.config.writeFn;
   const from: string = node.config.from ?? '';
   const section: string = node.config.section ?? '';
   const predecessors = predecessorsOf(graph, node.id);
-  const isKnownFn = writeFn === '' || KNOWN_SINK_WRITE_FNS.includes(writeFn);
+  const known = KNOWN_SINK_WRITE_FNS.find(f => f.value === writeFn);
+  const isKnownFn = writeFn === '' || known !== undefined;
 
   return (
     <>
@@ -157,14 +177,14 @@ function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGrap
         <select id="sink-write-fn" aria-label="Write function" className="form-select" value={isKnownFn ? writeFn : '__custom__'}
           onChange={(e) => onSave(node.id, { writeFn: e.target.value === '__custom__' ? '' : e.target.value })}>
           <option value="">— choose —</option>
-          {KNOWN_SINK_WRITE_FNS.map(fn => <option key={fn} value={fn}>{fn}</option>)}
+          {KNOWN_SINK_WRITE_FNS.map(fn => <option key={fn.value} value={fn.value}>{fn.value}</option>)}
           <option value="__custom__">Custom (registered in code)…</option>
         </select>
         {!isKnownFn && (
           <input className="form-input" value={writeFn} placeholder="custom writeFn name"
             onChange={(e) => onSave(node.id, { writeFn: e.target.value })} />
         )}
-        <div className="form-help">Name of a function registered in backend/services/ai-jobs/nodes/sink.ts.</div>
+        <div className="form-help">{known ? known.description : 'Name of a function registered in backend/services/ai-jobs/nodes/sink.ts.'}</div>
       </div>
       <div className="form-group">
         <label htmlFor="sink-from">From (predecessor)</label>
@@ -174,11 +194,12 @@ function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGrap
           {predecessors.map(id => <option key={id} value={id}>{id}</option>)}
         </select>
       </div>
-      <div className="form-group">
-        <label>Section title</label>
-        <input className="form-input" value={section} onChange={(e) => onSave(node.id, { section: e.target.value })} />
-        <div className="form-help">Only read by the "write-section" write function.</div>
-      </div>
+      {known?.usesSection && (
+        <div className="form-group">
+          <label htmlFor="sink-section">Section title</label>
+          <input id="sink-section" className="form-input" value={section} onChange={(e) => onSave(node.id, { section: e.target.value })} />
+        </div>
+      )}
     </>
   );
 }
@@ -214,7 +235,7 @@ function TransformBody({ node, onSave }: { node: NodeLike; onSave: (nodeId: stri
   return (
     <div className="form-group">
       <label>Transform function</label>
-      <input className="form-input" value={node.config.fn} placeholder="e.g. my-plugin/my-transform"
+      <input className="form-input" aria-label="Transform function" value={node.config.fn} placeholder="e.g. my-plugin/my-transform"
         onChange={(e) => onSave(node.id, { fn: e.target.value })} />
       <div className="form-help">No Transform functions are registered in this codebase yet — see backend/services/ai-jobs/nodes/transform.ts. A run through this node fails with "Unknown transform" until one is registered in code.</div>
     </div>
@@ -245,7 +266,7 @@ function ForEachBody({ node, onSave }: { node: NodeLike; onSave: (nodeId: string
   return (
     <div className="form-group">
       <label>Per-item function</label>
-      <input className="form-input" value={node.config.itemFn} placeholder="e.g. my-plugin/my-item-fn"
+      <input className="form-input" aria-label="Per-item function" value={node.config.itemFn} placeholder="e.g. my-plugin/my-item-fn"
         onChange={(e) => onSave(node.id, { itemFn: e.target.value })} />
       <div className="form-help">No ForEach item functions are registered in this codebase yet — see backend/services/ai-jobs/nodes/foreach.ts. A run through this node fails with "Unknown itemFn" until one is registered in code.</div>
     </div>

@@ -182,11 +182,24 @@ describe('seedApkAnalysisPipeline', () => {
     const pipelines = db.select().from(aiPipelines).all();
     expect(pipelines).toHaveLength(1);
     expect(pipelines[0].jobKind).toBe('apk-analysis');
-    expect(pipelines[0].name).toBe('Astérix pattern');
+    expect(pipelines[0].name).toBe('APK Analysis');
 
     const versions = db.select().from(aiPipelineVersions).all();
     const published = versions.filter(v => v.status === 'published');
     expect(published).toHaveLength(1);
     expect(published[0].graph).toEqual(ASTERIX_PATTERN_GRAPH);
+  });
+
+  it('self-heals a stale display name on an existing row instead of inserting a duplicate', () => {
+    const db = makeDb();
+    db.insert(aiPipelines).values({ name: 'Astérix pattern', jobKind: 'apk-analysis', createdAt: new Date() }).run();
+
+    seedApkAnalysisPipeline(db);
+
+    const pipelines = db.select().from(aiPipelines).all();
+    expect(pipelines).toHaveLength(1);
+    expect(pipelines[0].name).toBe('APK Analysis');
+    // No version was inserted for the pre-existing row — seeding only patches the name.
+    expect(db.select().from(aiPipelineVersions).all()).toHaveLength(0);
   });
 });

@@ -15,9 +15,15 @@ export interface SinkCtx {
 export type SinkWriteFn = (config: SinkConfig, input: Record<string, unknown>, ctx: SinkCtx) => Promise<void>;
 
 export const SINK_REGISTRY: Record<string, SinkWriteFn> = Object.create(null);
+/** Human-readable "where does this go" text per registered write function, for the editor UI. */
+export const SINK_DESCRIPTIONS: Record<string, string> = Object.create(null);
+/** Whether a write function reads `config.section` — governs whether the editor shows that field. */
+export const SINK_USES_SECTION: Record<string, boolean> = Object.create(null);
 
-export function registerSink(name: string, fn: SinkWriteFn): void {
+export function registerSink(name: string, fn: SinkWriteFn, description: string, usesSection = false): void {
   SINK_REGISTRY[name] = fn;
+  SINK_DESCRIPTIONS[name] = description;
+  SINK_USES_SECTION[name] = usesSection;
 }
 
 export async function runSink(config: SinkConfig, input: Record<string, unknown>, ctx: SinkCtx): Promise<void> {
@@ -26,10 +32,8 @@ export async function runSink(config: SinkConfig, input: Record<string, unknown>
   await fn(config, input, ctx);
 }
 
-// Patches each Report section in place rather than overwriting the whole note. Found in the final
-// review: the old setNote() overwrite wiped everything else in the note, including the Quick
-// Rescan zone's own "Diff Summary" section and anything an analyst wrote by hand, so the two
-// zones of the same pipeline undid each other. A source with no sections writes nothing.
+// Patches each section in place — never overwrites the whole note, so other sections (e.g. the
+// Quick Rescan zone's "Diff Summary", or anything an analyst wrote by hand) survive untouched.
 registerSink('apk-analysis/write-full-document', async (config, input, ctx) => {
   const source = config.from
     ? (input[config.from] as { markdown?: string; sections?: Array<{ title: string; body: string }> } | undefined)
@@ -38,9 +42,9 @@ registerSink('apk-analysis/write-full-document', async (config, input, ctx) => {
   for (const section of source.sections) {
     patchNoteSection(ctx.db, ctx.versionId, section.title, section.body);
   }
-});
+}, "Writes every section from the connected Report into this APK version's analysis notes.");
 
 registerSink('apk-analysis/write-section', async (config, input, ctx) => {
   const source = config.from ? (input[config.from] as { text?: string } | undefined) : undefined;
   patchNoteSection(ctx.db, ctx.versionId, config.section ?? 'Untitled', source?.text ?? '');
-});
+}, "Writes the connected step's output into one named section of this APK version's analysis notes.", true);

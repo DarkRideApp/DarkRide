@@ -1,17 +1,14 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useWebSocket, useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Canvas } from './Canvas';
 import { SidePanel } from './SidePanel';
 import { RunControls } from './RunControls';
-import { addNode, deleteNode, addEdge, deleteEdge, moveNode } from './graphEdit';
+import { addNode, deleteNode, addEdge, deleteEdge, moveNode, renameNode } from './graphEdit';
+import { nodeKindLabel } from './nodeKindLabels';
 import type { NodeKind, PipelineGraph, PipelineNode, TriggerConfig } from '../../../backend/services/ai-jobs/types';
 
-/**
- * Forward-reachability BFS defining a Trigger's zone — duplicated client-side rather than
- * imported, for the same frontend/backend-boundary reason `templatePreview.ts` duplicates
- * `resolveTemplate`. Verbatim copy of Task 16's `reachableFrom` in
- * backend/services/ai-jobs/pipeline-runner.ts.
- */
+/** Forward-reachability BFS defining a Trigger's zone — duplicated client-side (not imported) to keep backend code out of the frontend bundle. Verbatim copy of `reachableFrom` in backend/services/ai-jobs/pipeline-runner.ts. */
 export function reachableFrom(nodeId: string, graph: PipelineGraph): Set<string> {
   const seen = new Set<string>([nodeId]);
   const queue = [nodeId];
@@ -30,9 +27,7 @@ function isTriggerNode(n: PipelineNode): n is PipelineNode & { config: TriggerCo
   return n.config.kind === 'Trigger';
 }
 
-/** The Trigger whose zone actually contains `nodeId` — never just "the first Trigger in the
- * graph." A valid published graph (graph-validator, Task 16) guarantees every non-Trigger node
- * is reachable from some Trigger, so the fallback below is defensive, not a real path. */
+/** The Trigger whose zone actually contains `nodeId` — never just the first Trigger in the graph, since a pipeline can have disjoint Trigger zones with different schemas. */
 export function findOwningTriggerSchema(graph: PipelineGraph, nodeId: string): Array<{ field: string; type: string; description: string }> {
   const triggers = graph.nodes.filter(isTriggerNode);
   for (const trigger of triggers) {
@@ -45,51 +40,51 @@ export function findOwningTriggerSchema(graph: PipelineGraph, nodeId: string): A
 export const POLL_INTERVAL_MS = 2000;
 /** ~10 minutes at the default interval — bounded, never an infinite loop. */
 export const MAX_POLL_ATTEMPTS = 300;
+/** How long the editor waits after the last edit settles before autosaving a draft. */
+export const AUTOSAVE_DEBOUNCE_MS = 1500;
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 interface RecentVersion { id: number; appName: string | null; packageName: string; versionName: string | null }
-interface PipelineRow { id: number; name?: string | null; jobKind: string; pipelineVersionId: number | null; graph: PipelineGraph | null }
 
 const NODE_KINDS: NodeKind[] = ['Trigger', 'AgentCall', 'Transform', 'Branch', 'Report', 'ForEach', 'Sink'];
 const EMPTY_GRAPH: PipelineGraph = { nodes: [], edges: [] };
 
-/** `pollIntervalMs` exists so tests can poll without a real 2s wall-clock wait per attempt. */
-export function AiJobsWorkspace({ pollIntervalMs = POLL_INTERVAL_MS }: { pollIntervalMs?: number } = {}) {
-  useDocumentTitle('AI Job Pipelines');
+export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS, autosaveDebounceMs = AUTOSAVE_DEBOUNCE_MS }: {
+  pipelineId: number;
+  pollIntervalMs?: number;
+  autosaveDebounceMs?: number;
+}) {
   const { sendRestApi } = useWebSocket();
-  const [pipelines, setPipelines] = useState<PipelineRow[]>([]);
-  const [selectedPipelineId, setSelectedPipelineId] = useState<number | null>(null);
+  const [pipelineName, setPipelineName] = useState<string | null>(null);
   const [graph, setGraph] = useState<PipelineGraph | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [nodeStatuses, setNodeStatuses] = useState<Record<string, { status: string; wasMemoized?: boolean }>>({});
   const [recentVersions, setRecentVersions] = useState<RecentVersion[]>([]);
   const [selectedVersionId, setSelectedVersionId] = useState<number | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const [nodeKindToAdd, setNodeKindToAdd] = useState<NodeKind>('AgentCall');
-  const [showNewPipelineForm, setShowNewPipelineForm] = useState(false);
-  const [newPipelineName, setNewPipelineName] = useState('');
-  const [newPipelineJobKind, setNewPipelineJobKind] = useState('');
+  const [dirty, setDirty] = useState(false);
+  useDocumentTitle(pipelineName ? `Pipeline: ${pipelineName}` : 'Pipeline');
+
+  // Guards the dirty-tracking effect below against firing when the initial fetch lands —
+  // only a change AFTER that counts as a user edit.
+  const loadedRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
-    sendRestApi('GET', '/v1/ai-pipelines').then((res: any) => {
+    loadedRef.current = false;
+    setGraph(null);
+    setDirty(false);
+    sendRestApi('GET', `/v1/ai-pipelines/${pipelineId}`).then((res: any) => {
       if (cancelled) return;
-      const rows: PipelineRow[] = res.body?.data ?? [];
-      setPipelines(rows);
-      // Default to the real apk-analysis pipeline when it exists, else whatever's first.
-      const initial = rows.find(r => r.jobKind === 'apk-analysis') ?? rows[0];
-      if (initial) {
-        setSelectedPipelineId(initial.id);
-        setGraph(initial.graph ?? EMPTY_GRAPH);
-      }
+      const row = res.body?.data;
+      setPipelineName(row?.name ?? row?.jobKind ?? null);
+      setGraph(row?.graph ?? EMPTY_GRAPH);
     });
-    // The pipeline's Trigger expands `input.versionId` into the APK context — a run with no
-    // versionId throws at the Trigger (found in the final review: the Run button sent
-    // `input: {}`, so every UI run failed immediately). GET /v1/apps/recent is the existing
-    // "recent APK versions" list (backend/api/apps.ts).
+    // The pipeline's Trigger expands `input.versionId` into the APK context, so the run picker
+    // needs a real APK version to run against.
     sendRestApi('GET', '/v1/apps/recent').then((res: any) => {
       if (cancelled) return;
       const list: RecentVersion[] = res.body?.data ?? [];
@@ -97,50 +92,48 @@ export function AiJobsWorkspace({ pollIntervalMs = POLL_INTERVAL_MS }: { pollInt
       if (list.length > 0) setSelectedVersionId(list[0].id);
     });
     return () => { cancelled = true; };
-  }, [sendRestApi]);
+  }, [sendRestApi, pipelineId]);
 
-  // Imperative, not a useEffect keyed on `pipelines` — switching only happens from direct user
-  // action, so loading a different pipeline's graph can never be retriggered by an unrelated
-  // `pipelines` state change (e.g. appending a freshly created pipeline), which would otherwise
-  // clobber in-progress, unsaved edits on the pipeline currently open.
-  function handleSelectPipeline(id: number) {
-    setSelectedPipelineId(id);
-    const row = pipelines.find(p => p.id === id);
-    setGraph(row?.graph ?? EMPTY_GRAPH);
-    setSelected(null);
-    setNodeStatuses({});
+  useEffect(() => {
+    if (graph === null) return;
+    if (!loadedRef.current) { loadedRef.current = true; return; }
+    setDirty(true);
+  }, [graph]);
+
+  async function saveDraft(g: PipelineGraph): Promise<boolean> {
+    const res: any = await sendRestApi('POST', `/v1/ai-pipelines/${pipelineId}/versions`, { graph: g });
+    if (res.body?.success) { setDirty(false); return true; }
+    setStatusMessage(res.body?.error ?? 'Could not save the draft.');
+    return false;
   }
 
-  async function handleCreatePipeline() {
-    const name = newPipelineName.trim();
-    const jobKind = newPipelineJobKind.trim();
-    if (!name || !jobKind) {
-      setStatusMessage('Give the new pipeline a name and a job kind first.');
-      return;
-    }
-    const res: any = await sendRestApi('POST', '/v1/ai-pipelines', { name, jobKind, graph: EMPTY_GRAPH });
-    const id = res.body?.data?.id;
-    if (id == null) {
-      setStatusMessage(res.body?.error ?? 'Could not create the pipeline.');
-      return;
-    }
-    const row: PipelineRow = { id, name, jobKind, pipelineVersionId: null, graph: EMPTY_GRAPH };
-    setPipelines(prev => [...prev, row]);
-    setSelectedPipelineId(id);
-    setGraph(EMPTY_GRAPH);
-    setSelected(null);
-    setShowNewPipelineForm(false);
-    setNewPipelineName('');
-    setNewPipelineJobKind('');
-  }
+  // Debounced autosave: this is what actually protects against losing edits on navigating away
+  // by any in-app route — the browser never fires `beforeunload` for a client-side route change,
+  // so a "warn before leaving" approach alone would miss exactly that case.
+  useEffect(() => {
+    if (!dirty || !graph) return;
+    const timer = setTimeout(async () => {
+      if (await saveDraft(graph)) setStatusMessage('Autosaved.');
+    }, autosaveDebounceMs);
+    return () => clearTimeout(timer);
+  }, [graph, dirty, autosaveDebounceMs, pipelineId]);
 
-  function handleAddNode() {
+  // Safety net for the autosave debounce window itself — closing the tab or refreshing before
+  // the timer above fires.
+  useEffect(() => {
+    if (!dirty) return;
+    function handler(e: BeforeUnloadEvent) { e.preventDefault(); e.returnValue = ''; }
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [dirty]);
+
+  function handleAddNode(kind: NodeKind) {
     if (!graph) return;
     // Same placeholder-grid math Canvas falls back to for an unmoved node, offset below the
     // existing rows so a newly added node doesn't render stacked on top of another placeholder.
     const i = graph.nodes.length;
     const position = { x: (i % 4) * 260, y: Math.floor(i / 4) * 160 + 200 };
-    const { graph: next, newNodeId } = addNode(graph, nodeKindToAdd, position);
+    const { graph: next, newNodeId } = addNode(graph, kind, position);
     setGraph(next);
     setSelected(newNodeId);
   }
@@ -162,16 +155,21 @@ export function AiJobsWorkspace({ pollIntervalMs = POLL_INTERVAL_MS }: { pollInt
     setGraph(g => g && deleteEdge(g, from, to));
   }
 
-  async function handleSaveDraft() {
-    if (!graph || selectedPipelineId == null) return;
-    const res: any = await sendRestApi('POST', `/v1/ai-pipelines/${selectedPipelineId}/versions`, { graph });
-    if (res.body?.success) setStatusMessage(`Draft saved as version ${res.body?.data?.version}.`);
-    else setStatusMessage(res.body?.error ?? 'Could not save the draft.');
+  function handleRenameNode(nodeId: string, label: string) {
+    setGraph(g => g && renameNode(g, nodeId, label));
   }
 
+  async function handleSaveDraft() {
+    if (!graph) return;
+    if (await saveDraft(graph)) setStatusMessage('Draft saved.');
+  }
+
+  // Publish always acts on what's in the editor: if there are unsaved edits, it saves them as
+  // the draft first, then publishes that draft — "publish" means "make what I'm looking at
+  // live," not "make whatever I last explicitly saved live."
   async function handlePublish() {
-    if (selectedPipelineId == null) return;
-    const res: any = await sendRestApi('POST', `/v1/ai-pipelines/${selectedPipelineId}/publish`, {});
+    if (dirty && graph && !(await saveDraft(graph))) return;
+    const res: any = await sendRestApi('POST', `/v1/ai-pipelines/${pipelineId}/publish`, {});
     if (res.body?.success) {
       setStatusMessage('Published.');
       return;
@@ -198,7 +196,7 @@ export function AiJobsWorkspace({ pollIntervalMs = POLL_INTERVAL_MS }: { pollInt
       return;
     }
     setStatusMessage(null);
-    const runRes: any = await sendRestApi('POST', `/v1/ai-pipelines/${selectedPipelineId}/run`, {
+    const runRes: any = await sendRestApi('POST', `/v1/ai-pipelines/${pipelineId}/run`, {
       triggerNodeId, input: { versionId: selectedVersionId }, reuseUnchanged,
     });
     const runId = runRes.body?.data?.runId;
@@ -224,34 +222,14 @@ export function AiJobsWorkspace({ pollIntervalMs = POLL_INTERVAL_MS }: { pollInt
     setStatusMessage(`Run ${runId} is still running on the server. Check back later.`);
   }
 
-  const triggerNodes = graph ? graph.nodes.filter(n => n.config.kind === 'Trigger').map(n => ({ id: n.id, label: n.id })) : [];
+  const triggerNodes = graph ? graph.nodes.filter(isTriggerNode).map(n => ({ id: n.id, label: n.label ?? n.id })) : [];
 
   return (
-    <div className="ai-jobs-root">
+    <div className="ai-jobs-root page-full-bleed">
       <div className="ai-jobs-toolbar">
         <div className="ai-jobs-toolbar-group">
-          <label className="ai-jobs-toolbar-field">
-            Pipeline
-            <select
-              className="form-select"
-              aria-label="Pipeline"
-              value={selectedPipelineId ?? ''}
-              onChange={(e) => handleSelectPipeline(Number(e.target.value))}
-            >
-              {pipelines.length === 0 && <option value="">No pipelines yet</option>}
-              {pipelines.map(p => <option key={p.id} value={p.id}>{p.name ?? p.jobKind} (#{p.id})</option>)}
-            </select>
-          </label>
-          {!showNewPipelineForm ? (
-            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowNewPipelineForm(true)}>+ New pipeline</button>
-          ) : (
-            <span className="ai-jobs-toolbar-group">
-              <input className="form-input" aria-label="New pipeline name" placeholder="Name" value={newPipelineName} onChange={(e) => setNewPipelineName(e.target.value)} />
-              <input className="form-input" aria-label="New pipeline job kind" placeholder="Job kind" value={newPipelineJobKind} onChange={(e) => setNewPipelineJobKind(e.target.value)} />
-              <button type="button" className="btn btn-primary btn-sm" onClick={handleCreatePipeline}>Create</button>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowNewPipelineForm(false)}>Cancel</button>
-            </span>
-          )}
+          <Link to="/ui/pipelines" className="btn btn-ghost btn-sm">← Pipelines</Link>
+          <span className="ai-jobs-pipeline-name">{pipelineName ?? '…'}</span>
         </div>
 
         {graph && (
@@ -275,20 +253,18 @@ export function AiJobsWorkspace({ pollIntervalMs = POLL_INTERVAL_MS }: { pollInt
             </div>
 
             <div className="ai-jobs-toolbar-group">
-              <label className="ai-jobs-toolbar-field">
-                Add node
-                <select
-                  className="form-select"
-                  aria-label="Node kind to add"
-                  value={nodeKindToAdd}
-                  onChange={(e) => setNodeKindToAdd(e.target.value as NodeKind)}
-                >
-                  {NODE_KINDS.map(k => <option key={k} value={k}>{k}</option>)}
-                </select>
-              </label>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={handleAddNode}>+ Add node</button>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={handleSaveDraft}>Save Draft</button>
-              <button type="button" className="btn btn-primary btn-sm" onClick={handlePublish}>Publish</button>
+              <select
+                className="form-select"
+                aria-label="Add node"
+                value=""
+                onChange={(e) => { if (e.target.value) handleAddNode(e.target.value as NodeKind); }}
+              >
+                <option value="">+ Add node…</option>
+                {NODE_KINDS.map(k => <option key={k} value={k}>{nodeKindLabel(k)}</option>)}
+              </select>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={handleSaveDraft} title="Keeps your edits without making them live.">Save Draft</button>
+              <button type="button" className="btn btn-primary btn-sm" onClick={handlePublish} title="Makes this version the one real runs use — saves first if you have unsaved changes.">Publish</button>
+              <span className="ai-jobs-dirty-indicator">{dirty ? 'Unsaved changes…' : 'All changes saved'}</span>
             </div>
           </>
         )}
@@ -321,14 +297,12 @@ export function AiJobsWorkspace({ pollIntervalMs = POLL_INTERVAL_MS }: { pollInt
                   setGraph(g => g && ({ ...g, nodes: g.nodes.map(n => n.id === nodeId ? { ...n, config: { ...n.config, ...patch } } : n) }));
                 }}
                 onDeleteNode={handleDeleteNode}
+                onRename={handleRenameNode}
               />
             )}
           </>
         ) : (
-          <div className="page-header">
-            <h1>Pipelines</h1>
-            <p>{pipelines.length === 0 ? 'No pipelines yet — create one above.' : 'Loading…'}</p>
-          </div>
+          <div className="loading-center">Loading…</div>
         )}
       </div>
     </div>

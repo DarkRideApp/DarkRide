@@ -487,7 +487,8 @@ a:hover {
    Without this, .page-content grows to fit content and percentage-height children
    resolve against the content height instead of the available viewport space. */
 .page-content:has(.traffic-page),
-.page-content:has(.session-timeline-page) {
+.page-content:has(.session-timeline-page),
+.page-content:has(.ai-jobs-root) {
   min-height: 0;
   overflow: hidden;
   padding: 0;
@@ -8518,7 +8519,7 @@ body.live-log-open .ai-chat-fab {
 .ai-jobs-root {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
   position: relative;
 }
 .ai-jobs-toolbar {
@@ -8566,6 +8567,22 @@ body.live-log-open .ai-chat-fab {
   font-size: 13px;
   color: var(--text-secondary);
 }
+.ai-jobs-pipeline-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.ai-jobs-dirty-indicator {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.ai-jobs-node-label {
+  font-weight: 600;
+}
+.ai-jobs-node-meta {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
 .ai-jobs-canvas-wrap {
   flex: 1;
   min-height: 0;
@@ -8602,10 +8619,20 @@ body.live-log-open .ai-chat-fab {
   flex-shrink: 0;
 }
 .ai-jobs-side-panel-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.ai-jobs-node-name-input {
   font-size: 14px;
   font-weight: 600;
-  color: var(--text-primary);
-  word-break: break-word;
+  padding: 4px 8px;
+}
+.ai-jobs-side-panel-kind {
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 .ai-jobs-side-panel .form-textarea {
   min-height: 140px;

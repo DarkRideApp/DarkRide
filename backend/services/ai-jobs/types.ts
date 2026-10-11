@@ -81,6 +81,8 @@ export interface PipelineNode {
    *  frontend falls back to a placeholder grid layout for those. Purely a presentation
    *  concern: never read by the executor or the graph validator. */
   position?: { x: number; y: number };
+  /** User-facing display name, editable in the side panel; `id` stays the stable reference edges and `from` fields use. */
+  label?: string;
 }
 
 export interface PipelineEdge {
