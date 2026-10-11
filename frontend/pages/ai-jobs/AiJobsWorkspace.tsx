@@ -3,11 +3,11 @@ import { Link } from 'react-router-dom';
 import { useWebSocket, useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Canvas } from './Canvas';
 import { SidePanel } from './SidePanel';
+import { NodePicker } from './NodePicker';
 import {
   addNode, deleteNode, addEdge, deleteEdge, moveNode, renameNode,
   connectReportSection, disconnectReportSection, connectSinkInput, disconnectSinkInput,
 } from './graphEdit';
-import { nodeKindLabel } from './nodeKindLabels';
 import type { NodeKind, PipelineGraph, PipelineNode, TriggerConfig } from '../../../backend/services/ai-jobs/types';
 
 /** Forward-reachability BFS defining a Trigger's zone — duplicated client-side (not imported) to keep backend code out of the frontend bundle. Verbatim copy of `reachableFrom` in backend/services/ai-jobs/pipeline-runner.ts. */
@@ -51,7 +51,6 @@ function sleep(ms: number): Promise<void> {
 
 interface RecentVersion { id: number; appName: string | null; packageName: string; versionName: string | null }
 
-const NODE_KINDS: NodeKind[] = ['Trigger', 'AgentCall', 'Transform', 'Branch', 'Report', 'ForEach', 'Sink'];
 const EMPTY_GRAPH: PipelineGraph = { nodes: [], edges: [] };
 
 export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS, autosaveDebounceMs = AUTOSAVE_DEBOUNCE_MS }: {
@@ -249,15 +248,7 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
         {graph && (
           <>
             <div className="ai-jobs-toolbar-group">
-              <select
-                className="form-select"
-                aria-label="Add node"
-                value=""
-                onChange={(e) => { if (e.target.value) handleAddNode(e.target.value as NodeKind); }}
-              >
-                <option value="">+ Add node…</option>
-                {NODE_KINDS.map(k => <option key={k} value={k}>{nodeKindLabel(k)}</option>)}
-              </select>
+              <NodePicker onPick={handleAddNode} />
               <button type="button" className="btn btn-ghost btn-sm" onClick={handleSaveDraft} title="Keeps your edits without making them live.">Save Draft</button>
               <button type="button" className="btn btn-primary btn-sm" onClick={handlePublish} title="Makes this version the one real runs use — saves first if you have unsaved changes.">Publish</button>
               <span className="ai-jobs-dirty-indicator">{dirty ? 'Unsaved changes…' : 'All changes saved'}</span>

@@ -85,37 +85,70 @@ describe('SidePanel — Trigger', () => {
   };
   const graph: PipelineGraph = { nodes: [triggerNode], edges: [] };
 
-  it('edits the expand function name', () => {
-    const onSave = vi.fn();
-    render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    const input = screen.getByDisplayValue('apk-analysis/apk-context');
-    fireEvent.change(input, { target: { value: 'custom/expand' } });
-    expect(onSave).toHaveBeenCalledWith('trigger-full', { expandFn: 'custom/expand' });
+  it('shows the known expand function selected, with a plain-English description of what it does', () => {
+    render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getByLabelText(/starts from/i)).toHaveValue('apk-analysis/apk-context');
+    expect(screen.getByText(/looks up a tracked apk version/i)).toBeInTheDocument();
   });
 
-  it('adds a new output schema field', () => {
+  it('switching to Custom saves an empty expand function, clearing the known selection', () => {
     const onSave = vi.fn();
     render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    fireEvent.click(screen.getByRole('button', { name: /add output schema field/i }));
+    fireEvent.change(screen.getByLabelText(/starts from/i), { target: { value: '__custom__' } });
+    expect(onSave).toHaveBeenCalledWith('trigger-full', { expandFn: '' });
+  });
+
+  it('an unrecognized expand function shows as Custom with its own editable text field', () => {
+    const onSave = vi.fn();
+    const customNode = { id: 'trigger-full', config: { ...triggerNode.config, expandFn: 'my-plugin/my-trigger' } };
+    render(<SidePanel node={customNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
+    expect(screen.getByLabelText(/starts from/i)).toHaveValue('__custom__');
+    const customInput = screen.getByPlaceholderText(/custom expand function name/i);
+    expect(customInput).toHaveValue('my-plugin/my-trigger');
+    fireEvent.change(customInput, { target: { value: 'my-plugin/other-trigger' } });
+    expect(onSave).toHaveBeenCalledWith('trigger-full', { expandFn: 'my-plugin/other-trigger' });
+  });
+
+  it('adds a new output schema field, defaulting its type to string', () => {
+    const onSave = vi.fn();
+    render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
+    fireEvent.click(screen.getByRole('button', { name: /add output field/i }));
     expect(onSave).toHaveBeenCalledWith('trigger-full', {
-      outputSchema: [...triggerNode.config.outputSchema, { field: '', type: '', description: '' }],
+      outputSchema: [...triggerNode.config.outputSchema, { field: '', type: 'string', description: '' }],
     });
   });
 
   it('removes an output schema field', () => {
     const onSave = vi.fn();
     render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    fireEvent.click(screen.getByRole('button', { name: /remove output schema field/i }));
+    fireEvent.click(screen.getByRole('button', { name: /remove output field/i }));
     expect(onSave).toHaveBeenCalledWith('trigger-full', { outputSchema: [] });
   });
 
-  it('declares an input schema field, which the run form then uses', () => {
+  it('picks the field type from a closed list instead of freetext, for both output fields and run parameters', () => {
+    render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    const outputType = screen.getByLabelText(/output field type/i) as HTMLSelectElement;
+    expect(Array.from(outputType.options).map(o => o.value)).toEqual(['string', 'number', 'boolean', '__custom_type__']);
+  });
+
+  it('declares a run parameter, defaulting its type to Text, which the run form then uses', () => {
     const onSave = vi.fn();
     render(<SidePanel node={triggerNode} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
-    fireEvent.click(screen.getByRole('button', { name: /add input schema field/i }));
+    fireEvent.click(screen.getByRole('button', { name: /add parameter/i }));
     expect(onSave).toHaveBeenCalledWith('trigger-full', {
-      inputSchema: [{ field: '', type: '', description: '' }],
+      inputSchema: [{ field: '', type: 'string', description: '' }],
     });
+  });
+
+  it('a run parameter\'s type list includes the apk-version picker, not just the generic primitives', () => {
+    const withParam = {
+      ...triggerNode,
+      config: { ...triggerNode.config, inputSchema: [{ field: 'versionId', type: 'apk-version', description: '' }] },
+    };
+    render(<SidePanel node={withParam} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    const paramType = screen.getByLabelText(/parameter type/i) as HTMLSelectElement;
+    expect(paramType.value).toBe('apk-version');
+    expect(Array.from(paramType.options).map(o => o.value)).toContain('apk-version');
   });
 
   it('defaults to no run fields and an empty-input note when the Trigger declares no inputSchema', () => {

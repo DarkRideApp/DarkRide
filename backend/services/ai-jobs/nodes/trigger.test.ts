@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { describe, it, expect } from 'vitest';
 import * as schema from '../../../db/schema';
-import { TRIGGER_REGISTRY } from './trigger';
+import { TRIGGER_REGISTRY, TRIGGER_DESCRIPTIONS } from './trigger';
 
 function makeDb() {
   const sqlite = new Database(':memory:');
@@ -54,5 +54,9 @@ describe('apk-analysis/apk-context trigger', () => {
   // resolve off the registry itself, the same direct-lookup shape this file's other tests use.
   it('does not resolve an inherited Object.prototype key as a registered expander', () => {
     expect(TRIGGER_REGISTRY['constructor']).toBeUndefined();
+  });
+
+  it('describes every registered expand function', () => {
+    expect(TRIGGER_DESCRIPTIONS['apk-analysis/apk-context']).toBeTruthy();
   });
 });

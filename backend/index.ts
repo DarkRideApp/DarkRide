@@ -836,15 +836,11 @@ aiFactory.registerCoreIdentity('apk-diff-engine', {
 });
 apkDiffEngine.setAiFactory(aiFactory);
 
-// Task 20: the Astérix pattern pipeline's REST surface. `aiFactory` must already exist (just
-// above) — this is why this call lives here rather than back at the TODO comment Task 19 left
-// near registerJobEndpoints.
+// The AI Job Pipelines REST surface. `aiFactory` must already exist (just above).
 registerAiPipelineEndpoints({
   db,
   executors: buildApkAnalysisExecutors(),
   buildCtx: (identity, input) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number }),
-  // Same flag as apkAnalyzer.setPipelinesEnabled above: with it off, /run answers 403.
-  getPipelinesEnabled: (db) => isPipelinesEnabled(db),
 });
 
 // Wire notification service to broadcast events not handled by direct service hooks

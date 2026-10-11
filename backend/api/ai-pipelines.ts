@@ -13,10 +13,6 @@ export interface AiPipelineDeps {
   /** `identity` comes from the authenticated request (req.authUser), not a fixed core-service identity —
    * a manual run from the editor runs as the clicking user, same as `triggerAiAgentManual` does today. */
   buildCtx: (identity: { type: 'core-service' } | { type: 'user'; userId: number }, input: Record<string, unknown>) => ExecutionCtx;
-  /** Reads the `ai_pipelines_enabled` flag (production passes `isPipelinesEnabled` from
-   * run-executor.ts). Optional: omitted means enabled, so test harnesses that don't care about
-   * the flag keep working. When provided and it returns false, `/run` answers 403. */
-  getPipelinesEnabled?: (db: AppDatabase) => boolean;
 }
 
 /**
@@ -101,13 +97,11 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
     const { input, reuseUnchanged } = req.body as { triggerNodeId?: string; input: Record<string, unknown>; reuseUnchanged?: boolean };
     let { triggerNodeId } = req.body as { triggerNodeId?: string };
 
-    // Same flag that gates the production auto-trigger path (apk-analyzer.ts). Found in the final
-    // review: without this, the REST endpoint ran pipelines (real AgentCalls, real note writes)
-    // even with the feature switched off.
-    if (deps.getPipelinesEnabled && !deps.getPipelinesEnabled(db)) {
-      res.status(403).json({ success: false, error: 'AI job pipelines are disabled (the ai_pipelines_enabled setting is off)' });
-      return;
-    }
+    // `ai_pipelines_enabled` deliberately does NOT gate this endpoint — that flag controls only
+    // whether apk-analyzer.ts's automatic production trigger uses the pipeline engine yet. A
+    // manual run here is always a deliberate, authenticated, human-initiated action (same as
+    // clicking Run ever was before that flag existed), so it carries none of the "ran without
+    // anyone asking" risk the flag exists to prevent.
 
     // Fail closed. registerEndpoint's scope check should already have rejected an unauthenticated
     // request to this core.apk:manage route, but if that ever changes, the answer must be 401 —

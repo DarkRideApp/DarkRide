@@ -9,9 +9,12 @@ export interface TriggerCtx {
 export type TriggerExpander = (rawInput: Record<string, unknown>, ctx: TriggerCtx) => Promise<Record<string, unknown>>;
 
 export const TRIGGER_REGISTRY: Record<string, TriggerExpander> = Object.create(null);
+/** Human-readable "what this trigger does" text per registered expand function, for the editor UI. */
+export const TRIGGER_DESCRIPTIONS: Record<string, string> = Object.create(null);
 
-export function registerTrigger(name: string, fn: TriggerExpander): void {
+export function registerTrigger(name: string, fn: TriggerExpander, description: string): void {
   TRIGGER_REGISTRY[name] = fn;
+  TRIGGER_DESCRIPTIONS[name] = description;
 }
 
 registerTrigger('apk-analysis/apk-context', async (rawInput, ctx) => {
@@ -45,4 +48,4 @@ registerTrigger('apk-analysis/apk-context', async (rawInput, ctx) => {
     downloadedAt: row.downloadedAt instanceof Date ? row.downloadedAt.toISOString() : row.downloadedAt,
     source: row.source,
   };
-});
+}, 'Looks up a tracked APK version by id and expands it into app name, package, version, size, and source fields.');

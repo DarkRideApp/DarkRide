@@ -88,17 +88,21 @@ test.describe('AI job pipelines', () => {
     await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
     await expect(page.getByText('E2E Editor Pipeline')).toBeVisible();
 
-    // Add a Trigger node in one step (no separate "Add node" button) and configure + rename it.
-    await page.getByLabel('Add node').selectOption('Trigger');
+    // Add a Trigger node via the searchable node picker, configure + rename it.
+    await page.getByRole('button', { name: '+ Add node' }).click();
+    await page.getByRole('option', { name: /^Trigger/ }).click();
     const triggerPanel = page.getByRole('dialog');
     await expect(triggerPanel).toBeVisible();
-    await triggerPanel.getByLabel('Expand function').fill('e2e/expand');
+    await triggerPanel.getByLabel('Starts from').selectOption('__custom__');
+    await triggerPanel.getByPlaceholder('custom expand function name').fill('e2e/expand');
     await triggerPanel.getByLabel('Node name').fill('E2E Trigger');
     await page.getByRole('button', { name: /close/i }).click();
     await expect(page.locator('.react-flow__node').getByText('E2E Trigger', { exact: true })).toBeVisible();
 
-    // Add an AgentCall node.
-    await page.getByLabel('Add node').selectOption('AgentCall');
+    // Add an AgentCall node via the picker, filtering by a search term to prove it actually filters.
+    await page.getByRole('button', { name: '+ Add node' }).click();
+    await page.getByLabel('Search node kinds').fill('agent');
+    await page.getByRole('option', { name: /^Agent Call/ }).click();
     await page.getByRole('button', { name: /close/i }).click();
     await expect(page.locator('.react-flow__node')).toHaveCount(2);
 
@@ -144,9 +148,11 @@ test.describe('AI job pipelines', () => {
     await page.getByRole('button', { name: 'Create' }).click();
     await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
 
-    await page.getByLabel('Add node').selectOption('AgentCall');
+    await page.getByRole('button', { name: '+ Add node' }).click();
+    await page.getByRole('option', { name: /^Agent Call/ }).click();
     await page.getByRole('button', { name: /close/i }).click();
-    await page.getByLabel('Add node').selectOption('Report');
+    await page.getByRole('button', { name: '+ Add node' }).click();
+    await page.getByRole('option', { name: /^Report/ }).click();
     const reportPanel = page.getByRole('dialog');
     await expect(reportPanel).toBeVisible();
     await reportPanel.getByRole('button', { name: /add section/i }).click();

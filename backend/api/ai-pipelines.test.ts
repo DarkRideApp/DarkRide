@@ -109,10 +109,9 @@ function createApp(
   executors: NodeExecutors,
   scopes: string[] = ['core.apk:read', 'core.apk:manage'],
   buildCtx: AiPipelineDeps['buildCtx'] = (_identity, _input): ExecutionCtx => ({}),
-  getPipelinesEnabled?: AiPipelineDeps['getPipelinesEnabled'],
 ) {
   clearEndpoints();
-  const deps: AiPipelineDeps = { db, executors, buildCtx, ...(getPipelinesEnabled ? { getPipelinesEnabled } : {}) };
+  const deps: AiPipelineDeps = { db, executors, buildCtx };
   registerAiPipelineEndpoints(deps);
   const app = express();
   app.use(express.json());
@@ -459,43 +458,19 @@ describe('POST /v1/ai-pipelines/:id/run — concurrency guard', () => {
   });
 });
 
-describe('POST /v1/ai-pipelines/:id/run — ai_pipelines_enabled gate', () => {
-  let db: Db;
-  let pipelineId: number;
-
-  beforeEach(() => {
-    db = makeDb();
-    pipelineId = seedPipeline(db);
+describe('POST /v1/ai-pipelines/:id/run — not gated by ai_pipelines_enabled', () => {
+  // Deliberate: that flag controls only whether apk-analyzer.ts's automatic production trigger
+  // uses the pipeline engine. A manual run through this REST endpoint is always a deliberate,
+  // authenticated action and must work regardless of the flag — including while it's off, which
+  // is also the default. Regression guard for re-coupling the two.
+  it('runs a pipeline even when ai_pipelines_enabled is explicitly false', async () => {
+    const db = makeDb();
+    db.insert(schema.settings).values({ key: 'ai_pipelines_enabled', value: 'false' }).run();
+    const pipelineId = seedPipeline(db);
     seedVersion(db, pipelineId, 1, graphWithOneTrigger(), 'published');
-  });
-
-  it('returns 403 and never runs anything when getPipelinesEnabled returns false', async () => {
-    const executors = fakeExecutors();
-    const getPipelinesEnabled = vi.fn(() => false);
-    const app = createApp(db, executors, undefined, undefined, getPipelinesEnabled);
-    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
-
-    expect(res.status).toBe(403);
-    expect(res.body.error).toMatch(/disabled/i);
-    expect(getPipelinesEnabled).toHaveBeenCalledWith(db);
-    await new Promise((r) => setTimeout(r, 0));
-    expect(executors.Trigger).not.toHaveBeenCalled();
-    expect(db.select().from(schema.aiPipelineRuns).all()).toHaveLength(0);
-  });
-
-  it('runs when getPipelinesEnabled returns true', async () => {
-    const executors = fakeExecutors();
-    const app = createApp(db, executors, undefined, undefined, () => true);
-    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
-
-    expect(res.status).toBe(200);
-    await waitForRunToSettle(app, res.body.data.runId);
-    expect(executors.Trigger).toHaveBeenCalled();
-  });
-
-  it('defaults to enabled when getPipelinesEnabled is omitted', async () => {
     const executors = fakeExecutors();
     const app = createApp(db, executors);
+
     const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
 
     expect(res.status).toBe(200);

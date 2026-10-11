@@ -188,12 +188,13 @@ describe('AiJobsWorkspace', () => {
     expect(calledPaths(ws)).toContain('GET /v1/ai-pipelines/1');
   });
 
-  it('adding a node inserts it into the graph and opens its side panel, in one step', async () => {
+  it('adding a node via the picker inserts it into the graph and opens its side panel', async () => {
     const ws = createMockWs();
     render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
-    fireEvent.change(screen.getByLabelText('Add node'), { target: { value: 'AgentCall' } });
+    fireEvent.click(screen.getByRole('button', { name: '+ Add node' }));
+    fireEvent.click(screen.getByRole('option', { name: /^Agent Call/ }));
 
     await screen.findByRole('dialog', { name: /agent-\d+ details/ });
   });
@@ -266,7 +267,8 @@ describe('AiJobsWorkspace', () => {
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
     expect(screen.getByText('All changes saved')).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('Add node'), { target: { value: 'AgentCall' } });
+    fireEvent.click(screen.getByRole('button', { name: '+ Add node' }));
+    fireEvent.click(screen.getByRole('option', { name: /^Agent Call/ }));
     expect(screen.getByText('Unsaved changes…')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /save draft/i }));
@@ -278,7 +280,8 @@ describe('AiJobsWorkspace', () => {
     render(<AiJobsWorkspace pipelineId={1} autosaveDebounceMs={0} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
-    fireEvent.change(screen.getByLabelText('Add node'), { target: { value: 'AgentCall' } });
+    fireEvent.click(screen.getByRole('button', { name: '+ Add node' }));
+    fireEvent.click(screen.getByRole('option', { name: /^Agent Call/ }));
 
     await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines/1/versions'));
     await waitFor(() => expect(screen.getByText('All changes saved')).toBeInTheDocument());
@@ -294,7 +297,8 @@ describe('AiJobsWorkspace', () => {
     render(<AiJobsWorkspace pipelineId={1} autosaveDebounceMs={100000} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
-    fireEvent.change(screen.getByLabelText('Add node'), { target: { value: 'AgentCall' } });
+    fireEvent.click(screen.getByRole('button', { name: '+ Add node' }));
+    fireEvent.click(screen.getByRole('option', { name: /^Agent Call/ }));
     fireEvent.click(screen.getByRole('button', { name: /^publish$/i }));
 
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/published/i));

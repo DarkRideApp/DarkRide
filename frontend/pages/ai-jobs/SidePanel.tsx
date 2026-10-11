@@ -135,21 +135,59 @@ function AgentCallBody({ node, triggerSchema, onSave }: {
   );
 }
 
-function SchemaFieldListEditor({ label, help, fields, onChange, testId }: {
-  label: string; help: string; fields: SchemaField[]; onChange: (next: SchemaField[]) => void; testId: string;
+interface TypeOption { value: string; label: string }
+
+const CUSTOM_TYPE = '__custom_type__';
+/** Purely descriptive — nothing reads this to decide behavior, so a plain closed set is enough. */
+const OUTPUT_FIELD_TYPES: TypeOption[] = [
+  { value: 'string', label: 'string' },
+  { value: 'number', label: 'number' },
+  { value: 'boolean', label: 'boolean' },
+];
+/** Drives which control the Run form renders (SchemaFieldInput below) — 'apk-version' is the one
+ *  example of a "rich" type today; a job kind can register more without the frontend knowing
+ *  about them ahead of time (Custom still renders as plain text, same as any unrecognized type). */
+const RUN_PARAM_TYPES: TypeOption[] = [
+  { value: 'string', label: 'Text' },
+  { value: 'number', label: 'Number' },
+  { value: 'boolean', label: 'Yes/No' },
+  { value: 'apk-version', label: 'APK version (picker)' },
+];
+
+// Duplicated from backend/services/ai-jobs/nodes/trigger.ts's TRIGGER_DESCRIPTIONS — the
+// frontend can't import that module at runtime (it pulls in better-sqlite3).
+const KNOWN_TRIGGER_EXPAND_FNS: Array<{ value: string; description: string }> = [
+  { value: 'apk-analysis/apk-context',
+    description: 'Looks up a tracked APK version by id and expands it into app name, package, version, size, and source fields.' },
+];
+
+function SchemaFieldListEditor({ label, fieldNoun, help, fields, typeOptions, onChange, testId }: {
+  label: string; fieldNoun: string; help: string; fields: SchemaField[]; typeOptions: TypeOption[];
+  onChange: (next: SchemaField[]) => void; testId: string;
 }) {
   return (
     <div className="form-group">
       <label>{label}</label>
-      {fields.map((f, i) => (
-        <div key={i} className="ai-jobs-list-row" data-testid={testId}>
-          <input className="form-input" placeholder="field" value={f.field} onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, field: e.target.value } : s))} />
-          <input className="form-input" placeholder="type" value={f.type} onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, type: e.target.value } : s))} />
-          <input className="form-input" placeholder="description" value={f.description} onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, description: e.target.value } : s))} />
-          <button type="button" className="btn btn-danger-ghost btn-sm" aria-label={`Remove ${label.toLowerCase()} field`} onClick={() => onChange(fields.filter((_, j) => j !== i))}>×</button>
-        </div>
-      ))}
-      <button type="button" className="btn btn-ghost btn-sm" onClick={() => onChange([...fields, { field: '', type: '', description: '' }])}>+ Add {label.toLowerCase()} field</button>
+      {fields.map((f, i) => {
+        const isKnownType = typeOptions.some(t => t.value === f.type);
+        return (
+          <div key={i} className="ai-jobs-list-row" data-testid={testId}>
+            <input className="form-input" placeholder="name" value={f.field} onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, field: e.target.value } : s))} />
+            <select className="form-select" aria-label={`${fieldNoun} type`} value={isKnownType ? f.type : CUSTOM_TYPE}
+              onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, type: e.target.value === CUSTOM_TYPE ? '' : e.target.value } : s))}>
+              {typeOptions.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+              <option value={CUSTOM_TYPE}>Custom…</option>
+            </select>
+            {!isKnownType && (
+              <input className="form-input" placeholder="custom type" value={f.type}
+                onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, type: e.target.value } : s))} />
+            )}
+            <input className="form-input" placeholder="description" value={f.description} onChange={(e) => onChange(fields.map((s, j) => j === i ? { ...s, description: e.target.value } : s))} />
+            <button type="button" className="btn btn-danger-ghost btn-sm" aria-label={`Remove ${fieldNoun}`} onClick={() => onChange(fields.filter((_, j) => j !== i))}>×</button>
+          </div>
+        );
+      })}
+      <button type="button" className="btn btn-ghost btn-sm" onClick={() => onChange([...fields, { field: '', type: typeOptions[0].value, description: '' }])}>+ Add {fieldNoun}</button>
       <div className="form-help">{help}</div>
     </div>
   );
@@ -162,21 +200,41 @@ function TriggerBody({ node, onSave, recentVersions, onRun }: {
   const expandFn: string = node.config.expandFn;
   const inputSchema: SchemaField[] = node.config.inputSchema ?? [];
   const outputSchema: SchemaField[] = node.config.outputSchema;
+  const known = KNOWN_TRIGGER_EXPAND_FNS.find(f => f.value === expandFn);
+  // Selecting "Custom…" saves expandFn as '' until the user types something, so "known" can't be
+  // derived from expandFn alone — an empty value is ambiguous between "unset" and "mid-typing
+  // custom." A bit of local state remembers which one, reset whenever SidePanel remounts for a
+  // different node (see AiJobsWorkspace.tsx's `key={selected}` on SidePanel).
+  const [forceCustom, setForceCustom] = useState(false);
+  const isKnownFn = !forceCustom && (expandFn === '' || known !== undefined);
 
   return (
     <>
       <div className="form-group">
-        <label>Expand function</label>
-        <input className="form-input" aria-label="Expand function" value={expandFn} onChange={(e) => onSave(node.id, { expandFn: e.target.value })} />
-        <div className="form-help">Name of a function registered in backend/services/ai-jobs/nodes/trigger.ts.</div>
+        <label htmlFor="trigger-expand-fn">Starts from</label>
+        <select id="trigger-expand-fn" className="form-select" value={isKnownFn ? expandFn : '__custom__'}
+          onChange={(e) => {
+            const isCustom = e.target.value === '__custom__';
+            setForceCustom(isCustom);
+            onSave(node.id, { expandFn: isCustom ? '' : e.target.value });
+          }}>
+          <option value="">— choose —</option>
+          {KNOWN_TRIGGER_EXPAND_FNS.map(fn => <option key={fn.value} value={fn.value}>{fn.value}</option>)}
+          <option value="__custom__">Custom (registered in code)…</option>
+        </select>
+        {!isKnownFn && (
+          <input className="form-input" value={expandFn} placeholder="custom expand function name"
+            onChange={(e) => onSave(node.id, { expandFn: e.target.value })} />
+        )}
+        <div className="form-help">{known ? known.description : 'Name of a function registered in backend/services/ai-jobs/nodes/trigger.ts.'}</div>
       </div>
       <SchemaFieldListEditor
-        label="Input schema" testId="trigger-input-field-row"
-        help="What a run must supply to start this Trigger — drives the Run form below. An unrecognized type renders as plain text; 'apk-version' renders as a picker over recent APK versions."
+        label="Run parameters" fieldNoun="parameter" testId="trigger-input-field-row" typeOptions={RUN_PARAM_TYPES}
+        help="A Trigger has no incoming wire on the canvas — these are the values the Run form below asks for each time someone runs it, not data from another node."
         fields={inputSchema} onChange={(next) => onSave(node.id, { inputSchema: next })}
       />
       <SchemaFieldListEditor
-        label="Output schema" testId="schema-field-row"
+        label="Output schema" fieldNoun="output field" testId="schema-field-row" typeOptions={OUTPUT_FIELD_TYPES}
         help="What this Trigger hands downstream nodes, as {{trigger.field}}."
         fields={outputSchema} onChange={(next) => onSave(node.id, { outputSchema: next })}
       />
@@ -268,14 +326,21 @@ function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGrap
   const from: string | undefined = node.config.from;
   const section: string = node.config.section ?? '';
   const known = KNOWN_SINK_WRITE_FNS.find(f => f.value === writeFn);
-  const isKnownFn = writeFn === '' || known !== undefined;
+  // See TriggerBody's identical forceCustom for why: an empty writeFn is ambiguous between
+  // "unset" and "mid-typing custom" right after picking Custom…, so local state breaks the tie.
+  const [forceCustom, setForceCustom] = useState(false);
+  const isKnownFn = !forceCustom && (writeFn === '' || known !== undefined);
 
   return (
     <>
       <div className="form-group">
         <label htmlFor="sink-write-fn">Write function</label>
         <select id="sink-write-fn" aria-label="Write function" className="form-select" value={isKnownFn ? writeFn : '__custom__'}
-          onChange={(e) => onSave(node.id, { writeFn: e.target.value === '__custom__' ? '' : e.target.value })}>
+          onChange={(e) => {
+            const isCustom = e.target.value === '__custom__';
+            setForceCustom(isCustom);
+            onSave(node.id, { writeFn: isCustom ? '' : e.target.value });
+          }}>
           <option value="">— choose —</option>
           {KNOWN_SINK_WRITE_FNS.map(fn => <option key={fn.value} value={fn.value}>{fn.value}</option>)}
           <option value="__custom__">Custom (registered in code)…</option>

@@ -87,6 +87,16 @@ describe('Settings API Endpoints', () => {
       expect(res.body.data.value).toBe(value);
     });
 
+    it('should accept ai_pipelines_enabled key', async () => {
+      const res = await request(app)
+        .put('/v1/settings/ai_pipelines_enabled')
+        .send({ value: 'true' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data).toEqual({ key: 'ai_pipelines_enabled', value: 'true' });
+    });
+
     it('should mask password value in response', async () => {
       const res = await request(app)
         .put('/v1/settings/nordvpn_password')
