@@ -292,6 +292,22 @@ describe('AdbProxyPage', () => {
     expect(within(live).queryByText('10.0.0.8')).toBeNull();
   });
 
+  it('names a live connection after its stored key when the session did not carry a name', async () => {
+    mount({
+      snapshot: snapshot({
+        keys: [keyRow({ keyId: 'k1', comment: 'dev@laptop' })],
+        connections: [
+          { id: 1, deviceId: 'DEV1', peerIp: '10.0.0.7', state: 'ready', keyId: 'k1', comment: null, since: Date.now() - 90_000, streams: 0 },
+          { id: 2, deviceId: 'DEV1', peerIp: '10.0.0.8', state: 'ready', keyId: 'unknown', comment: null, since: Date.now() - 90_000, streams: 0 },
+        ],
+      }),
+    });
+    const live = await screen.findByTestId('adb-proxy-connections');
+    const rows = within(live).getAllByRole('row');
+    expect(within(rows[1]).getByText('dev@laptop')).toBeInTheDocument();
+    expect(within(rows[2]).getByText('(no name)')).toBeInTheDocument();
+  });
+
   it('shows empty states', async () => {
     mount();
     expect(await screen.findByText('No machines are waiting for approval.')).toBeInTheDocument();
@@ -454,15 +470,15 @@ describe('AdbProxyPage', () => {
       const [first, second] = within(approved).getAllByRole('button', { name: 'Revoke' });
 
       fireEvent.click(first);
-      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for "laptop" (from 10.0.0.7, fingerprint starting AA:BB:CC:DD:)?');
+      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for "laptop" (from 10.0.0.7, fingerprint starting AA:BB:CC:DD)?');
       fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
 
       fireEvent.click(second);
-      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for "laptop" (from 10.0.0.9, fingerprint starting 11:22:33:44:)?');
+      expect(screen.getByTestId('modal')).toHaveTextContent('Revoke access for "laptop" (from 10.0.0.9, fingerprint starting 11:22:33:44)?');
       fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
 
       fireEvent.click(within(screen.getByTestId('adb-proxy-blocked')).getByRole('button', { name: 'Forget', hidden: true }));
-      expect(screen.getByTestId('modal')).toHaveTextContent('Forget "old@box" (fingerprint starting AA:BB:CC:DD:)?');
+      expect(screen.getByTestId('modal')).toHaveTextContent('Forget "old@box" (fingerprint starting AA:BB:CC:DD)?');
     });
   });
 
