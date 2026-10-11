@@ -4,9 +4,17 @@ export interface BurstLog {
   stop(): void;
 }
 
-/** Emits the first event of an interval in full, counts the rest, and ends the interval with one "N more <kind> events suppressed" line. */
+const MAX_BACKOFF_FACTOR = 60;
+
+/**
+ * Emits the first event after a quiet period in full, counts the rest, and ends the interval with one
+ * "N more <kind> events suppressed" line. While events keep arriving the next interval is twice as long, up to
+ * 60 times the base, and its events are only counted; an interval with no events resets it.
+ */
 export function createBurstLog(intervalMs: number, kind: string, emit: (line: string) => void): BurstLog {
+  const longest = intervalMs * MAX_BACKOFF_FACTOR;
   let timer: NodeJS.Timeout | null = null;
+  let length = intervalMs;
   let suppressed = 0;
   let stopped = false;
 
@@ -22,6 +30,21 @@ export function createBurstLog(intervalMs: number, kind: string, emit: (line: st
     }
   };
 
+  const arm = () => {
+    timer = setTimeout(() => {
+      timer = null;
+      const hot = suppressed > 0;
+      summarise();
+      if (hot) {
+        length = Math.min(length * 2, longest);
+        arm();
+      } else {
+        length = intervalMs;
+      }
+    }, length);
+    timer.unref?.();
+  };
+
   return {
     log(line) {
       if (stopped) return emit(line);
@@ -30,11 +53,7 @@ export function createBurstLog(intervalMs: number, kind: string, emit: (line: st
         return;
       }
       emit(line);
-      timer = setTimeout(() => {
-        timer = null;
-        summarise();
-      }, intervalMs);
-      timer.unref?.();
+      arm();
     },
     stop() {
       stopped = true;

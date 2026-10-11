@@ -65,7 +65,71 @@ describe('createBurstLog', () => {
     expect(emit.mock.calls).toEqual([['a'], ['b']]);
   });
 
-  it('starts a fresh count after a summary', () => {
+  it('counts, without logging, in the interval after a hot one, and makes that interval twice as long', () => {
+    const emit = vi.fn();
+    const burst = createBurstLog(1000, 'probe', emit);
+    burst.log('a');
+    burst.log('b');
+    vi.advanceTimersByTime(1000);
+    expect(emit.mock.calls).toEqual([['a'], ['1 more probe events suppressed']]);
+    burst.log('c');
+    burst.log('d');
+    burst.log('e');
+    vi.advanceTimersByTime(1999);
+    expect(emit).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(1);
+    expect(emit.mock.calls).toEqual([['a'], ['1 more probe events suppressed'], ['3 more probe events suppressed']]);
+  });
+
+  it('doubles the interval while events keep coming, up to 60 times the base, with an exact count in each summary', () => {
+    const lines: string[] = [];
+    const stamps: number[] = [];
+    const burst = createBurstLog(1000, 'probe', (line) => {
+      lines.push(line);
+      stamps.push(Date.now());
+    });
+    const start = Date.now();
+    let events = 0;
+    for (let elapsed = 0; elapsed < 300_000; elapsed += 10) {
+      burst.log(`event ${events}`);
+      events++;
+      vi.advanceTimersByTime(10);
+    }
+
+    expect(lines[0]).toBe('event 0');
+    expect(stamps.slice(1).map((stamp) => stamp - start)).toEqual([1000, 3000, 7000, 15000, 31000, 63000, 123000, 183000, 243000]);
+    burst.stop();
+    expect(lines.length).toBeLessThanOrEqual(12);
+    expect(vi.getTimerCount()).toBe(0);
+    const counted = lines.slice(1).reduce((sum, line) => sum + Number(line.split(' ')[0]), 0);
+    expect(1 + counted).toBe(events);
+    expect(events).toBe(30_000);
+  });
+
+  it('goes back to the base interval after an interval with no events at all', () => {
+    const emit = vi.fn();
+    const burst = createBurstLog(1000, 'probe', emit);
+    burst.log('a');
+    burst.log('b');
+    vi.advanceTimersByTime(1000);
+    burst.log('c');
+    vi.advanceTimersByTime(2000);
+    expect(emit.mock.calls).toEqual([['a'], ['1 more probe events suppressed'], ['1 more probe events suppressed']]);
+    vi.advanceTimersByTime(4000);
+    expect(emit).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+
+    burst.log('x');
+    burst.log('y');
+    expect(emit).toHaveBeenLastCalledWith('x');
+    vi.advanceTimersByTime(999);
+    expect(emit).toHaveBeenCalledTimes(4);
+    vi.advanceTimersByTime(1);
+    expect(emit).toHaveBeenLastCalledWith('1 more probe events suppressed');
+    expect(emit).toHaveBeenCalledTimes(5);
+  });
+
+  it('stop() during a longer interval flushes its count and clears the timer', () => {
     const emit = vi.fn();
     const burst = createBurstLog(1000, 'probe', emit);
     burst.log('a');
@@ -73,9 +137,11 @@ describe('createBurstLog', () => {
     vi.advanceTimersByTime(1000);
     burst.log('c');
     burst.log('d');
-    burst.log('e');
-    vi.advanceTimersByTime(1000);
-    expect(emit.mock.calls).toEqual([['a'], ['1 more probe events suppressed'], ['c'], ['2 more probe events suppressed']]);
+    burst.stop();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(emit.mock.calls).toEqual([['a'], ['1 more probe events suppressed'], ['2 more probe events suppressed']]);
+    vi.advanceTimersByTime(10_000);
+    expect(emit).toHaveBeenCalledTimes(3);
   });
 
   it('keeps no timer while idle', () => {
@@ -128,6 +194,9 @@ describe('createBurstLog', () => {
     burst.log('b');
     expect(() => vi.advanceTimersByTime(1000)).not.toThrow();
     burst.log('c');
-    expect(emit).toHaveBeenLastCalledWith('c');
+    expect(() => vi.advanceTimersByTime(2000)).not.toThrow();
+    vi.advanceTimersByTime(4000);
+    burst.log('d');
+    expect(emit).toHaveBeenLastCalledWith('d');
   });
 });

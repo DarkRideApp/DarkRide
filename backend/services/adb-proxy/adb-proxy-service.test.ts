@@ -800,10 +800,10 @@ describe('AdbProxyService refusal logging', () => {
 
 describe('AdbProxyService log flooding by peers without an approved key', () => {
   /** Opens and drops `total` bare connections in batches that stay under the per-peer pre-auth cap. */
-  const bareCycles = async (h: Harness, total: number) => {
+  const bareCycles = async (h: Harness, total: number, perBatch = 5) => {
     const port = h.portOf('DEV1');
-    for (let done = 0; done < total; done += 5) {
-      const size = Math.min(5, total - done);
+    for (let done = 0; done < total; done += perBatch) {
+      const size = Math.min(perBatch, total - done);
       const batch = await Promise.all(Array.from({ length: size }, () => WireClient.connect(port)));
       await vi.waitFor(() => expect(h.service.snapshot().counters.connections).toBe(done + size), { interval: 5, timeout: 3000 });
       batch.forEach((c) => c.close());
@@ -821,6 +821,20 @@ describe('AdbProxyService log flooding by peers without an approved key', () => 
     await h.service.stop();
     expect(logged().filter((line) => line.includes('events suppressed'))).toEqual(['49 more unauthenticated close events suppressed']);
   });
+
+  it('keeps bare connections arriving over several intervals down to a handful of lines, with exact counters', async () => {
+    const h = await setup({ logIntervalMs: 50 });
+
+    await bareCycles(h, 500, 8);
+
+    expect(closeLines()).toHaveLength(1);
+    expect(h.service.snapshot().counters).toEqual({ connections: 500, approvals: 0, denials: 0, authFailures: 0, floodDrops: 0 });
+    await h.service.stop();
+    const summaries = logged().filter((line) => line.includes('unauthenticated close events suppressed'));
+    expect(summaries.length).toBeGreaterThanOrEqual(2);
+    expect(summaries.length).toBeLessThanOrEqual(12);
+    expect(summaries.reduce((sum, line) => sum + Number(line.split(' ')[0]), 0)).toBe(499);
+  }, 30_000);
 
   it('logs the first blocked offer in full and counts the other nine', async () => {
     const h = await setup({ logIntervalMs: 60_000 });
