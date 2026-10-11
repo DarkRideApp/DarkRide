@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { eq } from 'drizzle-orm';
 import fs from 'fs';
 import path from 'path';
+import * as schema from './schema';
+import { applyMigrations } from '../test-utils/create-test-db';
+import { forgetDeviceRow } from '../services/forget-device';
 
 const TAG = '0102_adb_proxy';
 
@@ -66,5 +71,84 @@ describe('migration 0102: ADB proxy keys and device ports', () => {
     db.prepare(`INSERT INTO devices (id) VALUES ('A')`).run();
     db.prepare(`INSERT INTO adb_proxy_devices (device_id, port, created_at) VALUES ('A', 6500, 1)`).run();
     expect(() => db.prepare(`DELETE FROM devices WHERE id = 'A'`).run()).toThrow();
+  });
+
+  it('enables a device port by default', () => {
+    db.prepare(`INSERT INTO devices (id) VALUES ('A')`).run();
+    db.prepare(`INSERT INTO adb_proxy_devices (device_id, port, created_at) VALUES ('A', 6500, 1)`).run();
+    expect((db.prepare('SELECT enabled FROM adb_proxy_devices').get() as any).enabled).toBe(1);
+  });
+
+  it('leaves every optional adb_proxy_keys column NULL on a minimal insert', () => {
+    db.prepare(
+      `INSERT INTO adb_proxy_keys (key_id, public_key, status, first_seen_at, last_seen_at) VALUES ('k', 'p', 'approved', 1, 1)`,
+    ).run();
+    expect(db.prepare('SELECT * FROM adb_proxy_keys').get()).toMatchObject({
+      comment: null,
+      device_ids: null,
+      last_seen_ip: null,
+      last_device_id: null,
+      decided_by: null,
+      decided_at: null,
+    });
+  });
+});
+
+describe('migration 0102 journal entry', () => {
+  it('is journalled as idx 102 with a when greater than every earlier entry (so it can never be skipped)', () => {
+    const j = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../migrations/meta/_journal.json'), 'utf8'));
+    const entry = j.entries.find((e: any) => e.idx === 102);
+    expect(entry?.tag).toBe(TAG);
+    expect(entry.breakpoints).toBe(true);
+    const maxOther = Math.max(...j.entries.filter((e: any) => e.idx !== 102).map((e: any) => e.when));
+    expect(entry.when).toBeGreaterThan(maxOther);
+  });
+});
+
+describe('migration 0102 on the full migration chain', () => {
+  let sqlite: Database.Database;
+  let db: ReturnType<typeof drizzle<typeof schema>>;
+
+  beforeEach(() => {
+    sqlite = new Database(':memory:');
+    sqlite.pragma('foreign_keys = ON');
+    applyMigrations(sqlite);
+    db = drizzle(sqlite, { schema });
+  });
+
+  it('creates both tables with the columns the Drizzle definitions use', () => {
+    const cols = (table: string) => (sqlite.prepare(`PRAGMA table_info(${table})`).all() as any[]).map((c) => c.name);
+    expect(cols('adb_proxy_keys')).toEqual([
+      'id', 'key_id', 'public_key', 'comment', 'status', 'device_ids', 'first_seen_at',
+      'last_seen_at', 'last_seen_ip', 'last_device_id', 'decided_by', 'decided_at',
+    ]);
+    expect(cols('adb_proxy_devices')).toEqual(['device_id', 'port', 'enabled', 'created_at']);
+  });
+
+  it('rejects a proxy row for a device that does not exist', () => {
+    expect(() =>
+      db.insert(schema.adbProxyDevices).values({ deviceId: 'MISSING', port: 6500, createdAt: new Date() }).run(),
+    ).toThrow();
+  });
+
+  it('round-trips a proxy row and a key row through the Drizzle tables', () => {
+    db.insert(schema.devices).values({ id: 'SER1' }).run();
+    db.insert(schema.adbProxyDevices).values({ deviceId: 'SER1', port: 6500, createdAt: new Date(1000) }).run();
+    expect(db.select().from(schema.adbProxyDevices).all()).toEqual([
+      { deviceId: 'SER1', port: 6500, enabled: true, createdAt: new Date(1000) },
+    ]);
+    db.insert(schema.adbProxyKeys).values({
+      keyId: 'abc', publicKey: 'pub', status: 'approved', deviceIds: ['SER1'],
+      firstSeenAt: new Date(1000), lastSeenAt: new Date(2000),
+    }).run();
+    expect(db.select().from(schema.adbProxyKeys).all()[0]).toMatchObject({ keyId: 'abc', deviceIds: ['SER1'], comment: null });
+  });
+
+  it('forgetDeviceRow removes a device and its proxy row on the real schema', () => {
+    db.insert(schema.devices).values({ id: 'SER1' }).run();
+    db.insert(schema.adbProxyDevices).values({ deviceId: 'SER1', port: 6500, createdAt: new Date() }).run();
+    expect(forgetDeviceRow(db, 'SER1')).toBe(true);
+    expect(db.select().from(schema.devices).where(eq(schema.devices.id, 'SER1')).all()).toHaveLength(0);
+    expect(db.select().from(schema.adbProxyDevices).all()).toHaveLength(0);
   });
 });
