@@ -507,6 +507,31 @@ describe('Session streams', () => {
       },
     );
 
+    it('closes the session when the restart announcement arrives split across two chunks', async () => {
+      expect(await runService('root:', ['restart', 'ing adbd as root\n'])).toMatchObject({ closed: true, reasons: ['device restarting'] });
+    });
+
+    it('reads the announcement only within the first 256 bytes of output', async () => {
+      expect(await runService('root:', ['x'.repeat(246), 'restarting\n'])).toMatchObject({ closed: true });
+      expect(await runService('root:', ['x'.repeat(247), 'restarting\n'])).toMatchObject({ closed: false });
+      expect(await runService('root:', ['x'.repeat(256), 'restarting adbd as root\n'])).toMatchObject({ closed: false, reasons: [] });
+    });
+
+    it('keeps no more than 256 bytes of a long output', async () => {
+      const run = await runService('root:', [Buffer.alloc(100_000, 'x'), Buffer.alloc(100_000, 'y')]);
+      expect(run.keptBeforeEnd).toBe(256);
+      expect(run.closed).toBe(false);
+    });
+
+    it.each([
+      ['root:', 'adbd is already running as root\n'],
+      ['root:', 'adbd cannot run as root in production builds\n'],
+      ['unroot:', 'adbd not running as root\n'],
+      ['root:', ''],
+    ])('keeps the session when %s answers %j', async (service, answer) => {
+      expect(await runService(service, answer ? [answer] : [])).toMatchObject({ closed: false, reasons: [] });
+    });
+
     it.each([['reboot:'], ['reboot:bootloader']])('closes the session after %s even with no output', async (service) => {
       expect(await runService(service)).toMatchObject({ closed: true, reasons: ['device restarting'] });
     });

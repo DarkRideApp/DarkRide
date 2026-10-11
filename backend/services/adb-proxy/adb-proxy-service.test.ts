@@ -1420,6 +1420,47 @@ describe('AdbProxyService device banner cache', () => {
     expect(reconnect.packets.some((p) => p.command === A_CNXN)).toBe(false);
   });
 
+  it('drops the cached banner as soon as a restart is triggered, while the session is still open', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    await approveKey(h, key, 'DEV2');
+    const live = await signIn(h, key);
+    expect((await live.next()).command).toBe(A_CNXN);
+    const service = h.service as any;
+    const banners = service.banners as Map<string, unknown>;
+    expect(banners.has('DEV1')).toBe(true);
+    const statesAtDrop: string[] = [];
+    const drop = banners.delete.bind(banners);
+    vi.spyOn(banners, 'delete').mockImplementation((id: string) => {
+      if (id === 'DEV1') statesAtDrop.push([...service.sessions].filter((s: Session) => s.deviceId === 'DEV1').map((s: Session) => s.state).join());
+      return drop(id);
+    });
+
+    const { localId } = await live.open('reboot:', 1);
+    await live.collectStream(1, localId, 'close');
+    expect(await live.waitClosed()).toBe(true);
+
+    expect(statesAtDrop[0]).toBe('ready');
+  });
+
+  it('drops the cached banner when a session closes because the device was unavailable', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    await approveKey(h, key, 'DEV2');
+    const features = () => h.fake.requests.filter((r) => r === 'host-serial:DEV1:features').length;
+    const live = await signIn(h, key);
+    expect((await live.next()).command).toBe(A_CNXN);
+    const before = features();
+
+    h.fake.setOnline('DEV1', false);
+    live.send(A_OPEN, 1, 0, 'shell:id\0');
+    expect(await live.waitClosed()).toBe(true);
+    h.fake.setOnline('DEV1', true);
+
+    expect(await fresh(h, key)).toBe(true);
+    expect(features()).toBe(before + 1);
+  });
+
   it('drops the cached banner when the device goes offline', async () => {
     const banner = holdableBanner();
     const h = await setup({ wrapBackend: banner.wrap });
