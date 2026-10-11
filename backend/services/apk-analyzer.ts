@@ -1048,7 +1048,7 @@ export class ApkAnalyzerService {
         graph: version.graph as PipelineGraph,
         triggerNodeId,
         input: { versionId },
-        triggeredBy: 'apk-analysis-complete',
+        triggeredBy: 'event',
         executors: buildApkAnalysisExecutors(),
         buildCtx: () => buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId }),
         onSettled: (result, crashError) => {

@@ -840,7 +840,7 @@ export const aiPipelineRuns = sqliteTable('ai_pipeline_runs', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   pipelineVersionId: integer('pipeline_version_id').notNull().references(() => aiPipelineVersions.id, { onDelete: 'cascade' }),
   triggerNodeId: text('trigger_node_id').notNull(),
-  triggeredBy: text('triggered_by').notNull(), // 'manual' | 'apk-analysis-complete'
+  triggeredBy: text('triggered_by').notNull(), // 'manual' | 'event'
   input: text('input', { mode: 'json' }).$type<Record<string, unknown>>(),
   reuseUnchanged: integer('reuse_unchanged', { mode: 'boolean' }).notNull().default(false),
   status: text('status', { enum: ['running', 'ok', 'failed', 'partial'] }).notNull().default('running'),

@@ -14,7 +14,7 @@ export interface StartPipelineRunOptions {
   triggerNodeId: string;
   input: Record<string, unknown>;
   reuseUnchanged?: boolean;
-  triggeredBy: 'manual' | 'apk-analysis-complete';
+  triggeredBy: 'manual' | 'event';
   executors: NodeExecutors;
   /**
    * A thunk, not a pre-built ctx — called AFTER the 'running' row is inserted, inside the same

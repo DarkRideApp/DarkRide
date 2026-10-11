@@ -116,7 +116,7 @@ describe('startPipelineRun', () => {
 
     const second = startPipelineRun({
       db, pipelineVersionId: versionId, graph: graph(), triggerNodeId: 'trigger', input: {},
-      triggeredBy: 'apk-analysis-complete', executors: fakeExecutors(), buildCtx: () => ({}),
+      triggeredBy: 'event', executors: fakeExecutors(), buildCtx: () => ({}),
     });
     expect(second).toEqual({
       ok: false,
@@ -130,7 +130,7 @@ describe('startPipelineRun', () => {
     const { onSettled, settled } = settledPromise();
     const started = startPipelineRun({
       db, pipelineVersionId: versionId, graph: graph(), triggerNodeId: 'trigger', input: { versionId: 9 },
-      triggeredBy: 'apk-analysis-complete', executors: fakeExecutors(), buildCtx: () => ({}), onSettled,
+      triggeredBy: 'event', executors: fakeExecutors(), buildCtx: () => ({}), onSettled,
     });
     if (!started.ok) throw new Error('expected ok');
     const result = await settled;
@@ -138,7 +138,7 @@ describe('startPipelineRun', () => {
     expect(result.status).toBe('ok');
     expect(result.nodes.map(n => n.nodeId)).toEqual(['trigger', 'agent', 'sink']);
     const run = runRow(db, started.runId);
-    expect(run).toMatchObject({ status: 'ok', triggeredBy: 'apk-analysis-complete', triggerNodeId: 'trigger', input: { versionId: 9 } });
+    expect(run).toMatchObject({ status: 'ok', triggeredBy: 'event', triggerNodeId: 'trigger', input: { versionId: 9 } });
     expect(run.finishedAt).toBeInstanceOf(Date);
     const nodeRuns = db.select().from(schema.aiPipelineNodeRuns).where(eq(schema.aiPipelineNodeRuns.runId, started.runId)).all();
     expect(nodeRuns.map(n => n.nodeId).sort()).toEqual(['agent', 'sink', 'trigger']);

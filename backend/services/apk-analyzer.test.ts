@@ -1412,7 +1412,7 @@ describe('ApkAnalyzerService', () => {
       const runs = db.select().from(schema.aiPipelineRuns).all();
       expect(runs).toHaveLength(1);
       expect(runs[0]).toMatchObject({
-        status: 'ok', triggerNodeId: 'trigger-full', triggeredBy: 'apk-analysis-complete', input: { versionId },
+        status: 'ok', triggerNodeId: 'trigger-full', triggeredBy: 'event', input: { versionId },
       });
       const published = db.select().from(schema.aiPipelineVersions).all().find(v => v.status === 'published')!;
       expect(runs[0].pipelineVersionId).toBe(published.id);
