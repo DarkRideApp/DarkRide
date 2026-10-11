@@ -109,9 +109,10 @@ function createApp(
   executors: NodeExecutors,
   scopes: string[] = ['core.apk:read', 'core.apk:manage'],
   buildCtx: AiPipelineDeps['buildCtx'] = (_identity, _input): ExecutionCtx => ({}),
+  extraDeps: Partial<AiPipelineDeps> = {},
 ) {
   clearEndpoints();
-  const deps: AiPipelineDeps = { db, executors, buildCtx };
+  const deps: AiPipelineDeps = { db, executors, buildCtx, ...extraDeps };
   registerAiPipelineEndpoints(deps);
   const app = express();
   app.use(express.json());
@@ -512,5 +513,59 @@ describe('GET /v1/ai-pipelines/runs/:runId', () => {
     const app = createApp(db, fakeExecutors());
     const res = await request(app).get('/v1/ai-pipelines/runs/99999');
     expect(res.status).toBe(404);
+  });
+});
+
+describe('GET /v1/ai-pipelines/hook-catalog', () => {
+  it('returns whatever the injected getHookCatalog provides', async () => {
+    const db = makeDb();
+    const catalog = [{ name: 'apk:analyzed', schema: [], description: 'x' }];
+    const app = createApp(db, fakeExecutors(), undefined, undefined, { getHookCatalog: () => catalog });
+    const res = await request(app).get('/v1/ai-pipelines/hook-catalog');
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual(catalog);
+  });
+
+  it('returns an empty array when no getHookCatalog was injected', async () => {
+    const db = makeDb();
+    const app = createApp(db, fakeExecutors());
+    const res = await request(app).get('/v1/ai-pipelines/hook-catalog');
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual([]);
+  });
+
+  // Regression guard: GET /v1/ai-pipelines/:id is also registered and would greedily match
+  // "hook-catalog" as :id if this route were registered after it — must hit the literal route,
+  // never fall through to a 404 "No pipeline with id hook-catalog." from the :id handler.
+  it('is reachable even though GET /v1/ai-pipelines/:id is also registered and could shadow it', async () => {
+    const db = makeDb();
+    const app = createApp(db, fakeExecutors(), undefined, undefined, { getHookCatalog: () => [] });
+    const res = await request(app).get('/v1/ai-pipelines/hook-catalog');
+    expect(res.status).toBe(200);
+    expect(res.body.error).toBeUndefined();
+  });
+});
+
+describe('POST /v1/ai-pipelines/:id/publish — onPublish callback', () => {
+  it('calls onPublish after a successful publish', async () => {
+    const db = makeDb();
+    const pipelineId = seedPipeline(db);
+    seedVersion(db, pipelineId, 1, graphWithOneTrigger(), 'draft');
+    const onPublish = vi.fn();
+    const app = createApp(db, fakeExecutors(), undefined, undefined, { onPublish });
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/publish`);
+    expect(res.status).toBe(200);
+    expect(onPublish).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not call onPublish when publish fails validation', async () => {
+    const db = makeDb();
+    const pipelineId = seedPipeline(db);
+    seedVersion(db, pipelineId, 1, { nodes: [], edges: [] }, 'draft'); // no Trigger — invalid
+    const onPublish = vi.fn();
+    const app = createApp(db, fakeExecutors(), undefined, undefined, { onPublish });
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/publish`);
+    expect(res.status).toBe(400);
+    expect(onPublish).not.toHaveBeenCalled();
   });
 });

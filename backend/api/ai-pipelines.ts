@@ -13,6 +13,12 @@ export interface AiPipelineDeps {
   /** `identity` comes from the authenticated request (req.authUser), not a fixed core-service identity —
    * a manual run from the editor runs as the clicking user, same as `triggerAiAgentManual` does today. */
   buildCtx: (identity: { type: 'core-service' } | { type: 'user'; userId: number }, input: Record<string, unknown>) => ExecutionCtx;
+  /** Returns the current typed-event catalog (HookBusImpl.getDefinedHooks()) — optional so tests
+   *  that don't care about event triggers don't need to inject one. */
+  getHookCatalog?: () => Array<{ name: string; schema: unknown[]; description: string }>;
+  /** Called once, after a publish actually succeeds — wired to HookTriggerDispatcher.refresh in
+   *  backend/index.ts, so a newly published event binding takes effect immediately. */
+  onPublish?: () => void;
 }
 
 /**
@@ -29,11 +35,20 @@ function rowWithGraph(db: AppDatabase, row: typeof aiPipelines.$inferSelect) {
 }
 
 export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
-  const { db } = deps;
+  const { db, getHookCatalog, onPublish } = deps;
 
   registerEndpoint('GET', '/v1/ai-pipelines', (req, res) => {
     const rows = db.select().from(aiPipelines).all();
     res.json({ success: true, data: rows.map(row => rowWithGraph(db, row)) });
+  }, { requires: ['core.apk:read'] });
+
+  // Registered BEFORE the parameterized GET /v1/ai-pipelines/:id below — both the Express router
+  // and handleWebSocketRestApi's manual dispatcher (api-service.ts) match routes in registration
+  // order, so a literal path registered after a ':id' pattern that would also match it is
+  // unreachable (':id' greedily matches "hook-catalog" as a param first). Order here is load-
+  // bearing, not stylistic.
+  registerEndpoint('GET', '/v1/ai-pipelines/hook-catalog', (req, res) => {
+    res.json({ success: true, data: getHookCatalog?.() ?? [] });
   }, { requires: ['core.apk:read'] });
 
   registerEndpoint('GET', '/v1/ai-pipelines/:id', (req, res) => {
@@ -89,6 +104,7 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
       .where(and(eq(aiPipelineVersions.pipelineId, pipelineId), eq(aiPipelineVersions.status, 'published')))
       .run();
     db.update(aiPipelineVersions).set({ status: 'published' }).where(eq(aiPipelineVersions.id, latest.id)).run();
+    onPublish?.();
     res.json({ success: true });
   }, { requires: ['core.apk:manage'] });
 
