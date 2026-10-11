@@ -8,11 +8,11 @@ import { AdbProxyService } from './adb-proxy-service';
 import { HostClient } from './host-client';
 import { KeyStore } from './key-store';
 import { DeviceListener } from './listener';
-import { A_AUTH, A_CLSE, A_CNXN, A_OPEN, AUTH_RSAPUBLICKEY } from './packet';
+import { A_AUTH, A_CLSE, A_CNXN, A_OPEN, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE } from './packet';
 import type { PendingOptions } from './pending';
 import { PendingRegistry } from './pending';
 import { PortAllocator } from './port-allocator';
-import { Session } from './session';
+import { Session, type BackendConnector } from './session';
 import { SettingsError, saveSettings } from './settings';
 import { FakeAdbServer } from './testing/fake-adb-server';
 import { freePortBase } from './testing/free-port';
@@ -63,6 +63,8 @@ interface SetupOptions {
   seed?: (db: ReturnType<typeof createTestDb>, base: number) => void;
   /** Devices beyond DEV1 and DEV2, known to the fake and the database. */
   extraDevices?: string[];
+  /** Wraps the host client the service is given. */
+  wrapBackend?: (real: HostClient) => BackendConnector;
 }
 
 async function setup(opts: SetupOptions = {}) {
@@ -88,7 +90,7 @@ async function setup(opts: SetupOptions = {}) {
   const directory = new StubDirectory(opts.online ?? ['DEV1', 'DEV2', ...extra]);
   const broadcasts: Array<Record<string, any>> = [];
   const service = new AdbProxyService({
-    db, directory, backend, broadcast: opts.broadcast ?? ((m) => broadcasts.push(m)), advertisedHost: () => '192.168.1.10', pending: opts.pending,
+    db, directory, backend: opts.wrapBackend ? opts.wrapBackend(backend) : backend, broadcast: opts.broadcast ?? ((m) => broadcasts.push(m)), advertisedHost: () => '192.168.1.10', pending: opts.pending,
     reconcileMs: opts.reconcileMs, logWindowMs: opts.logWindowMs, logMaxDetail: opts.logMaxDetail,
   });
   if (opts.start !== false) await service.start();
@@ -924,6 +926,190 @@ describe('AdbProxyService limits and reporting', () => {
   });
 });
 
+/** A new connection that has signed the token with `key`, without waiting for the answer. */
+async function signIn(h: Harness, key: TestAdbKey, deviceId = 'DEV1') {
+  const c = await h.connect(deviceId);
+  c.sendHostCnxn();
+  const token = await c.next();
+  expect(token.command).toBe(A_AUTH);
+  c.send(A_AUTH, AUTH_SIGNATURE, 0, key.sign(token.data));
+  return c;
+}
+
+/** A host client whose banner can be held back, counting the banners it was asked for per serial. */
+function holdableBanner() {
+  const state = { hold: false, calls: new Map<string, number>(), fail: false };
+  let waiters: Array<() => void> = [];
+  const wrap = (real: HostClient): BackendConnector => ({
+    openService: (serial, service) => real.openService(serial, service),
+    deviceBanner: async (serial) => {
+      state.calls.set(serial, (state.calls.get(serial) ?? 0) + 1);
+      if (state.hold) await new Promise<void>((resolve) => waiters.push(resolve));
+      if (state.fail) throw new Error('banner unavailable');
+      return real.deviceBanner(serial);
+    },
+  });
+  const release = () => {
+    state.hold = false;
+    for (const w of waiters.splice(0)) w();
+  };
+  return { state, wrap, release, calls: (serial: string) => state.calls.get(serial) ?? 0 };
+}
+
+describe('AdbProxyService handshakes in progress', () => {
+  const inStage = (h: Harness, keyId: string, ...states: string[]) =>
+    h.service.snapshot().connections.filter((c) => c.keyId === keyId && states.includes(c.state));
+  const capLines = () => logged().filter((line) => line.includes('too many sessions for this key'));
+
+  it('admits at most 8 of 100 concurrent handshakes for one key and device, keeps their pre-auth slots until CNXN, and asks the host for one banner', async () => {
+    const banner = holdableBanner();
+    const h = await setup({ wrapBackend: banner.wrap });
+    const key = makeTestAdbKey();
+    await approveKey(h, key, 'DEV2');
+    await vi.waitFor(() => expect(h.service.snapshot().connections).toEqual([]));
+    const requested = vi.spyOn((h.service as any).backend as BackendConnector, 'deviceBanner');
+    banner.state.hold = true;
+
+    const attempts = await Promise.all(Array.from({ length: 100 }, () => signIn(h, key).catch(() => null)));
+    cleanups.push(() => attempts.forEach((c) => c?.close()));
+
+    await vi.waitFor(() => expect(inStage(h, key.keyId, 'finishing')).toHaveLength(8), { timeout: 3000 });
+    await vi.waitFor(() => expect(attempts.filter((c) => c === null || c.closed)).toHaveLength(92), { timeout: 3000 });
+    expect(h.service.snapshot().counters.floodDrops).toBe(92);
+    expect(requested).toHaveBeenCalledTimes(8);
+    expect(banner.calls('DEV1')).toBe(1);
+    // The finishing sessions still hold the address's pre-auth slots.
+    const ninth = await h.connect();
+    expect(await ninth.waitClosed()).toBe(true);
+    expect(h.service.snapshot().counters.floodDrops).toBe(93);
+
+    banner.release();
+    const admitted = attempts.filter((c): c is WireClient => c !== null && !c.closed);
+    expect(admitted).toHaveLength(8);
+    for (const c of admitted) expect((await c.next()).command).toBe(A_CNXN);
+    expect(inStage(h, key.keyId, 'ready')).toHaveLength(8);
+    expect((h.service as any).limiter.active).toBe(0);
+
+    for (let batch = 0; batch < 4; batch++) {
+      const refused = await Promise.all(Array.from({ length: 5 }, () => signIn(h, key)));
+      for (const c of refused) {
+        expect(await c.waitClosed()).toBe(true);
+        expect(c.packets.some((p) => p.command === A_CNXN)).toBe(false);
+      }
+    }
+    expect(requested).toHaveBeenCalledTimes(8);
+    expect(inStage(h, key.keyId, 'finishing', 'ready')).toHaveLength(8);
+    expect(h.fake.requests.filter((r) => r === 'host-serial:DEV1:features')).toHaveLength(1);
+    expect(capLines()).toHaveLength(1);
+  }, 20_000);
+
+  it('counts a session that is still finishing toward the 32 per key', async () => {
+    const banner = holdableBanner();
+    const h = await setup({ wrapBackend: banner.wrap, extraDevices: ['DEV3', 'DEV4', 'DEV5'] });
+    const key = makeTestAdbKey();
+    await approveKey(h, key, 'DEV5');
+    await vi.waitFor(() => expect(h.service.snapshot().connections).toEqual([]));
+    const ready: WireClient[] = [];
+    for (const [deviceId, count] of [['DEV1', 8], ['DEV2', 8], ['DEV3', 8], ['DEV4', 7]] as const) {
+      for (let i = 0; i < count; i++) {
+        const c = await signIn(h, key, deviceId);
+        expect((await c.next()).command).toBe(A_CNXN);
+        ready.push(c);
+      }
+    }
+    // DEV4's banner is cached by now; dropping it makes the 32nd session wait on a fetch.
+    (h.service as any).banners.delete('DEV4');
+    banner.state.hold = true;
+    const finishing = await signIn(h, key, 'DEV4');
+    await vi.waitFor(() => expect(inStage(h, key.keyId, 'finishing')).toHaveLength(1));
+    expect(inStage(h, key.keyId, 'ready')).toHaveLength(31);
+
+    const extra = await signIn(h, key, 'DEV5');
+    expect(await extra.waitClosed()).toBe(true);
+    expect(extra.packets.some((p) => p.command === A_CNXN)).toBe(false);
+    banner.release();
+    expect((await finishing.next()).command).toBe(A_CNXN);
+    expect(inStage(h, key.keyId, 'ready')).toHaveLength(32);
+  }, 20_000);
+
+  it('frees the slot of a finishing session that a revoke closes', async () => {
+    const banner = holdableBanner();
+    const h = await setup({ wrapBackend: banner.wrap });
+    const key = makeTestAdbKey();
+    await approveKey(h, key, 'DEV2');
+    await vi.waitFor(() => expect(h.service.snapshot().connections).toEqual([]));
+    banner.state.hold = true;
+    const finishing: WireClient[] = [];
+    for (let i = 0; i < 8; i++) finishing.push(await signIn(h, key));
+    await vi.waitFor(() => expect(inStage(h, key.keyId, 'finishing')).toHaveLength(8));
+    expect((h.service as any).limiter.active).toBe(8);
+
+    expect(h.service.revokeKey(h.service.listKeys()[0].id, 1)).toEqual({ ok: true });
+
+    for (const c of finishing) expect(await c.waitClosed()).toBe(true);
+    await vi.waitFor(() => expect(h.service.snapshot().connections).toEqual([]));
+    expect((h.service as any).limiter.active).toBe(0);
+    banner.release();
+    const next = await h.connect();
+    expect(await next.waitClosed(200)).toBe(false);
+    expect(h.service.snapshot().counters.floodDrops).toBe(0);
+  });
+});
+
+describe('AdbProxyService device banner cache', () => {
+  const realNow = Date.now;
+  const fresh = async (h: Harness, key: TestAdbKey, deviceId = 'DEV1') => {
+    const c = await signIn(h, key, deviceId);
+    const reply = await c.next().catch(() => null);
+    c.close();
+    return reply?.command === A_CNXN;
+  };
+
+  it('asks the host once per serial within 5 seconds, again after, and not for a failed fetch', async () => {
+    let skew = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => realNow() + skew);
+    const banner = holdableBanner();
+    const h = await setup({ wrapBackend: banner.wrap });
+    const key = makeTestAdbKey();
+    await approveKey(h, key, 'DEV2');
+
+    for (let i = 0; i < 3; i++) expect(await fresh(h, key)).toBe(true);
+    expect(banner.calls('DEV1')).toBe(1);
+    skew += 4_000;
+    expect(await fresh(h, key)).toBe(true);
+    expect(banner.calls('DEV1')).toBe(1);
+    skew += 1_500;
+    expect(await fresh(h, key)).toBe(true);
+    expect(banner.calls('DEV1')).toBe(2);
+
+    skew += 6_000;
+    banner.state.fail = true;
+    expect(await fresh(h, key)).toBe(false);
+    expect(await fresh(h, key)).toBe(false);
+    expect(banner.calls('DEV1')).toBe(4);
+    banner.state.fail = false;
+    expect(await fresh(h, key)).toBe(true);
+    expect(banner.calls('DEV1')).toBe(5);
+  });
+
+  it('drops the cached banner when the device goes offline', async () => {
+    const banner = holdableBanner();
+    const h = await setup({ wrapBackend: banner.wrap });
+    const key = makeTestAdbKey();
+    await approveKey(h, key, 'DEV2');
+    expect(await fresh(h, key)).toBe(true);
+    expect(banner.calls('DEV1')).toBe(1);
+
+    h.directory.goOffline('DEV1');
+    h.directory.goOnline('DEV1');
+    await vi.waitFor(() => expect(stateOf(h, 'DEV1')).toBe('listening'));
+
+    expect(await fresh(h, key)).toBe(true);
+    expect(banner.calls('DEV1')).toBe(2);
+    expect((h.service as any).banners.size).toBeLessThanOrEqual(2);
+  });
+});
+
 describe('AdbProxyService ready-session caps', () => {
   const capLines = () => logged().filter((line) => line.includes('too many sessions for this key'));
   const readyFor = (h: Harness, keyId: string) => h.service.snapshot().connections.filter((c) => c.keyId === keyId && c.state === 'ready');
@@ -934,8 +1120,11 @@ describe('AdbProxyService ready-session caps', () => {
     expect((await c.authenticate(key)).command).toBe(A_CNXN);
     return c;
   };
+  /** A session over the cap is closed before the banner, so it never sees a CNXN. */
   const expectRefused = async (h: Harness, key: TestAdbKey, deviceId = 'DEV1') => {
-    expect(await (await session(h, key, deviceId)).waitClosed()).toBe(true);
+    const c = await signIn(h, key, deviceId);
+    expect(await c.waitClosed()).toBe(true);
+    expect(c.packets.some((p) => p.command === A_CNXN)).toBe(false);
   };
   const expectAllOpen = async (clients: WireClient[]) => {
     await sleep(100);

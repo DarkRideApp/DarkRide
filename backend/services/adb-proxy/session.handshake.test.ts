@@ -25,6 +25,7 @@ interface SetupOptions {
   /** Runs after the harness's own bookkeeping, so it can throw. */
   onLeavePreAuth?: () => void;
   onClose?: () => void;
+  admit?: (s: Session) => boolean;
 }
 
 async function setup(opts: SetupOptions = {}) {
@@ -43,6 +44,7 @@ async function setup(opts: SetupOptions = {}) {
       onClose: (s) => { closed.push(s); opts.onClose?.(); },
       onLeavePreAuth: () => { state.leaves++; opts.onLeavePreAuth?.(); },
       preAuthTimeoutMs: opts.preAuthTimeoutMs ?? 5000,
+      admit: opts.admit,
     }),
   );
   open.push(server);
@@ -465,6 +467,70 @@ describe('Session handshake', () => {
     release(BANNER);
     expect(await client.quiet(50)).toBe(true);
     expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+  });
+
+  describe('the handshake stage', () => {
+    const signIn = async (h: Awaited<ReturnType<typeof setup>>) => {
+      const client = await h.connect();
+      client.sendHostCnxn();
+      const token = await client.next();
+      client.send(A_AUTH, AUTH_SIGNATURE, 0, h.key.sign(token.data));
+      return client;
+    };
+
+    it('keeps the pre-auth slot while the banner is fetched and gives it back once CNXN is written', async () => {
+      let release!: (banner: string) => void;
+      const h = await setup({ banner: () => new Promise<string>((r) => { release = r; }) });
+      const client = await signIn(h);
+      await vi.waitFor(() => expect(h.server.sessions[0].state).toBe('finishing'));
+      expect(h.state.leaves).toBe(0);
+      release(BANNER);
+      expect((await client.next()).command).toBe(A_CNXN);
+      expect(h.state.leaves).toBe(1);
+    });
+
+    it('applies the pre-auth timeout to a session whose banner never arrives', async () => {
+      const h = await setup({ preAuthTimeoutMs: 300, banner: () => new Promise<string>(() => {}) });
+      const client = await signIn(h);
+      await vi.waitFor(() => expect(h.server.sessions[0].state).toBe('finishing'));
+      expect(await client.waitClosed(2000)).toBe(true);
+      expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'pre-auth timeout' });
+      expect(h.state.leaves).toBe(1);
+    });
+
+    it('asks admit() before the banner and closes a session it refuses without fetching one', async () => {
+      const seen: string[] = [];
+      const h = await setup({ admit: (s) => { seen.push(s.state); return false; } });
+      const client = await signIn(h);
+      expect(await client.waitClosed()).toBe(true);
+      expect(seen).toEqual(['finishing']);
+      expect(h.backend.deviceBanner).not.toHaveBeenCalled();
+      expect(client.packets.some((p) => p.command === A_CNXN)).toBe(false);
+      expect(h.events.find((e) => e.kind === 'closed')).toMatchObject({ reason: 'not admitted' });
+      expect(h.state.leaves).toBe(1);
+    });
+
+    it('asks admit() for a waiting connection once it is approved', async () => {
+      const admit = vi.fn(() => false);
+      const h = await setup({ admit });
+      let approve!: (d: 'approved' | 'denied') => void;
+      h.gate.outcome = { kind: 'pending', requestId: 'r1', decision: new Promise((r) => { approve = r; }), cancel: vi.fn() };
+      const client = await h.connect();
+      await client.offerKey(makeTestAdbKey());
+      await vi.waitFor(() => expect(h.gate.offers).toHaveLength(1));
+      expect(admit).not.toHaveBeenCalled();
+      approve('approved');
+      expect(await client.waitClosed()).toBe(true);
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(h.backend.deviceBanner).not.toHaveBeenCalled();
+    });
+
+    it('goes on to the banner when admit() accepts', async () => {
+      const h = await setup({ admit: () => true });
+      const client = await signIn(h);
+      expect((await client.next()).command).toBe(A_CNXN);
+      expect(h.backend.deviceBanner).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('closes without a banner when the device goes offline between CNXN and a valid signature', async () => {

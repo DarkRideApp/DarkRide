@@ -48,10 +48,12 @@ const DEFAULT_RECONCILE_MS = 5000;
 const DEFAULT_LOG_WINDOW_MS = 60_000;
 const DEFAULT_LOG_MAX_DETAIL = 5;
 const REFUSAL_LOG_LENGTH = 60;
-// Each ready session can buffer several MiB, so an approved key may not open them without limit.
+// Each ready session can buffer several MiB and each handshake costs host connections; finishing sessions count too.
 const MAX_READY_PER_KEY_DEVICE = 8;
 const MAX_READY_PER_KEY = 32;
 const SESSION_CAP_LOG_MS = 60_000;
+// Each banner fetch runs a shell on the phone, so a reconnect storm shares one.
+const BANNER_CACHE_MS = 5000;
 const short = (keyId: string) => keyId.slice(0, 12);
 // The service string comes from the client: keep printable ASCII only so it cannot forge or hide log lines.
 const printable = (text: string) => text.slice(0, REFUSAL_LOG_LENGTH).replace(/[^\x20-\x7e]/g, '?');
@@ -86,6 +88,7 @@ export class AdbProxyService {
   private readonly trusted = new WeakSet<Session>();
   private readonly capped = new WeakSet<Session>();
   private readonly capLogs = new Map<string, (line: string) => void>();
+  private readonly banners = new Map<string, { banner: Promise<string>; expires: number | null }>();
 
   constructor(private readonly deps: AdbProxyServiceDeps) {
     const budget = () => createBudgetLog({
@@ -106,14 +109,7 @@ export class AdbProxyService {
           throw e;
         }
       },
-      deviceBanner: async (serial) => {
-        try {
-          return await deps.backend.deviceBanner(serial);
-        } catch (e: any) {
-          this.logBackendFailure(`ADB server request failed for ${serial}: ${e?.message ?? e}`);
-          throw e;
-        }
-      },
+      deviceBanner: (serial) => this.cachedBanner(serial),
     };
     this.keys = new KeyStore(deps.db);
     this.ports = new PortAllocator(deps.db, () => ({ start: this.settings.portStart, end: this.settings.portEnd }));
@@ -154,6 +150,7 @@ export class AdbProxyService {
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.reconcileTimer = null;
     for (const s of [...this.sessions]) s.destroy('service stopping');
+    this.banners.clear();
     await this.stopAllDevices();
     this.peerLog.stop();
     this.refusalLog.stop();
@@ -439,6 +436,7 @@ export class AdbProxyService {
     // Waits for a bind in flight, which either registers its listener or has already closed it.
     await this.starts.get(deviceId);
     this.closeSessions((s) => s.deviceId === deviceId, 'listener stopped');
+    this.banners.delete(deviceId);
     const listener = this.listeners.get(deviceId);
     this.listeners.delete(deviceId);
     this.deviceErrors.delete(deviceId);
@@ -457,6 +455,7 @@ export class AdbProxyService {
 
   private deviceOffline(deviceId: string): void {
     if (!this.online.delete(deviceId)) return;
+    this.banners.delete(deviceId);
     this.closeSessions((s) => s.deviceId === deviceId, 'device offline');
     this.notifyChanged();
   }
@@ -502,14 +501,35 @@ export class AdbProxyService {
     return stuck.length > 0 && this.ports.hasFree() ? stuck : [];
   }
 
-  /** Closes a session that just became ready when its key already has as many ready sessions as allowed. */
+  /** Concurrent fetches for one serial share a promise; a success is kept for a few seconds, a failure is not kept. */
+  private cachedBanner(serial: string): Promise<string> {
+    const hit = this.banners.get(serial);
+    if (hit && (hit.expires === null || hit.expires > Date.now())) return hit.banner;
+    const banner = (async () => {
+      try {
+        return await this.deps.backend.deviceBanner(serial);
+      } catch (e: any) {
+        this.logBackendFailure(`ADB server request failed for ${serial}: ${e?.message ?? e}`);
+        throw e;
+      }
+    })();
+    const entry = { banner, expires: null as number | null };
+    this.banners.set(serial, entry);
+    banner.then(
+      () => { if (this.banners.get(serial) === entry) entry.expires = Date.now() + BANNER_CACHE_MS; },
+      () => { if (this.banners.get(serial) === entry) this.banners.delete(serial); },
+    );
+    return banner;
+  }
+
+  /** Closes a session whose key already has as many sessions finishing or ready as allowed; runs before the banner is fetched. */
   private overSessionCap(session: Session): boolean {
     const keyId = session.keyId;
     if (!keyId) return false;
     let perKey = 0;
     let perDevice = 0;
     for (const s of this.sessions) {
-      if (s.state !== 'ready' || s.keyId !== keyId) continue;
+      if ((s.state !== 'ready' && s.state !== 'finishing') || s.keyId !== keyId) continue;
       perKey++;
       if (s.deviceId === session.deviceId) perDevice++;
     }
@@ -552,6 +572,7 @@ export class AdbProxyService {
       backend: this.backend,
       isDeviceOnline: () => this.online.has(deviceId),
       onLeavePreAuth: release,
+      admit: (s) => !this.overSessionCap(s),
       onEvent: (e) => this.onSessionEvent(e),
       onClose: (s) => {
         this.sessions.delete(s);
@@ -567,7 +588,6 @@ export class AdbProxyService {
     switch (e.kind) {
       case 'auth-failed': this.counters.authFailures++; return;
       case 'authenticated':
-        if (this.overSessionCap(e.session)) return;
         this.trusted.add(e.session);
         log(`session ${e.session.id} authenticated ${who}`);
         break;

@@ -95,8 +95,10 @@ export interface SessionOptions {
   isDeviceOnline(): boolean;
   onEvent?(e: SessionEvent): void;
   onClose?(s: Session): void;
-  /** Called once when the connection stops counting against the pre-auth limits (pending, ready or closed). */
+  /** Called once when the connection stops counting against the pre-auth limits (pending, CNXN written, or closed). */
   onLeavePreAuth?(): void;
+  /** Asked once the key is proven and before the banner is fetched; false closes the session. It may close the session itself. */
+  admit?(s: Session): boolean;
   preAuthTimeoutMs?: number;
   maxStreams?: number;
 }
@@ -281,8 +283,9 @@ export class Session {
 
   private async becomeReady(): Promise<void> {
     this.state = 'finishing';
-    this.leavePreAuth();
     if (!this.opts.isDeviceOnline()) return this.close('device offline');
+    if (this.opts.admit && !this.opts.admit(this)) return this.close('not admitted');
+    if (this.closed) return;
     let banner: string;
     try {
       banner = await this.opts.backend.deviceBanner(this.deviceId);
@@ -291,6 +294,8 @@ export class Session {
       return this.close('banner failed');
     }
     if (this.closed) return;
+    // The slot and the pre-auth timer cover the banner fetch, so connections in this stage stay capped.
+    this.leavePreAuth();
     // No terminator: clients split the banner on commas and a trailing NUL makes them drop the last feature.
     this.send(A_CNXN, A_VERSION, MAX_DATA, Buffer.from(banner, 'utf8'));
     this.parser.setMaxPayload(MAX_DATA);
