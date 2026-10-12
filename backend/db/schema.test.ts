@@ -381,7 +381,7 @@ describe('migration 0103_ai_pipelines.sql', () => {
   });
 });
 
-describe('migration 0103_drop_ai_pipelines_job_kind.sql', () => {
+describe('migration 0104_drop_ai_pipelines_job_kind.sql', () => {
   function applyMigrationTagged(sqlite: Database.Database, tag: string) {
     const dir = path.resolve(__dirname, '../../migrations');
     const file = fs.readdirSync(dir).find((f) => f.startsWith(tag))!;
@@ -390,19 +390,19 @@ describe('migration 0103_drop_ai_pipelines_job_kind.sql', () => {
     for (const stmt of sql.split('--> statement-breakpoint')) if (stmt.trim()) sqlite.exec(stmt);
   }
 
-  // settings + ai_pipelines as they existed right before 0103 — 0103 itself only ever runs after
+  // settings + ai_pipelines as they existed right before 0104 — 0104 itself only ever runs after
   // both are already in place in the real migration chain.
-  function setupPre0103(sqlite: Database.Database) {
+  function setupPre0104(sqlite: Database.Database) {
     sqlite.exec(`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
-    applyMigrationTagged(sqlite, '0102_ai_pipelines');
+    applyMigrationTagged(sqlite, '0103_ai_pipelines');
   }
 
   it("backfills apk_analysis_pipeline_id from the existing job_kind='apk-analysis' row before dropping the column", () => {
     const sqlite = new Database(':memory:');
-    setupPre0103(sqlite);
+    setupPre0104(sqlite);
     sqlite.exec(`INSERT INTO ai_pipelines (id, name, job_kind, created_at) VALUES (5, 'APK Analysis', 'apk-analysis', 1000);`);
 
-    applyMigrationTagged(sqlite, '0103_drop_ai_pipelines_job_kind');
+    applyMigrationTagged(sqlite, '0104_drop_ai_pipelines_job_kind');
 
     const row = sqlite.prepare(`SELECT value FROM settings WHERE key = 'apk_analysis_pipeline_id'`).get() as { value: string } | undefined;
     expect(row?.value).toBe('5');
@@ -413,9 +413,9 @@ describe('migration 0103_drop_ai_pipelines_job_kind.sql', () => {
 
   it('writes nothing to settings on a fresh install with no apk-analysis row', () => {
     const sqlite = new Database(':memory:');
-    setupPre0103(sqlite);
+    setupPre0104(sqlite);
 
-    applyMigrationTagged(sqlite, '0103_drop_ai_pipelines_job_kind');
+    applyMigrationTagged(sqlite, '0104_drop_ai_pipelines_job_kind');
 
     const row = sqlite.prepare(`SELECT value FROM settings WHERE key = 'apk_analysis_pipeline_id'`).get();
     expect(row).toBeUndefined();
@@ -423,8 +423,8 @@ describe('migration 0103_drop_ai_pipelines_job_kind.sql', () => {
 
   it('a pipeline can be inserted with no job_kind after the migration', () => {
     const sqlite = new Database(':memory:');
-    setupPre0103(sqlite);
-    applyMigrationTagged(sqlite, '0103_drop_ai_pipelines_job_kind');
+    setupPre0104(sqlite);
+    applyMigrationTagged(sqlite, '0104_drop_ai_pipelines_job_kind');
 
     expect(() => sqlite.exec(`INSERT INTO ai_pipelines (name, created_at) VALUES ('p', 1000);`)).not.toThrow();
   });
