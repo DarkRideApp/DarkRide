@@ -38,6 +38,7 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 
 ### Fixed
 
+- The AI chat could drop the end of a reply, or the output of the last tool call, when the final text and the end-of-run event reached the browser in the same instant. The message then showed the tool call and no reply. It is now built from everything received.
 - Adding, editing, removing or toggling a plugin source no longer closes the Sources dialog, and now refreshes the marketplace straight away. Before, a newly added source showed nothing until you pressed Refresh, because the server caches the marketplace for an hour.
 - The Plugin Manager showed two restart prompts at once (the Settings banner and its own button). There is now one.
 - A marketplace plugin whose registry name differs from its runtime name (for example a git source) is matched to its installed copy by npm package, so it is no longer listed twice.

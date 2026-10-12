@@ -1184,3 +1184,48 @@ describe('convertDbMessages', () => {
     expect(convertDbMessages([])).toEqual([]);
   });
 });
+
+// ─── Streaming events that land in one batch ────────────────────────────────
+
+describe('AiChatPanel streamed events that arrive together', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  function startRun() {
+    const subscribe = vi.fn().mockReturnValue(() => {});
+    renderWithWs(<AiChatPanel pageContext="devices" contextId="d1" />, { subscribe });
+    fireEvent.change(screen.getByTestId('ai-chat-input'), { target: { value: 'check the device' } });
+    fireEvent.click(screen.getByTestId('ai-chat-send-btn'));
+    return (type: string) => subscribe.mock.calls.find((c: any[]) => c[0] === type)?.[1];
+  }
+
+  it('keeps the closing reply when its tokens and the done event land in the same batch', () => {
+    const on = startRun();
+
+    act(() => {
+      on('ai:tool-start')({ type: 'ai:tool-start', conversationId: null, toolUseId: 't1', toolName: 'list_devices', input: {}, toolUseCount: 1, turnsRemaining: 5 });
+      on('ai:tool-result')({ type: 'ai:tool-result', conversationId: null, toolUseId: 't1', result: '2 devices', durationMs: 1 });
+      on('ai:token')({ type: 'ai:token', conversationId: null, text: 'There are ' });
+      on('ai:token')({ type: 'ai:token', conversationId: null, text: 'two devices.' });
+      on('ai:done')({ type: 'ai:done', conversationId: 7 });
+    });
+
+    const reply = screen.getByTestId('ai-chat-message-1');
+    expect(reply).toHaveTextContent('There are two devices.');
+    expect(reply).toHaveTextContent('2 devices');
+  });
+
+  it('keeps the tool output when the result and the done event land in the same batch', () => {
+    const on = startRun();
+
+    act(() => {
+      on('ai:tool-start')({ type: 'ai:tool-start', conversationId: null, toolUseId: 't1', toolName: 'list_devices', input: {}, toolUseCount: 1, turnsRemaining: 5 });
+      on('ai:tool-result')({ type: 'ai:tool-result', conversationId: null, toolUseId: 't1', result: '2 devices', durationMs: 1 });
+      on('ai:done')({ type: 'ai:done', conversationId: 7 });
+    });
+
+    expect(screen.getByTestId('ai-chat-message-1')).toHaveTextContent('2 devices');
+  });
+});

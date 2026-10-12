@@ -380,10 +380,18 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   useEffect(() => {
     const unsubs: (() => void)[] = [];
 
+    // The ref is the source of truth for ai:done, which reads it synchronously. React runs a state updater later, at
+    // render, so a ref written inside one is stale when events land in the same batch and the last text is dropped.
+    const updateStreamingSegments = (update: (prev: MessageSegment[]) => MessageSegment[]) => {
+      const next = update(streamingSegmentsRef.current);
+      streamingSegmentsRef.current = next;
+      setStreamingSegments(next);
+    };
+
     unsubs.push(ws.subscribe('ai:token', (msg: AiTokenEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
-      setStreamingSegments(prev => {
+      updateStreamingSegments(prev => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (last?.type === 'text') {
@@ -391,7 +399,6 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
         } else {
           next.push({ type: 'text', text: msg.text });
         }
-        streamingSegmentsRef.current = next;
         return next;
       });
     }));
@@ -399,7 +406,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:tool-start', (msg: AiToolStartEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
-      setStreamingSegments(prev => {
+      updateStreamingSegments(prev => {
         const next = [...prev];
         const last = next[next.length - 1];
         const newTool: ToolCall = {
@@ -413,7 +420,6 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
         } else {
           next.push({ type: 'tools', tools: [newTool] });
         }
-        streamingSegmentsRef.current = next;
         return next;
       });
     }));
@@ -421,19 +427,15 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:tool-result', (msg: AiToolResultEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
-      setStreamingSegments(prev => {
-        const next = prev.map(seg => {
-          if (seg.type !== 'tools') return seg;
-          const updatedTools = seg.tools?.map(t =>
-            t.toolUseId === msg.toolUseId
-              ? { ...t, output: msg.result, durationMs: msg.durationMs, isRunning: false }
-              : t,
-          );
-          return { ...seg, tools: updatedTools };
-        });
-        streamingSegmentsRef.current = next;
-        return next;
-      });
+      updateStreamingSegments(prev => prev.map(seg => {
+        if (seg.type !== 'tools') return seg;
+        const updatedTools = seg.tools?.map(t =>
+          t.toolUseId === msg.toolUseId
+            ? { ...t, output: msg.result, durationMs: msg.durationMs, isRunning: false }
+            : t,
+        );
+        return { ...seg, tools: updatedTools };
+      }));
     }));
 
     unsubs.push(ws.subscribe('ai:context-usage', (msg: AiContextUsageEvent) => {
