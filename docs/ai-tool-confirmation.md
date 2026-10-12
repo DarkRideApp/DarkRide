@@ -39,7 +39,7 @@ The prompt exists only in the interactive chat. These paths never ask, whatever 
 - **The Claude CLI provider**, which reaches tools through MCP and runs with `--permission-mode bypassPermissions`.
 - **MCP clients, `POST /v1/tools/:name` and automation scripts** (`ctx.tools`), which call the tool registry directly.
 
-Confirmation is a check on what the chat model does for you, not a permission. Scopes are a separate check: the registry enforces a tool's required scope only when the caller passes the user's scopes. The chat and the MCP server do. `POST /v1/tools/:name` and `ctx.tools` call the registry without them.
+Confirmation is a check on what the chat model does for you, not a permission.
 
 ## Changing the list
 
