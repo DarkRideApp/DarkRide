@@ -273,6 +273,19 @@ describe('Session streams', () => {
     await expectNothingEscaped();
   });
 
+  it('tells its owner when a stream opens and when it closes, but not when an OPEN is refused', async () => {
+    const h = await setup();
+    const changes = () => h.events.filter((e) => e.kind === 'streams').length;
+    h.client.send(A_OPEN, 1, 0, 'tcpip:5555\0');
+    expect((await h.client.next()).command).toBe(A_CLSE);
+    expect(changes()).toBe(0);
+
+    const { localId } = await h.client.open('hold:', 2);
+    expect(changes()).toBe(1);
+    h.client.send(A_CLSE, 2, localId);
+    await vi.waitFor(() => expect(changes()).toBe(2));
+  });
+
   it('refuses an OPEN whose payload has bytes after the NUL', async () => {
     const h = await setup();
     h.client.send(A_OPEN, 5, 0, Buffer.from('shell:id\0extra'));

@@ -103,6 +103,8 @@ export interface BackendConnector {
 
 export type SessionEvent =
   | { kind: 'auth-failed' | 'authenticated' | 'pending' | 'blocked'; session: Session }
+  /** A stream opened or closed, so the open stream count changed. */
+  | { kind: 'streams'; session: Session }
   /** A stream told the device to restart; the session closes once its CLSE is flushed. */
   | { kind: 'device-restarting'; session: Session }
   | { kind: 'refused-service'; session: Session; service: string }
@@ -361,13 +363,13 @@ export class Session {
       localId: this.nextLocalId++, remoteId, backend: null, windowOpen: false, outQueue: [], backendEnded: false, ackPending: false,
       restart: restartRuleFor(service), head: Buffer.alloc(0),
     };
-    this.streams.set(stream.localId, stream);
+    this.addStream(stream);
     let opening: Promise<net.Socket>;
     try {
       opening = Promise.resolve(this.opts.backend.openService(this.deviceId, service));
     } catch (err: any) {
       logError(`session ${this.id} stream ${stream.localId} open error: ${err?.message ?? err}`);
-      this.streams.delete(stream.localId);
+      this.removeStream(stream);
       return this.refuse(remoteId);
     }
     opening.then(
@@ -379,7 +381,7 @@ export class Session {
         this.attach(stream, sock);
       }),
       (err) => this.guardStream(stream, 'open', () => {
-        if (!this.streams.delete(stream.localId)) return;
+        if (!this.removeStream(stream)) return;
         // A client keeps retrying OPEN while its transport looks alive, each one a fresh dial; a real adbd would have dropped it.
         if (err instanceof DeviceUnavailableError) return this.close('device unavailable');
         this.refuse(remoteId);
@@ -470,8 +472,19 @@ export class Session {
     this.closeStream(stream);
   }
 
+  private addStream(stream: Stream): void {
+    this.streams.set(stream.localId, stream);
+    this.emit({ kind: 'streams', session: this });
+  }
+
+  private removeStream(stream: Stream): boolean {
+    const removed = this.streams.delete(stream.localId);
+    if (removed) this.emit({ kind: 'streams', session: this });
+    return removed;
+  }
+
   private closeStream(stream: Stream): void {
-    if (!this.streams.delete(stream.localId)) return;
+    if (!this.removeStream(stream)) return;
     this.destroyBackend(stream);
     const restarting = stream.backend !== null && (stream.restart === 'always'
       || (stream.restart === 'if-announced' && stream.head.toString('latin1').includes(ADBD_RESTART_ANNOUNCEMENT)));

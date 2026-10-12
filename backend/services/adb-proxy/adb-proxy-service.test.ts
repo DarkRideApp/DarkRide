@@ -1179,6 +1179,24 @@ describe('AdbProxyService limits and reporting', () => {
     expect(last.devices).toHaveLength(2);
   });
 
+  it('broadcasts when a stream opens and again when it closes, so a connection row shows its live stream count', async () => {
+    const h = await setup();
+    const key = makeTestAdbKey();
+    await approveKey(h, key);
+    const client = await h.connect();
+    expect((await client.authenticate(key)).command).toBe(A_CNXN);
+    const streamsSeen = () => h.broadcasts.at(-1)?.connections?.[0]?.streams;
+    // The push that follows authentication must be out first, or it could be the one that carries the open stream.
+    await vi.waitFor(() => expect(h.broadcasts.at(-1)?.connections?.[0]?.state).toBe('ready'));
+    const afterAuth = h.broadcasts.length;
+
+    const { localId } = await client.open('hold:', 1);
+    await vi.waitFor(() => expect(streamsSeen()).toBe(1));
+    expect(h.broadcasts.length).toBeGreaterThan(afterAuth);
+    client.send(A_CLSE, 1, localId);
+    await vi.waitFor(() => expect(streamsSeen()).toBe(0));
+  });
+
   it('logs a broadcast callback that always throws once, however many connect and close cycles re-arm the notify timer', async () => {
     const attempts = vi.fn(() => {
       throw new Error('socket gone');
