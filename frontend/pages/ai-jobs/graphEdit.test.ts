@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   addNode, deleteNode, addEdge, deleteEdge, moveNode, renameNode, defaultConfigFor, nextNodeId,
   connectReportSection, disconnectReportSection, connectSinkInput, disconnectSinkInput,
+  duplicateNode, disconnectNode,
 } from './graphEdit';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
@@ -237,5 +238,67 @@ describe('disconnectSinkInput', () => {
   it('is a no-op on a node that is not a Sink', () => {
     const graph = disconnectSinkInput(sinkGraph, 'report');
     expect(graph).toEqual(sinkGraph);
+  });
+});
+
+describe('duplicateNode', () => {
+  it('clones the config and label at the given position, with a fresh generated id', () => {
+    const labeled: PipelineGraph = { ...baseGraph, nodes: baseGraph.nodes.map(n => n.id === 'agent-overview' ? { ...n, label: 'Overview Agent' } : n) };
+    const { graph, newNodeId } = duplicateNode(labeled, 'agent-overview', { x: 50, y: 60 });
+    expect(newNodeId).toBe('agent-1');
+    const copy = graph.nodes.find(n => n.id === 'agent-1')!;
+    expect(copy.config).toEqual({ kind: 'AgentCall', tier: 'High', toolAllowlist: [], instructionTemplate: 'x' });
+    expect(copy.label).toBe('Overview Agent');
+    expect(copy.position).toEqual({ x: 50, y: 60 });
+  });
+
+  it('never wires the copy to the original\'s edges', () => {
+    const { graph, newNodeId } = duplicateNode(baseGraph, 'agent-overview', { x: 0, y: 0 });
+    expect(graph.edges.some(e => e.from === newNodeId || e.to === newNodeId)).toBe(false);
+  });
+
+  it('is a no-op (returns the graph unchanged) when the source id does not exist', () => {
+    const { graph } = duplicateNode(baseGraph, 'does-not-exist', { x: 0, y: 0 });
+    expect(graph).toEqual(baseGraph);
+  });
+});
+
+describe('disconnectNode', () => {
+  it('severs a node from a Report section that fed from it, keeping the section row', () => {
+    const graph = disconnectNode(reportGraph, 'agent-overview');
+    const report = graph.nodes.find(n => n.id === 'report')!;
+    expect((report.config as any).sections[0]).toEqual({ title: 'Overview', from: '' });
+    expect(graph.edges).not.toContainEqual({ from: 'agent-overview', to: 'report' });
+    // the node itself survives
+    expect(graph.nodes.some(n => n.id === 'agent-overview')).toBe(true);
+  });
+
+  it("clears a Report node's own sections when disconnecting the Report itself, keeping the rows", () => {
+    const graph = disconnectNode(reportGraph, 'report');
+    const report = graph.nodes.find(n => n.id === 'report')!;
+    expect((report.config as any).sections).toEqual([{ title: 'Overview', from: '' }, { title: 'Maps', from: '' }]);
+    expect(graph.edges).not.toContainEqual({ from: 'agent-overview', to: 'report' });
+  });
+
+  it("clears a Sink's own `from` when disconnecting the Sink itself", () => {
+    const graph = disconnectNode(sinkGraph, 'sink-1');
+    expect((graph.nodes.find(n => n.id === 'sink-1')!.config as any).from).toBeUndefined();
+    expect(graph.edges).toEqual([]);
+  });
+
+  it('clears another Sink that was fed from the disconnected node', () => {
+    const graph = disconnectNode(sinkGraph, 'report');
+    expect((graph.nodes.find(n => n.id === 'sink-1')!.config as any).from).toBeUndefined();
+    expect(graph.edges).toEqual([]);
+  });
+
+  it('removes a plain graph.edges entry touching the node (e.g. Branch/AgentCall wiring), in either direction', () => {
+    const graph = disconnectNode(baseGraph, 'trigger-full');
+    expect(graph.edges).toEqual([{ from: 'agent-overview', to: 'report' }]);
+  });
+
+  it('is a no-op when the node id does not exist', () => {
+    const graph = disconnectNode(baseGraph, 'does-not-exist');
+    expect(graph).toEqual(baseGraph);
   });
 });

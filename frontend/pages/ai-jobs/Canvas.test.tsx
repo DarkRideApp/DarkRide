@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Canvas, toFlowEdges, toFlowNodes } from './Canvas';
+import { Canvas, toFlowEdges, toFlowNodes, connectionEndIntent } from './Canvas';
 import type { PipelineGraph } from '../../../backend/services/ai-jobs/types';
 
 // @xyflow/react's <ReactFlow> observes its pane with a ResizeObserver, which jsdom does not
@@ -207,5 +207,44 @@ describe('toFlowEdges', () => {
       edges: [{ from: 'trigger-1', to: 'agent-a' }],
     };
     expect(toFlowEdges(g)).toEqual([{ id: 'e0', source: 'trigger-1', sourceHandle: 'out', target: 'agent-a', targetHandle: 'in', animated: false }]);
+  });
+});
+
+describe('connectionEndIntent', () => {
+  it('returns null when the connection landed on a real handle (isValid true) — onConnect already handles it', () => {
+    expect(connectionEndIntent({ isValid: true, fromNode: { id: 'a' } as any, fromHandle: { id: 'out' } as any, to: { x: 1, y: 2 } })).toBeNull();
+  });
+
+  it('returns null when no drag was actually in progress (fromNode null)', () => {
+    expect(connectionEndIntent({ isValid: null, fromNode: null, fromHandle: null, to: null })).toBeNull();
+  });
+
+  it('returns the source node/handle and drop position when released on empty canvas', () => {
+    const intent = connectionEndIntent({ isValid: false, fromNode: { id: 'agent-overview' } as any, fromHandle: { id: 'out' } as any, to: { x: 100, y: 200 } });
+    expect(intent).toEqual({ sourceNodeId: 'agent-overview', sourceHandle: 'out', flowPosition: { x: 100, y: 200 } });
+  });
+
+  it('defaults sourceHandle to null when the dragged handle has no id', () => {
+    const intent = connectionEndIntent({ isValid: false, fromNode: { id: 'agent-overview' } as any, fromHandle: null, to: { x: 0, y: 0 } });
+    expect(intent?.sourceHandle).toBeNull();
+  });
+});
+
+describe('Canvas — right-click interactions', () => {
+  it('right-clicking empty canvas calls onAddNodeAt, suppressing the native context menu', () => {
+    const onAddNodeAt = vi.fn();
+    render(<Canvas graph={graph} onSelectNode={() => {}} onAddNodeAt={onAddNodeAt} />);
+    const pane = document.querySelector('.react-flow__pane') as HTMLElement;
+    fireEvent.contextMenu(pane, { clientX: 150, clientY: 250 });
+    expect(onAddNodeAt).toHaveBeenCalledWith(expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }), { x: 150, y: 250 });
+  });
+
+  it('right-clicking a node calls onNodeContextMenu with its id, not onAddNodeAt', () => {
+    const onAddNodeAt = vi.fn();
+    const onNodeContextMenu = vi.fn();
+    render(<Canvas graph={graph} onSelectNode={() => {}} onAddNodeAt={onAddNodeAt} onNodeContextMenu={onNodeContextMenu} />);
+    fireEvent.contextMenu(screen.getByText('agent-overview'), { clientX: 10, clientY: 20 });
+    expect(onNodeContextMenu).toHaveBeenCalledWith('agent-overview', { x: 10, y: 20 });
+    expect(onAddNodeAt).not.toHaveBeenCalled();
   });
 });

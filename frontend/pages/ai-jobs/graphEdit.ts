@@ -47,6 +47,46 @@ export function renameNode(graph: PipelineGraph, nodeId: string, label: string):
   return { ...graph, nodes: graph.nodes.map(n => n.id === nodeId ? { ...n, label: trimmed === '' ? undefined : trimmed } : n) };
 }
 
+/** Clones a node's config and label (but never its wiring) at a new position, for the Blueprint
+ *  editor's right-click "Duplicate". No-op (unchanged graph, empty id) when the source doesn't exist. */
+export function duplicateNode(
+  graph: PipelineGraph,
+  nodeId: string,
+  position: { x: number; y: number },
+): { graph: PipelineGraph; newNodeId: string } {
+  const original = graph.nodes.find(n => n.id === nodeId);
+  if (!original) return { graph, newNodeId: '' };
+  const newNodeId = nextNodeId(graph, original.config.kind);
+  const node: PipelineNode = { id: newNodeId, config: { ...original.config }, position, label: original.label };
+  return { graph: { ...graph, nodes: [...graph.nodes, node] }, newNodeId };
+}
+
+/** Unwires a node from every neighbor — both directions — without deleting it. Built from the
+ *  same per-pin disconnect functions the canvas already uses for a single connection, so a
+ *  Report/Sink's own incoming wiring and every other node's wiring that fed from this one both
+ *  get torn down consistently (a Report/Sink's drawn edges come from its own config, not
+ *  graph.edges, so clearing graph.edges alone would leave them visually still connected). */
+export function disconnectNode(graph: PipelineGraph, nodeId: string): PipelineGraph {
+  const node = graph.nodes.find(n => n.id === nodeId);
+  if (!node) return graph;
+
+  let next = graph;
+  if (node.config.kind === 'Report') {
+    node.config.sections.forEach((_, i) => { next = disconnectReportSection(next, nodeId, i); });
+  } else if (node.config.kind === 'Sink') {
+    next = disconnectSinkInput(next, nodeId);
+  }
+  for (const n of graph.nodes) {
+    if (n.id === nodeId) continue;
+    if (n.config.kind === 'Report') {
+      n.config.sections.forEach((s, i) => { if (s.from === nodeId) next = disconnectReportSection(next, n.id, i); });
+    } else if (n.config.kind === 'Sink' && n.config.from === nodeId) {
+      next = disconnectSinkInput(next, n.id);
+    }
+  }
+  return { ...next, edges: next.edges.filter(e => e.from !== nodeId && e.to !== nodeId) };
+}
+
 export function deleteNode(graph: PipelineGraph, nodeId: string): PipelineGraph {
   if (!graph.nodes.some(n => n.id === nodeId)) return graph;
   return {

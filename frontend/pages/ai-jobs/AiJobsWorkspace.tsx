@@ -3,10 +3,12 @@ import { Link } from 'react-router-dom';
 import { useWebSocket, useDocumentTitle } from '@darkrideapp/plugin-sdk/react';
 import { Canvas } from './Canvas';
 import { SidePanel } from './SidePanel';
-import { NodePicker } from './NodePicker';
+import { NodeKindPalette } from './NodeKindPalette';
+import { NodeContextMenu } from './NodeContextMenu';
 import {
   addNode, deleteNode, addEdge, deleteEdge, moveNode, renameNode,
   connectReportSection, disconnectReportSection, connectSinkInput, disconnectSinkInput,
+  duplicateNode, disconnectNode,
 } from './graphEdit';
 import type { NodeKind, PipelineGraph, PipelineNode, TriggerConfig } from '../../../backend/services/ai-jobs/types';
 
@@ -68,6 +70,15 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
   const [hookCatalog, setHookCatalog] = useState<HookCatalogEntry[]>([]);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
+  // The Blueprint-style "add node" gesture — right-click empty canvas, or drag a wire out and
+  // release on empty canvas. `connectFrom` is set only for the second case, so picking a kind
+  // both creates the node at the drop position and wires it to the node the drag started from.
+  const [palette, setPalette] = useState<{
+    screenPosition: { x: number; y: number };
+    flowPosition: { x: number; y: number };
+    connectFrom?: { nodeId: string; handle: string | null };
+  } | null>(null);
+  const [nodeMenu, setNodeMenu] = useState<{ nodeId: string; screenPosition: { x: number; y: number } } | null>(null);
   useDocumentTitle(pipelineName ? `Pipeline: ${pipelineName}` : 'Pipeline');
 
   // Guards the dirty-tracking effect below against firing when the initial fetch lands —
@@ -133,20 +144,58 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
     return () => window.removeEventListener('beforeunload', handler);
   }, [dirty]);
 
-  function handleAddNode(kind: NodeKind) {
+  function handleAddNode(kind: NodeKind, position: { x: number; y: number }) {
     if (!graph) return;
-    // Same placeholder-grid math Canvas falls back to for an unmoved node, offset below the
-    // existing rows so a newly added node doesn't render stacked on top of another placeholder.
-    const i = graph.nodes.length;
-    const position = { x: (i % 4) * 260, y: Math.floor(i / 4) * 160 + 200 };
     const { graph: next, newNodeId } = addNode(graph, kind, position);
     setGraph(next);
     setSelected(newNodeId);
+    return newNodeId;
   }
 
   function handleDeleteNode(nodeId: string) {
     setGraph(g => g && deleteNode(g, nodeId));
     setSelected(s => s === nodeId ? null : s);
+  }
+
+  /** Right-click empty canvas: open the node-kind palette at the click position. */
+  function handleAddNodeAt(flowPosition: { x: number; y: number }, screenPosition: { x: number; y: number }) {
+    setPalette({ flowPosition, screenPosition });
+  }
+
+  /** A connection dragged out to empty canvas and released: open the palette, remembering what to wire the new node to once a kind is picked. */
+  function handleConnectEndEmpty(sourceNodeId: string, sourceHandle: string | null, flowPosition: { x: number; y: number }, screenPosition: { x: number; y: number }) {
+    setPalette({ flowPosition, screenPosition, connectFrom: { nodeId: sourceNodeId, handle: sourceHandle } });
+  }
+
+  function handlePickFromPalette(kind: NodeKind) {
+    if (!palette) return;
+    const newNodeId = handleAddNode(kind, palette.flowPosition);
+    if (newNodeId && palette.connectFrom) {
+      handleConnectNodes(palette.connectFrom.nodeId, newNodeId, palette.connectFrom.handle, 'in');
+    }
+    setPalette(null);
+  }
+
+  function handleNodeContextMenuRequest(nodeId: string, screenPosition: { x: number; y: number }) {
+    setNodeMenu({ nodeId, screenPosition });
+  }
+
+  function handleDuplicateNode(nodeId: string) {
+    if (!graph) return;
+    const original = graph.nodes.find(n => n.id === nodeId);
+    const base = original?.position ?? { x: 0, y: 0 };
+    // One full placeholder-grid column over (same 260px Canvas.tsx's own grid fallback uses) —
+    // a small pixel offset left the copy visually on top of the original, since nodes render at
+    // ~200-260px wide (found live: the e2e context-menu test couldn't click the original again,
+    // the copy was intercepting its clicks).
+    const { graph: next, newNodeId } = duplicateNode(graph, nodeId, { x: base.x + 260, y: base.y });
+    if (!newNodeId) return;
+    setGraph(next);
+    setSelected(newNodeId);
+  }
+
+  function handleDisconnectNode(nodeId: string) {
+    setGraph(g => g && disconnectNode(g, nodeId));
   }
 
   function handleNodeMove(nodeId: string, position: { x: number; y: number }) {
@@ -256,7 +305,6 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
         {graph && (
           <>
             <div className="ai-jobs-toolbar-group">
-              <NodePicker onPick={handleAddNode} />
               <button type="button" className="btn btn-ghost btn-sm" onClick={handleSaveDraft} title="Keeps your edits without making them live.">Save Draft</button>
               <button type="button" className="btn btn-primary btn-sm" onClick={handlePublish} title="Makes this version the one real runs use — saves first if you have unsaved changes.">Publish</button>
               <span className="ai-jobs-dirty-indicator">{dirty ? 'Unsaved changes…' : 'All changes saved'}</span>
@@ -277,7 +325,26 @@ export function AiJobsWorkspace({ pipelineId, pollIntervalMs = POLL_INTERVAL_MS,
               onConnectNodes={handleConnectNodes}
               onDeleteNode={handleDeleteNode}
               onDeleteEdge={handleDeleteEdge}
+              onAddNodeAt={handleAddNodeAt}
+              onConnectEndEmpty={handleConnectEndEmpty}
+              onNodeContextMenu={handleNodeContextMenuRequest}
             />
+            {palette && (
+              <NodeKindPalette
+                position={palette.screenPosition}
+                onPick={handlePickFromPalette}
+                onClose={() => setPalette(null)}
+              />
+            )}
+            {nodeMenu && (
+              <NodeContextMenu
+                position={nodeMenu.screenPosition}
+                onDelete={() => handleDeleteNode(nodeMenu.nodeId)}
+                onDuplicate={() => handleDuplicateNode(nodeMenu.nodeId)}
+                onDisconnect={() => handleDisconnectNode(nodeMenu.nodeId)}
+                onClose={() => setNodeMenu(null)}
+              />
+            )}
             {selected && (
               // key: a different node must get a fresh panel. Without it React reuses the instance and
               // AgentCallBody's `template` state (seeded once from props) keeps showing the PREVIOUS

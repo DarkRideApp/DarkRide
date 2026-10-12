@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ReactFlow, Background, Controls, Handle, Position, applyNodeChanges, applyEdgeChanges,
   type Node, type Edge, type Connection, type NodeChange, type EdgeChange, type NodeProps,
+  type ReactFlowInstance, type FinalConnectionState,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 // Type-only import — erased at build, no runtime coupling to backend code.
@@ -170,7 +171,33 @@ export function toFlowEdges(graph: PipelineGraph): Edge[] {
   return result;
 }
 
-export function Canvas({ graph, onSelectNode, nodeStatuses, onNodeMove, onConnectNodes, onDeleteNode, onDeleteEdge }: {
+/** Works for a real MouseEvent or a React synthetic mouse event; falls back to a touch event's
+ *  first point. React Flow's context-menu/connect-end handlers hand back either shape. */
+function clientXY(event: { clientX: number; clientY: number } | TouchEvent): { x: number; y: number } {
+  if ('clientX' in event) return { x: event.clientX, y: event.clientY };
+  const touch = event.changedTouches[0] ?? event.touches[0];
+  return touch ? { x: touch.clientX, y: touch.clientY } : { x: 0, y: 0 };
+}
+
+/**
+ * Pure decision logic for a connection drag's release, kept outside the component so it's
+ * testable without simulating a real React Flow drag gesture (notoriously hard in jsdom). A
+ * valid drop (onto a real handle) is already handled by onConnect; this only fires for a drop on
+ * empty canvas — the Blueprint-style "drag a wire out, release, pick a node to create" gesture.
+ */
+export function connectionEndIntent(
+  connectionState: Pick<FinalConnectionState, 'isValid' | 'fromNode' | 'fromHandle' | 'to'>,
+): { sourceNodeId: string; sourceHandle: string | null; flowPosition: { x: number; y: number } } | null {
+  if (connectionState.isValid) return null;
+  if (!connectionState.fromNode || !connectionState.to) return null;
+  return {
+    sourceNodeId: connectionState.fromNode.id,
+    sourceHandle: connectionState.fromHandle?.id ?? null,
+    flowPosition: connectionState.to,
+  };
+}
+
+export function Canvas({ graph, onSelectNode, nodeStatuses, onNodeMove, onConnectNodes, onDeleteNode, onDeleteEdge, onAddNodeAt, onConnectEndEmpty, onNodeContextMenu }: {
   graph: PipelineGraph;
   onSelectNode: (nodeId: string) => void;
   nodeStatuses?: Record<string, { status: string; wasMemoized?: boolean; error?: string }>;
@@ -179,9 +206,15 @@ export function Canvas({ graph, onSelectNode, nodeStatuses, onNodeMove, onConnec
   onConnectNodes?: (from: string, to: string, sourceHandle: string | null, targetHandle: string | null) => void;
   onDeleteNode?: (nodeId: string) => void;
   onDeleteEdge?: (from: string, to: string, targetHandle: string | null) => void;
+  /** Right-click on empty canvas — the Blueprint-style "add node here" gesture. */
+  onAddNodeAt?: (flowPosition: { x: number; y: number }, screenPosition: { x: number; y: number }) => void;
+  /** A connection dragged out and released on empty canvas (not onto a real handle). */
+  onConnectEndEmpty?: (sourceNodeId: string, sourceHandle: string | null, flowPosition: { x: number; y: number }, screenPosition: { x: number; y: number }) => void;
+  onNodeContextMenu?: (nodeId: string, screenPosition: { x: number; y: number }) => void;
 }) {
   const [nodes, setNodes] = useState<Node[]>(() => toFlowNodes(graph, nodeStatuses));
   const [edges, setEdges] = useState<Edge[]>(() => toFlowEdges(graph));
+  const rfInstanceRef = useRef<ReactFlowInstance | null>(null);
 
   // The graph prop is the single source of truth (owned by AiJobsWorkspace). Resync whenever it
   // changes — after an add/delete/move round-trips through the parent, after a pipeline switch,
@@ -218,6 +251,19 @@ export function Canvas({ graph, onSelectNode, nodeStatuses, onNodeMove, onConnec
     }
   }
 
+  function handlePaneContextMenu(event: MouseEvent | React.MouseEvent) {
+    event.preventDefault();
+    const screenPosition = clientXY(event as MouseEvent);
+    const flowPosition = rfInstanceRef.current?.screenToFlowPosition(screenPosition) ?? screenPosition;
+    onAddNodeAt?.(flowPosition, screenPosition);
+  }
+
+  function handleConnectEnd(event: MouseEvent | TouchEvent, connectionState: FinalConnectionState) {
+    const intent = connectionEndIntent(connectionState);
+    if (!intent) return;
+    onConnectEndEmpty?.(intent.sourceNodeId, intent.sourceHandle, intent.flowPosition, clientXY(event));
+  }
+
   return (
     <div style={{ height: '100%', width: '100%' }}>
       <ReactFlow
@@ -227,7 +273,11 @@ export function Canvas({ graph, onSelectNode, nodeStatuses, onNodeMove, onConnec
         onNodesChange={handleNodesChange}
         onEdgesChange={handleEdgesChange}
         onConnect={handleConnect}
+        onConnectEnd={handleConnectEnd}
         onNodeClick={(_, node) => onSelectNode(node.id)}
+        onPaneContextMenu={handlePaneContextMenu}
+        onNodeContextMenu={(event, node) => { event.preventDefault(); onNodeContextMenu?.(node.id, clientXY(event as unknown as MouseEvent)); }}
+        onInit={(instance) => { rfInstanceRef.current = instance; }}
         deleteKeyCode={['Backspace', 'Delete']}
         fitView
       >

@@ -11,8 +11,14 @@
  * Run: npx playwright test tests/e2e/ai-pipelines.spec.ts
  */
 
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { loginAsAdmin, waitForBackend } from './helpers/auth';
+
+/** Opens the Blueprint-style add-node palette via a right-click on empty canvas — the old
+ *  toolbar "+ Add node" button this replaced is gone. */
+async function openAddNodePalette(page: Page) {
+  await page.locator('.react-flow__pane').click({ button: 'right', position: { x: 50, y: 50 } });
+}
 
 test.describe('AI job pipelines', () => {
   test('list page shows the seeded pipeline by its real name; its editor shows real prompt and Report content', async ({ page }) => {
@@ -88,7 +94,7 @@ test.describe('AI job pipelines', () => {
     await expect(page.getByText('E2E Editor Pipeline')).toBeVisible();
 
     // Add a Trigger node via the searchable node picker, configure + rename it.
-    await page.getByRole('button', { name: '+ Add node' }).click();
+    await openAddNodePalette(page);
     await page.getByRole('option', { name: /^Trigger/ }).click();
     const triggerPanel = page.getByRole('dialog');
     await expect(triggerPanel).toBeVisible();
@@ -99,7 +105,7 @@ test.describe('AI job pipelines', () => {
     await expect(page.locator('.react-flow__node').getByText('E2E Trigger', { exact: true })).toBeVisible();
 
     // Add an AgentCall node via the picker, filtering by a search term to prove it actually filters.
-    await page.getByRole('button', { name: '+ Add node' }).click();
+    await openAddNodePalette(page);
     await page.getByLabel('Search node kinds').fill('agent');
     await page.getByRole('option', { name: /^Agent Call/ }).click();
     await page.getByRole('button', { name: /close/i }).click();
@@ -146,10 +152,10 @@ test.describe('AI job pipelines', () => {
     await page.getByRole('button', { name: 'Create' }).click();
     await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
 
-    await page.getByRole('button', { name: '+ Add node' }).click();
+    await openAddNodePalette(page);
     await page.getByRole('option', { name: /^Agent Call/ }).click();
     await page.getByRole('button', { name: /close/i }).click();
-    await page.getByRole('button', { name: '+ Add node' }).click();
+    await openAddNodePalette(page);
     await page.getByRole('option', { name: /^Report/ }).click();
     const reportPanel = page.getByRole('dialog');
     await expect(reportPanel).toBeVisible();
@@ -197,7 +203,7 @@ test.describe('AI job pipelines', () => {
     // A real registered expand function (apk-analysis/apk-context) that genuinely throws without
     // a versionId — the whole point of this test is exercising the backend's real error message,
     // not a mocked one.
-    await page.getByRole('button', { name: '+ Add node' }).click();
+    await openAddNodePalette(page);
     await page.getByRole('option', { name: /^Trigger/ }).click();
     const triggerPanel = page.getByRole('dialog');
     await expect(triggerPanel).toBeVisible();
@@ -208,7 +214,7 @@ test.describe('AI job pipelines', () => {
     await expect(triggerPanel.getByTestId('trigger-input-field-row').getByPlaceholder('name')).toHaveValue('versionId');
     await page.getByRole('button', { name: /close/i }).click();
 
-    await page.getByRole('button', { name: '+ Add node' }).click();
+    await openAddNodePalette(page);
     await page.getByRole('option', { name: /^Agent Call/ }).click();
     await page.getByRole('button', { name: /close/i }).click();
 
@@ -257,7 +263,7 @@ test.describe('AI job pipelines', () => {
     await page.getByRole('button', { name: 'Create' }).click();
     await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
 
-    await page.getByRole('button', { name: '+ Add node' }).click();
+    await openAddNodePalette(page);
     await page.getByRole('option', { name: /^Trigger/ }).click();
     const triggerPanel = page.getByRole('dialog');
     await expect(triggerPanel).toBeVisible();
@@ -276,5 +282,70 @@ test.describe('AI job pipelines', () => {
     // No Run form for an event-sourced Trigger — nothing to click, the dispatcher starts these.
     await expect(triggerPanel.getByText(/fires automatically when "apk:analyzed"/i)).toBeVisible();
     await expect(triggerPanel.getByRole('button', { name: /^run$/i })).toHaveCount(0);
+  });
+
+  test('dragging a connection out to empty canvas opens the palette and auto-wires the new node', async ({ page }) => {
+    await loginAsAdmin(page);
+    await waitForBackend(page.request);
+    await page.goto('/ui/pipelines');
+    await expect(page.getByTestId('pipelines-table')).toBeVisible({ timeout: 15_000 });
+
+    await page.getByRole('button', { name: '+ New Pipeline' }).click();
+    await page.getByLabel('New pipeline name').fill('E2E Drag-To-Empty Pipeline');
+    await page.getByRole('button', { name: 'Create' }).click();
+    await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
+
+    await openAddNodePalette(page);
+    await page.getByRole('option', { name: /^Trigger/ }).click();
+    await page.getByRole('button', { name: /close/i }).click();
+
+    const triggerNode = page.locator('.react-flow__node[data-id^="trigger-"]').first();
+    const triggerOutHandle = triggerNode.locator('[data-handleid="out"]');
+    const handleBox = (await triggerOutHandle.boundingBox())!;
+
+    // Drag from the Trigger's output pin to a point on empty canvas, well clear of any node.
+    await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + handleBox.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(handleBox.x + 400, handleBox.y + 300, { steps: 10 });
+    await page.mouse.up();
+
+    // The palette opens right there — pick a kind, and it lands wired to the Trigger with no
+    // extra drag needed.
+    await expect(page.getByLabel('Search node kinds')).toBeVisible();
+    await page.getByRole('option', { name: /^Agent Call/ }).click();
+
+    await expect(page.locator('.react-flow__node')).toHaveCount(2);
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1);
+  });
+
+  test('right-clicking a node offers Duplicate, Disconnect and Delete', async ({ page }) => {
+    await loginAsAdmin(page);
+    await waitForBackend(page.request);
+    await page.goto('/ui/pipelines');
+    await expect(page.getByTestId('pipelines-table')).toBeVisible({ timeout: 15_000 });
+
+    await page.getByRole('button', { name: '+ New Pipeline' }).click();
+    await page.getByLabel('New pipeline name').fill('E2E Node Context Menu Pipeline');
+    await page.getByRole('button', { name: 'Create' }).click();
+    await expect(page).toHaveURL(/\/ui\/pipelines\/\d+$/);
+
+    await openAddNodePalette(page);
+    await page.getByRole('option', { name: /^Agent Call/ }).click();
+    await page.getByRole('button', { name: /close/i }).click();
+    await expect(page.locator('.react-flow__node')).toHaveCount(1);
+
+    const agentNode = page.locator('.react-flow__node[data-id^="agent-"]').first();
+    await agentNode.click({ button: 'right' });
+    await expect(page.getByRole('menuitem', { name: 'Duplicate' })).toBeVisible();
+
+    await page.getByRole('menuitem', { name: 'Duplicate' }).click();
+    await expect(page.locator('.react-flow__node')).toHaveCount(2);
+    // The duplicate opens selected, in its own side panel.
+    await expect(page.getByRole('dialog')).toBeVisible();
+    await page.getByRole('button', { name: /close/i }).click();
+
+    await page.locator('.react-flow__node[data-id^="agent-"]').first().click({ button: 'right' });
+    await page.getByRole('menuitem', { name: 'Delete' }).click();
+    await expect(page.locator('.react-flow__node')).toHaveCount(1);
   });
 });

@@ -24,6 +24,13 @@ afterEach(() => {
   globalThis.ResizeObserver = realRO as typeof ResizeObserver;
 });
 
+/** Opens the Blueprint-style add-node palette via a right-click on empty canvas — the toolbar
+ *  "+ Add node" button this replaced is gone. */
+function openPaletteViaRightClick() {
+  const pane = document.querySelector('.react-flow__pane') as HTMLElement;
+  fireEvent.contextMenu(pane, { clientX: 300, clientY: 300 });
+}
+
 describe('AiJobsWorkspace', () => {
   it('renders the Trigger, AgentCall, Report and Sink nodes from the fetched pipeline', async () => {
     const ws = createMockWs({ pipelineVersion: mockPipelineVersion() });
@@ -200,10 +207,47 @@ describe('AiJobsWorkspace', () => {
     render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: '+ Add node' }));
+    openPaletteViaRightClick();
     fireEvent.click(screen.getByRole('option', { name: /^Agent Call/ }));
 
     await screen.findByRole('dialog', { name: /agent-\d+ details/ });
+  });
+
+  it('right-clicking a node opens a context menu; Duplicate adds a copy and selects it', async () => {
+    const ws = createMockWs();
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('agent-overview')).toBeInTheDocument());
+
+    fireEvent.contextMenu(screen.getByText('agent-overview'), { clientX: 10, clientY: 10 });
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Duplicate' }));
+
+    await screen.findByRole('dialog', { name: /agent-\d+ details/ });
+    // The original is untouched, and a second AgentCall node now exists.
+    expect(screen.getByText('agent-overview')).toBeInTheDocument();
+    expect(screen.getAllByText('Agent Call').length).toBeGreaterThanOrEqual(8);
+  });
+
+  it('right-clicking a node and choosing Disconnect clears its wiring without deleting it', async () => {
+    const ws = createMockWs();
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('agent-overview')).toBeInTheDocument());
+
+    fireEvent.contextMenu(screen.getByText('agent-overview'), { clientX: 10, clientY: 10 });
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Disconnect' }));
+
+    // Still on the canvas, just no longer wired to its Report section.
+    expect(screen.getByText('agent-overview')).toBeInTheDocument();
+  });
+
+  it('right-clicking a node and choosing Delete removes it, same as the side panel\'s Delete button', async () => {
+    const ws = createMockWs();
+    render(<AiJobsWorkspace pipelineId={1} />, { wrapper: withProviders(ws) });
+    await waitFor(() => expect(screen.getByText('agent-overview')).toBeInTheDocument());
+
+    fireEvent.contextMenu(screen.getByText('agent-overview'), { clientX: 10, clientY: 10 });
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
+
+    expect(screen.queryByText('agent-overview')).not.toBeInTheDocument();
   });
 
   it('renaming a node updates its label on the canvas', async () => {
@@ -274,7 +318,7 @@ describe('AiJobsWorkspace', () => {
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
     expect(screen.getByText('All changes saved')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '+ Add node' }));
+    openPaletteViaRightClick();
     fireEvent.click(screen.getByRole('option', { name: /^Agent Call/ }));
     expect(screen.getByText('Unsaved changes…')).toBeInTheDocument();
 
@@ -287,7 +331,7 @@ describe('AiJobsWorkspace', () => {
     render(<AiJobsWorkspace pipelineId={1} autosaveDebounceMs={0} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: '+ Add node' }));
+    openPaletteViaRightClick();
     fireEvent.click(screen.getByRole('option', { name: /^Agent Call/ }));
 
     await waitFor(() => expect(calledPaths(ws)).toContain('POST /v1/ai-pipelines/1/versions'));
@@ -304,7 +348,7 @@ describe('AiJobsWorkspace', () => {
     render(<AiJobsWorkspace pipelineId={1} autosaveDebounceMs={100000} />, { wrapper: withProviders(ws) });
     await waitFor(() => expect(screen.getByText('Overview')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: '+ Add node' }));
+    openPaletteViaRightClick();
     fireEvent.click(screen.getByRole('option', { name: /^Agent Call/ }));
     fireEvent.click(screen.getByRole('button', { name: /^publish$/i }));
 
