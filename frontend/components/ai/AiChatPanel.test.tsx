@@ -1185,6 +1185,66 @@ describe('convertDbMessages', () => {
   });
 });
 
+// ─── Tool confirmation card ─────────────────────────────────────────────────
+
+describe('AiChatPanel tool confirmation card', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  /** Render the panel, start a run, and have the server ask to confirm a tool. */
+  function askToConfirm(toolName = 'run_adb_command', input: Record<string, unknown> = { command: 'getprop' }) {
+    const subscribe = vi.fn().mockReturnValue(() => {});
+    const { ws } = renderWithWs(<AiChatPanel pageContext="devices" contextId="d1" />, { subscribe });
+    fireEvent.change(screen.getByTestId('ai-chat-input'), { target: { value: 'check the device' } });
+    fireEvent.click(screen.getByTestId('ai-chat-send-btn'));
+    const onConfirm = subscribe.mock.calls.find((c: any[]) => c[0] === 'ai:tool-confirm')?.[1];
+    act(() => {
+      onConfirm({ type: 'ai:tool-confirm', conversationId: null, toolUseId: 'tu-1', toolName, input });
+    });
+    return ws;
+  }
+
+  const confirmResponses = (ws: WebSocketContextValue) =>
+    (ws.sendMessage as ReturnType<typeof vi.fn>).mock.calls.filter((c: any[]) => c[0] === 'ai:tool-confirm-response');
+
+  it('names the tool and offers Deny, Allow and Allow for this conversation', () => {
+    askToConfirm('update_setting', { key: 'ai.maxTurns' });
+
+    expect(screen.getByTestId('ai-chat-confirm')).toHaveTextContent('update_setting');
+    expect(screen.getByTestId('ai-chat-confirm-deny')).toHaveTextContent('Deny');
+    expect(screen.getByTestId('ai-chat-confirm-allow')).toHaveTextContent('Allow');
+    expect(screen.getByTestId('ai-chat-confirm-allow-conversation')).toHaveTextContent('Allow for this conversation');
+  });
+
+  it('Allow approves this one call only', () => {
+    const ws = askToConfirm();
+
+    fireEvent.click(screen.getByTestId('ai-chat-confirm-allow'));
+
+    expect(confirmResponses(ws)).toEqual([['ai:tool-confirm-response', { toolUseId: 'tu-1', allowed: true, scope: 'once' }]]);
+    expect(screen.queryByTestId('ai-chat-confirm')).not.toBeInTheDocument();
+  });
+
+  it('Allow for this conversation approves the tool for the rest of the conversation', () => {
+    const ws = askToConfirm();
+
+    fireEvent.click(screen.getByTestId('ai-chat-confirm-allow-conversation'));
+
+    expect(confirmResponses(ws)).toEqual([['ai:tool-confirm-response', { toolUseId: 'tu-1', allowed: true, scope: 'conversation' }]]);
+    expect(screen.queryByTestId('ai-chat-confirm')).not.toBeInTheDocument();
+  });
+
+  it('Deny refuses this call and does not ask the server to remember anything', () => {
+    const ws = askToConfirm();
+
+    fireEvent.click(screen.getByTestId('ai-chat-confirm-deny'));
+
+    expect(confirmResponses(ws)).toEqual([['ai:tool-confirm-response', { toolUseId: 'tu-1', allowed: false, scope: 'once' }]]);
+  });
+});
+
 // ─── Streaming events that land in one batch ────────────────────────────────
 
 describe('AiChatPanel streamed events that arrive together', () => {

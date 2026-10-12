@@ -16,6 +16,7 @@ import type {
   AiErrorEvent,
   AiContextUsageEvent,
   AiToolConfirmEvent,
+  AiToolConfirmScope,
   AiMessage,
   AiTextBlock,
   AiToolUseBlock,
@@ -529,11 +530,12 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     });
   }, [ws, conversationId, pageContext, contextId, isStreaming, resetStaleTimer]);
 
-  const respondToConfirm = useCallback((allowed: boolean) => {
+  const respondToConfirm = useCallback((allowed: boolean, scope: AiToolConfirmScope = 'once') => {
     if (!pendingConfirm) return;
     ws.sendMessage('ai:tool-confirm-response', {
       toolUseId: pendingConfirm.toolUseId,
       allowed,
+      scope,
     });
     setPendingConfirm(null);
     resetStaleTimer();
@@ -659,6 +661,14 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
                       data-testid="ai-chat-confirm-deny"
                     >
                       Deny
+                    </button>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => respondToConfirm(true, 'conversation')}
+                      title={`Stop asking about ${pendingConfirm.toolName} in this conversation`}
+                      data-testid="ai-chat-confirm-allow-conversation"
+                    >
+                      Allow for this conversation
                     </button>
                     <button
                       className="btn btn-primary btn-sm"

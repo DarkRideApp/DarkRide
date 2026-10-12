@@ -717,7 +717,6 @@ export function registerAllTools(
     },
     context: ['automations'],
     requiredScope: 'core.automations:execute',
-    requiresConfirmation: true,
     allowUnattended: false,
     async execute(params: { id: number; deviceId?: string }) {
       if (!runner || !scheduler) throw new Error('AutomationRunner/Scheduler not wired into AI tools');
@@ -749,7 +748,6 @@ export function registerAllTools(
     },
     context: ['automations'],
     requiredScope: 'core.automations:execute',
-    requiresConfirmation: true,
     async execute(params: { sessionId: number }) {
       if (!runner) throw new Error('AutomationRunner not wired into AI tools');
       const cancelled = runner.cancelRun(params.sessionId);
@@ -1276,7 +1274,6 @@ export function registerAllTools(
     },
     context: ['dashboard', 'apk-analysis'],
     requiredScope: 'core.apk:manage',
-    requiresConfirmation: true,
     allowUnattended: false,
     async execute(params: { versionId: number }) {
       const version = db.select().from(schema.apkVersions)
@@ -1350,7 +1347,6 @@ export function registerAllTools(
     },
     context: ['dashboard', 'apk-analysis'],
     requiredScope: 'core.apk:manage',
-    requiresConfirmation: true,
     async execute(params: { trackedAppId?: number; packageName?: string; source: string }) {
       const app = resolveTrackedApp(params);
       if (!app) return { error: 'Tracked app not found' };
@@ -2644,7 +2640,6 @@ export function registerAllTools(
     },
     context: ['devices', 'traffic'],
     requiredScope: 'core.traffic:manage',
-    requiresConfirmation: true,
     async execute(params: { deviceId: string; proxyMode?: 'none' | 'normal' | 'nordvpn'; proxyCountry?: string; tlsProfile?: string }) {
       if (!captureManager) throw new Error('CaptureSessionManager not wired into AI tools');
       const proxyOptions = params.proxyMode ? { mode: params.proxyMode, country: params.proxyCountry } : undefined;
@@ -3272,7 +3267,6 @@ export function registerAllTools(
     },
     context: ['frida', 'apk-analysis'],
     requiredScope: 'core.frida:manage',
-    requiresConfirmation: true,
     allowUnattended: false,
     async execute(params: { deviceId: string; bundleId: string; pattern: string }) {
       if (!bridgeManager) throw new Error('PythonBridgeManager not wired into AI tools');
@@ -3306,7 +3300,6 @@ export function registerAllTools(
     },
     context: ['frida', 'apk-analysis'],
     requiredScope: 'core.frida:manage',
-    requiresConfirmation: true,
     allowUnattended: false,
     async execute(params: { deviceId: string; bundleId: string; className: string }) {
       if (!bridgeManager) throw new Error('PythonBridgeManager not wired into AI tools');

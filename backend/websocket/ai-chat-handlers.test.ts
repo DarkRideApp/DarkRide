@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { registerAiChatEndpoints, cleanupSocket, type AiChatDeps } from './ai-chat-handlers';
+import { registerAiChatEndpoints, cleanupSocket, MAX_REMEMBERED_CONVERSATIONS, type AiChatDeps } from './ai-chat-handlers';
 import { getWebsocketHandler, clearWebsocketHandlers } from './handlers';
 import type { AiToolRegistry } from '../services/ai-tools';
 
@@ -693,6 +693,268 @@ describe('AI Chat Handlers', () => {
       // userId must NOT be present on the params (identity is in the factory-bound agent)
       expect(callParams.userId).toBeUndefined();
       expect(callParams.userScopes).toBeUndefined();
+    });
+  });
+
+  describe('tool confirmation', () => {
+    // Approvals live in module state, so every test takes a user id nobody else has used.
+    let nextUserId = 5000;
+    let toolUseSeq = 0;
+
+    const confirmEvents = (socket: any) =>
+      socket.send.mock.calls.map((c: any[]) => JSON.parse(c[0])).filter((e: any) => e.type === 'ai:tool-confirm');
+
+    const respond = (socket: any, toolUseId: string, allowed: boolean, scope?: unknown) =>
+      getWebsocketHandler('ai:tool-confirm-response')!.handler(
+        { toolUseId, allowed, ...(scope !== undefined ? { scope } : {}) },
+        socket,
+      );
+
+    interface Reply { allowed: boolean; scope?: unknown }
+    interface Turn {
+      conversationId: number | null;
+      /** Tools the agent asks to confirm, in order. */
+      tools: string[];
+      /** Answers for the prompts this turn raises, in order. A prompt with no reply is denied. */
+      replies?: Reply[];
+      /** Conversation id the agent reports when it finishes. Defaults to the one it was given. */
+      endsAs?: number;
+      /** Throw after the confirmations, as a provider failure would. */
+      fail?: boolean;
+    }
+
+    /** Run one `ai:message` through the real handler with a scripted agent, answering each prompt as it arrives. */
+    async function converse(socket: any, turn: Turn) {
+      const answers: boolean[] = [];
+      const agent = {
+        handleMessage: vi.fn(async (params: any) => {
+          for (const tool of turn.tools) {
+            answers.push(await params.onToolConfirm(`tu-${++toolUseSeq}`, tool, { call: answers.length }));
+          }
+          if (turn.fail) throw new Error('provider failed');
+          return { conversationId: turn.endsAs ?? turn.conversationId, usage: { inputTokens: 1, outputTokens: 1 } };
+        }),
+      };
+      (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+      const before = confirmEvents(socket).length;
+      let finished = false;
+      const done = getWebsocketHandler('ai:message')!.handler(
+        { conversationId: turn.conversationId, message: 'go', pageContext: 'devices', contextId: '' },
+        socket,
+      ).finally(() => { finished = true; });
+
+      let answered = 0;
+      while (!finished) {
+        const events = confirmEvents(socket);
+        if (events.length - before > answered) {
+          const reply = turn.replies?.[answered] ?? { allowed: false };
+          await respond(socket, events[before + answered].toolUseId, reply.allowed, reply.scope);
+          answered++;
+        } else {
+          await new Promise((r) => setTimeout(r, 1));
+        }
+      }
+      await done;
+      return { answers, prompts: confirmEvents(socket).slice(before).map((e: any) => e.toolName) };
+    }
+
+    it('sends the tool name and input with the prompt, and a denial reaches the agent', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, { conversationId: 1, tools: ['run_adb_command'], replies: [{ allowed: false }] });
+
+      expect(r.answers).toEqual([false]);
+      expect(confirmEvents(socket)[0]).toMatchObject({
+        type: 'ai:tool-confirm',
+        toolName: 'run_adb_command',
+        input: { call: 0 },
+      });
+    });
+
+    it('asks again for the same tool when the user allows only once', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'run_adb_command'],
+        replies: [{ allowed: true, scope: 'once' }, { allowed: true }],
+      });
+
+      expect(r.prompts).toEqual(['run_adb_command', 'run_adb_command']);
+      expect(r.answers).toEqual([true, true]);
+    });
+
+    it('does not ask again for a tool the user allowed for the conversation, within the same run', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'run_adb_command', 'run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }],
+      });
+
+      expect(r.prompts).toEqual(['run_adb_command']);
+      expect(r.answers).toEqual([true, true, true]);
+    });
+
+    it('keeps the approval to the tool it was given for', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'update_setting', 'run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }, { allowed: true }],
+      });
+
+      expect(r.prompts).toEqual(['run_adb_command', 'update_setting']);
+      expect(r.answers).toEqual([true, true, true]);
+    });
+
+    it('never remembers a denial, even one sent with the conversation scope', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'run_adb_command'],
+        replies: [{ allowed: false, scope: 'conversation' }, { allowed: true }],
+      });
+
+      expect(r.prompts).toEqual(['run_adb_command', 'run_adb_command']);
+      expect(r.answers).toEqual([false, true]);
+    });
+
+    it('treats an unrecognised scope as a single approval', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'run_adb_command'],
+        replies: [{ allowed: true, scope: 'forever' }, { allowed: true }],
+      });
+
+      expect(r.prompts).toHaveLength(2);
+    });
+
+    it('carries an approval into the next message of the same conversation', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      await converse(socket, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+
+      const next = await converse(socket, { conversationId: 7, tools: ['run_adb_command'] });
+
+      expect(next.prompts).toEqual([]);
+      expect(next.answers).toEqual([true]);
+    });
+
+    it('carries an approval made in a new conversation once the conversation has an id', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      await converse(socket, {
+        conversationId: null,
+        endsAs: 42,
+        tools: ['run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }],
+      });
+
+      const next = await converse(socket, { conversationId: 42, tools: ['run_adb_command'] });
+
+      expect(next.prompts).toEqual([]);
+      expect(next.answers).toEqual([true]);
+    });
+
+    it('does not carry an approval into a different conversation', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      await converse(socket, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+
+      const other = await converse(socket, { conversationId: 8, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+      expect(other.prompts).toEqual(['run_adb_command']);
+    });
+
+    it('does not carry an approval to another user in the same conversation', async () => {
+      const owner = createAuthenticatedSocket(++nextUserId);
+      await converse(owner, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+
+      const other = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(other, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+      expect(r.prompts).toEqual(['run_adb_command']);
+    });
+
+    it('keeps an approval across a reconnect', async () => {
+      const userId = ++nextUserId;
+      await converse(createAuthenticatedSocket(userId), {
+        conversationId: 7,
+        tools: ['run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }],
+      });
+
+      const reconnected = await converse(createAuthenticatedSocket(userId), { conversationId: 7, tools: ['run_adb_command'] });
+
+      expect(reconnected.prompts).toEqual([]);
+    });
+
+    it('keeps an approval when the run fails after it was given', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      await converse(socket, {
+        conversationId: 7,
+        fail: true,
+        tools: ['run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }],
+      });
+
+      const next = await converse(socket, { conversationId: 7, tools: ['run_adb_command'] });
+
+      expect(next.prompts).toEqual([]);
+    });
+
+    it('forgets the least recently approved conversations past the cap, so the store cannot grow without bound', async () => {
+      expect(MAX_REMEMBERED_CONVERSATIONS).toBeGreaterThan(0);
+      const socket = createAuthenticatedSocket(++nextUserId);
+      for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS + 1; id++) {
+        await converse(socket, { conversationId: id, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+      }
+
+      const oldest = await converse(socket, { conversationId: 1, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+      const newest = await converse(socket, { conversationId: MAX_REMEMBERED_CONVERSATIONS + 1, tools: ['run_adb_command'] });
+
+      expect(oldest.prompts).toEqual(['run_adb_command']);
+      expect(newest.prompts).toEqual([]);
+    }, 30_000);
+
+    it('denies a pending prompt when the socket disconnects', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const agent = {
+        handleMessage: vi.fn(async (params: any) => {
+          const allowed = await params.onToolConfirm('tu-disconnect', 'run_adb_command', {});
+          return { conversationId: 1, usage: { inputTokens: 1, outputTokens: 1 }, allowed };
+        }),
+      };
+      (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+      const done = getWebsocketHandler('ai:message')!.handler(
+        { conversationId: 1, message: 'go', pageContext: 'devices', contextId: '' },
+        socket,
+      );
+      await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+      cleanupSocket(socket);
+      await done;
+
+      expect(await agent.handleMessage.mock.results[0].value).toMatchObject({ allowed: false });
+    });
+
+    it('denies a pending prompt when the request is cancelled', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const agent = {
+        handleMessage: vi.fn(async (params: any) => {
+          const allowed = await params.onToolConfirm('tu-cancel', 'run_adb_command', {});
+          return { conversationId: 1, usage: { inputTokens: 1, outputTokens: 1 }, allowed };
+        }),
+      };
+      (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+      const done = getWebsocketHandler('ai:message')!.handler(
+        { conversationId: 1, message: 'go', pageContext: 'devices', contextId: '', requestId: 'req-cancel' },
+        socket,
+      );
+      await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+      await getWebsocketHandler('ai:cancel')!.handler({ conversationId: 1, requestId: 'req-cancel' }, socket);
+      await done;
+
+      expect(await agent.handleMessage.mock.results[0].value).toMatchObject({ allowed: false });
     });
   });
 });

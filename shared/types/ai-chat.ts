@@ -107,11 +107,19 @@ export interface AiChatCancelMessage {
   requestId?: string;
 }
 
+/**
+ * How far an approval reaches. `once` covers the single call being asked about; `conversation` also covers later
+ * calls to the same tool in the same conversation. A denial is always `once`.
+ */
+export type AiToolConfirmScope = 'once' | 'conversation';
+
 /** User responds to a tool confirmation prompt */
 export interface AiToolConfirmResponseMessage {
   action: 'ai:tool-confirm-response';
   toolUseId: string;
   allowed: boolean;
+  /** Defaults to `once`. Any value other than `conversation` is treated as `once`. */
+  scope?: AiToolConfirmScope;
 }
 
 // Server → Client
