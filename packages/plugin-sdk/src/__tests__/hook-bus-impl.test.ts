@@ -78,4 +78,68 @@ describe('HookBusImpl.define / getDefinedHooks', () => {
       { field: 'stale', type: 'number', description: '' },
     ]);
   });
+
+  // Two core services (e.g. capture-session-manager.ts and automation-runner.ts) both emit
+  // 'session:created' and both call define() for it in their own setHookBus(). Without
+  // dedupe, that pushed two catalog rows for the same name — the frontend event picker would
+  // show "Fires automatically on: session:created" twice.
+  it('calling define() twice for the same name replaces the catalog entry rather than duplicating it', () => {
+    const bus = new HookBusImpl();
+    bus.define('session:created', [{ field: 'deviceId', type: 'string', description: 'old' }], 'first description');
+    bus.define('session:created', [{ field: 'deviceId', type: 'string', description: 'new' }], 'second description');
+
+    expect(bus.getDefinedHooks()).toEqual([
+      {
+        name: 'session:created',
+        schema: [{ field: 'deviceId', type: 'string', description: 'new' }],
+        description: 'second description',
+      },
+    ]);
+  });
+
+  it('redefining a name keeps its original position in declaration order', () => {
+    const bus = new HookBusImpl();
+    bus.define('a', [], 'first');
+    bus.define('b', [], 'second');
+    bus.define('a', [], 'first redefined');
+    expect(bus.getDefinedHooks().map(d => d.name)).toEqual(['a', 'b']);
+  });
+});
+
+describe('HookBusImpl.emit — undefined-event visibility', () => {
+  it('warns when an event is emitted that was never define()\'d', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const bus = new HookBusImpl();
+      bus.emit('ghost:event', { x: 1 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('ghost:event'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does not warn when the event was defined first', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const bus = new HookBusImpl();
+      bus.define('known:event', [], 'x');
+      bus.emit('known:event', { x: 1 });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warns only once per undefined name, not on every emit', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const bus = new HookBusImpl();
+      bus.emit('ghost:event', {});
+      bus.emit('ghost:event', {});
+      bus.emit('ghost:event', {});
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });

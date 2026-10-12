@@ -16,6 +16,7 @@ import {
   suShell,
   ensureRootAccess,
 } from './device-manager';
+import { DEVICE_CONNECTED_SCHEMA, DEVICE_DISCONNECTED_SCHEMA } from './hook-schemas';
 
 const { devices } = schema;
 
@@ -957,6 +958,14 @@ describe('DeviceManager', () => {
     beforeEach(async () => {
       const cp = await import('child_process');
       execMock = cp.exec as unknown as ReturnType<typeof vi.fn>;
+    });
+
+    it('defines device:connected and device:disconnected as soon as the bus is wired', () => {
+      const bus = { define: vi.fn(), on: vi.fn(), off: vi.fn(), emit: vi.fn() };
+      manager.setHookBus(bus as any);
+
+      expect(bus.define).toHaveBeenCalledWith('device:connected', DEVICE_CONNECTED_SCHEMA, expect.any(String));
+      expect(bus.define).toHaveBeenCalledWith('device:disconnected', DEVICE_DISCONNECTED_SCHEMA, expect.any(String));
     });
 
     it('emits device:connected when a device first comes online', async () => {

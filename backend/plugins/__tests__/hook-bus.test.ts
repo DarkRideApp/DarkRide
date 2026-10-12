@@ -5,6 +5,7 @@ import type { HookBus } from '@darkrideapp/plugin-sdk';
 describe('HookBus', () => {
   it('emits events to all subscribers', () => {
     const bus = new HookBusImpl();
+    bus.define('test:event', [], 'x');
     const handler1 = vi.fn();
     const handler2 = vi.fn();
     bus.on('test:event', handler1);
@@ -18,6 +19,7 @@ describe('HookBus', () => {
 
   it('does not call unsubscribed handlers', () => {
     const bus = new HookBusImpl();
+    bus.define('test:event', [], 'x');
     const handler = vi.fn();
     bus.on('test:event', handler);
     bus.off('test:event', handler);
@@ -29,6 +31,8 @@ describe('HookBus', () => {
 
   it('handles multiple event types independently', () => {
     const bus = new HookBusImpl();
+    bus.define('event-a', [], 'x');
+    bus.define('event-b', [], 'x');
     const handlerA = vi.fn();
     const handlerB = vi.fn();
     bus.on('event-a', handlerA);
@@ -53,13 +57,20 @@ describe('HookBus', () => {
     });
   });
 
-  it('emits to no handlers gracefully', () => {
-    const bus = new HookBusImpl();
-    expect(() => bus.emit('nonexistent', {})).not.toThrow();
+  it('emits to no handlers gracefully (and warns, since the name was never defined)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const bus = new HookBusImpl();
+      expect(() => bus.emit('nonexistent', {})).not.toThrow();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('nonexistent'));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('catches and logs handler errors without stopping other handlers', () => {
     const bus = new HookBusImpl();
+    bus.define('test:event', [], 'x');
     const errorHandler = vi.fn(() => { throw new Error('boom'); });
     const goodHandler = vi.fn();
     bus.on('test:event', errorHandler);
@@ -78,6 +89,7 @@ describe('HookBus', () => {
 
     try {
       const bus = new HookBusImpl();
+      bus.define('test:event', [], 'x');
       bus.on('test:event', async () => { throw new Error('async boom'); });
 
       bus.emit('test:event', {});
@@ -95,6 +107,7 @@ describe('HookBus', () => {
 
   it('continues emitting to other handlers after an async rejection', async () => {
     const bus = new HookBusImpl();
+    bus.define('test:event', [], 'x');
     const failing = vi.fn(async () => { throw new Error('async boom'); });
     const succeeding = vi.fn();
     bus.on('test:event', failing);
@@ -111,6 +124,7 @@ describe('HookBus', () => {
 describe('HookBus interface', () => {
   it('exposes emit for plugin use', () => {
     const bus = new HookBusImpl();
+    bus.define('test:event', [], 'x');
     const typed: HookBus = bus;
     const received: any[] = [];
     typed.on('test:event', (payload) => { received.push(payload); });

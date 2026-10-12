@@ -14,6 +14,7 @@ import type { CaptureEgress } from '../../shared/types/api';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
 import type { CaptureModeRegistry } from './capture-mode-registry';
 import type { ProviderRegistry } from './providers';
+import { SESSION_CREATED_SCHEMA } from './hook-schemas';
 
 const { log, error } = createLoggers('capture-session-manager');
 
@@ -47,6 +48,7 @@ export class CaptureSessionManager {
 
   setHookBus(bus: HookBus): void {
     this.hookBus = bus;
+    bus.define('session:created', SESSION_CREATED_SCHEMA, 'Fires when a new session (capture or automation) is created.');
   }
 
   setCaptureModeRegistry(reg: CaptureModeRegistry): void {

@@ -6,6 +6,7 @@ import { pruneOldData, cleanStaleSessions } from './db/prune';
 import { setupWebSocket, getWebSocketServer, setStartupPhase, broadcastToAll } from './websocket/index';
 import { createLoggers } from './logs';
 import { backfillTrafficFilterColumns } from './services/traffic-filter-backfill';
+import { APP_STARTUP_SCHEMA, APP_SHUTDOWN_SCHEMA } from './services/hook-schemas';
 import { DeviceManager } from './services/device-manager';
 import { ProxyRotator } from './services/proxy-rotator';
 import { PythonBridgeManager, ensureVenvAsync } from './services/python-bridge';
@@ -1420,6 +1421,7 @@ httpServer.listen(PORT, HOST, () => {
   }
 
   // Emit startup hook
+  pluginManager.getHookBus().define('app:startup', APP_STARTUP_SCHEMA, 'Fires once when the backend process finishes booting (plugins loaded, routes registered).');
   pluginManager.getHookBus().emit('app:startup');
 
   // Plugin metadata endpoint
@@ -1579,6 +1581,7 @@ async function shutdown() {
   // Run all migrated plugins' stop() in reverse topological order.
   // All plugin teardown is handled by stopAll() per the new lifecycle.
   if (pluginManager) {
+    pluginManager.getHookBus().define('app:shutdown', APP_SHUTDOWN_SCHEMA, 'Fires when the backend begins graceful shutdown (SIGTERM/SIGINT).');
     pluginManager.getHookBus().emit('app:shutdown', undefined);
     try {
       await pluginManager.stopAll();

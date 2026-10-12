@@ -3,6 +3,7 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { AutomationRunner } from './automation-runner';
+import { SESSION_CREATED_SCHEMA, AUTOMATION_STARTED_SCHEMA, AUTOMATION_COMPLETED_SCHEMA } from './hook-schemas';
 import { AutomationCompiler } from './automation-compiler';
 import { PythonBridgeManager } from './python-bridge';
 import { TrafficHookRegistry } from './traffic-hook-registry';
@@ -1124,6 +1125,15 @@ describe('AutomationRunner', () => {
     function makeBus() {
       return { define: vi.fn(), on: vi.fn(), off: vi.fn(), emit: vi.fn() };
     }
+
+    it('defines session:created, automation:started and automation:completed as soon as the bus is wired', () => {
+      const bus = makeBus();
+      runner.setHookBus(bus as any);
+
+      expect(bus.define).toHaveBeenCalledWith('session:created', SESSION_CREATED_SCHEMA, expect.any(String));
+      expect(bus.define).toHaveBeenCalledWith('automation:started', AUTOMATION_STARTED_SCHEMA, expect.any(String));
+      expect(bus.define).toHaveBeenCalledWith('automation:completed', AUTOMATION_COMPLETED_SCHEMA, expect.any(String));
+    });
 
     it('emits session:created and automation:started when automation begins', async () => {
       const bus = makeBus();

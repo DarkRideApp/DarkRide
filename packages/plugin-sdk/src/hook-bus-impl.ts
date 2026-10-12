@@ -10,7 +10,8 @@ type HookHandler = (...args: any[]) => void | Promise<void>;
 
 export class HookBusImpl implements HookBus {
   private handlers = new Map<string, Set<HookHandler>>();
-  private definitions: HookDefinition[] = [];
+  private definitions = new Map<string, HookDefinition>();
+  private warnedUndefined = new Set<string>();
 
   define(name: string, schema?: SchemaField[] | Record<string, string>, description?: string): void {
     // A plugin already compiled against the pre-existing documented signature
@@ -23,7 +24,10 @@ export class HookBusImpl implements HookBus {
     const normalizedSchema = Array.isArray(schema)
       ? schema
       : Object.entries(schema ?? {}).map(([field, type]) => ({ field, type, description: '' }));
-    this.definitions.push({ name, schema: normalizedSchema, description: description ?? '' });
+    // Idempotent by name — two services can each define() the same shared event (e.g.
+    // 'session:created' from both capture-session-manager.ts and automation-runner.ts)
+    // without doubling it up in the catalog the frontend's event picker renders.
+    this.definitions.set(name, { name, schema: normalizedSchema, description: description ?? '' });
   }
 
   on(name: string, handler: HookHandler): void {
@@ -38,6 +42,10 @@ export class HookBusImpl implements HookBus {
   }
 
   emit(name: string, ...args: any[]): void {
+    if (!this.definitions.has(name) && !this.warnedUndefined.has(name)) {
+      this.warnedUndefined.add(name);
+      console.warn(`[hook-bus] "${name}" was emitted but never define()'d — it will not appear in the Trigger event picker.`);
+    }
     const handlers = this.handlers.get(name);
     if (!handlers) return;
     for (const handler of handlers) {
@@ -59,6 +67,6 @@ export class HookBusImpl implements HookBus {
   }
 
   getDefinedHooks(): HookDefinition[] {
-    return [...this.definitions];
+    return [...this.definitions.values()];
   }
 }

@@ -20,6 +20,7 @@ import type { SessionStatusUpdate } from '../../shared/types/websocket';
 import type { TriggerType } from '../../shared/types/api';
 import { DocumentStore } from './document-store';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
+import { SESSION_CREATED_SCHEMA, AUTOMATION_STARTED_SCHEMA, AUTOMATION_COMPLETED_SCHEMA } from './hook-schemas';
 
 const { log, error } = createLoggers('automation-runner');
 
@@ -55,6 +56,9 @@ export class AutomationRunner implements IAutomationRunner {
 
   setHookBus(bus: HookBus): void {
     this.hookBus = bus;
+    bus.define('session:created', SESSION_CREATED_SCHEMA, 'Fires when a new session (capture or automation) is created.');
+    bus.define('automation:started', AUTOMATION_STARTED_SCHEMA, 'Fires when an automation run begins.');
+    bus.define('automation:completed', AUTOMATION_COMPLETED_SCHEMA, 'Fires when an automation run finishes, successfully or not.');
   }
 
   setNotificationService(service: NotificationService) {
