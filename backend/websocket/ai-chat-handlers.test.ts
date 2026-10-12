@@ -721,6 +721,8 @@ describe('AI Chat Handlers', () => {
       endsAs?: number;
       /** Throw after the confirmations, as a provider failure would. */
       fail?: boolean;
+      /** The `yolo` flag a new chat sends with its first message. */
+      yolo?: boolean;
     }
 
     /** Run one `ai:message` through the real handler with a scripted agent, answering each prompt as it arrives. */
@@ -740,7 +742,7 @@ describe('AI Chat Handlers', () => {
       const before = confirmEvents(socket).length;
       let finished = false;
       const done = getWebsocketHandler('ai:message')!.handler(
-        { conversationId: turn.conversationId, message: 'go', pageContext: 'devices', contextId: '' },
+        { conversationId: turn.conversationId, message: 'go', pageContext: 'devices', contextId: '', ...(turn.yolo ? { yolo: true } : {}) },
         socket,
       ).finally(() => { finished = true; });
 
@@ -1014,6 +1016,195 @@ describe('AI Chat Handlers', () => {
       await done;
 
       expect(await agent.handleMessage.mock.results[0].value).toMatchObject({ allowed: false });
+    });
+
+    describe('YOLO mode', () => {
+      const yoloEvents = (socket: any) =>
+        socket.send.mock.calls.map((c: any[]) => JSON.parse(c[0])).filter((e: any) => e.type === 'ai:yolo-state');
+
+      /** Send `ai:yolo` and return the state the server answered with. Leave `enabled` out to ask. */
+      async function yolo(socket: any, target: { conversationId?: unknown; requestId?: string }, enabled?: boolean) {
+        await getWebsocketHandler('ai:yolo')!.handler({ ...target, ...(enabled === undefined ? {} : { enabled }) }, socket);
+        const events = yoloEvents(socket);
+        return events[events.length - 1];
+      }
+
+      /** An agent that confirms `tools` in order, pausing before each one until `gate()` resolves. */
+      function gatedAgent(tools: string[], gate: () => Promise<void>, answers: boolean[]) {
+        return {
+          handleMessage: vi.fn(async (params: any) => {
+            for (const tool of tools) {
+              await gate();
+              answers.push(await params.onToolConfirm(`tu-${++toolUseSeq}`, tool, {}));
+            }
+            return { conversationId: 5, usage: { inputTokens: 1, outputTokens: 1 } };
+          }),
+        };
+      }
+
+      it('is off for a conversation nobody switched it on for', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        expect(await yolo(socket, { conversationId: 7 })).toEqual({ type: 'ai:yolo-state', conversationId: 7, enabled: false });
+      });
+
+      it('reports each change back, and remembers it', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        expect((await yolo(socket, { conversationId: 7 }, true)).enabled).toBe(true);
+        expect((await yolo(socket, { conversationId: 7 })).enabled).toBe(true);
+        expect((await yolo(socket, { conversationId: 7 }, false)).enabled).toBe(false);
+        expect((await yolo(socket, { conversationId: 7 })).enabled).toBe(false);
+      });
+
+      it('is per user and per conversation', async () => {
+        const owner = createAuthenticatedSocket(++nextUserId);
+        await yolo(owner, { conversationId: 7 }, true);
+
+        expect((await yolo(owner, { conversationId: 8 })).enabled).toBe(false);
+        expect((await yolo(createAuthenticatedSocket(++nextUserId), { conversationId: 7 })).enabled).toBe(false);
+      });
+
+      it('keeps it across a reconnect', async () => {
+        const userId = ++nextUserId;
+        await yolo(createAuthenticatedSocket(userId), { conversationId: 7 }, true);
+
+        expect((await yolo(createAuthenticatedSocket(userId), { conversationId: 7 })).enabled).toBe(true);
+      });
+
+      it('runs every flagged tool without asking while it is on', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await yolo(socket, { conversationId: 7 }, true);
+
+        const r = await converse(socket, { conversationId: 7, tools: ['run_adb_command', 'update_setting', 'delete_intercept_rule'] });
+
+        expect(r.prompts).toEqual([]);
+        expect(r.answers).toEqual([true, true, true]);
+      });
+
+      it('asks again once it is switched off', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await yolo(socket, { conversationId: 7 }, true);
+        await yolo(socket, { conversationId: 7 }, false);
+
+        const r = await converse(socket, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+        expect(r.prompts).toEqual(['run_adb_command']);
+      });
+
+      it('does not touch other conversations of the same user', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await yolo(socket, { conversationId: 7 }, true);
+
+        const r = await converse(socket, { conversationId: 8, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+        expect(r.prompts).toEqual(['run_adb_command']);
+      });
+
+      it('switching it off in the middle of a run takes effect on the next tool call', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await yolo(socket, { conversationId: 5 }, true);
+        let release!: () => void;
+        const answers: boolean[] = [];
+        let first = true;
+        const agent = gatedAgent(['run_adb_command', 'run_adb_command'], async () => {
+          if (first) { first = false; return; }
+          await new Promise<void>((resolve) => { release = resolve; });
+        }, answers);
+        (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+        const done = getWebsocketHandler('ai:message')!.handler(
+          { conversationId: 5, message: 'go', pageContext: 'devices', contextId: '' },
+          socket,
+        );
+        await vi.waitFor(() => expect(answers).toEqual([true]));
+        await yolo(socket, { conversationId: 5 }, false);
+        release();
+        await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+        await respond(socket, confirmEvents(socket)[0].toolUseId, false);
+        await done;
+
+        expect(answers).toEqual([true, false]);
+      });
+
+      it('lets a new chat start in YOLO with the flag on its first message', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        const r = await converse(socket, { conversationId: null, endsAs: 42, yolo: true, tools: ['run_adb_command', 'update_setting'] });
+
+        expect(r.prompts).toEqual([]);
+        expect(r.answers).toEqual([true, true]);
+      });
+
+      it('does not keep a new chat in YOLO on its own: the browser switches it on for the new id', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await converse(socket, { conversationId: null, endsAs: 42, yolo: true, tools: ['run_adb_command'] });
+
+        expect((await yolo(socket, { conversationId: 42 })).enabled).toBe(false);
+        await yolo(socket, { conversationId: 42 }, true);
+        const next = await converse(socket, { conversationId: 42, tools: ['run_adb_command'] });
+
+        expect(next.prompts).toEqual([]);
+      });
+
+      it('ignores the flag on a message to an existing conversation', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        const r = await converse(socket, { conversationId: 7, yolo: true, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+        expect(r.prompts).toEqual(['run_adb_command']);
+      });
+
+      it('switches a new chat off by request id before its conversation has an id', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        let release!: () => void;
+        const answers: boolean[] = [];
+        let first = true;
+        const agent = gatedAgent(['run_adb_command', 'run_adb_command'], async () => {
+          if (first) { first = false; return; }
+          await new Promise<void>((resolve) => { release = resolve; });
+        }, answers);
+        (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+        const done = getWebsocketHandler('ai:message')!.handler(
+          { conversationId: null, message: 'go', pageContext: 'devices', contextId: '', requestId: 'req-new-chat', yolo: true },
+          socket,
+        );
+        await vi.waitFor(() => expect(answers).toEqual([true]));
+        expect(await yolo(socket, { requestId: 'req-new-chat' }, false)).toMatchObject({ requestId: 'req-new-chat', enabled: false });
+        release();
+        await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+        await respond(socket, confirmEvents(socket)[0].toolUseId, false);
+        await done;
+
+        expect(answers).toEqual([true, false]);
+      });
+
+      it('answers an unknown request id as off', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        expect(await yolo(socket, { requestId: 'nobody' }, true)).toMatchObject({ requestId: 'nobody', enabled: false });
+      });
+
+      it('does not let a client set it without a user, or for an id that is not a whole number', async () => {
+        const anonymous = { readyState: 1, send: vi.fn() } as any;
+        expect((await yolo(anonymous, { conversationId: 7 }, true)).enabled).toBe(false);
+
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (const bad of ['7', 7.5, null, undefined, {}]) {
+          expect((await yolo(socket, { conversationId: bad }, true)).enabled).toBe(false);
+        }
+        expect((await yolo(socket, { conversationId: 7 })).enabled).toBe(false);
+      });
+
+      it('forgets the least recently switched on conversation past the cap', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS + 1; id++) await yolo(socket, { conversationId: id }, true);
+
+        expect((await yolo(socket, { conversationId: 1 })).enabled).toBe(false);
+        expect((await yolo(socket, { conversationId: MAX_REMEMBERED_CONVERSATIONS + 1 })).enabled).toBe(true);
+        expect((await yolo(socket, { conversationId: 2 })).enabled).toBe(true);
+      });
     });
   });
 });

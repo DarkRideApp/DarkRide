@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -17,6 +18,7 @@ import type {
   AiContextUsageEvent,
   AiToolConfirmEvent,
   AiToolConfirmScope,
+  AiYoloStateEvent,
   AiMessage,
   AiTextBlock,
   AiToolUseBlock,
@@ -282,6 +284,11 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   const [turnLimitReached, setTurnLimitReached] = useState(false);
   const [contextPercent, setContextPercent] = useState<number | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+  const [yolo, setYolo] = useState(false);
+  const [yoloDialogOpen, setYoloDialogOpen] = useState(false);
+  const yoloRef = useRef(false);
+  const conversationIdRef = useRef<number | null>(null);
+  const newChatRunRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const streamingSegmentsRef = useRef<MessageSegment[]>([]);
@@ -370,12 +377,33 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
       clearStaleTimer();
       setMessages(prev => [...prev, { role: 'assistant', content: 'Error: Connection lost while the response was streaming.' }]);
       activeRequestIdRef.current = null;
+      newChatRunRef.current = false;
       setPendingConfirm(null);
       setStreamingSegments([]);
       streamingSegmentsRef.current = [];
       setIsStreaming(false);
     }
   }, [ws.connected, clearStaleTimer]);
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
+
+  // The server holds YOLO mode, so ask it whenever a conversation opens or the connection returns, and show its answer.
+  useEffect(() => {
+    if (ws.connected && conversationId !== null) ws.sendMessage('ai:yolo', { conversationId });
+  }, [ws.connected, conversationId]);
+
+  const applyYolo = (enabled: boolean) => {
+    hasLocalMutationRef.current = true;
+    yoloRef.current = enabled;
+    setYolo(enabled);
+    if (conversationId !== null) {
+      ws.sendMessage('ai:yolo', { conversationId, enabled });
+    } else if (newChatRunRef.current && activeRequestIdRef.current) {
+      ws.sendMessage('ai:yolo', { requestId: activeRequestIdRef.current, enabled });
+    }
+  };
 
   // WebSocket subscriptions
   useEffect(() => {
@@ -448,6 +476,11 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
       setPendingConfirm(null);
+      // A new chat's server-side YOLO needs the id this run just got.
+      if (newChatRunRef.current && yoloRef.current && msg.conversationId != null) {
+        ws.sendMessage('ai:yolo', { conversationId: msg.conversationId, enabled: true });
+      }
+      newChatRunRef.current = false;
       const segments = streamingSegmentsRef.current;
       const content = segments
         .filter(s => s.type === 'text')
@@ -486,6 +519,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
       setPendingConfirm(null);
+      newChatRunRef.current = false;
       const segments = streamingSegmentsRef.current;
       const content = segments
         .filter(s => s.type === 'text')
@@ -503,6 +537,13 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
       setStreamingSegments([]);
       setContextPercent(null);
       streamingSegmentsRef.current = [];
+    }));
+
+    unsubs.push(ws.subscribe('ai:yolo-state', (msg: AiYoloStateEvent) => {
+      // Answers by request id are for a run still in flight, which this panel already shows.
+      if (msg.requestId || msg.conversationId === null || msg.conversationId !== conversationIdRef.current) return;
+      yoloRef.current = msg.enabled;
+      setYolo(msg.enabled);
     }));
 
     return () => unsubs.forEach(fn => fn());
@@ -524,12 +565,15 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     streamingSegmentsRef.current = [];
     resetStaleTimer();
 
+    const startsNewChat = conversationId === null;
+    newChatRunRef.current = startsNewChat;
     ws.sendMessage('ai:message', {
       conversationId: conversationId ?? undefined,
       message: trimmed,
       pageContext,
       contextId,
       requestId,
+      ...(startsNewChat && yoloRef.current ? { yolo: true } : {}),
     });
   }, [ws, conversationId, pageContext, contextId, isStreaming, resetStaleTimer]);
 
@@ -552,6 +596,11 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     hasLocalMutationRef.current = true;
     if (activeRequestIdRef.current) ws.sendMessage('ai:cancel', { conversationId, requestId: activeRequestIdRef.current });
     activeRequestIdRef.current = null;
+    if (yoloRef.current && conversationId !== null) ws.sendMessage('ai:yolo', { conversationId, enabled: false });
+    yoloRef.current = false;
+    newChatRunRef.current = false;
+    setYolo(false);
+    setYoloDialogOpen(false);
     setPendingConfirm(null);
     clearStaleTimer();
     setMessages([]);
@@ -588,6 +637,15 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
           </span>
         )}
         <button
+          className={`btn btn-sm ai-chat-yolo-toggle${yolo ? ' ai-chat-yolo-toggle-on' : ''}`}
+          onClick={yolo ? () => applyYolo(false) : () => setYoloDialogOpen(true)}
+          aria-pressed={yolo}
+          title={yolo ? 'Turn YOLO mode off' : 'Run every tool without asking'}
+          data-testid="ai-chat-yolo-toggle"
+        >
+          YOLO
+        </button>
+        <button
           className="btn btn-sm"
           onClick={newConversation}
           data-testid="ai-chat-new-btn"
@@ -595,6 +653,58 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
           New Chat
         </button>
       </div>
+
+      {yolo && (
+        <div className="ai-chat-yolo-banner" role="status" data-testid="ai-chat-yolo-badge">
+          <ShieldAlert size={14} />
+          <span>YOLO mode: every tool runs without asking</span>
+        </div>
+      )}
+
+      {yoloDialogOpen && createPortal(
+        <div className="modal-overlay" onClick={() => setYoloDialogOpen(false)}>
+          <div
+            className="modal ai-chat-yolo-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="ai-chat-yolo-title"
+            onClick={e => e.stopPropagation()}
+            onKeyDown={e => {
+              if (e.key !== 'Escape') return;
+              e.stopPropagation(); // the drawer closes itself on a window-level Escape
+              setYoloDialogOpen(false);
+            }}
+            data-testid="ai-chat-yolo-dialog"
+          >
+            <h3 id="ai-chat-yolo-title">Turn on YOLO mode?</h3>
+            <p>
+              Every tool runs without asking in this conversation: ADB shell commands, Frida scripts, changes to settings
+              and plugin switches. Your permissions still apply, and a model that reads hostile input can use these tools too.
+            </p>
+            <p>You can switch it off at any time, and New Chat turns it off.</p>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="btn btn-secondary"
+                autoFocus
+                onClick={() => setYoloDialogOpen(false)}
+                data-testid="ai-chat-yolo-cancel"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger"
+                onClick={() => { setYoloDialogOpen(false); applyYolo(true); }}
+                data-testid="ai-chat-yolo-confirm"
+              >
+                Turn on YOLO
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
 
       <div className="ai-chat-messages" data-testid="ai-chat-messages">
         {isEmpty && (

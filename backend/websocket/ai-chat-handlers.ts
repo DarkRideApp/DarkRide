@@ -55,12 +55,37 @@ function rememberApprovals(userId: number, conversationId: number, tools: Readon
   for (const tool of tools) merged.add(tool);
   conversationApprovals.delete(key);
   conversationApprovals.set(key, merged);
-  while (conversationApprovals.size > MAX_REMEMBERED_CONVERSATIONS) {
-    const oldest = conversationApprovals.keys().next().value;
+  evictOldest(conversationApprovals);
+}
+
+function evictOldest(store: Map<string, unknown> | Set<string>): void {
+  while (store.size > MAX_REMEMBERED_CONVERSATIONS) {
+    const oldest = store.keys().next().value;
     if (oldest === undefined) break;
-    conversationApprovals.delete(oldest);
+    store.delete(oldest);
   }
 }
+
+// ── YOLO mode: every tool runs without asking ───────────────────────
+
+/** Conversations in YOLO mode as `${userId}:${conversationId}`, oldest first. In memory only. */
+const yoloConversations = new Set<string>();
+
+function isYolo(userId: number, conversationId: number): boolean {
+  return yoloConversations.has(approvalKey(userId, conversationId));
+}
+
+function setYolo(userId: number, conversationId: number, enabled: boolean): void {
+  const key = approvalKey(userId, conversationId);
+  yoloConversations.delete(key);
+  if (enabled) {
+    yoloConversations.add(key);
+    evictOldest(yoloConversations);
+  }
+}
+
+/** Map<socket, Map<requestId, run>>: the first run of a new chat, which has no conversation id to switch YOLO by. */
+const newChatRuns = new Map<WebSocket, Map<string, { yolo: boolean }>>();
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -110,12 +135,13 @@ export function cleanupSocket(socket: WebSocket): void {
     }
     pendingConfirmations.delete(socket);
   }
+  newChatRuns.delete(socket);
 }
 
 /** Valid page context name: lowercase alphanumeric with hyphens only. */
 const VALID_CONTEXT_RE = /^[a-z0-9-]+$/;
 
-/** Register `ai:message` and `ai:cancel` WebSocket handlers. */
+/** Register the AI chat WebSocket handlers. */
 export function registerAiChatEndpoints(deps: AiChatDeps): void {
   // ── ai:message ─────────────────────────────────────────────────
   registerWebsocketEndpoint('ai:message', async (message, socket) => {
@@ -169,6 +195,16 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
       ? recallApprovals(userId, incomingConversationId)
       : new Set();
     let finalConversationId: number | null = incomingConversationId;
+    // The flag only starts a new chat in YOLO; an existing conversation follows the server's state.
+    const run = { yolo: message.yolo === true && incomingConversationId == null };
+    if (requestId && incomingConversationId == null) {
+      let runs = newChatRuns.get(socket);
+      if (!runs) {
+        runs = new Map();
+        newChatRuns.set(socket, runs);
+      }
+      runs.set(requestId, run);
+    }
 
     try {
       // During streaming, conversationId may be null for new conversations.
@@ -195,6 +231,10 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
           sendJson(socket, { type: 'ai:context-usage', conversationId: streamConversationId, ...(requestId ? { requestId } : {}), percent });
         },
         onToolConfirm: (toolUseId: string, toolName: string, input: unknown) => {
+          if (run.yolo || (userId != null && incomingConversationId != null && isYolo(userId, incomingConversationId))) {
+            log(`Tool ${toolName} runs without a prompt: YOLO mode, user ${userId}, conversation ${incomingConversationId ?? 'new'}`);
+            return Promise.resolve(true);
+          }
           if (allowedTools.has(toolName)) {
             log(`Tool ${toolName} runs without a prompt: user ${userId} allowed it for conversation ${incomingConversationId ?? 'new'}`);
             return Promise.resolve(true);
@@ -258,6 +298,11 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
       });
     } finally {
       untrackRequest(socket, trackingId);
+      if (requestId) {
+        const runs = newChatRuns.get(socket);
+        runs?.delete(requestId);
+        if (runs?.size === 0) newChatRuns.delete(socket);
+      }
       if (userId != null && finalConversationId != null) {
         rememberApprovals(userId, finalConversationId, allowedTools);
       }
@@ -295,6 +340,30 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
         pending.resolve(!!allowed);
       }
     }
+  }, { requires: ['core.ai:chat'] });
+
+  // ── ai:yolo ────────────────────────────────────────────────────
+  // Switch YOLO mode for a conversation, or for a new chat's first run by its requestId. Leave `enabled` out to ask.
+  registerWebsocketEndpoint('ai:yolo', (message, socket) => {
+    const { conversationId, requestId, enabled } = message;
+    const userId: number | undefined = (socket as any).authUser?.userId;
+    const change = typeof enabled === 'boolean' ? enabled : undefined;
+
+    if (typeof requestId === 'string') {
+      const run = newChatRuns.get(socket)?.get(requestId);
+      if (run && change !== undefined) run.yolo = change;
+      sendJson(socket, { type: 'ai:yolo-state', conversationId: null, requestId, enabled: run?.yolo ?? false });
+      return;
+    }
+    if (userId == null || !Number.isInteger(conversationId)) {
+      sendJson(socket, { type: 'ai:yolo-state', conversationId: null, enabled: false });
+      return;
+    }
+    if (change !== undefined) {
+      setYolo(userId, conversationId, change);
+      log(`YOLO mode ${change ? 'on' : 'off'} for conversation ${conversationId} by user ${userId}`);
+    }
+    sendJson(socket, { type: 'ai:yolo-state', conversationId, enabled: isYolo(userId, conversationId) });
   }, { requires: ['core.ai:chat'] });
 
   // ── ai:cancel ──────────────────────────────────────────────────

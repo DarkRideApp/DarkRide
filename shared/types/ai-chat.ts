@@ -98,6 +98,19 @@ export interface AiChatSendMessage {
   contextId?: string;
   message: string;
   requestId?: string;
+  /** Starts a new chat in YOLO mode. Ignored when `conversationId` is set: the server's state for that conversation decides. */
+  yolo?: boolean;
+}
+
+/**
+ * Switch YOLO mode for a conversation, or for a new chat's first run by its `requestId`. Leave `enabled` out to ask.
+ * The server answers with `ai:yolo-state`.
+ */
+export interface AiYoloMessage {
+  action: 'ai:yolo';
+  conversationId?: number;
+  requestId?: string;
+  enabled?: boolean;
 }
 
 /** Cancel an in-progress AI response */
@@ -190,6 +203,14 @@ export interface AiToolConfirmEvent {
   input: Record<string, any>;
 }
 
+/** Whether YOLO mode is on: for a conversation, or for a new chat's first run when `requestId` is set */
+export interface AiYoloStateEvent {
+  type: 'ai:yolo-state';
+  conversationId: number | null;
+  requestId?: string;
+  enabled: boolean;
+}
+
 /** Union of all server → client AI events */
 export type AiServerEvent =
   | AiTokenEvent
@@ -198,7 +219,8 @@ export type AiServerEvent =
   | AiDoneEvent
   | AiErrorEvent
   | AiContextUsageEvent
-  | AiToolConfirmEvent;
+  | AiToolConfirmEvent
+  | AiYoloStateEvent;
 
 // ── Conversation (API response shape) ───────────────────────────────
 
