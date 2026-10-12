@@ -25,6 +25,7 @@ const ALLOWED_KEYS = new Set([
   'notification_base_url',
   'disk_space_threshold',
   'mcp_enabled',
+  'ai_pipelines_enabled', // 'true' | 'false' — kill switch for the AI Job Pipelines run endpoint
   'oauth_public_base_url',
   'apk_local_retention_count',
   'qq_fetch_default', // 'true' | 'false' — default enablement for QQ on newly-tracked apps

@@ -18,6 +18,7 @@ import {
   Download,
   Bug,
   Package,
+  Workflow,
   Settings,
   Users,
   User,
@@ -94,6 +95,7 @@ const CORE_NAV_GROUPS: NavGroup[] = [
       // One home for plugins: Installed and Discover tabs in a single workspace.
       // The old /ui/marketplace and /ui/settings/plugins routes redirect here.
       { to: '/ui/plugins', label: 'Plugins', icon: Package, requiredScope: 'core.plugins:manage' },
+      { to: '/ui/pipelines', label: 'Pipelines', icon: Workflow, requiredScope: 'core.apk:read' },
     ],
   },
   {

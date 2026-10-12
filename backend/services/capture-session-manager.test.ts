@@ -3,6 +3,7 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { CaptureSessionManager } from './capture-session-manager';
+import { SESSION_CREATED_SCHEMA } from './hook-schemas';
 import { createCaptureModeRegistry } from './capture-mode-registry';
 import { makeCaptureHandlers } from './capture-handlers';
 import type { AppDatabase } from '../db/index';
@@ -625,6 +626,13 @@ describe('CaptureSessionManager', () => {
   });
 
   describe('hookBus lifecycle hooks', () => {
+    it('defines session:created on the bus as soon as it is wired', () => {
+      const bus = { define: vi.fn(), on: vi.fn(), off: vi.fn(), emit: vi.fn() };
+      manager.setHookBus(bus as any);
+
+      expect(bus.define).toHaveBeenCalledWith('session:created', SESSION_CREATED_SCHEMA, expect.any(String));
+    });
+
     it('emits session:created after session row is inserted', async () => {
       const bus = { define: vi.fn(), on: vi.fn(), off: vi.fn(), emit: vi.fn() };
       manager.setHookBus(bus as any);

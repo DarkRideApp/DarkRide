@@ -63,9 +63,12 @@ describe('PluginContextImpl', () => {
     hookBus.emit('some:event', { data: 1 });
 
     expect(handler).toHaveBeenCalledWith({ data: 1 });
+    // Legacy Record<string,string> shape — normalized into SchemaField[] (see
+    // packages/plugin-sdk/src/__tests__/hook-bus-impl.test.ts for dedicated tests).
     expect(hookBus.getDefinedHooks()).toContainEqual({
       name: 'test-plugin:ready',
-      schema: { status: 'string' },
+      schema: [{ field: 'status', type: 'string', description: '' }],
+      description: '',
     });
   });
 

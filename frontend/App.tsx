@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useParams } from 'react-router-dom';
 import { pluginRegistry, usePluginRegistrySnapshot } from '@darkrideapp/plugin-sdk/react';
 import { installSlotInspectorShortcut } from '@darkrideapp/plugin-sdk/react';
 import './plugins'; // side-effect: registers all plugin frontend entries
@@ -42,6 +42,16 @@ import { CloudBrowser } from './pages/CloudBrowser';
 import { ApiExplorer } from './pages/ApiExplorer';
 import { Jobs } from './pages/Jobs';
 import { PluginsWorkspace } from './pages/plugins/PluginsWorkspace';
+import { AiJobsWorkspace } from './pages/ai-jobs/AiJobsWorkspace';
+import { PipelinesList } from './pages/ai-jobs/PipelinesList';
+
+function PipelineEditorRoute() {
+  const { id } = useParams();
+  // key: a different pipeline id must get a fresh component instance, not a reused one with
+  // updated props — otherwise this editor's dirty-tracking/autosave state from the previous
+  // pipeline would bleed into the next.
+  return <AiJobsWorkspace key={id} pipelineId={Number(id)} />;
+}
 import { LegacyPluginsRedirect } from './pages/plugins/LegacyPluginsRedirect';
 import { ProfilePage } from './pages/ProfilePage';
 import { AdminUsersPage } from './pages/AdminUsersPage';
@@ -283,6 +293,8 @@ function AuthenticatedApp() {
                 above). The old Marketplace and Settings > Plugins routes redirect in,
                 query string included, so existing links and docs keep working. */}
             <Route path="plugins" element={<PluginsWorkspace />} />
+            <Route path="pipelines" element={<PipelinesList />} />
+            <Route path="pipelines/:id" element={<PipelineEditorRoute />} />
             <Route path="marketplace" element={<LegacyPluginsRedirect tab="discover" />} />
             <Route path="cloud" element={<CloudBrowser />} />
             <Route path="api-catalogue" element={<LegacyNetworkRedirect pane="catalogue" />} />

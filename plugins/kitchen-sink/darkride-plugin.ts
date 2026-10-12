@@ -106,7 +106,10 @@ export default definePlugin({
     ]);
 
     // --- Extension Point: Hooks (define + subscribe) ---
-    ctx.hooks.define('kitchen-sink:item-created', { id: 'number', title: 'string' });
+    ctx.hooks.define('kitchen-sink:item-created', [
+      { field: 'id', type: 'number', description: 'The new item\'s id' },
+      { field: 'title', type: 'string', description: 'The new item\'s title' },
+    ], 'Fires when the kitchen-sink demo plugin creates a new item.');
 
     const logger = ctx.logger();
 

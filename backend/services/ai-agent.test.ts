@@ -17,6 +17,7 @@ import { ModelRefusedError, OverloadedError } from './ai/errors';
 import type {
   AiStreamEvent,
   AiMessage,
+  AiToolDefinition,
 } from '../../shared/types/ai-chat';
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -2670,6 +2671,182 @@ describe('AiAgent', () => {
       expect(usage?.requests.map((r) => r.inputTokens)).toEqual([40, 60]);
       expect(usage?.turns).toBe(2);
       expect(usage?.toolCalls).toBe(1);
+    });
+  });
+
+  describe('toolAllowlist', () => {
+    const identity: AgentIdentity = {
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: ['devices:read', 'devices:write'],
+      onBehalfOfService: 'test',
+    };
+
+    function makeCapturingProvider(): { provider: AiStreamingProvider; capturedTools: () => AiToolDefinition[] } {
+      let capturedTools: AiToolDefinition[] = [];
+      const createStreamingRequest = vi.fn(
+        (_messages: AiMessage[], _systemPrompt: string, tools: AiToolDefinition[]) => {
+          capturedTools = tools;
+          return textOnlyStream('ok');
+        },
+      );
+      return { provider: makeMockProvider(createStreamingRequest), capturedTools: () => capturedTools };
+    }
+
+    it('restricts the resolved tool list to just the allowlisted names', async () => {
+      const { provider, capturedTools } = makeCapturingProvider();
+      const registry = makeRegistry([
+        { name: 'tool_a' },
+        { name: 'tool_b' },
+        { name: 'tool_c' },
+      ]);
+      const agent = new AiAgent(db, registry, provider);
+
+      const result = await agent.handleMessageWithIdentity(identity, {
+        conversationId: null,
+        message: 'test',
+        pageContext: 'devices',
+        contextId: '1',
+        onToken: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolResult: vi.fn(),
+        mode: 'silent',
+        maxTurns: 5,
+        toolAllowlist: ['tool_a', 'tool_b'],
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(capturedTools().map((t) => t.name).sort()).toEqual(['tool_a', 'tool_b']);
+    });
+
+    it('keeps full-context behavior when toolAllowlist is omitted', async () => {
+      const { provider, capturedTools } = makeCapturingProvider();
+      const registry = makeRegistry([
+        { name: 'tool_a' },
+        { name: 'tool_b' },
+        { name: 'tool_c' },
+      ]);
+      const agent = new AiAgent(db, registry, provider);
+
+      const result = await agent.handleMessageWithIdentity(identity, {
+        conversationId: null,
+        message: 'test',
+        pageContext: 'devices',
+        contextId: '1',
+        onToken: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolResult: vi.fn(),
+        mode: 'silent',
+        maxTurns: 5,
+      });
+
+      expect(result.error).toBeUndefined();
+      // Full set: the 3 registered tools plus the request_tools meta-tool, unfiltered.
+      expect(capturedTools().length).toBeGreaterThan(2);
+      expect(capturedTools().map((t) => t.name).sort()).toEqual(
+        ['request_tools', 'tool_a', 'tool_b', 'tool_c'],
+      );
+    });
+
+    it('re-narrows the tool list after a request_tools escalation, instead of reverting to the full broader-context set', async () => {
+      const capturedToolCalls: AiToolDefinition[][] = [];
+      let callCount = 0;
+      const createStreamingRequest = vi.fn(
+        (_messages: AiMessage[], _systemPrompt: string, tools: AiToolDefinition[]) => {
+          capturedToolCalls.push(tools);
+          callCount++;
+          if (callCount === 1) {
+            // Model escalates: asks for tools from the 'other' context, which is NOT
+            // in the toolAllowlist — this must not widen what gets declared next turn.
+            return (async function* () {
+              yield { type: 'tool_use' as const, id: 'rt1', name: 'request_tools', input: { contexts: ['other'] } };
+              yield { type: 'usage' as const, inputTokens: 10, outputTokens: 5 };
+            })();
+          }
+          return textOnlyStream('Done');
+        },
+      );
+      const provider = makeMockProvider(createStreamingRequest);
+
+      const registry = makeRegistry([
+        { name: 'tool_a', context: ['devices'] },
+        { name: 'tool_b', context: ['devices'] },
+        { name: 'tool_x', context: ['other'] },
+      ]);
+      const agent = new AiAgent(db, registry, provider);
+
+      const result = await agent.handleMessageWithIdentity(identity, {
+        conversationId: null,
+        message: 'test',
+        pageContext: 'devices',
+        contextId: '1',
+        onToken: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolResult: vi.fn(),
+        mode: 'silent',
+        maxTurns: 5,
+        toolAllowlist: ['request_tools', 'tool_a'],
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(callCount).toBe(2);
+      // activeContexts grew to include 'other' (tool_x became reachable), but the
+      // second turn's declared tool list must still be exactly the original
+      // allowlist — not tool_b, not the newly-reachable tool_x.
+      expect(capturedToolCalls[1].map((t) => t.name).sort()).toEqual(['request_tools', 'tool_a']);
+    });
+
+    it('refuses to execute a tool_use for a name outside the allowlist, even when scopes would allow it', async () => {
+      // The allowlist used to filter only what was DECLARED to the model; a tool_use naming any
+      // other in-scope tool (e.g. injected by untrusted APK content) still executed.
+      const executeA = vi.fn().mockResolvedValue('a ran');
+      const executeB = vi.fn().mockResolvedValue('b ran');
+      const registry = makeRegistry([
+        { name: 'tool_a', context: ['devices'], execute: executeA },
+        { name: 'tool_b', context: ['devices'], execute: executeB },
+      ]);
+      const sentMessages: AiMessage[][] = [];
+      let callCount = 0;
+      const provider = makeMockProvider(vi.fn((messages: AiMessage[]) => {
+        sentMessages.push(structuredClone(messages));
+        callCount++;
+        if (callCount === 1) {
+          return (async function* () {
+            yield { type: 'tool_use' as const, id: 'tb1', name: 'tool_b', input: {} };
+            yield { type: 'tool_use' as const, id: 'ta1', name: 'tool_a', input: {} };
+            yield { type: 'usage' as const, inputTokens: 10, outputTokens: 5 };
+          })();
+        }
+        return textOnlyStream('Done');
+      }));
+      const agent = new AiAgent(db, registry, provider);
+      const onToolStart = vi.fn();
+      const onToolResult = vi.fn();
+
+      const result = await agent.handleMessageWithIdentity(identity, {
+        conversationId: null,
+        message: 'test',
+        pageContext: 'devices',
+        contextId: '1',
+        onToken: vi.fn(),
+        onToolStart,
+        onToolResult,
+        mode: 'silent',
+        maxTurns: 5,
+        toolAllowlist: ['tool_a'],
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(executeB).not.toHaveBeenCalled();
+      expect(executeA).toHaveBeenCalledTimes(1);
+      expect(onToolStart.mock.calls.map((c) => c[1])).toEqual(['tool_a']);
+      expect(onToolResult).toHaveBeenCalledWith('tb1', 'tool_b', 'Tool "tool_b" is not in this call\'s allowed tool list.', 0);
+      // The denial goes back to the model as tool_b's tool_result on the next turn.
+      const secondTurn = sentMessages[1];
+      const denial = secondTurn.find((m: any) => m.role === 'tool_result' && m.toolUseId === 'tb1') as any;
+      expect(denial.content).toBe('Tool "tool_b" is not in this call\'s allowed tool list.');
+      const allowed = secondTurn.find((m: any) => m.role === 'tool_result' && m.toolUseId === 'ta1') as any;
+      expect(allowed.content).toBe('a ran');
     });
   });
 });

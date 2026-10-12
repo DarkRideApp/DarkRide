@@ -6,6 +6,7 @@ import { pruneOldData, cleanStaleSessions } from './db/prune';
 import { setupWebSocket, getWebSocketServer, setStartupPhase, broadcastToAll } from './websocket/index';
 import { createLoggers } from './logs';
 import { backfillTrafficFilterColumns } from './services/traffic-filter-backfill';
+import { APP_STARTUP_SCHEMA, APP_SHUTDOWN_SCHEMA } from './services/hook-schemas';
 import { DeviceManager } from './services/device-manager';
 import { ProxyRotator } from './services/proxy-rotator';
 import { PythonBridgeManager, ensureVenvAsync } from './services/python-bridge';
@@ -103,6 +104,10 @@ import { NotificationService } from './services/notification-service';
 import { registerNotificationEndpoints } from './api/notifications';
 import { JobRegistry } from './services/job-registry';
 import { registerJobEndpoints } from './api/jobs';
+import { registerAiPipelineEndpoints } from './api/ai-pipelines';
+import { APK_ANALYZER_AI_SCOPES, buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, apkVersionIdFromEventPayload, seedApkAnalysisPipeline } from './services/ai-jobs/apk-analysis-pipeline';
+import { HookTriggerDispatcher } from './services/ai-jobs/hook-trigger-dispatcher';
+import { isPipelinesEnabled, resetRunningPipelineRuns } from './services/ai-jobs/run-executor';
 import { PluginManager } from './plugins/plugin-manager';
 import { computeLoadOrder } from './plugins/load-order';
 import { discoverPlugins, discoverNpmPlugins, applyPluginFilter } from './plugins/discover';
@@ -601,6 +606,7 @@ registerFridaGadgetEndpoints(gadgetInjector);
 const toolManager = new ToolManager();
 apkAnalyzer.setToolManager(toolManager);
 apkAnalyzer.setFileSync(fileSync);
+apkAnalyzer.setNotificationService(notificationService);
 
 // Wire up AI config (prompt/autorun/tier) for post-analysis review
 apkAnalyzer.setAiConfig(
@@ -615,6 +621,9 @@ apkAnalyzer.setAiConfig(
   () => getTierConfig(['patch_analysis_section', 'write_analysis_notes']),
 );
 // Note: apkAnalyzer.setAiFactory(aiFactory) is called after aiFactory is constructed below.
+
+// Gate for the new pipeline-engine path (Task 21). Defaults to false — opt in deliberately.
+apkAnalyzer.setPipelinesEnabled(() => isPipelinesEnabled(db));
 
 // Wire up APK diff engine
 const apkDiffEngine = new ApkDiffEngine(db);
@@ -778,6 +787,9 @@ pluginSourceManager.fetchAll(true).catch(err => {
   error(`Initial plugin source fetch failed (will retry on schedule): ${err.message}`);
 });
 registerJobEndpoints(jobRegistry);
+// registerAiPipelineEndpoints wiring moved below, right after `aiFactory` is constructed —
+// this call site runs before that `const aiFactory = ...` declaration executes, and referencing
+// it here would throw (temporal dead zone for a top-level `const`).
 registerInterceptRuleEndpoints(db, (msg) => broadcastToAll(msg));
 // Interactive intercept ("breakpoints") — separate from the rule-based feature above.
 registerInterceptLiveEndpoints((msg) => broadcastToAll(msg), (config) => writeHoldConfig(config));
@@ -818,7 +830,7 @@ registerAiChatEndpoints({
 // registerCoreIdentity MUST happen before setAiFactory so the first auto-trigger
 // doesn't race ahead before the identity is provisioned.
 aiFactory.registerCoreIdentity('apk-analyzer', {
-  aiScopes: ['core.apk:read', 'core.apk:manage', 'mcp'],
+  aiScopes: APK_ANALYZER_AI_SCOPES,
 });
 apkAnalyzer.setAiFactory(aiFactory);
 
@@ -826,6 +838,30 @@ aiFactory.registerCoreIdentity('apk-diff-engine', {
   aiScopes: ['core.apk:read', 'core.apk:manage', 'mcp'],
 });
 apkDiffEngine.setAiFactory(aiFactory);
+
+// The AI Job Pipelines REST surface. `aiFactory` must already exist (just above).
+const aiPipelineExecutors = buildApkAnalysisExecutors();
+const buildAiPipelineCtx = (identity: { type: 'core-service' } | { type: 'user'; userId: number }, input: Record<string, unknown>) =>
+  buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number, notificationService });
+
+const hookTriggerDispatcher = new HookTriggerDispatcher({
+  db,
+  executors: aiPipelineExecutors,
+  // An event payload has no "identity" the way a manual run does — every event-fired run
+  // executes as the apk-analyzer core-service identity, same as apk-analyzer.ts's own existing
+  // auto-trigger path does today (buildApkAnalysisExecutionCtx's `identity` param).
+  buildCtx: (payload) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity: { type: 'core-service' }, versionId: apkVersionIdFromEventPayload(payload), notificationService }),
+  notificationService,
+});
+
+registerAiPipelineEndpoints({
+  db,
+  executors: aiPipelineExecutors,
+  buildCtx: buildAiPipelineCtx,
+  getHookCatalog: () => pluginManager!.getHookBus().getDefinedHooks(),
+  onPublish: () => hookTriggerDispatcher.refresh(),
+  notificationService,
+});
 
 // Wire notification service to broadcast events not handled by direct service hooks
 onBroadcast((msg) => {
@@ -1224,6 +1260,12 @@ httpServer.listen(PORT, HOST, () => {
   deviceManager.setHookBus(pluginManager.getHookBus());
   captureManager.setHookBus(pluginManager.getHookBus());
   runner.setHookBus(pluginManager.getHookBus());
+  // Before attach/refresh: seedApkAnalysisPipeline republishes when ASTERIX_PATTERN_GRAPH has
+  // drifted from what's stored (e.g. Quick Rescan moving onto apk:version-detected) — refresh
+  // must see that republished version on THIS boot, not wait for the next one.
+  seedApkAnalysisPipeline(db);
+  hookTriggerDispatcher.attach(pluginManager.getHookBus());
+  hookTriggerDispatcher.refresh(); // covers a published version that existed before this feature shipped
 
   // Wire AiAgentFactory into each plugin context (Task 14).
   // Tasks 15+ will call aiFactory.registerCoreIdentity for core services.
@@ -1381,7 +1423,12 @@ httpServer.listen(PORT, HOST, () => {
     routeSetup(getApiRouter());
   }
 
-  // Emit startup hook
+  // Emit startup hook. app:shutdown is defined here too, not at its own emit site below — it
+  // only ever fires once, at the very end of the process's life, so defining it lazily right
+  // before that emit would mean it can never appear in the Trigger event picker while the
+  // server is actually running (the only time picking it would be useful).
+  pluginManager.getHookBus().define('app:startup', APP_STARTUP_SCHEMA, 'Fires once when the backend process finishes booting (plugins loaded, routes registered).');
+  pluginManager.getHookBus().define('app:shutdown', APP_SHUTDOWN_SCHEMA, 'Fires when the backend begins graceful shutdown (SIGTERM/SIGINT).');
   pluginManager.getHookBus().emit('app:startup');
 
   // Plugin metadata endpoint
@@ -1404,6 +1451,10 @@ httpServer.listen(PORT, HOST, () => {
     log('APK tracker skipped (job disabled)');
   }
   apkAnalyzer.resetRunningJobs();
+  // Same idea for pipeline runs: a restart mid-run would otherwise leave the row 'running' and
+  // 409 every later run of that pipeline version forever. Before apkAnalyzer.start(), so a run
+  // it kicks off on boot can never be caught by this reset.
+  resetRunningPipelineRuns(db);
   apkAnalyzer.start();
   fridaReleaseManager.start().catch(err => error('Frida release manager failed: ' + err.message));
   fileSync.start();

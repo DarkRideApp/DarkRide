@@ -16,6 +16,7 @@ import type { DeviceFilter } from '../../shared/types/api';
 import { matchesDeviceFilter, migrateDeviceFilter } from '../../shared/lib/device-filter';
 import { getMitmproxyConfdir } from './mitmproxy-manager';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
+import { DEVICE_CONNECTED_SCHEMA, DEVICE_DISCONNECTED_SCHEMA } from './hook-schemas';
 import type { ProviderRegistry } from './providers';
 import type { CaptureModeRegistry } from './capture-mode-registry';
 
@@ -367,6 +368,8 @@ export class DeviceManager {
 
   setHookBus(bus: HookBus): void {
     this.hookBus = bus;
+    bus.define('device:connected', DEVICE_CONNECTED_SCHEMA, 'Fires when a device first comes online.');
+    bus.define('device:disconnected', DEVICE_DISCONNECTED_SCHEMA, 'Fires when a previously-online device goes offline.');
   }
 
   /**

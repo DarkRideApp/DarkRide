@@ -1,18 +1,33 @@
-import type { HookBus } from './types/hooks';
+import type { HookBus, SchemaField } from './types/hooks';
 
 interface HookDefinition {
   name: string;
-  schema?: Record<string, string>;
+  schema: SchemaField[];
+  description: string;
 }
 
 type HookHandler = (...args: any[]) => void | Promise<void>;
 
 export class HookBusImpl implements HookBus {
   private handlers = new Map<string, Set<HookHandler>>();
-  private definitions: HookDefinition[] = [];
+  private definitions = new Map<string, HookDefinition>();
+  private warnedUndefined = new Set<string>();
 
-  define(name: string, schema?: Record<string, string>): void {
-    this.definitions.push({ name, schema });
+  define(name: string, schema?: SchemaField[] | Record<string, string>, description?: string): void {
+    // A plugin already compiled against the pre-existing documented signature
+    // (define(name, Record<string,string>) or define(name) with no schema at all — see
+    // docs/plugins/backend.md) calls this at runtime with the old shape regardless of which
+    // @darkrideapp/plugin-sdk version it was built against: plugins run in-process against
+    // this host's live HookBusImpl, not their own. Normalize rather than trust the caller, so
+    // getDefinedHooks() always returns a real SchemaField[] — never an object a consumer
+    // (e.g. the editor's SchemaFieldListEditor, which calls .map on it) would crash on.
+    const normalizedSchema = Array.isArray(schema)
+      ? schema
+      : Object.entries(schema ?? {}).map(([field, type]) => ({ field, type, description: '' }));
+    // Idempotent by name — two services can each define() the same shared event (e.g.
+    // 'session:created' from both capture-session-manager.ts and automation-runner.ts)
+    // without doubling it up in the catalog the frontend's event picker renders.
+    this.definitions.set(name, { name, schema: normalizedSchema, description: description ?? '' });
   }
 
   on(name: string, handler: HookHandler): void {
@@ -27,6 +42,10 @@ export class HookBusImpl implements HookBus {
   }
 
   emit(name: string, ...args: any[]): void {
+    if (!this.definitions.has(name) && !this.warnedUndefined.has(name)) {
+      this.warnedUndefined.add(name);
+      console.warn(`[hook-bus] "${name}" was emitted but never define()'d — it will not appear in the Trigger event picker.`);
+    }
     const handlers = this.handlers.get(name);
     if (!handlers) return;
     for (const handler of handlers) {
@@ -48,6 +67,6 @@ export class HookBusImpl implements HookBus {
   }
 
   getDefinedHooks(): HookDefinition[] {
-    return [...this.definitions];
+    return [...this.definitions.values()];
   }
 }
