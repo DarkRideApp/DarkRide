@@ -77,6 +77,38 @@ describe('HookTriggerDispatcher', () => {
     }));
   });
 
+  it('notifies via notificationService when an event-fired run fails', () => {
+    const db = makeDb();
+    seedPublished(db, 1, 1, eventTriggerGraph('apk:analyzed'));
+    const bus = fakeHookBus();
+    const emit = vi.fn();
+    const dispatcher = new HookTriggerDispatcher({ db, executors: {} as NodeExecutors, buildCtx: () => ({}), notificationService: { emit } });
+    dispatcher.attach(bus as any);
+    dispatcher.refresh();
+
+    bus.emit('apk:analyzed', {});
+    const onSettled = startSpy.mock.calls[0][0].onSettled!;
+    onSettled({ status: 'failed', nodes: [{ nodeId: 'agent', status: 'failed', error: 'boom' }] }, undefined);
+
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'ai-pipeline:failed' }));
+  });
+
+  it('does not notify when an event-fired run succeeds', () => {
+    const db = makeDb();
+    seedPublished(db, 1, 1, eventTriggerGraph('apk:analyzed'));
+    const bus = fakeHookBus();
+    const emit = vi.fn();
+    const dispatcher = new HookTriggerDispatcher({ db, executors: {} as NodeExecutors, buildCtx: () => ({}), notificationService: { emit } });
+    dispatcher.attach(bus as any);
+    dispatcher.refresh();
+
+    bus.emit('apk:analyzed', {});
+    const onSettled = startSpy.mock.calls[0][0].onSettled!;
+    onSettled({ status: 'ok', nodes: [] }, undefined);
+
+    expect(emit).not.toHaveBeenCalled();
+  });
+
   it('does not double-subscribe when refresh() is called twice with no graph changes', () => {
     const db = makeDb();
     seedPublished(db, 1, 1, eventTriggerGraph('apk:analyzed'));

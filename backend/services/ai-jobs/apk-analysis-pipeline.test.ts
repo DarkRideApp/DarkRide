@@ -160,6 +160,20 @@ describe('ASTERIX_PATTERN_GRAPH', () => {
     expect(forCoreService).toHaveBeenCalledTimes(2); // not once, reused — once per node
     expect(forCoreService).toHaveBeenCalledWith('apk-analyzer', { tier: 'High' });
   });
+
+  it('threads an optional notificationService into the returned ctx, so a core/notify Sink can reach it', () => {
+    const emit = vi.fn();
+    const ctx = buildApkAnalysisExecutionCtx({
+      db: {} as any, aiFactory: {} as unknown as AiAgentFactory, identity: { type: 'core-service' }, versionId: 431,
+      notificationService: { emit },
+    });
+    expect((ctx as any).notificationService).toEqual({ emit });
+  });
+
+  it('omits notificationService from ctx (undefined) when the caller does not pass one', () => {
+    const ctx = buildApkAnalysisExecutionCtx({ db: {} as any, aiFactory: {} as unknown as AiAgentFactory, identity: { type: 'core-service' }, versionId: 431 });
+    expect((ctx as any).notificationService).toBeUndefined();
+  });
 });
 
 describe('apkVersionIdFromEventPayload', () => {

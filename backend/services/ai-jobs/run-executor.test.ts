@@ -7,7 +7,7 @@ import type { AppDatabase } from '../../db/index';
 import { applyMigrations } from '../../test-utils/create-test-db';
 import type { PipelineGraph } from './types';
 import type { NodeExecutors, RunResult } from './pipeline-runner';
-import { startPipelineRun, resetRunningPipelineRuns, isPipelinesEnabled } from './run-executor';
+import { startPipelineRun, resetRunningPipelineRuns, isPipelinesEnabled, notifyPipelineFailure } from './run-executor';
 
 vi.mock('../../logs', () => ({
   createLoggers: () => ({ log: vi.fn(), error: vi.fn(), warn: vi.fn() }),
@@ -288,5 +288,55 @@ describe('isPipelinesEnabled', () => {
     const db = makeDb();
     db.delete(schema.settings).where(eq(schema.settings.key, 'ai_pipelines_enabled')).run();
     expect(isPipelinesEnabled(db)).toBe(false);
+  });
+});
+
+// A caller's own onSettled opts into this — run-executor.ts itself never calls it (see
+// StartPipelineRunOptions.onSettled's doc comment: "this module has no opinion on what a
+// pipeline run finishing should visibly do"). Shared here so the REST /run endpoint, the
+// HookTriggerDispatcher event path and apk-analyzer.ts's own auto-trigger path all notify the
+// same way instead of three hand-written copies.
+describe('notifyPipelineFailure', () => {
+  it('emits ai-pipeline:failed with the pipeline name and a working deep link, on a failed result', () => {
+    const db = makeDb();
+    const pipelineVersionId = seedVersion(db);
+    const emit = vi.fn();
+
+    notifyPipelineFailure({ emit }, db, pipelineVersionId, { status: 'failed', nodes: [{ nodeId: 'agent', status: 'failed', error: 'boom' }] });
+
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'ai-pipeline:failed',
+      title: expect.stringContaining('P'),
+      body: expect.stringContaining('boom'),
+      sourceType: 'ai-pipeline',
+      url: expect.stringContaining('/ui/pipelines/'),
+    }));
+  });
+
+  it('includes crashError in the body when the run crashed before producing node results', () => {
+    const db = makeDb();
+    const pipelineVersionId = seedVersion(db);
+    const emit = vi.fn();
+
+    notifyPipelineFailure({ emit }, db, pipelineVersionId, { status: 'failed', nodes: [] }, 'ctx boom');
+
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('ctx boom') }));
+  });
+
+  it('does nothing when the result did not fail', () => {
+    const db = makeDb();
+    const pipelineVersionId = seedVersion(db);
+    const emit = vi.fn();
+
+    notifyPipelineFailure({ emit }, db, pipelineVersionId, { status: 'ok', nodes: [] });
+    notifyPipelineFailure({ emit }, db, pipelineVersionId, { status: 'partial', nodes: [] });
+
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when no notificationService is wired in', () => {
+    const db = makeDb();
+    const pipelineVersionId = seedVersion(db);
+    expect(() => notifyPipelineFailure(undefined, db, pipelineVersionId, { status: 'failed', nodes: [] })).not.toThrow();
   });
 });

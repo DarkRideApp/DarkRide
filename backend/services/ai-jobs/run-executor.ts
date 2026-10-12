@@ -1,6 +1,6 @@
 import { eq, and } from 'drizzle-orm';
 import type { AppDatabase } from '../../db/index';
-import { aiPipelineRuns, aiPipelineNodeRuns, settings } from '../../db/schema';
+import { aiPipelineRuns, aiPipelineNodeRuns, aiPipelineVersions, aiPipelines, settings } from '../../db/schema';
 import { runPipeline, type NodeExecutors, type ExecutionCtx, type RunResult } from './pipeline-runner';
 import type { PipelineGraph } from './types';
 import { createLoggers } from '../../logs';
@@ -134,6 +134,38 @@ export function startPipelineRun(opts: StartPipelineRunOptions): StartPipelineRu
   })();
 
   return { ok: true, runId };
+}
+
+/**
+ * Opt-in — a caller's own `onSettled` calls this when it wants the standard "a pipeline run
+ * failed" notification; `startPipelineRun` itself never calls it (see
+ * `StartPipelineRunOptions.onSettled`'s doc comment). Shared so the REST /run endpoint, the
+ * HookTriggerDispatcher event path and apk-analyzer.ts's own auto-trigger path all produce the
+ * same notification instead of three hand-written copies drifting apart.
+ */
+export function notifyPipelineFailure(
+  notificationService: { emit: (event: { type: string; title: string; body: string; sourceType?: string; sourceId?: string; url?: string }) => void } | undefined,
+  db: AppDatabase,
+  pipelineVersionId: number,
+  result: RunResult,
+  crashError?: string,
+): void {
+  if (!notificationService || result.status !== 'failed') return;
+  const row = db.select({ pipelineId: aiPipelines.id, name: aiPipelines.name })
+    .from(aiPipelineVersions)
+    .innerJoin(aiPipelines, eq(aiPipelineVersions.pipelineId, aiPipelines.id))
+    .where(eq(aiPipelineVersions.id, pipelineVersionId))
+    .all()[0];
+  const name = row?.name ?? `pipeline version ${pipelineVersionId}`;
+  const body = crashError ?? (result.nodes.filter(n => n.status === 'failed').map(n => `${n.nodeId}: ${n.error}`).join('; ') || 'Run failed.');
+  notificationService.emit({
+    type: 'ai-pipeline:failed',
+    title: `Pipeline "${name}" failed`,
+    body,
+    sourceType: 'ai-pipeline',
+    sourceId: row ? String(row.pipelineId) : undefined,
+    url: row ? `/ui/pipelines/${row.pipelineId}` : undefined,
+  });
 }
 
 /**

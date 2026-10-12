@@ -11,8 +11,9 @@ import type { TierConfig } from './ai-agent';
 import { AI_ANALYSIS_MAX_TURNS } from './ai-agent';
 import type { AiAgentFactory } from './ai-agent-factory';
 import { buildApkAnalysisExecutors, buildApkAnalysisExecutionCtx, APK_ANALYSIS_PIPELINE_ID_SETTING, type ApkAnalysisIdentity } from './ai-jobs/apk-analysis-pipeline';
-import { startPipelineRun } from './ai-jobs/run-executor';
+import { startPipelineRun, notifyPipelineFailure } from './ai-jobs/run-executor';
 import type { PipelineGraph } from './ai-jobs/types';
+import type { NotificationService } from './notification-service';
 import { broadcastToAll } from '../websocket/index';
 import { createLoggers } from '../logs';
 import { APK_DIR, apkFilePath, resolveApkLocal, apkCloudKey, ensureApkLocal, analysisDir as getAnalysisDir } from '../utils/apk-paths';
@@ -66,6 +67,7 @@ export class ApkAnalyzerService {
   private activeAiAgentRuns = new Set<number>();
   private diffEngine: import('./apk-diff-engine').ApkDiffEngine | null = null;
   private hookBus: import('@darkrideapp/plugin-sdk').HookBus | null = null;
+  private notificationService: NotificationService | null = null;
 
   constructor(private db: AppDatabase) {}
 
@@ -83,6 +85,10 @@ export class ApkAnalyzerService {
 
   setAiFactory(factory: AiAgentFactory): void {
     this.aiFactory = factory;
+  }
+
+  setNotificationService(service: NotificationService): void {
+    this.notificationService = service;
   }
 
   setAiConfig(getPrompt: () => string, getAutorun?: () => boolean, getTierConfig?: () => TierConfig | null): void {
@@ -1050,7 +1056,7 @@ export class ApkAnalyzerService {
         input: { versionId },
         triggeredBy: 'event',
         executors: buildApkAnalysisExecutors(),
-        buildCtx: () => buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId }),
+        buildCtx: () => buildApkAnalysisExecutionCtx({ db: this.db, aiFactory: this.aiFactory!, identity, versionId, notificationService: this.notificationService ?? undefined }),
         onSettled: (result, crashError) => {
           // try/finally: a throw from any side effect below must never leave this promise
           // pending, or runAiAgent's `.finally` never clears activeAiAgentRuns and this APK
@@ -1059,6 +1065,7 @@ export class ApkAnalyzerService {
             if (result.status === 'failed') {
               const failedNodes = result.nodes.filter(n => n.status === 'failed').map(n => `${n.nodeId}: ${n.error}`).join('; ');
               this.recordAiFailure(versionId, failedNodes || crashError || 'Pipeline run failed');
+              notifyPipelineFailure(this.notificationService ?? undefined, this.db, version.id, result, crashError);
             } else {
               this.clearAiFailure(versionId);
               // Scope gap, stated plainly rather than silently absorbed: `frontend/pages/ApkAnalysis.tsx`

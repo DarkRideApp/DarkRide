@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as schema from '../../../db/schema';
 import { runSink, SINK_DESCRIPTIONS, SINK_USES_SECTION } from './sink';
 import { getNote, setNote } from '../../apk-notes';
@@ -109,7 +109,45 @@ describe('SINK_DESCRIPTIONS / SINK_USES_SECTION', () => {
   it('describes every registered write function and flags which read config.section', () => {
     expect(SINK_DESCRIPTIONS['apk-analysis/write-full-document']).toBeTruthy();
     expect(SINK_DESCRIPTIONS['apk-analysis/write-section']).toBeTruthy();
+    expect(SINK_DESCRIPTIONS['core/notify']).toBeTruthy();
     expect(SINK_USES_SECTION['apk-analysis/write-full-document']).toBe(false);
     expect(SINK_USES_SECTION['apk-analysis/write-section']).toBe(true);
+  });
+});
+
+describe('core/notify', () => {
+  it("emits via ctx.notificationService, resolving title/body templates against input", async () => {
+    const db = makeDb();
+    const emit = vi.fn();
+    await runSink(
+      { writeFn: 'core/notify', titleTemplate: 'Doc {{trigger.docId}} updated', bodyTemplate: 'New revision: {{trigger.revision}}' },
+      { trigger: { docId: 'someimportantdoc', revision: 'rev-7' } },
+      { db, versionId: 431, notificationService: { emit } },
+    );
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'ai-pipeline:notify',
+      title: 'Doc someimportantdoc updated',
+      body: 'New revision: rev-7',
+    }));
+  });
+
+  it('is a no-op (never throws) when no notificationService is wired into ctx', async () => {
+    const db = makeDb();
+    await expect(runSink(
+      { writeFn: 'core/notify', titleTemplate: 'x', bodyTemplate: 'y' },
+      { trigger: {} },
+      { db, versionId: 431 },
+    )).resolves.toBeUndefined();
+  });
+
+  it('fails loud (does not silently send a broken message) when a template references a missing field', async () => {
+    const db = makeDb();
+    const emit = vi.fn();
+    await expect(runSink(
+      { writeFn: 'core/notify', titleTemplate: 'Doc {{trigger.docId}}', bodyTemplate: 'x' },
+      { trigger: {} },
+      { db, versionId: 431, notificationService: { emit } },
+    )).rejects.toThrow(/docId/);
+    expect(emit).not.toHaveBeenCalled();
   });
 });

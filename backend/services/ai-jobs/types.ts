@@ -29,6 +29,9 @@ export interface BranchConfig {
   predicate: string;
   /** Edge labels this Branch can route to; must match outgoing edge labels in the graph. */
   edges: string[];
+  /** Static config a predicate reads at call time — e.g. core/field-equals's `{ field, value }`.
+   *  Only meaningful to the specific predicate named above; most predicates ignore it entirely. */
+  args?: Record<string, string>;
 }
 
 export interface ReportSection {
@@ -56,6 +59,11 @@ export interface SinkConfig {
   from?: string;
   /** Static section title — only meaningful for the 'apk-analysis/write-section' writeFn. */
   section?: string;
+  /** {{trigger.field}}-style templates for the notification title/body — only meaningful for the
+   *  'core/notify' writeFn. Resolved against the same `input` bag an AgentCall's
+   *  instructionTemplate resolves against (see template.ts). */
+  titleTemplate?: string;
+  bodyTemplate?: string;
 }
 
 export interface SchemaField { field: string; type: string; description: string }

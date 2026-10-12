@@ -606,6 +606,7 @@ registerFridaGadgetEndpoints(gadgetInjector);
 const toolManager = new ToolManager();
 apkAnalyzer.setToolManager(toolManager);
 apkAnalyzer.setFileSync(fileSync);
+apkAnalyzer.setNotificationService(notificationService);
 
 // Wire up AI config (prompt/autorun/tier) for post-analysis review
 apkAnalyzer.setAiConfig(
@@ -841,7 +842,7 @@ apkDiffEngine.setAiFactory(aiFactory);
 // The AI Job Pipelines REST surface. `aiFactory` must already exist (just above).
 const aiPipelineExecutors = buildApkAnalysisExecutors();
 const buildAiPipelineCtx = (identity: { type: 'core-service' } | { type: 'user'; userId: number }, input: Record<string, unknown>) =>
-  buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number });
+  buildApkAnalysisExecutionCtx({ db, aiFactory, identity, versionId: input.versionId as number, notificationService });
 
 const hookTriggerDispatcher = new HookTriggerDispatcher({
   db,
@@ -849,7 +850,8 @@ const hookTriggerDispatcher = new HookTriggerDispatcher({
   // An event payload has no "identity" the way a manual run does — every event-fired run
   // executes as the apk-analyzer core-service identity, same as apk-analyzer.ts's own existing
   // auto-trigger path does today (buildApkAnalysisExecutionCtx's `identity` param).
-  buildCtx: (payload) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity: { type: 'core-service' }, versionId: apkVersionIdFromEventPayload(payload) }),
+  buildCtx: (payload) => buildApkAnalysisExecutionCtx({ db, aiFactory, identity: { type: 'core-service' }, versionId: apkVersionIdFromEventPayload(payload), notificationService }),
+  notificationService,
 });
 
 registerAiPipelineEndpoints({
@@ -858,6 +860,7 @@ registerAiPipelineEndpoints({
   buildCtx: buildAiPipelineCtx,
   getHookCatalog: () => pluginManager!.getHookBus().getDefinedHooks(),
   onPublish: () => hookTriggerDispatcher.refresh(),
+  notificationService,
 });
 
 // Wire notification service to broadcast events not handled by direct service hooks

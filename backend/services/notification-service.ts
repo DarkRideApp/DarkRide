@@ -18,6 +18,8 @@ export const CORE_NOTIFICATION_EVENTS: Array<{ type: string; label: string; desc
   { type: 'capture:error', label: 'Capture error', description: 'When traffic capture encounters an error', critical: true },
   { type: 'system:disk-space-low', label: 'Low disk space', description: 'When free disk space drops below threshold (default 10%)', critical: true },
   { type: 'api:regression', label: 'API regression detected', description: 'When an API endpoint returns a different status code or response structure than previously observed' },
+  { type: 'ai-pipeline:notify', label: 'AI pipeline notification', description: "A pipeline's own notify Sink node fired" },
+  { type: 'ai-pipeline:failed', label: 'AI pipeline failed', description: 'When an AI job pipeline run fails', critical: true },
 ];
 
 export const NOTIFICATION_EVENT_TYPES = CORE_NOTIFICATION_EVENTS.map(e => e.type);

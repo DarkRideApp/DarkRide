@@ -458,7 +458,7 @@ describe('SidePanel — Transform / Branch / ForEach (unregistered primitives)',
     expect(screen.getByText(/no transform functions are registered/i)).toBeInTheDocument();
   });
 
-  it('Branch: edits predicate and edge labels', () => {
+  it('Branch: edits edge labels', () => {
     const node = { id: 'branch-1', config: { kind: 'Branch' as const, predicate: '', edges: ['yes', 'no'] } };
     const onSave = vi.fn();
     render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
@@ -474,5 +474,60 @@ describe('SidePanel — Transform / Branch / ForEach (unregistered primitives)',
     fireEvent.change(screen.getByRole('textbox', { name: /per-item function/i }), { target: { value: 'my/item-fn' } });
     expect(onSave).toHaveBeenCalledWith('foreach-1', { itemFn: 'my/item-fn' });
     expect(screen.getByText(/no foreach item functions are registered/i)).toBeInTheDocument();
+  });
+});
+
+describe('SidePanel — Branch: core/field-equals', () => {
+  const graph: PipelineGraph = { nodes: [], edges: [] };
+
+  it('core/field-equals shows Field/Value inputs', () => {
+    const node = { id: 'branch-1', config: { kind: 'Branch' as const, predicate: 'core/field-equals', edges: ['yes', 'no'] } };
+    render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getByLabelText(/^field$/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/^value$/i)).toBeInTheDocument();
+  });
+
+  it('editing the Field input writes into config.args, preserving the existing value', () => {
+    const node = { id: 'branch-1', config: { kind: 'Branch' as const, predicate: 'core/field-equals', edges: ['yes', 'no'], args: { field: '', value: 'someimportantdoc' } } };
+    const onSave = vi.fn();
+    render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText(/^field$/i), { target: { value: 'docId' } });
+    expect(onSave).toHaveBeenCalledWith('branch-1', { args: { field: 'docId', value: 'someimportantdoc' } });
+  });
+
+  it('editing the Value input writes into config.args, preserving the existing field', () => {
+    const node = { id: 'branch-1', config: { kind: 'Branch' as const, predicate: 'core/field-equals', edges: ['yes', 'no'], args: { field: 'docId', value: '' } } };
+    const onSave = vi.fn();
+    render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText(/^value$/i), { target: { value: 'someimportantdoc' } });
+    expect(onSave).toHaveBeenCalledWith('branch-1', { args: { field: 'docId', value: 'someimportantdoc' } });
+  });
+
+  it('does not show Field/Value inputs for a custom (non-registered) predicate', () => {
+    const node = { id: 'branch-1', config: { kind: 'Branch' as const, predicate: 'my-plugin/my-predicate', edges: ['a', 'b'] } };
+    render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.queryByLabelText(/^field$/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('SidePanel — Sink: core/notify', () => {
+  const graph: PipelineGraph = { nodes: [{ id: 'trigger', config: { kind: 'Trigger', source: 'event', eventName: 'couchbase:document-changed', outputSchema: [] } }], edges: [] };
+
+  it('core/notify shows Title/Body template inputs instead of Section title', () => {
+    const node = { id: 'sink-1', config: { kind: 'Sink' as const, writeFn: 'core/notify' } };
+    render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={() => {}} />);
+    expect(screen.getByLabelText(/title template/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/body template/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/section title/i)).not.toBeInTheDocument();
+  });
+
+  it('editing the templates writes titleTemplate/bodyTemplate', () => {
+    const node = { id: 'sink-1', config: { kind: 'Sink' as const, writeFn: 'core/notify', titleTemplate: '', bodyTemplate: '' } };
+    const onSave = vi.fn();
+    render(<SidePanel node={node} graph={graph} triggerSchema={triggerSchema} onClose={() => {}} onSave={onSave} />);
+    fireEvent.change(screen.getByLabelText(/title template/i), { target: { value: 'Doc {{trigger.docId}} updated' } });
+    expect(onSave).toHaveBeenCalledWith('sink-1', { titleTemplate: 'Doc {{trigger.docId}} updated' });
+    fireEvent.change(screen.getByLabelText(/body template/i), { target: { value: 'Revision {{trigger.revision}}' } });
+    expect(onSave).toHaveBeenCalledWith('sink-1', { bodyTemplate: 'Revision {{trigger.revision}}' });
   });
 });

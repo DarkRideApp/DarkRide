@@ -2,10 +2,15 @@ import type { SinkConfig } from '../types';
 import type { AppDatabase } from '../../../db/index';
 import { patchNoteSection } from '../../apk-notes';
 import { createFunctionRegistry } from './function-registry';
+import { resolveTemplate } from '../template';
 
 export interface SinkCtx {
   db: AppDatabase;
   versionId: number;
+  /** Narrowed to just `emit` — a Sink only ever sends, never manages channels/history. Absent in
+   *  contexts that don't wire notifications in (e.g. most existing tests); core/notify no-ops
+   *  rather than throwing when it's missing. */
+  notificationService?: { emit: (event: { type: string; title: string; body: string; sourceType?: string; sourceId?: string; url?: string }) => void };
 }
 
 // Every node's input is wrapped by source-node-id, even with exactly one incoming edge (see
@@ -53,3 +58,14 @@ registerSink('apk-analysis/write-section', async (config, input, ctx) => {
   const source = config.from ? (input[config.from] as { text?: string } | undefined) : undefined;
   patchNoteSection(ctx.db, ctx.versionId, config.section ?? 'Untitled', source?.text ?? '');
 }, "Writes the connected step's output into one named section of this APK version's analysis notes.", true);
+
+// Generic, pipeline-agnostic — unlike the two apk-analysis sinks above, this reads nothing off
+// `config.from`/`input` directly; titleTemplate/bodyTemplate resolve {{node.field}} placeholders
+// against the whole input bag (same convention as AgentCall's instructionTemplate), so a pipeline
+// author composes the message entirely from the graph editor, no new backend code per condition.
+registerSink('core/notify', async (config, input, ctx) => {
+  if (!ctx.notificationService) return;
+  const title = resolveTemplate(config.titleTemplate ?? '', input);
+  const body = resolveTemplate(config.bodyTemplate ?? '', input);
+  ctx.notificationService.emit({ type: 'ai-pipeline:notify', title, body });
+}, 'Sends a notification through the configured channels (Discord, Slack, email, etc). Title/body use {{node.field}} templates.');

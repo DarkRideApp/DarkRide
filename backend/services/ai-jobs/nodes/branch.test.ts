@@ -29,3 +29,35 @@ describe('runBranch', () => {
     expect(() => runBranch({ predicate: 'constructor', edges: ['a'] }, { status: 'ok', output: {} })).toThrow(/Unknown branch predicate "constructor"/);
   });
 });
+
+describe('core/field-equals', () => {
+  const config = { predicate: 'core/field-equals', edges: ['yes', 'no'], args: { field: 'docId', value: 'someimportantdoc' } };
+
+  it("routes to 'yes' when the named output field equals the configured value", () => {
+    const edge = runBranch(config, { status: 'ok', output: { docId: 'someimportantdoc' } });
+    expect(edge).toBe('yes');
+  });
+
+  it("routes to 'no' when the named output field does not equal the configured value", () => {
+    const edge = runBranch(config, { status: 'ok', output: { docId: 'some-other-doc' } });
+    expect(edge).toBe('no');
+  });
+
+  it("routes to 'no' when the named field is absent from the output", () => {
+    const edge = runBranch(config, { status: 'ok', output: {} });
+    expect(edge).toBe('no');
+  });
+
+  it("routes to 'no' for a non-ok envelope — there is no output to compare", () => {
+    const edge = runBranch(config, { status: 'failed', error: 'boom' });
+    expect(edge).toBe('no');
+  });
+
+  it('compares values as strings, so a number field matches a string-configured value', () => {
+    const edge = runBranch(
+      { predicate: 'core/field-equals', edges: ['yes', 'no'], args: { field: 'count', value: '3' } },
+      { status: 'ok', output: { count: 3 } },
+    );
+    expect(edge).toBe('yes');
+  });
+});

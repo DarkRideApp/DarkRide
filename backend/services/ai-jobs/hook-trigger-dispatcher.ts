@@ -3,7 +3,7 @@ import type { AppDatabase } from '../../db/index';
 import { aiPipelineVersions } from '../../db/schema';
 import type { NodeExecutors, ExecutionCtx } from './pipeline-runner';
 import type { PipelineGraph } from './types';
-import { startPipelineRun } from './run-executor';
+import { startPipelineRun, notifyPipelineFailure } from './run-executor';
 import { createLoggers } from '../../logs';
 
 const { log, error } = createLoggers('ai-jobs-hook-dispatch');
@@ -36,6 +36,7 @@ export class HookTriggerDispatcher {
     db: AppDatabase;
     executors: NodeExecutors;
     buildCtx: (eventPayload: Record<string, unknown>) => ExecutionCtx;
+    notificationService?: { emit: (event: { type: string; title: string; body: string; sourceType?: string; sourceId?: string; url?: string }) => void };
   }) {}
 
   attach(hookBus: HookBusLike): void {
@@ -94,6 +95,7 @@ export class HookTriggerDispatcher {
         onSettled: (result, crashError) => {
           if (result.status === 'failed') {
             error(`Event-fired run for pipeline version ${binding.pipelineVersionId} ("${eventName}") failed: ${crashError ?? result.nodes.filter(n => n.status === 'failed').map(n => `${n.nodeId}: ${n.error}`).join('; ')}`);
+            notifyPipelineFailure(this.deps.notificationService, this.deps.db, binding.pipelineVersionId, result, crashError);
           } else {
             log(`Event-fired run for pipeline version ${binding.pipelineVersionId} ("${eventName}") finished: ${result.status}`);
           }

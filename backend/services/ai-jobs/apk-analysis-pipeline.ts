@@ -156,7 +156,12 @@ export function apkVersionIdFromEventPayload(payload: Record<string, unknown>): 
 }
 
 export function buildApkAnalysisExecutionCtx(
-  deps: { db: AppDatabase; aiFactory: AiAgentFactory; identity: ApkAnalysisIdentity; versionId: number },
+  deps: {
+    db: AppDatabase; aiFactory: AiAgentFactory; identity: ApkAnalysisIdentity; versionId: number;
+    /** Lets a core/notify Sink (nodes/sink.ts) reach the real NotificationService. Optional —
+     *  most callers (e.g. unit tests) have no need for a Sink node to actually send anything. */
+    notificationService?: { emit: (event: { type: string; title: string; body: string; sourceType?: string; sourceId?: string; url?: string }) => void };
+  },
 ): ExecutionCtx {
   return {
     db: deps.db,
@@ -164,6 +169,7 @@ export function buildApkAnalysisExecutionCtx(
     identity: deps.identity,
     contextId: String(deps.versionId),
     versionId: deps.versionId,
+    notificationService: deps.notificationService,
   };
 }
 

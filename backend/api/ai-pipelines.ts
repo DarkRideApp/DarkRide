@@ -4,7 +4,7 @@ import { aiPipelines, aiPipelineVersions, aiPipelineRuns, aiPipelineNodeRuns } f
 import type { AppDatabase } from '../db/index';
 import { validateGraph } from '../services/ai-jobs/graph-validator';
 import type { NodeExecutors, ExecutionCtx } from '../services/ai-jobs/pipeline-runner';
-import { startPipelineRun, type StartPipelineRunResult } from '../services/ai-jobs/run-executor';
+import { startPipelineRun, notifyPipelineFailure, type StartPipelineRunResult } from '../services/ai-jobs/run-executor';
 import type { PipelineGraph } from '../services/ai-jobs/types';
 
 export interface AiPipelineDeps {
@@ -19,6 +19,9 @@ export interface AiPipelineDeps {
   /** Called once, after a publish actually succeeds — wired to HookTriggerDispatcher.refresh in
    *  backend/index.ts, so a newly published event binding takes effect immediately. */
   onPublish?: () => void;
+  /** Optional — when wired, a manually-triggered run's failure sends the standard
+   *  "pipeline failed" notification (see run-executor.ts's notifyPipelineFailure). */
+  notificationService?: { emit: (event: { type: string; title: string; body: string; sourceType?: string; sourceId?: string; url?: string }) => void };
 }
 
 /**
@@ -35,7 +38,7 @@ function rowWithGraph(db: AppDatabase, row: typeof aiPipelines.$inferSelect) {
 }
 
 export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
-  const { db, getHookCatalog, onPublish } = deps;
+  const { db, getHookCatalog, onPublish, notificationService } = deps;
 
   registerEndpoint('GET', '/v1/ai-pipelines', (req, res) => {
     const rows = db.select().from(aiPipelines).all();
@@ -165,6 +168,7 @@ export function registerAiPipelineEndpoints(deps: AiPipelineDeps): void {
         triggeredBy: 'manual',
         executors: deps.executors,
         buildCtx: () => deps.buildCtx(identity, input ?? {}),
+        onSettled: (result, crashError) => notifyPipelineFailure(notificationService, db, version.id, result, crashError),
       });
     } catch (err) {
       res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });

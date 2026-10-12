@@ -413,17 +413,21 @@ function TriggerRunSection({ inputSchema, recentVersions, onRun }: {
 
 // Duplicated from backend/services/ai-jobs/nodes/sink.ts's SINK_DESCRIPTIONS/SINK_USES_SECTION —
 // the frontend can't import that module at runtime (it pulls in better-sqlite3).
-const KNOWN_SINK_WRITE_FNS: Array<{ value: string; description: string; usesSection: boolean }> = [
-  { value: 'apk-analysis/write-full-document', usesSection: false,
+const KNOWN_SINK_WRITE_FNS: Array<{ value: string; description: string; usesSection: boolean; usesTemplates: boolean }> = [
+  { value: 'apk-analysis/write-full-document', usesSection: false, usesTemplates: false,
     description: "Writes every section from the connected Report into this APK version's analysis notes." },
-  { value: 'apk-analysis/write-section', usesSection: true,
+  { value: 'apk-analysis/write-section', usesSection: true, usesTemplates: false,
     description: "Writes the connected step's output into one named section of this APK version's analysis notes." },
+  { value: 'core/notify', usesSection: false, usesTemplates: true,
+    description: 'Sends a notification through the configured channels (Discord, Slack, email, etc).' },
 ];
 
 function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGraph; onSave: (nodeId: string, patch: Record<string, unknown>) => void }) {
   const writeFn: string = node.config.writeFn;
   const from: string | undefined = node.config.from;
   const section: string = node.config.section ?? '';
+  const titleTemplate: string = node.config.titleTemplate ?? '';
+  const bodyTemplate: string = node.config.bodyTemplate ?? '';
   const known = KNOWN_SINK_WRITE_FNS.find(f => f.value === writeFn);
 
   return (
@@ -437,15 +441,32 @@ function SinkBody({ node, graph, onSave }: { node: NodeLike; graph: PipelineGrap
         help="Name of a function registered in backend/services/ai-jobs/nodes/sink.ts."
         customPlaceholder="custom writeFn name"
       />
-      <div className="form-group">
-        <label>Input</label>
-        <WiredFrom graph={graph} from={from} />
-      </div>
+      {!known?.usesTemplates && (
+        <div className="form-group">
+          <label>Input</label>
+          <WiredFrom graph={graph} from={from} />
+        </div>
+      )}
       {known?.usesSection && (
         <div className="form-group">
           <label htmlFor="sink-section">Section title</label>
           <input id="sink-section" className="form-input" value={section} onChange={(e) => onSave(node.id, { section: e.target.value })} />
         </div>
+      )}
+      {known?.usesTemplates && (
+        <>
+          <div className="form-group">
+            <label htmlFor="sink-title-template">Title template</label>
+            <input id="sink-title-template" className="form-input" value={titleTemplate} placeholder="e.g. Doc {{trigger.docId}} updated"
+              onChange={(e) => onSave(node.id, { titleTemplate: e.target.value })} />
+          </div>
+          <div className="form-group">
+            <label htmlFor="sink-body-template">Body template</label>
+            <input id="sink-body-template" className="form-input" value={bodyTemplate} placeholder="e.g. Revision {{trigger.revision}}"
+              onChange={(e) => onSave(node.id, { bodyTemplate: e.target.value })} />
+            <div className="form-help">{'{{node.field}} templates, same as an AgentCall’s instructions.'}</div>
+          </div>
+        </>
       )}
     </>
   );
@@ -500,16 +521,43 @@ function TransformBody({ node, onSave }: { node: NodeLike; onSave: (nodeId: stri
   );
 }
 
+// Duplicated from backend/services/ai-jobs/nodes/branch.ts's registered predicates — the
+// frontend can't import that module at runtime (it pulls in better-sqlite3).
+const KNOWN_BRANCH_PREDICATES: Array<{ value: string; description: string; usesArgs: boolean }> = [
+  { value: 'core/field-equals', usesArgs: true,
+    description: "Compares a named field off the predecessor's output to a static value, routing to 'yes' or 'no' (set your edges to those two labels)." },
+];
+
 function BranchBody({ node, onSave }: { node: NodeLike; onSave: (nodeId: string, patch: Record<string, unknown>) => void }) {
   const edges: string[] = node.config.edges;
+  const predicate: string = node.config.predicate;
+  const args: { field?: string; value?: string } = node.config.args ?? {};
+  const known = KNOWN_BRANCH_PREDICATES.find(p => p.value === predicate);
   return (
     <>
-      <div className="form-group">
-        <label>Branch predicate</label>
-        <input className="form-input" value={node.config.predicate} placeholder="e.g. my-plugin/my-predicate"
-          onChange={(e) => onSave(node.id, { predicate: e.target.value })} />
-        <div className="form-help">No Branch predicates are registered in this codebase yet — see backend/services/ai-jobs/nodes/branch.ts.</div>
-      </div>
+      <KnownOptionPicker
+        id="branch-predicate" label="Branch predicate"
+        options={KNOWN_BRANCH_PREDICATES}
+        value={predicate}
+        onPick={(picked) => onSave(node.id, { predicate: picked })}
+        onCustomType={(typed) => onSave(node.id, { predicate: typed })}
+        help="No Branch predicates are registered in this codebase yet — see backend/services/ai-jobs/nodes/branch.ts."
+        customPlaceholder="e.g. my-plugin/my-predicate"
+      />
+      {known?.usesArgs && (
+        <>
+          <div className="form-group">
+            <label htmlFor="branch-arg-field">Field</label>
+            <input id="branch-arg-field" className="form-input" value={args.field ?? ''} placeholder="e.g. docId"
+              onChange={(e) => onSave(node.id, { args: { ...args, field: e.target.value } })} />
+          </div>
+          <div className="form-group">
+            <label htmlFor="branch-arg-value">Value</label>
+            <input id="branch-arg-value" className="form-input" value={args.value ?? ''} placeholder="e.g. someimportantdoc"
+              onChange={(e) => onSave(node.id, { args: { ...args, value: e.target.value } })} />
+          </div>
+        </>
+      )}
       <div className="form-group">
         <label>Outgoing edge labels (comma-separated)</label>
         <input className="form-input" value={edges.join(', ')}

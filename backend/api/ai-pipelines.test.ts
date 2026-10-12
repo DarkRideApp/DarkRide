@@ -486,6 +486,38 @@ describe('POST /v1/ai-pipelines/:id/run — concurrency guard', () => {
   });
 });
 
+describe('POST /v1/ai-pipelines/:id/run — pipeline-failure notification', () => {
+  it('notifies via notificationService when the run fails', async () => {
+    const db = makeDb();
+    const pipelineId = seedPipeline(db);
+    const versionId = seedVersion(db, pipelineId, 1, graphWithOneTrigger(), 'published');
+    void versionId;
+    const executors = fakeExecutors({ AgentCall: vi.fn(async () => { throw new Error('boom'); }) });
+    const emit = vi.fn();
+    const app = createApp(db, executors, undefined, undefined, { notificationService: { emit } });
+
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
+    expect(res.status).toBe(200);
+    await waitForRunToSettle(app, res.body.data.runId);
+
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'ai-pipeline:failed' }));
+  });
+
+  it('does not notify when the run succeeds', async () => {
+    const db = makeDb();
+    const pipelineId = seedPipeline(db);
+    seedVersion(db, pipelineId, 1, graphWithOneTrigger(), 'published');
+    const executors = fakeExecutors();
+    const emit = vi.fn();
+    const app = createApp(db, executors, undefined, undefined, { notificationService: { emit } });
+
+    const res = await request(app).post(`/v1/ai-pipelines/${pipelineId}/run`).send({ input: {} });
+    await waitForRunToSettle(app, res.body.data.runId);
+
+    expect(emit).not.toHaveBeenCalled();
+  });
+});
+
 describe('POST /v1/ai-pipelines/:id/run — not gated by ai_pipelines_enabled', () => {
   // Deliberate: that flag controls only whether apk-analyzer.ts's automatic production trigger
   // uses the pipeline engine. A manual run through this REST endpoint is always a deliberate,
