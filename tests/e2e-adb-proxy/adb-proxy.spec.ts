@@ -1,7 +1,7 @@
 import { test, expect, type Locator } from '@playwright/test';
 import { loginAsAdmin, waitForBackend } from '../e2e/helpers/auth';
 import { fingerprintOf } from '../../backend/services/adb-proxy/adb-key';
-import { A_CNXN, MAX_DATA } from '../../backend/services/adb-proxy/packet';
+import { A_CLSE, A_CNXN, MAX_DATA } from '../../backend/services/adb-proxy/packet';
 import { makeTestAdbKey } from '../../backend/services/adb-proxy/testing/test-keys';
 import { WireClient } from '../../backend/services/adb-proxy/testing/wire-client';
 
@@ -86,6 +86,33 @@ test.describe('ADB proxy', () => {
     expect((await session.collectStream(1, localId, 'close', WAIT_MS)).toString()).toContain('ran: echo e2e');
     await expect(page.getByTestId('adb-proxy-connections')).toContainText('e2e@runner');
     session.close();
+  });
+
+  test('an open connection keeps itself current: its stream count follows the streams and its time keeps running', async ({ page }) => {
+    await loginAsAdmin(page);
+    await page.goto('/ui/settings/adb-proxy');
+    const connections = page.getByTestId('adb-proxy-connections');
+    await expect(connections).toContainText('No machines are connected.');
+
+    const session = await connect();
+    expect((await session.authenticate(runner, MAX_DATA, WAIT_MS)).command).toBe(A_CNXN);
+    const row = connections.getByRole('row').nth(1);
+    await expect(row).toContainText('e2e@runner');
+    const elapsed = row.getByRole('cell').nth(3);
+    const streams = row.getByRole('cell').nth(4);
+    await expect(streams).toHaveText('0');
+
+    const { localId } = await session.open('hold:', 1, WAIT_MS);
+    await expect(streams).toHaveText('1');
+    session.send(A_CLSE, 1, localId);
+    await expect(streams).toHaveText('0');
+
+    // No push is needed for the time to move: the page counts it itself.
+    const before = await elapsed.textContent();
+    await expect(elapsed).not.toHaveText(before ?? '', { timeout: 5000 });
+
+    session.close();
+    await expect(connections).toContainText('No machines are connected.');
   });
 
   test('revoking drops a live session, blocks the key, and forgetting lets it ask again', async ({ page }) => {

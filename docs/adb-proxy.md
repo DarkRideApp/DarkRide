@@ -68,6 +68,7 @@ services:
 - **Revoke** an approved machine under *Approved machines*. Its live connections close at once and it is refused from then on. It moves to *Denied and revoked*.
 - **Deny** a waiting request to close it. DarkRide then ignores that key, with no new request, until you forget it.
 - **Forget** a machine under *Denied and revoked* to let it ask again. If it connects again it waits for approval like a new machine. A machine that was denied or revoked cannot ask again until you do this.
+- The page updates itself. New requests, connections, open streams, device changes and setting changes appear without a reload, and the times (*Connected for*, request age, last seen) keep counting. If the page stops following changes, reload it; a reload also fetches the current state again.
 - A waiting request is held for 5 minutes. It lives in memory only, so a restart clears it. When a request times out or is cleared, the waiting connection closes and the other machine runs `adb connect` again. A machine that asks again for the same device replaces its waiting request instead of adding a second one.
 - In the Devices table you can change a device's port (type a new port and press **Save port**; it must be inside the range and not used by another device) or clear its **Proxy** checkbox to stop proxying that device. Changing a port, clearing the checkbox, changing the bind address and switching **Remote access** off each close the live connections they affect.
 
@@ -147,7 +148,7 @@ API, all under `/v1/adb-proxy`. In the table, read means the scope `core.adb-pro
 
 Responses are `{ "success": true, "data": ... }`, where write calls return the status snapshot. Errors are `{ "success": false, "error": "<code>" }` with status 404 for `not-found` and `unknown-device`, 409 for `not-approved`, `in-use` and `range-full`, and 400 for `out-of-range` and `invalid`. A rejected `PUT /settings` returns status 400 with the reason as `error`.
 
-Live updates are `adb-proxy` messages carrying the full status snapshot. Send `{ "action": "__ws:subscribe", "channels": ["adb-proxy"] }` on `/ws`. Without `core.adb-proxy:read` the subscription is silently ignored: the client gets no error and no messages.
+Live updates are `adb-proxy` messages carrying the full status snapshot. One is sent, at most about every 50 ms, after a connection opens or closes, a stream opens or closes, or a request, key, device or setting changes. The page counts elapsed times itself between messages. Send `{ "action": "__ws:subscribe", "channels": ["adb-proxy"] }` on `/ws`. Without `core.adb-proxy:read` the subscription is silently ignored: the client gets no error and no messages.
 
 Tests:
 

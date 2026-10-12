@@ -3,6 +3,7 @@ import { ConfirmDialog, EmptyState, LoadingSpinner, useAuthOptional, useDocument
 import { AccessDenied } from '../../components/auth/AccessDenied';
 import { FieldRow, SaveButton, SectionCard, SectionHeading } from '../../components/settings/SettingsShared';
 import { useAdbProxyStatus } from '../../hooks/useAdbProxyStatus';
+import { useNow } from '../../hooks/useNow';
 import type { DeviceProxyState, DeviceStatusView, KeyView, PendingView } from '../../../shared/types/adb-proxy';
 
 const API_ERRORS = new Map<string, string>([
@@ -39,20 +40,24 @@ const WRAP: React.CSSProperties = { overflowWrap: 'anywhere' };
 // On narrow screens a table keeps a minimum width inside a card that clips, so each card scrolls sideways instead.
 const SCROLL_X: React.CSSProperties = { overflowX: 'auto' };
 
-function ago(ms: number): string {
-  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+function ago(ms: number, now: number): string {
+  const s = Math.max(0, Math.floor((now - ms) / 1000));
   if (s < 60) return 'just now';
   if (s < 3600) return `${Math.floor(s / 60)} min ago`;
   if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
   return `${Math.floor(s / 86400)} d ago`;
 }
 
-function duration(ms: number): string {
-  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-  if (s < 60) return 'under a minute';
+function duration(ms: number, now: number): string {
+  const s = Math.max(0, Math.floor((now - ms) / 1000));
+  if (s < 60) return `${s} s`;
   if (s < 3600) return `${Math.floor(s / 60)} min`;
   return `${Math.floor(s / 3600)} h`;
 }
+
+// Each cell reads the shared clock itself, so a tick re-renders these cells and not the whole page.
+const Ago = ({ ms }: { ms: number }) => <>{ago(ms, useNow())}</>;
+const Elapsed = ({ ms }: { ms: number }) => <>{duration(ms, useNow())}</>;
 
 const machine = (comment: string | null) => comment || '(no name)';
 
@@ -229,7 +234,7 @@ function AdbProxyContent({ canManage, canApprove }: { canManage: boolean; canApp
         <td><code style={WRAP}>{p.fingerprint}</code></td>
         <td style={WRAP}>{p.peerIp}</td>
         <td style={WRAP}>{deviceName(p.deviceId)}</td>
-        <td>{ago(p.createdAt)}</td>
+        <td><Ago ms={p.createdAt} /></td>
         {canManage && (
           <td>
             <div style={{ display: 'flex', gap: 4 }}>
@@ -248,7 +253,7 @@ function AdbProxyContent({ canManage, canApprove }: { canManage: boolean; canApp
     <tr key={k.id}>
       <td style={WRAP}>{machine(k.comment)}</td>
       <td><code style={WRAP}>{k.fingerprint}</code></td>
-      <td style={WRAP}>{ago(k.lastSeenAt)}{k.lastSeenIp ? ` from ${k.lastSeenIp}` : ''}</td>
+      <td style={WRAP}><Ago ms={k.lastSeenAt} />{k.lastSeenIp ? ` from ${k.lastSeenIp}` : ''}</td>
       {canManage && (
         <td>
           <button className="btn btn-sm btn-danger" disabled={busy.has(keyTarget(k.id))} onClick={() => setConfirmation({ action: 'revoke', key: k })}>Revoke</button>
@@ -506,7 +511,7 @@ function AdbProxyContent({ canManage, canApprove }: { canManage: boolean; canApp
                       <td style={WRAP}>{machine(c.comment)}</td>
                       <td style={WRAP}>{c.peerIp}</td>
                       <td style={WRAP}>{deviceName(c.deviceId)}</td>
-                      <td>{duration(c.since)}</td>
+                      <td><Elapsed ms={c.since} /></td>
                       <td>{c.streams}</td>
                     </tr>
                   ))}

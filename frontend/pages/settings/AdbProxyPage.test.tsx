@@ -799,4 +799,60 @@ describe('AdbProxyPage', () => {
       expect(after).toHaveAttribute('aria-checked', 'false');
     });
   });
+
+  describe('elapsed times', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('keep counting between pushes: connected for, request age and last seen', async () => {
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      const now = Date.now();
+      mount({
+        snapshot: snapshot({
+          connections: [{ id: 1, deviceId: 'DEV1', peerIp: '10.0.0.7', state: 'ready', keyId: 'k1', comment: 'dev@laptop', since: now - 5_000, streams: 1 }],
+          pending: [pendingReq({ createdAt: now - 50_000 })],
+          keys: [keyRow({ lastSeenAt: now - 50_000 })],
+        }),
+      });
+      const connections = await screen.findByTestId('adb-proxy-connections');
+      const request = screen.getByTestId('adb-proxy-request');
+      const approved = screen.getByTestId('adb-proxy-approved');
+      expect(within(connections).getByText('5 s')).toBeInTheDocument();
+      expect(within(request).getByText('just now')).toBeInTheDocument();
+      expect(within(approved).getByText(/just now from 10\.0\.0\.7/)).toBeInTheDocument();
+
+      act(() => { vi.advanceTimersByTime(10_000); });
+      expect(within(connections).getByText('15 s')).toBeInTheDocument();
+      expect(within(request).getByText('1 min ago')).toBeInTheDocument();
+      expect(within(approved).getByText(/1 min ago from 10\.0\.0\.7/)).toBeInTheDocument();
+
+      act(() => { vi.advanceTimersByTime(50_000); });
+      expect(within(connections).getByText('1 min')).toBeInTheDocument();
+    });
+
+    it('show a connection that is under a minute old in seconds, not as "under a minute"', async () => {
+      mount({
+        snapshot: snapshot({
+          connections: [{ id: 1, deviceId: 'DEV1', peerIp: '10.0.0.7', state: 'ready', keyId: 'k1', comment: 'dev@laptop', since: Date.now() - 12_000, streams: 0 }],
+        }),
+      });
+      const connections = await screen.findByTestId('adb-proxy-connections');
+      expect(within(connections).getByText(/^1[2-5] s$/)).toBeInTheDocument();
+      expect(within(connections).queryByText('under a minute')).toBeNull();
+    });
+
+    it('stop their timer when the page is left', async () => {
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      mount({
+        snapshot: snapshot({
+          connections: [{ id: 1, deviceId: 'DEV1', peerIp: '10.0.0.7', state: 'ready', keyId: 'k1', comment: 'dev@laptop', since: Date.now(), streams: 0 }],
+        }),
+      });
+      await screen.findByTestId('adb-proxy-connections');
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+      cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+  });
 });
