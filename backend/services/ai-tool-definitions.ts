@@ -717,6 +717,7 @@ export function registerAllTools(
     },
     context: ['automations'],
     requiredScope: 'core.automations:execute',
+    requiresConfirmation: true,
     allowUnattended: false,
     async execute(params: { id: number; deviceId?: string }) {
       if (!runner || !scheduler) throw new Error('AutomationRunner/Scheduler not wired into AI tools');
