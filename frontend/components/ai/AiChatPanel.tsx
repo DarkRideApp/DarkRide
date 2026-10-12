@@ -381,8 +381,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   useEffect(() => {
     const unsubs: (() => void)[] = [];
 
-    // The ref is the source of truth for ai:done, which reads it synchronously. React runs a state updater later, at
-    // render, so a ref written inside one is stale when events land in the same batch and the last text is dropped.
+    // Compute from the ref, not inside an updater: updaters can run at render, after ai:done has read the ref.
     const updateStreamingSegments = (update: (prev: MessageSegment[]) => MessageSegment[]) => {
       const next = update(streamingSegmentsRef.current);
       streamingSegmentsRef.current = next;
@@ -428,6 +427,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:tool-result', (msg: AiToolResultEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
+      setPendingConfirm(prev => (prev?.toolUseId === msg.toolUseId ? null : prev));
       updateStreamingSegments(prev => prev.map(seg => {
         if (seg.type !== 'tools') return seg;
         const updatedTools = seg.tools?.map(t =>
@@ -447,6 +447,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:done', (msg: AiDoneEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
+      setPendingConfirm(null);
       const segments = streamingSegmentsRef.current;
       const content = segments
         .filter(s => s.type === 'text')
@@ -484,6 +485,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:error', (msg: AiErrorEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
+      setPendingConfirm(null);
       const segments = streamingSegmentsRef.current;
       const content = segments
         .filter(s => s.type === 'text')
@@ -516,6 +518,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     setMessages(prev => [...prev, { role: 'user', content: trimmed }]);
     setInput('');
     setIsStreaming(true);
+    setPendingConfirm(null);
     setStreamingSegments([]);
     setTurnLimitReached(false);
     streamingSegmentsRef.current = [];
@@ -653,6 +656,9 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
                         {JSON.stringify(pendingConfirm.input, null, 2)}
                       </pre>
                     )}
+                    <p className="ai-chat-confirm-hint" data-testid="ai-chat-confirm-hint">
+                      Allow for this conversation covers every call to <code>{pendingConfirm.toolName}</code>, whatever the arguments.
+                    </p>
                   </div>
                   <div className="ai-chat-confirm-actions">
                     <button

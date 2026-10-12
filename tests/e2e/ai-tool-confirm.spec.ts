@@ -23,10 +23,7 @@ const MODEL_NAME = 'E2E Tool Confirm';
 const MODEL_ID = 'claude-opus-4-6';
 const PLACEHOLDER_KEY = 'sk-test-placeholder';
 const GATED_TOOL = 'delete_intercept_rule';
-/**
- * The stub's closing reply for the n-th run. Each run gets its own text so a test can tell this run's reply from an
- * earlier one anywhere in the chat, whichever way the chat has numbered its messages.
- */
+/** Each run gets its own reply text, so a test can tell it from an earlier run's anywhere in the chat. */
 const replyFor = (turn: number): string => `Stub reply for tool confirmation run ${turn}.`;
 
 interface StubRequest {
@@ -97,10 +94,7 @@ function startStub(): Promise<void> {
   }));
 }
 
-/**
- * Remove the model and the provider this spec created. The model goes first, since the provider DELETE answers
- * 409 while a model still references it. Deletes need the CSRF header or they return 403. Safe when nothing exists.
- */
+/** Remove this spec's model, then its provider (the provider DELETE answers 409 while a model uses it). Safe when nothing exists. */
 async function cleanup(browser: Browser): Promise<void> {
   const ctx = await browser.newContext();
   try {
@@ -183,20 +177,16 @@ test.describe('AI tool confirmation', () => {
       await postJson(api.request, csrf, 'put', '/v1/ai/models/reorder', { ids: [model.id, ...allModels.map((m) => m.id).filter((id) => id !== model.id)] });
 
       await loginAsAdmin(page);
-      // The chat restores the latest conversation of its page context, and no API deletes one. Chat on a page whose
-      // context the other AI specs never use, so this spec leaves their dashboard chat untouched. Not /ui/traffic:
-      // it redirects to /ui/network, which has no context of its own and so chats as the dashboard.
+      // Own page context, so other specs' dashboard chat is untouched. Not /ui/traffic: it redirects to /ui/network, which chats as dashboard.
       await page.goto('/ui/devices');
       await page.waitForLoadState('networkidle');
       await page.getByTestId('ai-chat-fab').click();
       await expect(page.getByTestId('ai-chat-panel')).toBeVisible({ timeout: 10_000 });
-      // Playwright's database outlives a retry, so start from an empty conversation: an earlier attempt cannot leave
-      // a reply behind.
+      // Start from an empty conversation: the database outlives a retry.
       await page.getByTestId('ai-chat-new-btn').click();
 
       const card = page.getByTestId('ai-chat-confirm');
-      // Replies are found by their text anywhere in the chat: a conversation reloaded from the database numbers its
-      // messages differently from one streamed live, so a fixed message index is not safe to assert on.
+      // Find replies by their text: a conversation reloaded from the database numbers its messages differently.
       const chat = page.getByTestId('ai-chat-messages');
 
       // ── First call in a conversation: the user is asked, and allows it for the conversation ──
@@ -209,8 +199,7 @@ test.describe('AI tool confirmation', () => {
       // The tool ran once the user allowed it.
       expect(requests.at(-1)?.toolResult).toContain('Rule not found');
 
-      // ── Same conversation, same tool: the run goes straight through. A prompt would hold the run until it was
-      //    answered or timed out, so a reply inside this wait means nobody was asked. ──
+      // ── Same conversation, same tool: a prompt would hold the run, so a reply inside this wait means nobody was asked ──
       await send(page, 'Delete intercept rule 999998');
       await expect(chat).toContainText(replyFor(2), { timeout: 30_000 });
       await expect(card).toHaveCount(0);

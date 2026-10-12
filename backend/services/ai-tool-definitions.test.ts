@@ -106,8 +106,7 @@ describe('registerAllTools', () => {
   // ── Confirmation policy ───────────────────────────────────────
 
   describe('confirmation policy', () => {
-    // Tools that change configuration or run code on a device or in an app. Each one asks once per conversation.
-    // Adding or removing a name here is a policy decision, not a test fix.
+    // Asked about before each call, unless the user allows the tool for the conversation. Editing this list is a policy decision.
     const CONFIRMED = [
       'create_automation',
       'update_automation_code',
@@ -124,8 +123,7 @@ describe('registerAllTools', () => {
       'run_frida_and_collect',
     ];
 
-    // Read-only inspection, plus starting or stopping the user's own capture, automation and APK jobs. These run
-    // without a prompt, so the chat only interrupts for the tools above.
+    // Run without asking: Frida class inspection (spawns the app, writes nothing) and starting or stopping your own jobs.
     const UNCONFIRMED = [
       'inspect_runtime_classes',
       'inspect_class_methods',

@@ -827,22 +827,24 @@ describe('AI Chat Handlers', () => {
         replies: [{ allowed: true, scope: 'forever' }, { allowed: true }],
       });
 
-      expect(r.prompts).toHaveLength(2);
+      expect(r.prompts).toEqual(['run_adb_command', 'run_adb_command']);
+      expect(r.answers).toEqual([true, true]);
     });
 
     it('carries an approval into the next message of the same conversation', async () => {
       const socket = createAuthenticatedSocket(++nextUserId);
-      await converse(socket, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+      const first = await converse(socket, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
 
       const next = await converse(socket, { conversationId: 7, tools: ['run_adb_command'] });
 
+      expect(first.answers).toEqual([true]);
       expect(next.prompts).toEqual([]);
       expect(next.answers).toEqual([true]);
     });
 
     it('carries an approval made in a new conversation once the conversation has an id', async () => {
       const socket = createAuthenticatedSocket(++nextUserId);
-      await converse(socket, {
+      const first = await converse(socket, {
         conversationId: null,
         endsAs: 42,
         tools: ['run_adb_command'],
@@ -851,6 +853,7 @@ describe('AI Chat Handlers', () => {
 
       const next = await converse(socket, { conversationId: 42, tools: ['run_adb_command'] });
 
+      expect(first.answers).toEqual([true]);
       expect(next.prompts).toEqual([]);
       expect(next.answers).toEqual([true]);
     });
@@ -876,7 +879,7 @@ describe('AI Chat Handlers', () => {
 
     it('keeps an approval across a reconnect', async () => {
       const userId = ++nextUserId;
-      await converse(createAuthenticatedSocket(userId), {
+      const first = await converse(createAuthenticatedSocket(userId), {
         conversationId: 7,
         tools: ['run_adb_command'],
         replies: [{ allowed: true, scope: 'conversation' }],
@@ -884,12 +887,14 @@ describe('AI Chat Handlers', () => {
 
       const reconnected = await converse(createAuthenticatedSocket(userId), { conversationId: 7, tools: ['run_adb_command'] });
 
+      expect(first.answers).toEqual([true]);
       expect(reconnected.prompts).toEqual([]);
+      expect(reconnected.answers).toEqual([true]);
     });
 
     it('keeps an approval when the run fails after it was given', async () => {
       const socket = createAuthenticatedSocket(++nextUserId);
-      await converse(socket, {
+      const failed = await converse(socket, {
         conversationId: 7,
         fail: true,
         tools: ['run_adb_command'],
@@ -898,22 +903,76 @@ describe('AI Chat Handlers', () => {
 
       const next = await converse(socket, { conversationId: 7, tools: ['run_adb_command'] });
 
+      expect(failed.answers).toEqual([true]);
       expect(next.prompts).toEqual([]);
+      expect(next.answers).toEqual([true]);
     });
 
-    it('forgets the least recently approved conversations past the cap, so the store cannot grow without bound', async () => {
-      expect(MAX_REMEMBERED_CONVERSATIONS).toBeGreaterThan(0);
+    describe('the cap on remembered conversations', () => {
+      const allowForConversation = (socket: any, id: number) =>
+        converse(socket, { conversationId: id, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+      const askAgain = (socket: any, id: number) =>
+        converse(socket, { conversationId: id, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+      it('is 500', () => {
+        expect(MAX_REMEMBERED_CONVERSATIONS).toBe(500);
+      });
+
+      it('remembers every conversation up to the cap', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS; id++) await allowForConversation(socket, id);
+
+        expect((await askAgain(socket, 1)).prompts).toEqual([]);
+        expect((await askAgain(socket, MAX_REMEMBERED_CONVERSATIONS)).prompts).toEqual([]);
+      }, 30_000);
+
+      it('drops the oldest conversation once past it', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS + 1; id++) await allowForConversation(socket, id);
+
+        expect((await askAgain(socket, 1)).prompts).toEqual(['run_adb_command']);
+        expect((await askAgain(socket, MAX_REMEMBERED_CONVERSATIONS + 1)).prompts).toEqual([]);
+      }, 30_000);
+
+      it('keeps a conversation that was used recently over an older one', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS; id++) await allowForConversation(socket, id);
+        await askAgain(socket, 1);
+        await allowForConversation(socket, MAX_REMEMBERED_CONVERSATIONS + 1);
+
+        expect((await askAgain(socket, 2)).prompts).toEqual(['run_adb_command']);
+        expect((await askAgain(socket, 1)).prompts).toEqual([]);
+      }, 30_000);
+    });
+
+    it('denies a prompt nobody answers within 60 seconds, and a late click remembers nothing', async () => {
       const socket = createAuthenticatedSocket(++nextUserId);
-      for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS + 1; id++) {
-        await converse(socket, { conversationId: id, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+      const agent = {
+        handleMessage: vi.fn(async (params: any) => {
+          const allowed = await params.onToolConfirm('tu-late', 'run_adb_command', {});
+          return { conversationId: 9, usage: { inputTokens: 1, outputTokens: 1 }, allowed };
+        }),
+      };
+      (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+      vi.useFakeTimers();
+      try {
+        const done = getWebsocketHandler('ai:message')!.handler(
+          { conversationId: 9, message: 'go', pageContext: 'devices', contextId: '' },
+          socket,
+        );
+        await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+        await vi.advanceTimersByTimeAsync(60_000);
+        await done;
+        expect(await agent.handleMessage.mock.results[0].value).toMatchObject({ allowed: false });
+        await respond(socket, 'tu-late', true, 'conversation');
+      } finally {
+        vi.useRealTimers();
       }
 
-      const oldest = await converse(socket, { conversationId: 1, tools: ['run_adb_command'], replies: [{ allowed: true }] });
-      const newest = await converse(socket, { conversationId: MAX_REMEMBERED_CONVERSATIONS + 1, tools: ['run_adb_command'] });
-
-      expect(oldest.prompts).toEqual(['run_adb_command']);
-      expect(newest.prompts).toEqual([]);
-    }, 30_000);
+      const next = await converse(socket, { conversationId: 9, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+      expect(next.prompts).toEqual(['run_adb_command']);
+    });
 
     it('denies a pending prompt when the socket disconnects', async () => {
       const socket = createAuthenticatedSocket(++nextUserId);

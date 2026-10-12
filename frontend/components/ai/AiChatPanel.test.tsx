@@ -1193,18 +1193,20 @@ describe('AiChatPanel tool confirmation card', () => {
     Element.prototype.scrollIntoView = vi.fn();
   });
 
-  /** Render the panel, start a run, and have the server ask to confirm a tool. */
-  function askToConfirm(toolName = 'run_adb_command', input: Record<string, unknown> = { command: 'getprop' }) {
+  /** Render the panel, start a run, and have the server ask to confirm a tool. `on` reaches the panel's other server events. */
+  function openConfirm(toolName = 'run_adb_command', input: Record<string, unknown> = { command: 'getprop' }) {
     const subscribe = vi.fn().mockReturnValue(() => {});
     const { ws } = renderWithWs(<AiChatPanel pageContext="devices" contextId="d1" />, { subscribe });
+    const on = (type: string) => subscribe.mock.calls.find((c: any[]) => c[0] === type)?.[1];
     fireEvent.change(screen.getByTestId('ai-chat-input'), { target: { value: 'check the device' } });
     fireEvent.click(screen.getByTestId('ai-chat-send-btn'));
-    const onConfirm = subscribe.mock.calls.find((c: any[]) => c[0] === 'ai:tool-confirm')?.[1];
     act(() => {
-      onConfirm({ type: 'ai:tool-confirm', conversationId: null, toolUseId: 'tu-1', toolName, input });
+      on('ai:tool-confirm')({ type: 'ai:tool-confirm', conversationId: null, toolUseId: 'tu-1', toolName, input });
     });
-    return ws;
+    return { ws, on };
   }
+
+  const askToConfirm = (toolName?: string, input?: Record<string, unknown>) => openConfirm(toolName, input).ws;
 
   const confirmResponses = (ws: WebSocketContextValue) =>
     (ws.sendMessage as ReturnType<typeof vi.fn>).mock.calls.filter((c: any[]) => c[0] === 'ai:tool-confirm-response');
@@ -1242,6 +1244,50 @@ describe('AiChatPanel tool confirmation card', () => {
     fireEvent.click(screen.getByTestId('ai-chat-confirm-deny'));
 
     expect(confirmResponses(ws)).toEqual([['ai:tool-confirm-response', { toolUseId: 'tu-1', allowed: false, scope: 'once' }]]);
+    expect(screen.queryByTestId('ai-chat-confirm')).not.toBeInTheDocument();
+  });
+
+  it('says the approval covers every call to the tool, whatever its arguments', () => {
+    askToConfirm('run_adb_command', { command: 'getprop' });
+
+    expect(screen.getByTestId('ai-chat-confirm-hint')).toHaveTextContent('run_adb_command');
+    expect(screen.getByTestId('ai-chat-confirm-hint')).toHaveTextContent('whatever the arguments');
+  });
+
+  it('closes the card when the server settles the call without an answer', () => {
+    const { on } = openConfirm();
+
+    act(() => {
+      on('ai:tool-result')({ type: 'ai:tool-result', conversationId: null, toolUseId: 'tu-1', result: 'Tool execution denied by user.', durationMs: 0 });
+    });
+
+    expect(screen.queryByTestId('ai-chat-confirm')).not.toBeInTheDocument();
+  });
+
+  it('keeps the card when a different call settles', () => {
+    const { on } = openConfirm();
+
+    act(() => {
+      on('ai:tool-result')({ type: 'ai:tool-result', conversationId: null, toolUseId: 'tu-other', result: 'ok', durationMs: 1 });
+    });
+
+    expect(screen.getByTestId('ai-chat-confirm')).toBeInTheDocument();
+  });
+
+  it.each([
+    ['finishes', 'ai:done', { type: 'ai:done', conversationId: 7 }],
+    ['fails', 'ai:error', { type: 'ai:error', conversationId: 7, error: 'provider failed' }],
+  ])('does not bring the card back on the next message when the run %s with it open', (_label, type, event) => {
+    const { on } = openConfirm();
+    act(() => {
+      on(type)(event);
+    });
+
+    fireEvent.change(screen.getByTestId('ai-chat-input'), { target: { value: 'try again' } });
+    fireEvent.click(screen.getByTestId('ai-chat-send-btn'));
+
+    expect(screen.getByTestId('ai-chat-streaming')).toBeInTheDocument();
+    expect(screen.queryByTestId('ai-chat-confirm')).not.toBeInTheDocument();
   });
 });
 

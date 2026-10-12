@@ -34,27 +34,18 @@ const pendingConfirmations = new Map<WebSocket, Map<string, PendingConfirmation>
 
 // ── Approvals that last for a conversation ──────────────────────────
 
-/**
- * Cap on conversations with remembered approvals. Approvals live in memory only, so a restart asks again, and the
- * least recently used conversation is dropped first.
- */
+/** Conversations with remembered approvals; the least recently used is dropped first. */
 export const MAX_REMEMBERED_CONVERSATIONS = 500;
 
-/** Map<`${userId}:${conversationId}`, tool names>. Insertion order is recency, oldest first. */
+/** Map<`${userId}:${conversationId}`, tool names>, oldest first. In memory only. */
 const conversationApprovals = new Map<string, Set<string>>();
 
 function approvalKey(userId: number, conversationId: number): string {
   return `${userId}:${conversationId}`;
 }
 
-/** Tools the user has allowed for this conversation. Reading counts as use, so a live conversation is kept. */
 function recallApprovals(userId: number, conversationId: number): Set<string> {
-  const key = approvalKey(userId, conversationId);
-  const tools = conversationApprovals.get(key);
-  if (!tools) return new Set();
-  conversationApprovals.delete(key);
-  conversationApprovals.set(key, tools);
-  return new Set(tools);
+  return new Set(conversationApprovals.get(approvalKey(userId, conversationId)));
 }
 
 function rememberApprovals(userId: number, conversationId: number, tools: ReadonlySet<string>): void {
@@ -172,8 +163,7 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
     const trackingId = requestId ?? String(conversationId ?? -1);
     trackRequest(socket, trackingId, controller);
 
-    // Tools the user has allowed for this conversation: those from earlier messages, plus any allowed during this
-    // run. A new conversation has no id until the run ends, so what is allowed during it is stored once the id is known.
+    // A new conversation has no id until its run ends, so approvals given during it are stored in the finally below.
     const incomingConversationId: number | null = Number.isInteger(conversationId) ? conversationId : null;
     const allowedTools: Set<string> = userId != null && incomingConversationId != null
       ? recallApprovals(userId, incomingConversationId)
@@ -300,7 +290,7 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
       if (pending) {
         confirms.delete(toolUseId);
         if (confirms.size === 0) pendingConfirmations.delete(socket);
-        // Only an approval is remembered. Anything but the exact scope `conversation` covers this one call.
+        // A denial is never remembered, and any scope but 'conversation' covers this one call.
         if (allowed && scope === 'conversation') pending.remember();
         pending.resolve(!!allowed);
       }
