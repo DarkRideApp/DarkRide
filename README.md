@@ -76,6 +76,8 @@ docker logs darkride 2>&1 | grep -E "bootstrap|claim"   # find the admin passwor
 
 Open `http://localhost:3000/ui`. The container ships with Node 24 + Python 3.13 + `adb` + the mitmproxy/frida/pymobiledevice3 Python bridges, ready to talk to a USB-attached Android device once you mount it with `--device` (Linux hosts) or set up `adb connect` over the network.
 
+To let other machines use those devices through the [ADB proxy](docs/adb-proxy.md), also publish its port range (6500 to 6599 unless you change it in Settings) with `-p 6500-6599:6500-6599`, and set `-e WG_SERVER_IP=<the host's address>`. The proxy is off until you turn it on. [Running in Docker](docs/adb-proxy.md#running-in-docker) explains the firewall behaviour and what happens if you change the range.
+
 Tags available: `:latest` follows main; `:sha-<7chars>` pins to a specific build for rollback.
 
 ### Install and Run (development)

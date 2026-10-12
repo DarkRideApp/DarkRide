@@ -8,7 +8,7 @@ It is off by default. Nothing listens until you turn it on, and while it is off 
 
 1. Open **Settings → ADB Proxy** (in the Advanced group) and switch **Remote access** on.
 2. In the **Network** card, check the **Bind address** and the **First port** and **Last port**. If you change any of them, press **Save** (it stays disabled until a value changes). The defaults are `0.0.0.0` (every IPv4 interface) and 6500 to 6599. The bind address must be an IP address, and the range must lie between 1024 and 65535 and hold at most 1000 ports. Once the proxy is on, each online Android device gets one port from the range, the lowest free one, and keeps it across restarts and reconnects. The one case where a device loses its port is described under **No free port** in Troubleshooting.
-3. Open that port range on the host's firewall.
+3. Open that port range on the host's firewall. In Docker, publish it instead (see [Running in Docker](#running-in-docker)).
 4. On the other machine, run the command from the **Connect command** column of the Devices table (the **Copy** button copies it):
 
    ```bash
@@ -33,6 +33,35 @@ It is off by default. Nothing listens until you turn it on, and while it is off 
 6. On the other machine, `adb devices` changes from `unauthorized` to `device` without a reconnect. From then on it can use the device like one attached by USB, for example `adb shell`, `adb push`, `adb pull` and `adb forward`.
 
 A machine is identified by its adb key, whose public half is the file `adbkey.pub` in the `.android` folder of the home directory of the account that runs `adb` on that machine. A different account, or `sudo adb`, can use a different key, and then the recipe above will not match it. Approving a key gives that machine a shell on every proxied device, including devices attached later, and it approves the key's waiting requests for the other devices at the same time. Approval survives restarts. Revoke it at any time.
+
+## Running in Docker
+
+The proxy listens inside the container, so other machines can only reach it if the range is published. Publish each port on the same number it has inside, because the **Connect command** shows the port the container listens on. Also set `WG_SERVER_IP` to the host's address, because the command otherwise names the address DarkRide finds inside the container, which is internal to Docker:
+
+```bash
+docker run -d --name darkride \
+  -p 3000:3000 \
+  -p 6500-6599:6500-6599 \
+  -e WG_SERVER_IP=192.168.1.10 \
+  ...                      # the other options from the README
+```
+
+In Compose:
+
+```yaml
+services:
+  darkride:
+    ports:
+      - "3000:3000"
+      - "6500-6599:6500-6599"
+    environment:
+      WG_SERVER_IP: 192.168.1.10
+```
+
+- **The range is fixed when the container is created.** If you change **First port** or **Last port** in the Network card, recreate the container with the new range: Docker cannot add published ports to a running one. Leave the **Bind address** at `0.0.0.0` inside the container and choose the exposed address when you publish.
+- **By default, a host firewall such as `ufw` does not filter published ports.** Docker adds its own rules and sends the traffic around them, so opening or closing the range in `ufw` changes nothing. To limit who can connect, publish on one host address, for example `-p 192.168.1.10:6500-6599:6500-6599`, or put the host behind a network firewall or VPN.
+- **Only devices the container's own ADB server can see are proxied.** See the Docker section of the README for passing devices in.
+- On Linux, `--network host` instead of `-p` skips publishing. The ports then belong to the host, and the host firewall applies as described above.
 
 ## Managing machines
 
@@ -84,8 +113,8 @@ Viewing needs the scope `core.adb-proxy:read`. Denying, revoking, forgetting and
 | `adb devices` stays `unauthorized` | The machine is waiting for approval. Open Settings → ADB Proxy and look under **Waiting for approval**. |
 | Nothing is listed under **Waiting for approval** | The request timed out after 5 minutes, or the rate limit of 3 new requests per source address per minute was reached (wait a minute and run `adb connect` again), or 20 requests are already waiting (approve or deny some first; each also expires after 5 minutes). Dropped requests are logged and counted. If the machine was denied or revoked, see the next row. If `adb connect` never reached DarkRide, see the rows about refused connections and device badges. |
 | A machine that was denied or revoked cannot ask again | DarkRide ignores its key. Press **Forget** on it under *Denied and revoked*, then run `adb connect` again. |
-| `adb connect` is refused or times out | The proxy is off, the device is **Disabled**, or the firewall blocks the port range. Check the device's badge in the Devices table. |
-| The Connect command shows the wrong address | With a specific **Bind address** the command names that address. With `0.0.0.0` or `::`, DarkRide picks the address of a LAN interface and skips virtual and VPN adapters by name. Set `WG_SERVER_IP` to the address clients should use and restart. It is the same variable WireGuard capture uses. |
+| `adb connect` is refused or times out | The proxy is off, the device is **Disabled**, the firewall blocks the port range, or, in Docker, the container does not publish it. Check the device's badge in the Devices table. |
+| The Connect command shows the wrong address | With a specific **Bind address** the command names that address. With `0.0.0.0` or `::`, DarkRide picks the address of a LAN interface and skips virtual and VPN adapters by name. In Docker that is an address inside the container. Set `WG_SERVER_IP` to the address clients should use and restart. It is the same variable WireGuard capture uses. |
 | The device shows **Off** | **Remote access** is switched off, or the listener is still starting. |
 | The device shows **Disabled** | The **Proxy** checkbox for that device is cleared. |
 | The device shows **Device offline** | DarkRide does not see the device as online: it is unplugged, offline, or unauthorized on the host. Its port stays reserved and works again when the device returns. Connections to it are closed meanwhile. |
