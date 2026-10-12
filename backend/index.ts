@@ -1420,8 +1420,12 @@ httpServer.listen(PORT, HOST, () => {
     routeSetup(getApiRouter());
   }
 
-  // Emit startup hook
+  // Emit startup hook. app:shutdown is defined here too, not at its own emit site below — it
+  // only ever fires once, at the very end of the process's life, so defining it lazily right
+  // before that emit would mean it can never appear in the Trigger event picker while the
+  // server is actually running (the only time picking it would be useful).
   pluginManager.getHookBus().define('app:startup', APP_STARTUP_SCHEMA, 'Fires once when the backend process finishes booting (plugins loaded, routes registered).');
+  pluginManager.getHookBus().define('app:shutdown', APP_SHUTDOWN_SCHEMA, 'Fires when the backend begins graceful shutdown (SIGTERM/SIGINT).');
   pluginManager.getHookBus().emit('app:startup');
 
   // Plugin metadata endpoint
@@ -1581,7 +1585,6 @@ async function shutdown() {
   // Run all migrated plugins' stop() in reverse topological order.
   // All plugin teardown is handled by stopAll() per the new lifecycle.
   if (pluginManager) {
-    pluginManager.getHookBus().define('app:shutdown', APP_SHUTDOWN_SCHEMA, 'Fires when the backend begins graceful shutdown (SIGTERM/SIGINT).');
     pluginManager.getHookBus().emit('app:shutdown', undefined);
     try {
       await pluginManager.stopAll();
