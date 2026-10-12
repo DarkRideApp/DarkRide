@@ -739,6 +739,28 @@ export const passwordResetTokens = sqliteTable('password_reset_tokens', {
   usedAt: integer('used_at', { mode: 'timestamp' }),
 });
 
+export const adbProxyKeys = sqliteTable('adb_proxy_keys', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  keyId: text('key_id').notNull().unique(),
+  publicKey: text('public_key').notNull(),
+  comment: text('comment'),
+  status: text('status', { enum: ['approved', 'denied', 'revoked'] as const }).notNull(),
+  deviceIds: text('device_ids', { mode: 'json' }).$type<string[] | null>(),
+  firstSeenAt: integer('first_seen_at', { mode: 'timestamp' }).notNull(),
+  lastSeenAt: integer('last_seen_at', { mode: 'timestamp' }).notNull(),
+  lastSeenIp: text('last_seen_ip'),
+  lastDeviceId: text('last_device_id'),
+  decidedBy: integer('decided_by').references(() => users.id, { onDelete: 'set null' }),
+  decidedAt: integer('decided_at', { mode: 'timestamp' }),
+});
+
+export const adbProxyDevices = sqliteTable('adb_proxy_devices', {
+  deviceId: text('device_id').primaryKey().references(() => devices.id),
+  port: integer('port').notNull().unique(),
+  enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+});
+
 export const aiCallLog = sqliteTable('ai_call_log', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   startedAt: integer('started_at', { mode: 'timestamp' }).notNull(),

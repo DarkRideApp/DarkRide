@@ -17,6 +17,7 @@ import { Proxies } from '../pages/Proxies';
 import { Credentials } from '../pages/Credentials';
 import { Jobs } from '../pages/Jobs';
 import { McpSettings } from '../pages/McpSettings';
+import { AdbProxyPage } from '../pages/settings/AdbProxyPage';
 import { Utils } from '../pages/Utils';
 import { SdkCatalog } from '../pages/SdkCatalog';
 
@@ -139,7 +140,16 @@ describe('Settings tour — every page renders without an error toast', () => {
   // Pages tested below all live under /ui/settings/* in App.tsx.
   // If you add a new settings route, add it here too — that's the whole
   // point of the tour.
-  const pages: Array<{ name: string; Component: React.ComponentType }> = [
+  const adbProxyStatus = {
+    enabled: false, bindHost: '0.0.0.0', portStart: 6500, portEnd: 6599, advertisedHost: '127.0.0.1',
+    devices: [], connections: [], pending: [], keys: [],
+    counters: { connections: 0, approvals: 0, denials: 0, authFailures: 0, floodDrops: 0 },
+  };
+  const pages: Array<{
+    name: string;
+    Component: React.ComponentType;
+    handlers?: Record<string, (method: string, body?: any) => any>;
+  }> = [
     { name: 'Notifications', Component: NotificationsPage },
     { name: 'Integrations', Component: IntegrationsPage },
     { name: 'AI', Component: AIPage },
@@ -151,14 +161,19 @@ describe('Settings tour — every page renders without an error toast', () => {
     { name: 'Credentials', Component: Credentials },
     { name: 'Jobs', Component: Jobs },
     { name: 'MCP Server', Component: McpSettings },
+    {
+      name: 'ADB Proxy',
+      Component: AdbProxyPage,
+      handlers: { '/v1/adb-proxy/status': () => ({ success: true, data: adbProxyStatus }) },
+    },
     { name: 'Utilities', Component: Utils },
     { name: 'SDK Catalog', Component: SdkCatalog },
     { name: 'Changelog', Component: ChangelogPage },
   ];
 
-  for (const { name, Component } of pages) {
+  for (const { name, Component, handlers } of pages) {
     it(`${name} renders without flashing an error toast`, async () => {
-      renderPage(Component);
+      renderPage(Component, undefined, handlers);
       // Let any deferred promise chains / fetches resolve.
       await waitFor(() => {
         // Wait for at least one render cycle; we just need the effects to run.

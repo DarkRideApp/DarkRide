@@ -2,10 +2,12 @@ import React, { useContext, useEffect, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import { usePluginRegistrySnapshot, AuthContext } from '@darkrideapp/plugin-sdk/react';
 import { RestartConfirmModal } from './RestartConfirmModal';
+import { AdbProxyPendingBadge } from './AdbProxyPendingBadge';
 
 interface SidebarItem {
   label: string;
   path: string;
+  badge?: React.ReactNode;
 }
 
 const GENERAL: SidebarItem[] = [
@@ -25,6 +27,7 @@ const PLUGINS_STATIC: SidebarItem[] = [
 
 const ADVANCED: SidebarItem[] = [
   { label: 'Proxies', path: '/ui/settings/proxies' },
+  { label: 'ADB Proxy', path: '/ui/settings/adb-proxy' },
   { label: 'Credentials', path: '/ui/settings/credentials' },
   { label: 'Jobs', path: '/ui/settings/jobs' },
   { label: 'MCP Server', path: '/ui/settings/mcp' },
@@ -50,6 +53,7 @@ function Group({ label, items }: { label: string; items: SidebarItem[] }) {
           className={({ isActive }) => `settings-sidebar-link${isActive ? ' active' : ''}`}
         >
           {item.label}
+          {item.badge}
         </NavLink>
       ))}
     </div>
@@ -93,12 +97,16 @@ export function SettingsSidebar() {
   ];
 
   const canRestart = auth?.hasScope?.(RESTART_SCOPE) ?? false;
+  const canSeeAdbProxy = auth?.hasScope?.('core.adb-proxy:read') ?? false;
+  const advancedItems = ADVANCED.map((item) =>
+    item.path === '/ui/settings/adb-proxy' && canSeeAdbProxy ? { ...item, badge: <AdbProxyPendingBadge /> } : item,
+  );
 
   return (
     <aside className="settings-sidebar">
       <Group label="General" items={GENERAL} />
       <Group label="Plugins" items={pluginsItems} />
-      <Group label="Advanced" items={ADVANCED} />
+      <Group label="Advanced" items={advancedItems} />
       <Group label="About" items={ABOUT} />
       {canRestart && (
         <div className="settings-sidebar-group">

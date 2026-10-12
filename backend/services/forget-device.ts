@@ -1,5 +1,5 @@
 import { eq } from 'drizzle-orm';
-import { devices, automationSessions, capturedTraffic, websocketMessages } from '../db/schema';
+import { devices, automationSessions, capturedTraffic, websocketMessages, adbProxyDevices } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 
 /**
@@ -10,7 +10,9 @@ import type { AppDatabase } from '../db/index';
  *
  * The child rows are kept — they have forensic value beyond the lifetime
  * of any one device record — but their `device_id` is NULL'd so the
- * delete is permitted. Everything runs in a single transaction.
+ * delete is permitted. The device's ADB proxy port row (adb_proxy_devices)
+ * is derived data, unlike those kept rows, so it is deleted outright.
+ * Everything runs in a single transaction.
  *
  * Returns whether a row was actually deleted (false = no such device).
  */
@@ -21,6 +23,7 @@ export function forgetDeviceRow(db: AppDatabase, deviceId: string): boolean {
     tx.update(automationSessions).set({ deviceId: null }).where(eq(automationSessions.deviceId, deviceId)).run();
     tx.update(capturedTraffic).set({ deviceId: null }).where(eq(capturedTraffic.deviceId, deviceId)).run();
     tx.update(websocketMessages).set({ deviceId: null }).where(eq(websocketMessages.deviceId, deviceId)).run();
+    tx.delete(adbProxyDevices).where(eq(adbProxyDevices.deviceId, deviceId)).run();
     tx.delete(devices).where(eq(devices.id, deviceId)).run();
   });
   return true;

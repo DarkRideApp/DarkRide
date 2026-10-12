@@ -70,7 +70,8 @@ describe('migration 0101: per-request AI usage rows and run tool-call count', ()
     const j = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../migrations/meta/_journal.json'), 'utf8'));
     const entry = j.entries.find((e: any) => e.idx === 101);
     expect(entry?.tag).toBe(TAG);
-    const maxOther = Math.max(...j.entries.filter((e: any) => e.idx !== 101).map((e: any) => e.when));
-    expect(entry.when).toBeGreaterThan(maxOther);
+    // Only entries before this migration count: later migrations legitimately have a greater `when`.
+    const maxEarlier = Math.max(...j.entries.filter((e: any) => e.idx < 101).map((e: any) => e.when));
+    expect(entry.when).toBeGreaterThan(maxEarlier);
   });
 });

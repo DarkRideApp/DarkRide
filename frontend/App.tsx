@@ -30,6 +30,7 @@ import { CloudStoragePage } from './pages/settings/CloudStoragePage';
 import { CertificatesPage } from './pages/settings/CertificatesPage';
 import { TrafficSettingsPage } from './pages/settings/TrafficSettingsPage';
 import { ChangelogPage } from './pages/settings/ChangelogPage';
+import { AdbProxyPage } from './pages/settings/AdbProxyPage';
 import { Credentials } from './pages/Credentials';
 import { SessionHistory } from './pages/SessionHistory';
 import { ProxiedRequests } from './pages/ProxiedRequests';
@@ -301,6 +302,7 @@ function AuthenticatedApp() {
               <Route path="credentials" element={<Credentials />} />
               <Route path="jobs" element={<Jobs />} />
               <Route path="mcp" element={<McpSettings />} />
+              <Route path="adb-proxy" element={<AdbProxyPage />} />
               <Route path="utils" element={<Utils />} />
               <Route path="sdk-catalog" element={<SdkCatalog />} />
               <Route path="changelog" element={<ChangelogPage />} />

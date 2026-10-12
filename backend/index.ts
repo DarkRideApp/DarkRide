@@ -149,7 +149,11 @@ import { createDockerClient, setActiveDockerClient, getActiveDockerClient, spawn
 import { createAvdProvider } from './services/providers/avd';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { makeCaptureHandlers } from './services/capture-handlers';
-import { ensureConfigs, getDeviceLanIp } from './services/wireguard-config';
+import { ensureConfigs, getDeviceLanIp, getServerIp } from './services/wireguard-config';
+import { AdbProxyService } from './services/adb-proxy/adb-proxy-service';
+import { createDeviceDirectory } from './services/adb-proxy/device-directory';
+import { HostClient } from './services/adb-proxy/host-client';
+import { adbProxyBroadcast, registerAdbProxyEndpoints } from './api/adb-proxy';
 import { reconcileWithProviders } from './services/device-manager-reconcile';
 import { DeviceInstancesRepo } from './services/device-instances-repo';
 import { stopSpawnedInstances } from './services/stop-spawned-instances';
@@ -421,6 +425,14 @@ registerOAuthGrantsRoutes(app, db);
 registerAdminUserEndpoints(db, claimManager, sessionManager);
 registerProxyEndpoints(db);
 registerDeviceEndpoints(deviceManager, db, iosDeviceManager);
+const adbProxyService = new AdbProxyService({
+  db,
+  directory: createDeviceDirectory(deviceManager, db),
+  backend: new HostClient(),
+  broadcast: adbProxyBroadcast(broadcastToAll),
+  advertisedHost: () => getServerIp(),
+});
+registerAdbProxyEndpoints(adbProxyService);
 registerTrafficEndpoints(db, trafficHookRegistry);
 registerAutomationEndpoints(db, runner, compiler, scheduler, captureManager, fileSync);
 registerManagedAutomationEndpoints(db, scheduler);
@@ -1380,6 +1392,7 @@ httpServer.listen(PORT, HOST, () => {
 
   // Phase 2: Start services
   setStartupPhase('starting_services', 'Starting services...');
+  adbProxyService.start().catch((err: any) => error(`ADB proxy failed to start: ${err?.message ?? err}`));
   deviceManager.start();
   iosDeviceManager.start();
   scheduler.start();
@@ -1513,6 +1526,7 @@ async function shutdown() {
   apkTracker.stop();
   fridaReleaseManager.stop();
   iosDeviceManager.stop();
+  try { await adbProxyService.stop(); } catch (err: any) { error(`ADB proxy cleanup: ${err.message}`); }
   deviceManager.stop();
   scheduler.stop();
   bridgeManager.stopAll();

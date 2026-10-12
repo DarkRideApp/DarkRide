@@ -35,6 +35,7 @@ const PAGES = [
   { path: '/ui/settings/jobs', name: 'Jobs' },
   { path: '/ui/settings/utils', name: 'Utils' },
   { path: '/ui/settings/mcp', name: 'MCP Server' },
+  { path: '/ui/settings/adb-proxy', name: 'ADB Proxy' },
   { path: '/ui/settings/cloud', name: 'Cloud Storage' },
   { path: '/ui/selector-debugger', name: 'Selector Debugger' },
   { path: '/ui/request-builder', name: 'Request Builder' },
