@@ -38,6 +38,7 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 
 ### Fixed
 
+- **Security: `POST /v1/tools/{name}` now enforces the tool's required scope.** Before, any signed-in user or API key could run any tool through this endpoint whatever scopes it held. A caller without the scope now gets `403`, and a request with no identity gets `401`. An API key or script that relied on this needs the scope the tool lists, for example `core.credentials:read` for `list_credentials`. Upgrade promptly if you give API keys to people or tools you trust less than an administrator.
 - Adding, editing, removing or toggling a plugin source no longer closes the Sources dialog, and now refreshes the marketplace straight away. Before, a newly added source showed nothing until you pressed Refresh, because the server caches the marketplace for an hour.
 - The Plugin Manager showed two restart prompts at once (the Settings banner and its own button). There is now one.
 - A marketplace plugin whose registry name differs from its runtime name (for example a git source) is matched to its installed copy by npm package, so it is no longer listed twice.
