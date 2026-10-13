@@ -1,4 +1,4 @@
-import { lt, and, eq, not, notInArray, inArray, sql } from 'drizzle-orm';
+import { lt, and, or, eq, not, notInArray, inArray, sql } from 'drizzle-orm';
 import { unlink } from 'fs/promises';
 import { existsSync, unlinkSync } from 'fs';
 import { join, resolve } from 'path';
@@ -10,11 +10,14 @@ import { getDataRoot } from '../config/paths';
 
 const { log } = createLoggers('prune');
 
+export const DEFAULT_AI_CONVERSATION_DAYS = 90;
+
 export async function pruneOldData(
   db: AppDatabase,
   pruneDays: number,
   screenshotPath: string,
   fileSync?: FileStorageService,
+  options: { aiConversationDays?: number } = {},
 ): Promise<void> {
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - pruneDays);
@@ -122,8 +125,13 @@ export async function pruneOldData(
 
   db.delete(automationSessions).where(deletedSessionCondition).run();
 
-  // Prune old AI conversations
-  db.delete(aiConversations).where(lt(aiConversations.updatedAt, cutoffDate)).run();
+  // Automated runs follow the data window; chats people can recall in History keep their own, longer one
+  const chatCutoff = new Date();
+  chatCutoff.setDate(chatCutoff.getDate() - (options.aiConversationDays ?? DEFAULT_AI_CONVERSATION_DAYS));
+  db.delete(aiConversations).where(or(
+    and(eq(aiConversations.automated, true), lt(aiConversations.updatedAt, cutoffDate)),
+    lt(aiConversations.updatedAt, chatCutoff),
+  )).run();
 
   // Prune old notification history
   db.delete(notificationHistory).where(lt(notificationHistory.createdAt, cutoffDate)).run();

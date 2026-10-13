@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { registerEndpoint, getApiRouter, clearEndpoints } from './api-service';
+import { registerEndpoint, getApiRouter, clearEndpoints, handleWebSocketRestApi } from './api-service';
 
 function createTestApp() {
   const app = express();
@@ -9,6 +9,34 @@ function createTestApp() {
   app.use(getApiRouter());
   return app;
 }
+
+describe('REST over WebSocket query parsing', () => {
+  beforeEach(() => {
+    clearEndpoints();
+  });
+
+  async function queryOf(path: string): Promise<Record<string, string>> {
+    let seen: Record<string, string> = {};
+    registerEndpoint('GET', '/v1/echo', (req, res) => {
+      seen = req.query as Record<string, string>;
+      res.json({ ok: true });
+    });
+    await handleWebSocketRestApi('GET', path, undefined, 'r1', { send: vi.fn() } as any);
+    return seen;
+  }
+
+  it('decodes + as a space, as URLSearchParams writes it and an HTTP request reads it', async () => {
+    expect(await queryOf('/v1/echo?q=hello+world')).toEqual({ q: 'hello world' });
+  });
+
+  it('keeps an encoded plus and decodes percent escapes', async () => {
+    expect(await queryOf('/v1/echo?a=1%2B1&b=caf%C3%A9%20bar&c=')).toEqual({ a: '1+1', b: 'café bar', c: '' });
+  });
+
+  it('decodes a + in a parameter name too', async () => {
+    expect(await queryOf('/v1/echo?a+b=1')).toEqual({ 'a b': '1' });
+  });
+});
 
 describe('API Service', () => {
   beforeEach(() => {

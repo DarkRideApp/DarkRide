@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { useLocation } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Sparkles, X } from 'lucide-react';
 import { AiChatPanel } from './AiChatPanel';
 import { type PluginToolContext, getPageContext } from './page-context';
@@ -9,6 +9,7 @@ export function AiChatDrawer() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [pluginContexts, setPluginContexts] = useState<PluginToolContext[]>([]);
   const location = useLocation();
+  const navigate = useNavigate();
 
   useEffect(() => {
     fetch('/v1/plugins/registry')
@@ -87,6 +88,8 @@ export function AiChatDrawer() {
             <AiChatPanel
               pageContext={pageContext}
               contextId={contextId}
+              originPath={location.pathname + location.search}
+              onNavigate={navigate}
               onStreamingChange={setIsStreaming}
             />
           </div>

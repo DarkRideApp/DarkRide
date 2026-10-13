@@ -417,6 +417,14 @@ export const aiConversations = sqliteTable('ai_conversations', {
   outputTokens: integer('output_tokens'),
   /** Claude CLI session ID for --resume support (null for non-CLI conversations) */
   claudeSessionId: text('claude_session_id'),
+  /** Owner. Null for chats saved before ownership existed, which every user can see. */
+  userId: integer('user_id'),
+  /** App path the chat was started from, so history can link back to it. */
+  originPath: text('origin_path'),
+  /** Set when a run starts and cleared when it ends cleanly, so a cancel, an error or a crash leaves it set. */
+  unfinished: integer('unfinished', { mode: 'boolean' }).notNull().default(false),
+  /** Started by an automated run (APK analysis, diff summary), not by a person chatting. */
+  automated: integer('automated', { mode: 'boolean' }).notNull().default(false),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });

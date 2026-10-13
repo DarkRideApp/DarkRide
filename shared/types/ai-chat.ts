@@ -98,6 +98,8 @@ export interface AiChatSendMessage {
   contextId?: string;
   message: string;
   requestId?: string;
+  /** App path the chat is started from (for example `/ui/analysis/12`), kept so history can link back. Used only for a new chat. */
+  originPath?: string;
   /** Starts a new chat in YOLO mode. Ignored when `conversationId` is set: the server's state for that conversation decides. */
   yolo?: boolean;
 }
@@ -233,4 +235,22 @@ export interface AiConversation {
   messages: AiMessage[];
   createdAt: number;
   updatedAt: number;
+  /** App path the chat was started from, or null for a chat saved before history existed. */
+  originPath: string | null;
+  /** The last reply did not finish: it was cancelled, it failed, or the connection dropped. */
+  unfinished: boolean;
+}
+
+/** One row of the chat history list: a conversation without its messages. */
+export type AiConversationSummary = Omit<AiConversation, 'messages'>;
+
+/**
+ * `GET /v1/ai/conversations?limit=&offset=&q=&pageContext=&contextId=`, newest activity first.
+ * `limit` defaults to 30 (max 100). `q` matches the title and the message text. `pageContext` and
+ * `contextId` narrow the list to one page context. Only the caller's own conversations are listed,
+ * plus ones saved before history existed. Chats started by automated runs are left out.
+ */
+export interface AiConversationListResponse {
+  conversations: AiConversationSummary[];
+  hasMore: boolean;
 }

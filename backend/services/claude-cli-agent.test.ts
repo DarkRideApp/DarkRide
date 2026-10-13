@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { ClaudeCliProvider } from './claude-cli-provider';
 import { ClaudeCliAgent } from './claude-cli-agent';
 import { createTestDb } from '../test-utils/create-test-db';
+import * as schema from '../db/schema';
 import type { AgentIdentity, HandleMessageParams } from './ai-agent';
 import type { ClaudeCliCallbacks } from './claude-cli-provider';
 
@@ -67,5 +68,58 @@ describe('ClaudeCliAgent — text-based tool-call leak detection', () => {
 
     const result = await agent.handleMessageWithIdentity(identity, baseParams());
     expect(result.error).toBeUndefined();
+  });
+});
+
+describe('ClaudeCliAgent conversation history persistence', () => {
+  let db: ReturnType<typeof createTestDb>;
+  beforeEach(() => { db = createTestDb(); });
+  const all = () => db.select().from(schema.aiConversations).all();
+  const params = (extra: Record<string, unknown> = {}) => ({ ...baseParams(), originPath: '/ui/analysis/190', mode: 'streaming', ...extra }) as HandleMessageParams;
+  const textProvider = () => fakeProvider((cb) => { cb.onText('done'); return { numTurns: 1 }; });
+
+  it('saves a new chat with its owner and where it started, and clears the unfinished flag', async () => {
+    const agent = new ClaudeCliAgent(db, textProvider(), 'opus');
+    const result = await agent.handleMessageWithIdentity(identity, params());
+    expect(all()[0]).toMatchObject({ id: result.conversationId, userId: 1, originPath: '/ui/analysis/190', unfinished: false, automated: false, claudeSessionId: 's1' });
+  });
+
+  it('saves an automated run with no owner, flagged automated', async () => {
+    const agent = new ClaudeCliAgent(db, textProvider(), 'opus');
+    await agent.handleMessageWithIdentity(identity, params({ mode: 'silent' }));
+    expect(all()[0]).toMatchObject({ userId: null, automated: true, unfinished: false });
+  });
+
+  it('has the user message stored before the CLI is called', async () => {
+    let seen: typeof schema.aiConversations.$inferSelect | undefined;
+    const provider = fakeProvider((cb) => { seen = all()[0]; cb.onText('x'); return { numTurns: 1 }; });
+    await new ClaudeCliAgent(db, provider, 'opus').handleMessageWithIdentity(identity, params());
+    expect(seen?.unfinished).toBe(true);
+    expect(JSON.parse(seen!.messages)).toEqual([{ role: 'user', content: 'Analyze APK version 190 using the tools.' }]);
+  });
+
+  it('leaves the chat unfinished when the run throws', async () => {
+    const provider = fakeProvider((cb) => { cb.onText('<invoke name="x">'); return { numTurns: 1 }; });
+    await expect(new ClaudeCliAgent(db, provider, 'opus').handleMessageWithIdentity(identity, params())).rejects.toThrow();
+    expect(all()[0].unfinished).toBe(true);
+  });
+
+  it('leaves the chat unfinished when the CLI reports an error', async () => {
+    const provider = { async sendMessage() { return { sessionId: 's1', usage: { inputTokens: 1, outputTokens: 1 }, numTurns: 1, error: 'cancelled' }; } } as unknown as ClaudeCliProvider;
+    await new ClaudeCliAgent(db, provider, 'opus').handleMessageWithIdentity(identity, params());
+    expect(all()[0].unfinished).toBe(true);
+  });
+
+  it('starts a new chat, with no CLI session to resume, instead of continuing another user\'s conversation', async () => {
+    const theirs = Number(db.insert(schema.aiConversations).values({
+      pageContext: 'apk-analysis', contextId: '190', title: 't', messages: '[]', userId: 9, claudeSessionId: 'theirs',
+      createdAt: new Date(1000), updatedAt: new Date(1000),
+    }).run().lastInsertRowid);
+    let resumed: string | undefined = 'unset';
+    const provider = { async sendMessage(_p: string, _cb: unknown, opts: { sessionId?: string }) { resumed = opts.sessionId; return { sessionId: 's1', usage: { inputTokens: 1, outputTokens: 1 }, numTurns: 1 }; } } as unknown as ClaudeCliProvider;
+    const result = await new ClaudeCliAgent(db, provider, 'opus').handleMessageWithIdentity(identity, params({ conversationId: theirs }));
+    expect(resumed).toBeUndefined();
+    expect(result.conversationId).not.toBe(theirs);
+    expect(all()).toHaveLength(2);
   });
 });

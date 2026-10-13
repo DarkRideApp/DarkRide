@@ -65,7 +65,7 @@ Commands:
 
 ### Pruning
 
-`backend/db/prune.ts` runs daily at 3 AM. Deletes automation sessions, screenshots (files + DB rows), captured traffic, WebSocket messages, and injected APKs older than `PRUNE_DAYS` (default: 7, except injected APKs which use a 3-day TTL). Pinned sessions and their related data are excluded. Delete order respects FK constraints.
+`backend/db/prune.ts` runs daily at 3 AM. Deletes automation sessions, screenshots (files + DB rows), captured traffic, WebSocket messages, and injected APKs older than `PRUNE_DAYS` (default: 7, except injected APKs which use a 3-day TTL). Pinned sessions and their related data are excluded. Delete order respects FK constraints. AI chats are kept for `AI_CONVERSATION_PRUNE_DAYS` (default 90) after their last use; conversations from automated runs follow `PRUNE_DAYS`.
 
 ## Device Management
 

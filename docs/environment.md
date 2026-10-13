@@ -11,7 +11,8 @@ DarkRide is configured via environment variables. Copy `.env.example` to `.env` 
 | DATA_ROOT | ./data | Root for all runtime data (DB, screenshots, APKs, plugin storage, etc.). Override to point at a separate disk or mount. |
 | DATABASE_PATH | ./data/darkride.db | SQLite database file path |
 | SCREENSHOT_PATH | ./data/screenshots | Screenshot storage directory |
-| PRUNE_DAYS | 7 | Days of data to retain before auto-cleanup |
+| PRUNE_DAYS | 7 | Days of data to retain before auto-cleanup. Also applies to conversations started by automated runs (APK analysis, diff summaries) |
+| AI_CONVERSATION_PRUNE_DAYS | 90 | Days to keep AI chats you can reopen from the chat History list. See [ai-chat-history.md](ai-chat-history.md) |
 | NODE_ENV | - | Set to `production` to serve frontend static files |
 | DEBUG_LOGS | - | Set to any value to enable verbose logging |
 | TRUST_PROXY | - | Set when behind a reverse proxy (Traefik, nginx). Values: hop count (e.g. `1`), `loopback`, `linklocal`, `uniquelocal`, or a comma-separated IP/subnet list. |

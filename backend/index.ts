@@ -2,7 +2,7 @@ import { mkdirSync, statSync, existsSync } from 'fs';
 import { join as pathJoin } from 'path';
 import { app, httpServer, mountApiRouter } from './app';
 import { initDatabase } from './db/index';
-import { pruneOldData, cleanStaleSessions } from './db/prune';
+import { pruneOldData, cleanStaleSessions, DEFAULT_AI_CONVERSATION_DAYS } from './db/prune';
 import { setupWebSocket, getWebSocketServer, setStartupPhase, broadcastToAll } from './websocket/index';
 import { createLoggers } from './logs';
 import { backfillTrafficFilterColumns } from './services/traffic-filter-backfill';
@@ -198,6 +198,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const DATABASE_PATH = process.env.DATABASE_PATH || './data/darkride.db';
 const SCREENSHOT_PATH = process.env.SCREENSHOT_PATH || pathJoin(getDataRoot(), 'screenshots');
 const PRUNE_DAYS = parseInt(process.env.PRUNE_DAYS || '7', 10);
+const AI_CONVERSATION_PRUNE_DAYS = Math.max(1, parseInt(process.env.AI_CONVERSATION_PRUNE_DAYS || '', 10) || DEFAULT_AI_CONVERSATION_DAYS);
 
 // Ensure runtime directories exist
 mkdirSync(SCREENSHOT_PATH, { recursive: true });
@@ -729,11 +730,11 @@ jobRegistry.register({
 jobRegistry.register({
   id: 'database-prune',
   name: 'Database Pruning',
-  description: `Delete sessions, traffic, screenshots older than ${PRUNE_DAYS} days`,
+  description: `Delete sessions, traffic, screenshots older than ${PRUNE_DAYS} days and AI chats older than ${AI_CONVERSATION_PRUNE_DAYS} days`,
   category: 'maintenance',
   defaultSchedule: '0 3 * * *',
   canRunManually: true,
-  run: () => pruneOldData(db, PRUNE_DAYS, SCREENSHOT_PATH, fileSync),
+  run: () => pruneOldData(db, PRUNE_DAYS, SCREENSHOT_PATH, fileSync, { aiConversationDays: AI_CONVERSATION_PRUNE_DAYS }),
 });
 jobRegistry.register({
   id: 'stale-session-cleanup',
@@ -910,7 +911,7 @@ httpServer.listen(PORT, HOST, () => {
   log(`DarkRide server running on http://${HOST}:${PORT}`);
   log(`Database: ${DATABASE_PATH}`);
   log(`Screenshot path: ${SCREENSHOT_PATH}`);
-  log(`Prune days: ${PRUNE_DAYS}`);
+  log(`Prune days: ${PRUNE_DAYS} (AI chats: ${AI_CONVERSATION_PRUNE_DAYS})`);
   if (HOST === '0.0.0.0' || HOST === '::') {
     log('⚠  Server bound to all interfaces. Auth is enabled — confirm before exposing:');
     log('⚠    - first-boot admin claim is complete (unclaimed bootstrap = open door)');
