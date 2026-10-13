@@ -39,6 +39,7 @@ All notable user-facing changes to DarkRide are recorded here. The format follow
 
 ### Fixed
 
+- **Security: `POST /v1/tools/{name}` now enforces the tool's required scope.** Before, any signed-in user or API key could run any tool through this endpoint whatever scopes it held. A caller without the scope now gets `403`, and a request with no identity gets `401`. An API key or script that relied on this needs the scope the tool lists, for example `core.credentials:read` for `list_credentials`. Upgrade promptly if you give API keys to people or tools you trust less than an administrator.
 - The AI chat could drop the end of a reply, or the output of the last tool call, when the final text and the end-of-run event reached the browser in the same instant. The message then showed the tool call and no reply. It is now built from everything received.
 - The AI chat's confirmation card stayed open after the server had settled the call (a 60 second timeout or a cancel) and came back on the next message, where its buttons did nothing. It now closes when the call is settled or the run ends.
 - Adding, editing, removing or toggling a plugin source no longer closes the Sources dialog, and now refreshes the marketplace straight away. Before, a newly added source showed nothing until you pressed Refresh, because the server caches the marketplace for an hour.
