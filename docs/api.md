@@ -371,6 +371,18 @@ The same tool registry that backs the AI chat and the MCP server.
 
 Both need a signed-in session or an API key; a request with no identity gets `401`. A tool can list a required scope, for example `core.credentials:read` for `list_credentials`. `GET /v1/tools` leaves out tools whose scope the caller does not hold, so its length is what MCP shows that caller. `POST /v1/tools/:name` answers `403` when the scope is missing and `404` for an unknown name.
 
+### Analysis tools
+
+The decompilers and scanners that APK analysis uses. They install themselves on the first analysis; these routes let you do it ahead of time or check what is there.
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | /v1/tools/status | `core.apk:read` | `{ tools, java }`: for each of `jadx`, `apktool`, `mobsfscan` and `blutter`, whether it is installed, its version and its path on the server |
+| POST | /v1/tools/install/:toolName | `core.apk:manage` | Install `jadx`, `apktool` or `mobsfscan` (anything else is `400`), then return the status |
+| POST | /v1/tools/install-all | `core.apk:manage` | Install every analysis tool that is missing |
+
+A request with no identity gets `401`, and one without the scope gets `403` before anything is installed.
+
 ## Plugin Endpoints
 
 Plugins can register their own REST endpoints using `ctx.api()` in their `start()` hook. Endpoints added this way are available over both HTTP and the WebSocket-REST transport (the `restapi` action), exactly like core endpoints. For full details see [docs/plugins/backend.md — API Endpoints](plugins/backend.md#api-endpoints).
