@@ -103,6 +103,66 @@ describe('registerAllTools', () => {
     expect(names).toContain('list_sessions');
   });
 
+  // ── Confirmation policy ───────────────────────────────────────
+
+  describe('confirmation policy', () => {
+    // Asked about before each call, unless the user allows the tool for the conversation. Editing this list is a policy decision.
+    const CONFIRMED = [
+      'create_automation',
+      'update_automation_code',
+      'patch_automation_code',
+      'update_automation_config',
+      'run_automation',
+      'create_intercept_rule',
+      'update_intercept_rule',
+      'delete_intercept_rule',
+      'enable_plugin',
+      'disable_plugin',
+      'update_setting',
+      'run_frida_script',
+      'run_adb_command',
+      'run_frida_and_collect',
+    ];
+
+    // Run without asking: Frida class inspection (spawns the app, writes nothing) and starting or stopping your own jobs.
+    const UNCONFIRMED = [
+      'inspect_runtime_classes',
+      'inspect_class_methods',
+      'start_capture',
+      'cancel_automation_run',
+      'trigger_apk_analysis',
+      'fetch_app_from_source',
+    ];
+
+    const registered = () => {
+      const byName = new Map<string, boolean>();
+      for (const ctx of registry.listContexts()) {
+        for (const tool of registry.getToolsForContext(ctx)) byName.set(tool.name, registry.requiresConfirmation(tool.name));
+      }
+      return byName;
+    };
+
+    it('registers every tool the policy names, so a rename cannot slip past it', () => {
+      const names = registered();
+      for (const name of [...CONFIRMED, ...UNCONFIRMED]) {
+        expect(names.has(name), `${name} is not registered`).toBe(true);
+      }
+    });
+
+    it('asks only for the tools in the confirmed list', () => {
+      const asking = [...registered()].filter(([, asks]) => asks).map(([name]) => name).sort();
+      expect(asking).toEqual([...CONFIRMED].sort());
+    });
+
+    it.each(UNCONFIRMED)('does not ask before running %s', (name) => {
+      expect(registry.requiresConfirmation(name)).toBe(false);
+    });
+
+    it.each(CONFIRMED)('still asks before running %s', (name) => {
+      expect(registry.requiresConfirmation(name)).toBe(true);
+    });
+  });
+
   // ── query_session_traffic ─────────────────────────────────────
 
   describe('query_session_traffic', () => {

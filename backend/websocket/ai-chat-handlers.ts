@@ -23,8 +23,44 @@ const activeRequests = new Map<WebSocket, Map<string, AbortController>>();
 
 const CONFIRM_TIMEOUT_MS = 60_000;
 
-/** Map<socket, Map<toolUseId, resolve>> */
-const pendingConfirmations = new Map<WebSocket, Map<string, (allowed: boolean) => void>>();
+interface PendingConfirmation {
+  resolve: (allowed: boolean) => void;
+  /** Called when the user allows the tool for the rest of the conversation. */
+  remember: () => void;
+}
+
+/** Map<socket, Map<toolUseId, PendingConfirmation>> */
+const pendingConfirmations = new Map<WebSocket, Map<string, PendingConfirmation>>();
+
+// ── Approvals that last for a conversation ──────────────────────────
+
+/** Conversations with remembered approvals; the least recently used is dropped first. */
+export const MAX_REMEMBERED_CONVERSATIONS = 500;
+
+/** Map<`${userId}:${conversationId}`, tool names>, oldest first. In memory only. */
+const conversationApprovals = new Map<string, Set<string>>();
+
+function approvalKey(userId: number, conversationId: number): string {
+  return `${userId}:${conversationId}`;
+}
+
+function recallApprovals(userId: number, conversationId: number): Set<string> {
+  return new Set(conversationApprovals.get(approvalKey(userId, conversationId)));
+}
+
+function rememberApprovals(userId: number, conversationId: number, tools: ReadonlySet<string>): void {
+  if (tools.size === 0) return;
+  const key = approvalKey(userId, conversationId);
+  const merged = new Set(conversationApprovals.get(key));
+  for (const tool of tools) merged.add(tool);
+  conversationApprovals.delete(key);
+  conversationApprovals.set(key, merged);
+  while (conversationApprovals.size > MAX_REMEMBERED_CONVERSATIONS) {
+    const oldest = conversationApprovals.keys().next().value;
+    if (oldest === undefined) break;
+    conversationApprovals.delete(oldest);
+  }
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -69,8 +105,8 @@ export function cleanupSocket(socket: WebSocket): void {
   // Deny all pending tool confirmations
   const confirms = pendingConfirmations.get(socket);
   if (confirms) {
-    for (const resolve of confirms.values()) {
-      resolve(false);
+    for (const pending of confirms.values()) {
+      pending.resolve(false);
     }
     pendingConfirmations.delete(socket);
   }
@@ -127,6 +163,13 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
     const trackingId = requestId ?? String(conversationId ?? -1);
     trackRequest(socket, trackingId, controller);
 
+    // A new conversation has no id until its run ends, so approvals given during it are stored in the finally below.
+    const incomingConversationId: number | null = Number.isInteger(conversationId) ? conversationId : null;
+    const allowedTools: Set<string> = userId != null && incomingConversationId != null
+      ? recallApprovals(userId, incomingConversationId)
+      : new Set();
+    let finalConversationId: number | null = incomingConversationId;
+
     try {
       // During streaming, conversationId may be null for new conversations.
       // The ai:done event carries the final (assigned) conversationId.
@@ -152,6 +195,10 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
           sendJson(socket, { type: 'ai:context-usage', conversationId: streamConversationId, ...(requestId ? { requestId } : {}), percent });
         },
         onToolConfirm: (toolUseId: string, toolName: string, input: unknown) => {
+          if (allowedTools.has(toolName)) {
+            log(`Tool ${toolName} runs without a prompt: user ${userId} allowed it for conversation ${incomingConversationId ?? 'new'}`);
+            return Promise.resolve(true);
+          }
           return new Promise<boolean>((resolve) => {
             // Track the pending confirmation
             let socketConfirms = pendingConfirmations.get(socket);
@@ -159,7 +206,13 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
               socketConfirms = new Map();
               pendingConfirmations.set(socket, socketConfirms);
             }
-            socketConfirms.set(toolUseId, resolve);
+            socketConfirms.set(toolUseId, {
+              resolve,
+              remember: () => {
+                allowedTools.add(toolName);
+                log(`Tool ${toolName} allowed for the rest of conversation ${incomingConversationId ?? 'new'} by user ${userId}`);
+              },
+            });
 
             // Send confirmation request to client
             sendJson(socket, {
@@ -184,6 +237,7 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
         },
       };
       const result = await agent.handleMessage(handleParams);
+      finalConversationId = Number.isInteger(result.conversationId) ? result.conversationId : finalConversationId;
 
       sendJson(socket, {
         type: 'ai:done',
@@ -204,6 +258,9 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
       });
     } finally {
       untrackRequest(socket, trackingId);
+      if (userId != null && finalConversationId != null) {
+        rememberApprovals(userId, finalConversationId, allowedTools);
+      }
     }
   }, { requires: ['core.ai:chat'] });
 
@@ -226,14 +283,16 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
 
   // ── ai:tool-confirm-response ────────────────────────────────────
   registerWebsocketEndpoint('ai:tool-confirm-response', (message, socket) => {
-    const { toolUseId, allowed } = message;
+    const { toolUseId, allowed, scope } = message;
     const confirms = pendingConfirmations.get(socket);
     if (confirms) {
-      const resolve = confirms.get(toolUseId);
-      if (resolve) {
+      const pending = confirms.get(toolUseId);
+      if (pending) {
         confirms.delete(toolUseId);
         if (confirms.size === 0) pendingConfirmations.delete(socket);
-        resolve(!!allowed);
+        // A denial is never remembered, and any scope but 'conversation' covers this one call.
+        if (allowed && scope === 'conversation') pending.remember();
+        pending.resolve(!!allowed);
       }
     }
   }, { requires: ['core.ai:chat'] });
@@ -253,7 +312,7 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
     // immediately so cancellation does not wait for the confirmation timeout.
     const confirms = pendingConfirmations.get(socket);
     if (confirms) {
-      for (const resolve of confirms.values()) resolve(false);
+      for (const pending of confirms.values()) pending.resolve(false);
       pendingConfirmations.delete(socket);
     }
   }, { requires: ['core.ai:chat'] });

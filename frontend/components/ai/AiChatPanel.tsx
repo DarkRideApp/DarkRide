@@ -16,6 +16,7 @@ import type {
   AiErrorEvent,
   AiContextUsageEvent,
   AiToolConfirmEvent,
+  AiToolConfirmScope,
   AiMessage,
   AiTextBlock,
   AiToolUseBlock,
@@ -380,10 +381,17 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   useEffect(() => {
     const unsubs: (() => void)[] = [];
 
+    // Compute from the ref, not inside an updater: updaters can run at render, after ai:done has read the ref.
+    const updateStreamingSegments = (update: (prev: MessageSegment[]) => MessageSegment[]) => {
+      const next = update(streamingSegmentsRef.current);
+      streamingSegmentsRef.current = next;
+      setStreamingSegments(next);
+    };
+
     unsubs.push(ws.subscribe('ai:token', (msg: AiTokenEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
-      setStreamingSegments(prev => {
+      updateStreamingSegments(prev => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (last?.type === 'text') {
@@ -391,7 +399,6 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
         } else {
           next.push({ type: 'text', text: msg.text });
         }
-        streamingSegmentsRef.current = next;
         return next;
       });
     }));
@@ -399,7 +406,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:tool-start', (msg: AiToolStartEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
-      setStreamingSegments(prev => {
+      updateStreamingSegments(prev => {
         const next = [...prev];
         const last = next[next.length - 1];
         const newTool: ToolCall = {
@@ -413,7 +420,6 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
         } else {
           next.push({ type: 'tools', tools: [newTool] });
         }
-        streamingSegmentsRef.current = next;
         return next;
       });
     }));
@@ -421,19 +427,16 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:tool-result', (msg: AiToolResultEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
-      setStreamingSegments(prev => {
-        const next = prev.map(seg => {
-          if (seg.type !== 'tools') return seg;
-          const updatedTools = seg.tools?.map(t =>
-            t.toolUseId === msg.toolUseId
-              ? { ...t, output: msg.result, durationMs: msg.durationMs, isRunning: false }
-              : t,
-          );
-          return { ...seg, tools: updatedTools };
-        });
-        streamingSegmentsRef.current = next;
-        return next;
-      });
+      setPendingConfirm(prev => (prev?.toolUseId === msg.toolUseId ? null : prev));
+      updateStreamingSegments(prev => prev.map(seg => {
+        if (seg.type !== 'tools') return seg;
+        const updatedTools = seg.tools?.map(t =>
+          t.toolUseId === msg.toolUseId
+            ? { ...t, output: msg.result, durationMs: msg.durationMs, isRunning: false }
+            : t,
+        );
+        return { ...seg, tools: updatedTools };
+      }));
     }));
 
     unsubs.push(ws.subscribe('ai:context-usage', (msg: AiContextUsageEvent) => {
@@ -444,6 +447,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:done', (msg: AiDoneEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
+      setPendingConfirm(null);
       const segments = streamingSegmentsRef.current;
       const content = segments
         .filter(s => s.type === 'text')
@@ -481,6 +485,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:error', (msg: AiErrorEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
+      setPendingConfirm(null);
       const segments = streamingSegmentsRef.current;
       const content = segments
         .filter(s => s.type === 'text')
@@ -513,6 +518,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     setMessages(prev => [...prev, { role: 'user', content: trimmed }]);
     setInput('');
     setIsStreaming(true);
+    setPendingConfirm(null);
     setStreamingSegments([]);
     setTurnLimitReached(false);
     streamingSegmentsRef.current = [];
@@ -527,11 +533,12 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     });
   }, [ws, conversationId, pageContext, contextId, isStreaming, resetStaleTimer]);
 
-  const respondToConfirm = useCallback((allowed: boolean) => {
+  const respondToConfirm = useCallback((allowed: boolean, scope: AiToolConfirmScope = 'once') => {
     if (!pendingConfirm) return;
     ws.sendMessage('ai:tool-confirm-response', {
       toolUseId: pendingConfirm.toolUseId,
       allowed,
+      scope,
     });
     setPendingConfirm(null);
     resetStaleTimer();
@@ -649,6 +656,9 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
                         {JSON.stringify(pendingConfirm.input, null, 2)}
                       </pre>
                     )}
+                    <p className="ai-chat-confirm-hint" data-testid="ai-chat-confirm-hint">
+                      Allow for this conversation covers every call to <code>{pendingConfirm.toolName}</code>, whatever the arguments.
+                    </p>
                   </div>
                   <div className="ai-chat-confirm-actions">
                     <button
@@ -657,6 +667,14 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
                       data-testid="ai-chat-confirm-deny"
                     >
                       Deny
+                    </button>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => respondToConfirm(true, 'conversation')}
+                      title={`Stop asking about ${pendingConfirm.toolName} in this conversation`}
+                      data-testid="ai-chat-confirm-allow-conversation"
+                    >
+                      Allow for this conversation
                     </button>
                     <button
                       className="btn btn-primary btn-sm"
