@@ -938,8 +938,8 @@ describe('AiChatPanel', () => {
       subscribe: subscribeMock,
     });
 
-    // Should have 7 subscriptions (token, tool-start, tool-result, tool-confirm, done, error, context-usage)
-    expect(subscribeMock).toHaveBeenCalledTimes(7);
+    // Should have 8 subscriptions (token, tool-start, tool-result, tool-confirm, done, error, context-usage, yolo-state)
+    expect(subscribeMock).toHaveBeenCalledTimes(8);
 
     unmount();
 
@@ -1333,5 +1333,243 @@ describe('AiChatPanel streamed events that arrive together', () => {
     });
 
     expect(screen.getByTestId('ai-chat-message-1')).toHaveTextContent('2 devices');
+  });
+});
+
+// ─── YOLO mode ──────────────────────────────────────────────────────────────
+
+describe('AiChatPanel YOLO mode', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  function openPanel(wsOverrides: Partial<WebSocketContextValue> = {}) {
+    const subscribe = vi.fn().mockReturnValue(() => {});
+    const utils = renderWithWs(<AiChatPanel pageContext="devices" contextId="d1" />, { subscribe, ...wsOverrides });
+    const on = (type: string) => subscribe.mock.calls.find((c: any[]) => c[0] === type)?.[1];
+    return { ...utils, on };
+  }
+
+  const sentTo = (ws: WebSocketContextValue, action: string): any[] =>
+    (ws.sendMessage as ReturnType<typeof vi.fn>).mock.calls.filter((c: any[]) => c[0] === action).map((c: any[]) => c[1]);
+  /** `ai:yolo` messages that change something; the ones without `enabled` are questions. */
+  const yoloChanges = (ws: WebSocketContextValue) => sentTo(ws, 'ai:yolo').filter((m) => m.enabled !== undefined);
+
+  const typeAndSend = (text = 'check the device') => {
+    fireEvent.change(screen.getByTestId('ai-chat-input'), { target: { value: text } });
+    fireEvent.click(screen.getByTestId('ai-chat-send-btn'));
+  };
+
+  /** Run one message to its end so the panel has a conversation with this id. */
+  const haveConversation = (on: (type: string) => any, id = 7) => {
+    typeAndSend('hello');
+    act(() => {
+      on('ai:done')({ type: 'ai:done', conversationId: id });
+    });
+  };
+
+  const switchOn = () => {
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-confirm'));
+  };
+
+  it('offers a YOLO toggle that starts off, with no banner', () => {
+    openPanel();
+
+    expect(screen.getByTestId('ai-chat-yolo-toggle')).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByTestId('ai-chat-yolo-badge')).not.toBeInTheDocument();
+  });
+
+  it('asks before switching on, and the dialog names what it unlocks', () => {
+    openPanel();
+
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('ADB shell');
+    expect(dialog).toHaveTextContent('Frida');
+    expect(dialog).toHaveTextContent('settings');
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+  });
+
+  it('Cancel, and the Escape key, leave it off and tell the server nothing', () => {
+    const { ws } = openPanel();
+
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-cancel'));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    expect(screen.queryByTestId('ai-chat-yolo-badge')).not.toBeInTheDocument();
+    expect(yoloChanges(ws)).toEqual([]);
+  });
+
+  it('keeps Escape in the dialog from reaching the window, where the drawer closes itself on Escape', () => {
+    const onWindowKey = vi.fn();
+    window.addEventListener('keydown', onWindowKey);
+    try {
+      openPanel();
+      fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+
+      fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+
+      expect(onWindowKey).not.toHaveBeenCalled();
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    } finally {
+      window.removeEventListener('keydown', onWindowKey);
+    }
+  });
+
+  it('puts the safe choice first in the dialog', () => {
+    openPanel();
+
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+
+    expect(screen.getByTestId('ai-chat-yolo-cancel')).toHaveFocus();
+  });
+
+  it('shows the banner once on, and tells the server for an existing conversation', () => {
+    const { ws, on } = openPanel();
+    haveConversation(on, 7);
+
+    switchOn();
+
+    expect(screen.getByTestId('ai-chat-yolo-badge')).toBeInTheDocument();
+    expect(screen.getByTestId('ai-chat-yolo-toggle')).toHaveAttribute('aria-pressed', 'true');
+    expect(yoloChanges(ws)).toEqual([{ conversationId: 7, enabled: true }]);
+  });
+
+  it('arms a new chat in the browser and sends the flag with its first message', () => {
+    const { ws } = openPanel();
+
+    switchOn();
+    expect(yoloChanges(ws)).toEqual([]);
+    typeAndSend();
+
+    expect(sentTo(ws, 'ai:message')[0]).toMatchObject({ yolo: true });
+  });
+
+  it('does not send the flag on a message to an existing conversation', () => {
+    const { ws, on } = openPanel();
+    haveConversation(on, 7);
+    switchOn();
+
+    typeAndSend('again');
+
+    expect(sentTo(ws, 'ai:message')[1]).not.toHaveProperty('yolo');
+  });
+
+  it('switches a new chat on for its conversation once the first run has an id', () => {
+    const { ws, on } = openPanel();
+    switchOn();
+    typeAndSend();
+
+    act(() => {
+      on('ai:done')({ type: 'ai:done', conversationId: 9 });
+    });
+
+    expect(yoloChanges(ws)).toEqual([{ conversationId: 9, enabled: true }]);
+  });
+
+  it('switches off without a dialog and tells the server', () => {
+    const { ws, on } = openPanel();
+    haveConversation(on, 7);
+    switchOn();
+
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('ai-chat-yolo-badge')).not.toBeInTheDocument();
+    expect(yoloChanges(ws)).toEqual([{ conversationId: 7, enabled: true }, { conversationId: 7, enabled: false }]);
+  });
+
+  it('switches off during a new chat first run by request id, and does not switch the new conversation on', () => {
+    const { ws, on } = openPanel();
+    switchOn();
+    typeAndSend();
+    const { requestId } = sentTo(ws, 'ai:message')[0];
+
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+    act(() => {
+      on('ai:done')({ type: 'ai:done', conversationId: 9 });
+    });
+
+    expect(yoloChanges(ws)).toEqual([{ requestId, enabled: false }]);
+  });
+
+  it('New Chat turns it off and tells the server for the conversation it leaves', () => {
+    const { ws, on } = openPanel();
+    haveConversation(on, 7);
+    switchOn();
+
+    fireEvent.click(screen.getByTestId('ai-chat-new-btn'));
+
+    expect(screen.queryByTestId('ai-chat-yolo-badge')).not.toBeInTheDocument();
+    expect(yoloChanges(ws)).toEqual([{ conversationId: 7, enabled: true }, { conversationId: 7, enabled: false }]);
+  });
+
+  it('shows what the server says about the open conversation, and ignores other conversations', () => {
+    const { on } = openPanel();
+    haveConversation(on, 7);
+
+    act(() => {
+      on('ai:yolo-state')({ type: 'ai:yolo-state', conversationId: 8, enabled: true });
+    });
+    expect(screen.queryByTestId('ai-chat-yolo-badge')).not.toBeInTheDocument();
+
+    act(() => {
+      on('ai:yolo-state')({ type: 'ai:yolo-state', conversationId: 7, enabled: true });
+    });
+    expect(screen.getByTestId('ai-chat-yolo-badge')).toBeInTheDocument();
+
+    act(() => {
+      on('ai:yolo-state')({ type: 'ai:yolo-state', conversationId: 7, enabled: false });
+    });
+    expect(screen.queryByTestId('ai-chat-yolo-badge')).not.toBeInTheDocument();
+  });
+
+  it('asks the server about a conversation it opens', () => {
+    const { ws, on } = openPanel();
+
+    haveConversation(on, 7);
+
+    expect(sentTo(ws, 'ai:yolo')).toContainEqual({ conversationId: 7 });
+  });
+
+  it('asks again after a reconnect, so a restarted server cannot leave a stale banner', () => {
+    const subscribe = vi.fn().mockReturnValue(() => {});
+    const ws = createMockWs({ subscribe, connected: true });
+    const tree = (value: WebSocketContextValue) => (
+      <WebSocketContext.Provider value={value}>
+        <AiChatPanel pageContext="devices" contextId="d1" />
+      </WebSocketContext.Provider>
+    );
+    const { rerender } = render(tree(ws));
+    const on = (type: string) => subscribe.mock.calls.find((c: any[]) => c[0] === type)?.[1];
+    haveConversation(on, 7);
+    (ws.sendMessage as ReturnType<typeof vi.fn>).mockClear();
+
+    rerender(tree({ ...ws, connected: false }));
+    rerender(tree({ ...ws, connected: true }));
+
+    expect(sentTo(ws, 'ai:yolo')).toContainEqual({ conversationId: 7 });
+  });
+
+  it('does not let a late restore of an old conversation replace a YOLO chosen in the meantime', async () => {
+    let resolveRestore!: (value: unknown) => void;
+    const sendRestApi = vi.fn().mockReturnValue(new Promise((resolve) => { resolveRestore = resolve; }));
+    const { ws } = openPanel({ sendRestApi });
+
+    switchOn();
+    await act(async () => {
+      resolveRestore({ id: '1', type: 'restapi', status: 200, body: { data: { id: 99, messages: [{ role: 'user', content: 'old' }] } } });
+    });
+
+    expect(screen.getByTestId('ai-chat-yolo-badge')).toBeInTheDocument();
+    expect(sentTo(ws, 'ai:yolo')).not.toContainEqual({ conversationId: 99 });
   });
 });

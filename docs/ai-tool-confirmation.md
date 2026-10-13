@@ -33,6 +33,17 @@ Every other tool runs without asking. That includes tools that change state:
 - `start_capture`, `cancel_automation_run`, `trigger_apk_analysis` (which re-runs the AI review) and `fetch_app_from_source` start or stop your own jobs.
 - `toggle_intercept_rule`, `set_app_source`, `create_frida_script`, `update_frida_script`, `patch_frida_script` and `append_frida_hook` edit configuration and scripts.
 
+## YOLO mode
+
+YOLO mode makes all 14 tools run without asking, in one conversation. Switch it on with the **YOLO** button in the chat header. A dialog says what it unlocks (ADB shell, Frida scripts, setting changes, plugin switches) and asks you to confirm. While it is on, a warning banner stays under the header and no confirmation card appears.
+
+- **One conversation.** It applies to the conversation you are in. **New Chat** turns it off, and so does the **YOLO** button, without a dialog.
+- **Held on the server.** A page reload keeps it, because the restored conversation asks the server. A backend restart clears it, and the banner follows the server's answer when the connection returns. A new chat starts in YOLO with the flag on its first message, and the browser switches the new conversation on once the run has an id.
+- **Checked on every call.** Switching it off in the middle of a run takes effect on the next tool call, and a card that is already open when you switch it on stays until you answer it. Each call that skips the prompt is written to the server log as `runs without a prompt: YOLO mode`.
+- **Not a permission.** It skips the confirmation card and nothing else. Your scopes still decide which tools you can use, and the tools marked `allowUnattended: false` are unchanged. Approvals from **Allow for this conversation** are separate and keep working.
+
+While it is on, a model that reads hostile input, such as text from an APK or a web page, can run any tool your scopes allow, including shell commands on a device. Only the dialog and the banner stand in the way.
+
 ## What the prompt does not cover
 
 The prompt exists only in the interactive chat. These paths never ask, whatever a tool's flag says:
@@ -49,4 +60,4 @@ Confirmation is a check on what the chat model does for you, not a permission.
 
 A tool asks when its registration in `backend/services/ai-tool-definitions.ts` sets `requiresConfirmation: true`. The list is pinned by `confirmation policy` in `backend/services/ai-tool-definitions.test.ts`, so adding or removing a flag fails that test until the lists in it are changed to match. Treat an edit to those lists as a policy decision. The test covers the tools registered there, not tools that plugins register.
 
-The approval store is in `backend/websocket/ai-chat-handlers.ts`, and the card is in `frontend/components/ai/AiChatPanel.tsx`. `tests/e2e/ai-tool-confirm.spec.ts` runs Allow for this conversation and Deny through the chat drawer against a stubbed model API.
+The approval store and YOLO state are in `backend/websocket/ai-chat-handlers.ts` (the `ai:yolo` message), and the card, toggle and dialog are in `frontend/components/ai/AiChatPanel.tsx`. `tests/e2e/ai-tool-confirm.spec.ts` runs Allow for this conversation and Deny, and `tests/e2e/ai-yolo-mode.spec.ts` runs YOLO mode, through the chat drawer against a stubbed model API.

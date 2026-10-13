@@ -3283,6 +3283,32 @@ body.live-log-open .main-content {
   color: var(--warning-color, #f59e0b);
   font-weight: 600;
 }
+.ai-chat-yolo-toggle {
+  margin-left: auto;
+  margin-right: 8px;
+}
+.ai-chat-yolo-toggle-on {
+  background: var(--warning);
+  border-color: var(--warning);
+  color: #1f1300;
+  font-weight: 600;
+}
+.ai-chat-yolo-dialog p {
+  margin: 10px 0 0;
+  line-height: 1.5;
+}
+.ai-chat-yolo-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--warning-fg);
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  border-bottom: 1px solid var(--warning);
+  flex-shrink: 0;
+}
 
 /* Message Area */
 .ai-chat-messages {
