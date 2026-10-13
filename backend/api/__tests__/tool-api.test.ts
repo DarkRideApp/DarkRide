@@ -244,6 +244,51 @@ describe('Tool API Endpoints', () => {
     });
   });
 
+  describe('GET /v1/tools scope filtering', () => {
+    let scoped: AiToolRegistry;
+
+    beforeEach(() => {
+      scoped = new AiToolRegistry();
+      const tool = (name: string, context: string[], requiredScope?: string) => ({
+        name,
+        description: `description of ${name}`,
+        inputSchema: { type: 'object', properties: {} },
+        context,
+        requiredScope,
+        execute: vi.fn(),
+      });
+      scoped.register(tool('creds_tool', ['credentials'], 'core.credentials:read'));
+      scoped.register(tool('device_shell_tool', ['devices'], 'core.devices:manage'));
+      scoped.register(tool('open_tool', ['credentials', 'devices']));
+    });
+
+    const namesFor = async (scopes: string[] | null) =>
+      (await request(createApp(scoped, scopes)).get('/v1/tools')).body.data?.map((t: { name: string }) => t.name).sort();
+
+    it('lists only the tools the caller may run', async () => {
+      expect(await namesFor(['core.credentials:read'])).toEqual(['creds_tool', 'open_tool']);
+    });
+
+    it('lists only unrestricted tools for a caller with no scopes', async () => {
+      expect(await namesFor([])).toEqual(['open_tool']);
+    });
+
+    it('lists a tool when a wildcard grant covers its scope', async () => {
+      expect(await namesFor(['core.credentials:*', 'core.devices:*'])).toEqual(['creds_tool', 'device_shell_tool', 'open_tool']);
+    });
+
+    it('does not mention a hidden tool anywhere in the response', async () => {
+      const res = await request(createApp(scoped, ['core.credentials:read'])).get('/v1/tools');
+      expect(JSON.stringify(res.body)).not.toContain('device_shell_tool');
+    });
+
+    it('answers 401 with no tool names when the request carries no identity', async () => {
+      const res = await request(createApp(scoped, null)).get('/v1/tools');
+      expect(res.status).toBe(401);
+      expect(JSON.stringify(res.body)).not.toContain('open_tool');
+    });
+  });
+
   describe('POST /v1/tools/:name scope enforcement', () => {
     const guarded = vi.fn(async (params: any) => ({ echoed: params }));
     const open = vi.fn(async () => 'ok');

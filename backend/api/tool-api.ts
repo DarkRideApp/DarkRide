@@ -2,25 +2,13 @@ import { registerEndpoint } from './api-service';
 import type { AiToolRegistry } from '../services/ai-tools';
 
 export function registerToolApiEndpoints(registry: AiToolRegistry): void {
-  // List all tools (name, description, contexts only — no execute)
-  registerEndpoint('GET', '/v1/tools', (_req, res) => {
-    const contexts = registry.listContexts();
-    const tools: Array<{ name: string; description: string; contexts: string[] }> = [];
-    const seen = new Set<string>();
-
-    for (const ctx of contexts) {
-      for (const tool of registry.getToolsForContext(ctx)) {
-        if (!seen.has(tool.name)) {
-          seen.add(tool.name);
-          tools.push({
-            name: tool.name,
-            description: tool.description,
-            contexts: tool.context,
-          });
-        }
-      }
+  // List the tools the caller may run (name, description, contexts only, no execute)
+  registerEndpoint('GET', '/v1/tools', (req, res) => {
+    if (!req.authUser) {
+      res.status(401).json({ success: false, error: 'Authentication required' });
+      return;
     }
-    res.json({ success: true, data: tools });
+    res.json({ success: true, data: registry.listTools(req.authUser.effectiveScopes) });
   });
 
   // Execute a tool by name

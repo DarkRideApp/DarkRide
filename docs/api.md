@@ -322,7 +322,7 @@ If the client disconnects, the upstream request is cancelled and nothing is writ
 
 `GET /v1/ai/usage/report` needs the `core.settings:read` scope. The Usage panel in Settings → AI reads it. The rest of this section describes it.
 
-`GET /v1/ai/usage` is a separate, older endpoint: it sums the input and output tokens stored on chat conversations and returns `{ totalInputTokens, totalOutputTokens, conversationCount, byContext, conversations }`. It has no cache tokens, costs or agent runs.
+`GET /v1/ai/usage` is a separate, older endpoint: it sums the input and output tokens stored on chat conversations and returns `{ totalInputTokens, totalOutputTokens, conversationCount, byContext, conversations }`. It has no cache tokens, costs or agent runs. It needs the `core.ai:chat` scope and counts only the caller's own conversations plus ones with no owner (automated runs and chats saved before ownership existed). For totals across all users, use `GET /v1/ai/usage/report`.
 
 Query parameters, both optional:
 
@@ -359,6 +359,17 @@ Notes:
 |--------|---------|------|
 | 400 | `days must be an integer from 1 to 90` | `days` is empty, repeated, not a whole number, or out of range |
 | 400 | `limit must be an integer from 1 to 200` | `limit` is empty, repeated, not a whole number, or out of range |
+
+## Tools
+
+The same tool registry that backs the AI chat and the MCP server.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | /v1/tools | The tools the caller may run: `{ name, description, contexts }` each |
+| POST | /v1/tools/:name | Run a tool with the request body as its parameters |
+
+Both need a signed-in session or an API key; a request with no identity gets `401`. A tool can list a required scope, for example `core.credentials:read` for `list_credentials`. `GET /v1/tools` leaves out tools whose scope the caller does not hold, so its length is what MCP shows that caller. `POST /v1/tools/:name` answers `403` when the scope is missing and `404` for an unknown name.
 
 ## Plugin Endpoints
 

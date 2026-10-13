@@ -44,6 +44,8 @@ All routes need `core.ai:chat`, and only reach conversations the caller can see.
 | `DELETE /v1/ai/conversations/:id` | `{ success: true }`, or 404. |
 | `GET /v1/ai/conversations/latest?pageContext=&contextId=` | The newest conversation for a page context, as before. |
 
+`GET /v1/ai/usage` (the older token summary) follows the same visibility rule and scope.
+
 Each conversation carries `originPath` (the app path it was started from, or null) and `unfinished`. The WebSocket `ai:message` takes an optional `originPath` for a new chat. The server keeps it only if it is an app path starting with `/ui`.
 
 ## Upgrading
