@@ -2672,4 +2672,124 @@ describe('AiAgent', () => {
       expect(usage?.toolCalls).toBe(1);
     });
   });
+
+  describe('conversation history persistence', () => {
+    const person = (id: number): AgentIdentity => ({ identityType: 'user', actorUserId: id, effectiveScopes: [] });
+    const run = (agent: AiAgent, identity: AgentIdentity, extra: Record<string, unknown> = {}) => agent.handleMessageWithIdentity(identity, {
+      conversationId: null,
+      message: 'hello there',
+      pageContext: 'apk-analysis',
+      contextId: '12',
+      originPath: '/ui/analysis/12',
+      onToken: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolResult: vi.fn(),
+      mode: 'streaming',
+      ...extra,
+    } as any);
+    const all = () => db.select().from(schema.aiConversations).all();
+    const seedRow = (over: Partial<typeof schema.aiConversations.$inferInsert> = {}) => Number(db.insert(schema.aiConversations).values({
+      pageContext: 'apk-analysis', contextId: '12', title: 'old chat', createdAt: new Date(1000), updatedAt: new Date(1000),
+      messages: JSON.stringify([{ role: 'user', content: 'q' }, { role: 'assistant', content: [{ type: 'text', text: 'a' }] }]),
+      ...over,
+    }).run().lastInsertRowid);
+
+    it('saves a new chat with its owner and where it started, and clears the unfinished flag when it ends cleanly', async () => {
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('hi')));
+      const result = await run(agent, person(5));
+      const row = all()[0];
+      expect(row.id).toBe(result.conversationId);
+      expect(row).toMatchObject({ userId: 5, originPath: '/ui/analysis/12', unfinished: false, automated: false, title: 'hello there' });
+    });
+
+    it('saves an automated run with no owner, flagged automated', async () => {
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('hi')));
+      await run(agent, person(5), { mode: 'silent', originPath: undefined });
+      expect(all()[0]).toMatchObject({ userId: null, automated: true, originPath: null, unfinished: false });
+    });
+
+    it('has the user message stored before the model is called', async () => {
+      let seen: typeof schema.aiConversations.$inferSelect | undefined;
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => {
+        seen = all()[0];
+        return textOnlyStream('hi');
+      }));
+      await run(agent, person(5));
+      expect(seen).toBeDefined();
+      expect(seen!.unfinished).toBe(true);
+      expect(JSON.parse(seen!.messages)).toEqual([{ role: 'user', content: 'hello there' }]);
+    });
+
+    it('keeps the message and leaves the chat unfinished when the model request throws', async () => {
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => {
+        throw new Error('provider down');
+      }));
+      await expect(run(agent, person(5))).rejects.toThrow('provider down');
+      const row = all()[0];
+      expect(row.unfinished).toBe(true);
+      expect(JSON.parse(row.messages)).toEqual([{ role: 'user', content: 'hello there' }]);
+    });
+
+    it('leaves the chat unfinished when the run is cancelled, and keeps the completed turns', async () => {
+      const controller = new AbortController();
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => (async function* () {
+        controller.abort();
+        yield { type: 'text', text: 'partial' } as AiStreamEvent;
+      })()));
+      const result = await run(agent, person(5), { signal: controller.signal });
+      expect(result.aborted).toBe(true);
+      expect(all()[0].unfinished).toBe(true);
+    });
+
+    it('leaves the chat unfinished when it stops at the turn limit', async () => {
+      const registry = makeRegistry([{ name: 'ping', context: ['apk-analysis'] }]);
+      const agent = new AiAgent(db, registry, makeMockProvider(() => (async function* () {
+        yield { type: 'tool_use', id: 't', name: 'ping', input: {} } as AiStreamEvent;
+        yield { type: 'usage', inputTokens: 1, outputTokens: 1 } as AiStreamEvent;
+      })()));
+      const result = await run(agent, person(5), { maxTurns: 1 });
+      expect(result.turnLimitReached).toBe(true);
+      expect(all()[0].unfinished).toBe(true);
+    });
+
+    it('continues an existing chat, keeping its owner, title and origin, and clears the flag', async () => {
+      const id = seedRow({ userId: 5, originPath: '/ui/analysis/12', unfinished: true });
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('again')));
+      const result = await run(agent, person(5), { conversationId: id, originPath: '/ui/devices', message: 'next' });
+      expect(result.conversationId).toBe(id);
+      expect(all()).toHaveLength(1);
+      expect(all()[0]).toMatchObject({ userId: 5, title: 'old chat', originPath: '/ui/analysis/12', unfinished: false });
+      expect(JSON.parse(all()[0].messages)).toHaveLength(4);
+    });
+
+    it('puts a note between the old message and the new one when the earlier run never replied', async () => {
+      const id = seedRow({ userId: 5, unfinished: true, messages: JSON.stringify([{ role: 'user', content: 'unanswered' }]) });
+      let sent: AiMessage[] = [];
+      const agent = new AiAgent(db, makeRegistry(), {
+        name: 'mock',
+        createStreamingRequest: (messages: AiMessage[]) => { sent = structuredClone(messages); return textOnlyStream('ok'); },
+      } as AiStreamingProvider);
+      await run(agent, person(5), { conversationId: id, message: 'continue' });
+      expect(sent.map(m => m.role)).toEqual(['user', 'assistant', 'user']);
+      expect(sent[2]).toEqual({ role: 'user', content: 'continue' });
+    });
+
+    it('starts a new chat instead of continuing another user\'s conversation', async () => {
+      const theirs = seedRow({ userId: 9 });
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('hi')));
+      const result = await run(agent, person(5), { conversationId: theirs });
+      expect(result.conversationId).not.toBe(theirs);
+      const rows = all();
+      expect(rows).toHaveLength(2);
+      expect(rows.find(r => r.id === theirs)!.messages).toContain('"q"');
+      expect(rows.find(r => r.id === result.conversationId)!.userId).toBe(5);
+    });
+
+    it('starts a new chat when the conversation id no longer exists', async () => {
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('hi')));
+      const result = await run(agent, person(5), { conversationId: 4242 });
+      expect(result.conversationId).not.toBe(4242);
+      expect(all()).toHaveLength(1);
+    });
+  });
 });

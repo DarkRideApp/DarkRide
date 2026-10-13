@@ -30,6 +30,8 @@ export interface ToolCallStubOptions {
 export interface ToolCallStub {
   readonly requests: StubRequest[];
   readonly port: number;
+  /** Hold the answer to the next request for `ms`, so a spec can interrupt a run. The request is recorded on arrival. */
+  delayNext(ms: number): void;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -53,15 +55,17 @@ export function createToolCallStub(options: ToolCallStubOptions): ToolCallStub {
   const requests: StubRequest[] = [];
   let server: http.Server;
   let port = 0;
+  let nextDelayMs = 0;
 
   return {
     requests,
     get port() { return port; },
+    delayNext(ms: number) { nextDelayMs = ms; },
     start() {
       server = http.createServer((req, res) => {
         let raw = '';
         req.on('data', (chunk) => { raw += chunk; });
-        req.on('end', () => {
+        req.on('end', async () => {
           if (req.method !== 'POST' || req.url !== '/v1/messages') {
             res.statusCode = 404;
             res.setHeader('content-type', 'application/json');
@@ -74,6 +78,16 @@ export function createToolCallStub(options: ToolCallStubOptions): ToolCallStub {
           requests.push({ toolResult });
           // Runs so far: every run begins with exactly one request that asks for the tool.
           const turn = requests.filter((r) => r.toolResult === null).length;
+
+          const delayMs = nextDelayMs;
+          nextDelayMs = 0;
+          if (delayMs > 0) {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, delayMs);
+              res.on('close', () => { clearTimeout(timer); resolve(); });
+            });
+            if (res.destroyed) return;
+          }
 
           res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
           sse(res, 'message_start', {

@@ -1,9 +1,14 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, act } from '@testing-library/react';
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import { ToolCallCard } from './ToolCallCard';
 import { AiChatPanel, convertDbMessages } from './AiChatPanel';
 import { WebSocketContext, type WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
+
+// The panel remembers the open conversation per page context in localStorage.
+beforeEach(() => {
+  localStorage.clear();
+});
 
 // ─── Existing ToolCallCard tests ────────────────────────────────────────────
 
@@ -450,6 +455,7 @@ function createMockWs(overrides: Partial<WebSocketContextValue> = {}): WebSocket
     sendMessage: vi.fn(),
     sendRestApi: vi.fn().mockResolvedValue({ id: '1', type: 'restapi', status: 200, body: {} }),
     subscribe: vi.fn().mockReturnValue(() => {}),
+    subscribeBinary: vi.fn().mockReturnValue(() => {}),
     ...overrides,
   };
 }
@@ -1571,5 +1577,518 @@ describe('AiChatPanel YOLO mode', () => {
 
     expect(screen.getByTestId('ai-chat-yolo-badge')).toBeInTheDocument();
     expect(sentTo(ws, 'ai:yolo')).not.toContainEqual({ conversationId: 99 });
+  });
+});
+
+// ─── Chat history, remembered conversation, origin ──────────────────────────
+
+const OPEN_KEY = 'darkride:ai-chat:open:devices:d1';
+
+const restOk = (data: unknown) => ({ id: '1', type: 'restapi', status: 200, body: { success: true, data } });
+const restStatus = (status: number) => ({ id: '1', type: 'restapi', status, body: { success: false, error: 'x' } });
+
+function savedConversation(id: number, over: Record<string, unknown> = {}) {
+  return {
+    id,
+    pageContext: 'devices',
+    contextId: 'd1',
+    title: `Chat ${id}`,
+    originPath: '/ui/devices',
+    createdAt: Date.now() - 4 * 3_600_000,
+    updatedAt: Date.now() - 3 * 3_600_000,
+    unfinished: false,
+    messages: [
+      { role: 'user', content: `Question ${id}` },
+      { role: 'assistant', content: [{ type: 'text', text: `Answer ${id}` }] },
+    ],
+    ...over,
+  };
+}
+
+function savedSummary(id: number, over: Record<string, unknown> = {}) {
+  const { messages: _messages, ...summary } = savedConversation(id, over);
+  return summary;
+}
+
+type Route = (method: string, url: string) => unknown;
+const isLatest = (url: string) => url.startsWith('/v1/ai/conversations/latest');
+const isList = (url: string) => url.startsWith('/v1/ai/conversations?');
+const idOf = (url: string) => /^\/v1\/ai\/conversations\/(\d+)$/.exec(url)?.[1];
+
+/** A server holding chats 7 and 8, where `latest` finds nothing. */
+const library: Route = (method, url) => {
+  if (isList(url)) return restOk({ conversations: [savedSummary(7), savedSummary(8)], hasMore: false });
+  const id = idOf(url);
+  if (id && method === 'GET') return restOk(savedConversation(Number(id)));
+  return restOk(null);
+};
+
+function openHistoryPanel(route: Route = library, props: Partial<React.ComponentProps<typeof AiChatPanel>> = {}) {
+  const subscribe = vi.fn().mockReturnValue(() => {});
+  const sendRestApi = vi.fn((method: string, url: string) => Promise.resolve(route(method, url)));
+  const ws = createMockWs({ subscribe, sendRestApi: sendRestApi as unknown as WebSocketContextValue['sendRestApi'] });
+  const tree = (extra: Partial<React.ComponentProps<typeof AiChatPanel>> = {}) => (
+    <WebSocketContext.Provider value={ws}>
+      <AiChatPanel pageContext="devices" contextId="d1" {...props} {...extra} />
+    </WebSocketContext.Provider>
+  );
+  const utils = render(tree());
+  const on = (type: string) => subscribe.mock.calls.find((c: any[]) => c[0] === type)?.[1];
+  return { ...utils, ws, sendRestApi, on, rerenderWith: (extra: Partial<React.ComponentProps<typeof AiChatPanel>>) => utils.rerender(tree(extra)) };
+}
+
+const sentOf = (ws: WebSocketContextValue, action: string): any[] =>
+  (ws.sendMessage as ReturnType<typeof vi.fn>).mock.calls.filter((c: any[]) => c[0] === action).map((c: any[]) => c[1]);
+
+const typeAndSend = (text = 'hello') => {
+  fireEvent.change(screen.getByTestId('ai-chat-input'), { target: { value: text } });
+  fireEvent.click(screen.getByTestId('ai-chat-send-btn'));
+};
+
+/** Run one message to its end so the panel holds a conversation with this id. */
+const finishConversation = (on: (type: string) => any, id = 7) => {
+  typeAndSend('hello');
+  act(() => {
+    on('ai:done')({ type: 'ai:done', conversationId: id });
+  });
+};
+
+const toggleHistory = () => fireEvent.click(screen.getByTestId('ai-chat-history-toggle'));
+
+describe('AiChatPanel history view', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  it('swaps the conversation and composer for the saved chats, and back', async () => {
+    openHistoryPanel();
+    const toggle = screen.getByTestId('ai-chat-history-toggle');
+    expect(toggle).toHaveAttribute('aria-label', 'Chat history');
+    expect(toggle).toHaveAttribute('aria-pressed', 'false');
+
+    fireEvent.click(toggle);
+
+    expect(await screen.findByTestId('ai-chat-history-item-7')).toBeInTheDocument();
+    expect(screen.queryByTestId('ai-chat-messages')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('ai-chat-input-area')).not.toBeInTheDocument();
+    expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.click(toggle);
+
+    expect(screen.getByTestId('ai-chat-messages')).toBeInTheDocument();
+    expect(screen.queryByTestId('ai-chat-history')).not.toBeInTheDocument();
+    expect(toggle).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('closes on Escape without closing the drawer', async () => {
+    const windowKeydown = vi.fn();
+    window.addEventListener('keydown', windowKeydown);
+    openHistoryPanel();
+    toggleHistory();
+    await screen.findByTestId('ai-chat-history-item-7');
+
+    fireEvent.keyDown(screen.getByTestId('ai-chat-history-search'), { key: 'Escape' });
+    window.removeEventListener('keydown', windowKeydown);
+
+    expect(screen.queryByTestId('ai-chat-history')).not.toBeInTheDocument();
+    expect(windowKeydown).not.toHaveBeenCalled();
+  });
+
+  it('opens a chat from the list, shows it, and carries on in that conversation', async () => {
+    const { ws } = openHistoryPanel();
+    toggleHistory();
+
+    fireEvent.click(await screen.findByTestId('ai-chat-history-item-8'));
+
+    await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 8'));
+    expect(screen.getByTestId('ai-chat-message-1')).toHaveTextContent('Answer 8');
+    expect(screen.queryByTestId('ai-chat-history')).not.toBeInTheDocument();
+    expect(screen.getByTestId('ai-chat-history-toggle')).toHaveAttribute('aria-pressed', 'false');
+    expect(sentOf(ws, 'ai:yolo')).toContainEqual({ conversationId: 8 });
+    expect(localStorage.getItem(OPEN_KEY)).toBe('8');
+
+    typeAndSend('and then?');
+
+    expect(sentOf(ws, 'ai:message')).toEqual([expect.objectContaining({ conversationId: 8, message: 'and then?' })]);
+  });
+
+  it('shows the YOLO state of the chat it switches to, not the one it left', async () => {
+    const { on } = openHistoryPanel();
+    finishConversation(on, 7);
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+    fireEvent.click(screen.getByTestId('ai-chat-yolo-confirm'));
+    expect(screen.getByTestId('ai-chat-yolo-badge')).toBeInTheDocument();
+
+    toggleHistory();
+    fireEvent.click(await screen.findByTestId('ai-chat-history-item-8'));
+
+    await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 8'));
+    expect(screen.queryByTestId('ai-chat-yolo-badge')).not.toBeInTheDocument();
+  });
+
+  it('highlights the chat that is open when the list is shown again', async () => {
+    openHistoryPanel();
+    toggleHistory();
+    fireEvent.click(await screen.findByTestId('ai-chat-history-item-8'));
+    await screen.findByTestId('ai-chat-message-0');
+
+    toggleHistory();
+
+    expect(await screen.findByTestId('ai-chat-history-item-8')).toHaveAttribute('aria-current', 'true');
+  });
+
+  it('cannot open or delete a chat while a reply is streaming', async () => {
+    openHistoryPanel();
+    typeAndSend('working on it');
+
+    toggleHistory();
+    const row = await screen.findByTestId('ai-chat-history-item-7');
+
+    expect(row).toBeDisabled();
+    expect(screen.getByTestId('ai-chat-history-delete-7')).toBeDisabled();
+  });
+
+  it('returns to the conversation when a tool needs confirmation', async () => {
+    const { on } = openHistoryPanel();
+    typeAndSend('run it');
+    toggleHistory();
+    await screen.findByTestId('ai-chat-history');
+
+    act(() => {
+      on('ai:tool-confirm')({ type: 'ai:tool-confirm', conversationId: null, toolUseId: 't1', toolName: 'run_adb_command', input: {} });
+    });
+
+    expect(screen.queryByTestId('ai-chat-history')).not.toBeInTheDocument();
+    expect(screen.getByTestId('ai-chat-confirm')).toBeInTheDocument();
+  });
+
+  it('New Chat leaves the list and starts a blank conversation', async () => {
+    openHistoryPanel();
+    toggleHistory();
+    await screen.findByTestId('ai-chat-history-item-7');
+
+    fireEvent.click(screen.getByTestId('ai-chat-new-btn'));
+
+    expect(screen.queryByTestId('ai-chat-history')).not.toBeInTheDocument();
+    expect(screen.getByTestId('ai-chat-empty')).toBeInTheDocument();
+  });
+
+  describe('deleting', () => {
+    const withChat7Open: Route = (method, url) => {
+      if (method === 'DELETE') return restOk(null);
+      return library(method, url);
+    };
+
+    const deleteFromList = async (id: number) => {
+      toggleHistory();
+      await screen.findByTestId(`ai-chat-history-item-${id}`);
+      fireEvent.click(screen.getByTestId(`ai-chat-history-delete-${id}`));
+      fireEvent.click(screen.getByTestId('ai-chat-history-delete-confirm'));
+      await waitFor(() => expect(screen.queryByTestId(`ai-chat-history-item-${id}`)).not.toBeInTheDocument());
+    };
+
+    it('resets the panel like New Chat when the open chat is deleted', async () => {
+      localStorage.setItem(OPEN_KEY, '7');
+      const { ws } = openHistoryPanel(withChat7Open);
+      await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 7'));
+      fireEvent.click(screen.getByTestId('ai-chat-yolo-toggle'));
+      fireEvent.click(screen.getByTestId('ai-chat-yolo-confirm'));
+      expect(screen.getByTestId('ai-chat-yolo-badge')).toBeInTheDocument();
+
+      await deleteFromList(7);
+      toggleHistory();
+
+      expect(screen.getByTestId('ai-chat-empty')).toBeInTheDocument();
+      expect(screen.queryByTestId('ai-chat-yolo-badge')).not.toBeInTheDocument();
+      expect(localStorage.getItem(OPEN_KEY)).toBeNull();
+      expect(sentOf(ws, 'ai:yolo')).toContainEqual({ conversationId: 7, enabled: false });
+      typeAndSend('fresh start');
+      expect(sentOf(ws, 'ai:message')[0].conversationId).toBeUndefined();
+    });
+
+    it('leaves the open chat alone when another one is deleted', async () => {
+      localStorage.setItem(OPEN_KEY, '7');
+      openHistoryPanel(withChat7Open);
+      await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 7'));
+
+      await deleteFromList(8);
+      toggleHistory();
+
+      expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 7');
+      expect(localStorage.getItem(OPEN_KEY)).toBe('7');
+    });
+  });
+});
+
+describe('AiChatPanel origin bar', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  const restoring = (over: Record<string, unknown>): Route => (_method, url) => (
+    isLatest(url) ? restOk(savedConversation(7, over)) : restOk(null)
+  );
+
+  it('says where a chat started and offers a way back when you are on another page', async () => {
+    const onNavigate = vi.fn();
+    openHistoryPanel(restoring({ pageContext: 'automations', contextId: '', originPath: '/ui/automations?tab=runs' }), {
+      originPath: '/ui/devices',
+      onNavigate,
+    });
+
+    const bar = await screen.findByTestId('ai-chat-origin-bar');
+    expect(bar).toHaveTextContent('Started on Automations');
+
+    fireEvent.click(screen.getByTestId('ai-chat-origin-go'));
+
+    expect(onNavigate).toHaveBeenCalledWith('/ui/automations?tab=runs');
+  });
+
+  it('stays hidden on the page the chat started on, whatever the query string says', async () => {
+    openHistoryPanel(restoring({ originPath: '/ui/devices?filter=old' }), { originPath: '/ui/devices?filter=new', onNavigate: vi.fn() });
+
+    await screen.findByTestId('ai-chat-message-0');
+
+    expect(screen.queryByTestId('ai-chat-origin-bar')).not.toBeInTheDocument();
+  });
+
+  it('stays hidden for a chat saved before origins were kept', async () => {
+    openHistoryPanel(restoring({ originPath: null }), { originPath: '/ui/devices', onNavigate: vi.fn() });
+
+    await screen.findByTestId('ai-chat-message-0');
+
+    expect(screen.queryByTestId('ai-chat-origin-bar')).not.toBeInTheDocument();
+  });
+
+  it('stays hidden when the panel does not know where it is', async () => {
+    openHistoryPanel(restoring({ originPath: '/ui/automations' }));
+
+    await screen.findByTestId('ai-chat-message-0');
+
+    expect(screen.queryByTestId('ai-chat-origin-bar')).not.toBeInTheDocument();
+  });
+
+  it('goes away once you are on the page the chat started on', async () => {
+    const { rerenderWith } = openHistoryPanel(restoring({ originPath: '/ui/automations' }), { originPath: '/ui/devices', onNavigate: vi.fn() });
+    await screen.findByTestId('ai-chat-origin-bar');
+
+    rerenderWith({ originPath: '/ui/automations' });
+
+    expect(screen.queryByTestId('ai-chat-origin-bar')).not.toBeInTheDocument();
+  });
+
+  it('appears for a chat you started here once you move to another page', async () => {
+    const { on, rerenderWith } = openHistoryPanel(library, { originPath: '/ui/devices', onNavigate: vi.fn() });
+    finishConversation(on, 7);
+    expect(screen.queryByTestId('ai-chat-origin-bar')).not.toBeInTheDocument();
+
+    rerenderWith({ originPath: '/ui/traffic' });
+
+    expect(screen.getByTestId('ai-chat-origin-bar')).toHaveTextContent('Started on Devices #d1');
+  });
+
+  it('shows the bar for a chat opened from the list', async () => {
+    openHistoryPanel(library, { originPath: '/ui/traffic', onNavigate: vi.fn() });
+    toggleHistory();
+
+    fireEvent.click(await screen.findByTestId('ai-chat-history-item-8'));
+
+    expect(await screen.findByTestId('ai-chat-origin-bar')).toHaveTextContent('Started on Devices #d1');
+  });
+
+  it('sends the origin with the first message of a new chat only', () => {
+    const { ws, on } = openHistoryPanel(library, { originPath: '/ui/devices?x=1' });
+
+    typeAndSend('first');
+    act(() => { on('ai:done')({ type: 'ai:done', conversationId: 7 }); });
+    typeAndSend('second');
+
+    const [first, second] = sentOf(ws, 'ai:message');
+    expect(first.originPath).toBe('/ui/devices?x=1');
+    expect(second.conversationId).toBe(7);
+    expect(second).not.toHaveProperty('originPath');
+  });
+
+  it('sends no origin when the panel does not know where it is', () => {
+    const { ws } = openHistoryPanel(library);
+
+    typeAndSend('first');
+
+    expect(sentOf(ws, 'ai:message')[0]).not.toHaveProperty('originPath');
+  });
+});
+
+describe('AiChatPanel remembered conversation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  const remembering = (id: number, remembered: unknown): Route => (_method, url) => {
+    if (idOf(url) === String(id)) return remembered;
+    if (isLatest(url)) return restOk(savedConversation(99));
+    return restOk(null);
+  };
+
+  it('reopens the conversation remembered for this page instead of the latest one', async () => {
+    localStorage.setItem(OPEN_KEY, '12');
+    const { sendRestApi } = openHistoryPanel(remembering(12, restOk(savedConversation(12))));
+
+    await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 12'));
+
+    expect(sendRestApi.mock.calls.some(([, url]) => isLatest(url))).toBe(false);
+  });
+
+  it('falls back to the latest conversation, and forgets the id, when the remembered one is gone', async () => {
+    localStorage.setItem(OPEN_KEY, '12');
+    openHistoryPanel(remembering(12, restStatus(404)));
+
+    await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 99'));
+
+    expect(localStorage.getItem(OPEN_KEY)).toBeNull();
+  });
+
+  it('falls back to the latest conversation when the remembered one cannot be fetched', async () => {
+    localStorage.setItem(OPEN_KEY, '12');
+    const route: Route = (method, url) => {
+      if (idOf(url) === '12') return Promise.reject(new Error('socket closed'));
+      return remembering(12, null)(method, url);
+    };
+    openHistoryPanel(route);
+
+    await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 99'));
+  });
+
+  it('falls back to the latest conversation when the remembered one has no messages', async () => {
+    localStorage.setItem(OPEN_KEY, '12');
+    openHistoryPanel(remembering(12, restOk(savedConversation(12, { messages: [] }))));
+
+    await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 99'));
+  });
+
+  it('uses the latest conversation when nothing is remembered', async () => {
+    openHistoryPanel(remembering(12, restOk(savedConversation(12))));
+
+    await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 99'));
+  });
+
+  it('keeps a separate memory for each page context', async () => {
+    localStorage.setItem(OPEN_KEY, '12');
+    openHistoryPanel(remembering(12, restOk(savedConversation(12))), { contextId: 'd2' });
+
+    await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 99'));
+  });
+
+  it('still works when storage cannot be read or written', async () => {
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('denied'); });
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('denied'); });
+    try {
+      const { on } = openHistoryPanel(remembering(12, restOk(savedConversation(12))));
+      await waitFor(() => expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('Question 99'));
+
+      finishConversation(on, 5);
+
+      expect(screen.getByTestId('ai-chat-message-2')).toBeInTheDocument();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('remembers the id a new chat gets, and forgets it on New Chat', () => {
+    const { on } = openHistoryPanel(library);
+
+    finishConversation(on, 7);
+    expect(localStorage.getItem(OPEN_KEY)).toBe('7');
+
+    fireEvent.click(screen.getByTestId('ai-chat-new-btn'));
+    expect(localStorage.getItem(OPEN_KEY)).toBeNull();
+  });
+
+  it('does not let a late remembered chat replace what the user did in the meantime', async () => {
+    localStorage.setItem(OPEN_KEY, '12');
+    let resolveRemembered!: (value: unknown) => void;
+    const route: Route = (method, url) => (
+      idOf(url) === '12' ? new Promise((resolve) => { resolveRemembered = resolve; }) : library(method, url)
+    );
+    const { ws } = openHistoryPanel(route);
+
+    typeAndSend('typed meanwhile');
+    await act(async () => { resolveRemembered(restOk(savedConversation(12))); });
+
+    expect(screen.queryByText('Question 12')).not.toBeInTheDocument();
+    expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('typed meanwhile');
+    expect(sentOf(ws, 'ai:yolo')).not.toContainEqual({ conversationId: 12 });
+  });
+
+  it('does not let a late fallback to the latest chat replace what the user did in the meantime', async () => {
+    localStorage.setItem(OPEN_KEY, '12');
+    let resolveLatest!: (value: unknown) => void;
+    const route: Route = (method, url) => {
+      if (idOf(url) === '12') return restStatus(404);
+      if (isLatest(url)) return new Promise((resolve) => { resolveLatest = resolve; });
+      return library(method, url);
+    };
+    openHistoryPanel(route);
+    await waitFor(() => expect(resolveLatest).toBeDefined());
+
+    typeAndSend('typed meanwhile');
+    await act(async () => { resolveLatest(restOk(savedConversation(99))); });
+
+    expect(screen.queryByText('Question 99')).not.toBeInTheDocument();
+    expect(screen.getByTestId('ai-chat-message-0')).toHaveTextContent('typed meanwhile');
+  });
+});
+
+describe('AiChatPanel unfinished notice', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  const restoring = (over: Record<string, unknown>): Route => (_method, url) => (
+    isLatest(url) ? restOk(savedConversation(7, over)) : restOk(null)
+  );
+
+  it('tells you a restored chat was cut off, until you send the next message', async () => {
+    openHistoryPanel(restoring({ unfinished: true }));
+
+    const notice = await screen.findByTestId('ai-chat-unfinished-notice');
+    expect(notice).toHaveTextContent('The last reply was cut off');
+    expect(notice).toHaveTextContent('continue');
+
+    typeAndSend('continue');
+
+    expect(screen.queryByTestId('ai-chat-unfinished-notice')).not.toBeInTheDocument();
+  });
+
+  it('says nothing about a chat that finished', async () => {
+    openHistoryPanel(restoring({ unfinished: false }));
+
+    await screen.findByTestId('ai-chat-message-0');
+
+    expect(screen.queryByTestId('ai-chat-unfinished-notice')).not.toBeInTheDocument();
+  });
+
+  it('tells you about a cut-off chat opened from the list', async () => {
+    const route: Route = (method, url) => (
+      idOf(url) === '8' ? restOk(savedConversation(8, { unfinished: true })) : library(method, url)
+    );
+    openHistoryPanel(route);
+    toggleHistory();
+
+    fireEvent.click(await screen.findByTestId('ai-chat-history-item-8'));
+
+    expect(await screen.findByTestId('ai-chat-unfinished-notice')).toBeInTheDocument();
+  });
+
+  it('goes away on New Chat', async () => {
+    openHistoryPanel(restoring({ unfinished: true }));
+    await screen.findByTestId('ai-chat-unfinished-notice');
+
+    fireEvent.click(screen.getByTestId('ai-chat-new-btn'));
+
+    expect(screen.queryByTestId('ai-chat-unfinished-notice')).not.toBeInTheDocument();
   });
 });

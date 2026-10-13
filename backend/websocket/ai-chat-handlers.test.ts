@@ -131,6 +131,43 @@ describe('AI Chat Handlers', () => {
       });
     });
 
+    describe('originPath', () => {
+      async function sentOriginPath(originPath: unknown): Promise<unknown> {
+        const mockAgent = { handleMessage: vi.fn().mockResolvedValue({ conversationId: 1 }) };
+        setupAgentAndProvider(deps, mockAgent);
+        const handler = getWebsocketHandler('ai:message')!.handler;
+        await handler({ conversationId: null, message: 'hi', pageContext: 'devices', contextId: '', originPath }, createAuthenticatedSocket());
+        return mockAgent.handleMessage.mock.calls[0][0].originPath;
+      }
+
+      it('passes an app path through to the agent', async () => {
+        expect(await sentOriginPath('/ui/analysis/12')).toBe('/ui/analysis/12');
+        expect(await sentOriginPath('/ui/network?pane=traffic&host=api.example.com')).toBe('/ui/network?pane=traffic&host=api.example.com');
+        expect(await sentOriginPath('/ui')).toBe('/ui');
+      });
+
+      it.each([
+        ['an absolute URL', 'https://evil.test/ui/x'],
+        ['a protocol-relative URL', '//evil.test/ui/x'],
+        ['a script URL', 'javascript:alert(1)'],
+        ['a path outside the app', '/v1/auth/me'],
+        ['a lookalike prefix', '/uix/devices'],
+        ['a parent segment', '/ui/../v1/auth/me'],
+        ['whitespace', '/ui/devices x'],
+        ['a newline', '/ui/devices\n/x'],
+        ['a backslash', '/ui\\evil'],
+        ['too long a path', `/ui/${'a'.repeat(600)}`],
+        ['a number', 42],
+        ['an empty string', ''],
+      ])('drops %s', async (_label, value) => {
+        expect(await sentOriginPath(value)).toBeUndefined();
+      });
+
+      it('sends nothing when the browser sends nothing', async () => {
+        expect(await sentOriginPath(undefined)).toBeUndefined();
+      });
+    });
+
     it('should send ai:error when handleMessage throws', async () => {
       const mockAgent = {
         handleMessage: vi.fn().mockRejectedValue(new Error('Provider failed')),

@@ -141,6 +141,16 @@ export function cleanupSocket(socket: WebSocket): void {
 /** Valid page context name: lowercase alphanumeric with hyphens only. */
 const VALID_CONTEXT_RE = /^[a-z0-9-]+$/;
 
+/** An in-app path, `/ui` or under it, with an optional query. It becomes a link in chat history, so nothing else gets through. */
+const ORIGIN_PATH_RE = /^\/ui(?:\/[\w.~%!$&'()*+,;=:@/-]*)?(?:\?[\w.~%!$&'()*+,;=:@/?-]*)?$/;
+const MAX_ORIGIN_PATH_LENGTH = 500;
+
+function sanitizeOriginPath(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || raw.length > MAX_ORIGIN_PATH_LENGTH) return undefined;
+  if (!ORIGIN_PATH_RE.test(raw) || raw.includes('..')) return undefined;
+  return raw;
+}
+
 /** Register the AI chat WebSocket handlers. */
 export function registerAiChatEndpoints(deps: AiChatDeps): void {
   // ── ai:message ─────────────────────────────────────────────────
@@ -216,6 +226,7 @@ export function registerAiChatEndpoints(deps: AiChatDeps): void {
         message: userMessage,
         pageContext,
         contextId,
+        originPath: sanitizeOriginPath(message.originPath),
         mode: 'streaming',
         signal: controller.signal,
         onToken: (text: string) => {

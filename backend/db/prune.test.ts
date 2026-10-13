@@ -551,3 +551,43 @@ describe('injected APK pruning', () => {
     expect(remaining[0].packageName).toBe('recent.app');
   });
 });
+
+describe('AI conversation pruning', () => {
+  let db: BetterSQLite3Database<typeof schema>;
+
+  beforeEach(() => {
+    db = createTestDb();
+    vi.clearAllMocks();
+  });
+
+  function seed(title: string, ageDays: number, automated = false) {
+    db.insert(schema.aiConversations).values({
+      pageContext: 'devices', contextId: '', title, messages: '[]', automated,
+      createdAt: daysAgo(ageDays), updatedAt: daysAgo(ageDays),
+    }).run();
+  }
+  const titles = () => db.select().from(schema.aiConversations).all().map(r => r.title).sort();
+
+  it('keeps a chat past the traffic window and removes it after 90 days by default', async () => {
+    seed('8 days', 8);
+    seed('89 days', 89);
+    seed('91 days', 91);
+    await pruneOldData(db as any, 7, '/tmp/screenshots');
+    expect(titles()).toEqual(['8 days', '89 days']);
+  });
+
+  it('removes an automated run after the traffic window like other analysis data', async () => {
+    seed('auto 8 days', 8, true);
+    seed('auto 2 days', 2, true);
+    seed('chat 8 days', 8);
+    await pruneOldData(db as any, 7, '/tmp/screenshots');
+    expect(titles()).toEqual(['auto 2 days', 'chat 8 days']);
+  });
+
+  it('uses the chat retention it is given', async () => {
+    seed('20 days', 20);
+    seed('40 days', 40);
+    await pruneOldData(db as any, 7, '/tmp/screenshots', undefined, { aiConversationDays: 30 });
+    expect(titles()).toEqual(['20 days']);
+  });
+});

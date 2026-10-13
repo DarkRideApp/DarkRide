@@ -1,6 +1,5 @@
-import { eq } from 'drizzle-orm';
 import type { AppDatabase } from '../db/index';
-import { aiConversations } from '../db/schema';
+import { appendUserMessage, loadForRun, ownerOf, saveRunEnd, saveRunStart } from './ai-conversation-store';
 import type { AiToolRegistry } from './ai-tools';
 import type { AiStreamingProvider } from './ai/dialect';
 import { ModelRefusedError } from './ai/errors';
@@ -39,6 +38,8 @@ export interface HandleMessageParams {
   message: string;
   pageContext: string;
   contextId: string;
+  /** App path a new chat is started from, kept so chat history can link back. Ignored for an existing conversation. */
+  originPath?: string;
   onToken: (text: string) => void;
   onToolStart: (toolUseId: string, toolName: string, input: unknown, toolUseCount: number, turnsRemaining: number) => void;
   onToolResult: (toolUseId: string, toolName: string, output: unknown, durationMs: number) => void;
@@ -416,23 +417,23 @@ export class AiAgent implements AiAgentInterface {
 
     const unattended = mode === 'silent';
 
-    let { conversationId } = params;
+    // 1. Load the conversation this run continues; an unknown or foreign id starts a new one
+    const ownerId = ownerOf(identity, unattended);
+    const existing = loadForRun(this.db, params.conversationId, ownerId);
+    let messages: AiMessage[] = existing ? JSON.parse(existing.messages) : [];
 
-    // 1. Load or create conversation
-    let messages: AiMessage[] = [];
-    if (conversationId !== null) {
-      const row = this.db
-        .select()
-        .from(aiConversations)
-        .where(eq(aiConversations.id, conversationId))
-        .get();
-      if (row) {
-        messages = JSON.parse(row.messages);
-      }
-    }
-
-    // 2. Append user message
-    messages.push({ role: 'user', content: message });
+    // 2. Append the user message and save it before the model is called
+    messages = appendUserMessage(messages, message);
+    const conversationId = saveRunStart(this.db, {
+      conversationId: existing ? existing.id : null,
+      ownerId,
+      automated: unattended,
+      pageContext,
+      contextId,
+      originPath: params.originPath,
+      title: generateTitle(message),
+      messages,
+    });
 
     // 3. Get tool definitions for the page context (filtered by user scopes + unattended mode)
     const activeContexts = new Set<string>([pageContext]);
@@ -675,37 +676,13 @@ export class AiAgent implements AiAgentInterface {
       }
     }
 
-    // 6. Save conversation to DB
-    const title = generateTitle(message);
-    const now = new Date();
-
-    if (conversationId !== null) {
-      this.db
-        .update(aiConversations)
-        .set({
-          messages: JSON.stringify(messages),
-          inputTokens: totalUsage.inputTokens,
-          outputTokens: totalUsage.outputTokens,
-          updatedAt: now,
-        })
-        .where(eq(aiConversations.id, conversationId))
-        .run();
-    } else {
-      const result = this.db
-        .insert(aiConversations)
-        .values({
-          pageContext,
-          contextId,
-          title,
-          messages: JSON.stringify(messages),
-          inputTokens: totalUsage.inputTokens,
-          outputTokens: totalUsage.outputTokens,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .run();
-      conversationId = Number(result.lastInsertRowid);
-    }
+    // 6. Save the conversation
+    saveRunEnd(this.db, conversationId, {
+      messages,
+      inputTokens: totalUsage.inputTokens,
+      outputTokens: totalUsage.outputTokens,
+      unfinished: Boolean(error) || turnLimitReached,
+    });
 
     // 7. Return result
     return {
