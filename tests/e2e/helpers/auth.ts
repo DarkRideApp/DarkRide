@@ -48,6 +48,14 @@ export async function apiLogin(
   return data.csrfToken;
 }
 
+/** The CSRF token of the page's session. The server returns it in the login and /v1/auth/me bodies; there is no cookie. */
+export async function getCsrfToken(page: Page): Promise<string> {
+  const res = await page.request.get('/v1/auth/me');
+  const data = await res.json();
+  if (!data.csrfToken) throw new Error('No CSRF token for the current session');
+  return data.csrfToken;
+}
+
 /**
  * Wait for the AuthGuard to resolve past the "Loading..." state.
  * Returns 'login' if the login form appears, 'app' if the authenticated app loaded.
