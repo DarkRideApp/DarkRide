@@ -258,6 +258,63 @@ describe('GET /v1/ai/conversations/latest, owner and history fields', () => {
     const res = await request(createApp(db, null)).get('/v1/ai/conversations/latest?pageContext=devices&contextId=');
     expect(res.status).toBe(401);
   });
+
+  it('answers 403 without the chat scope and returns no messages, including for unowned conversations', async () => {
+    insertConversation(db, 'apk-analysis', '12', [{ role: 'user', content: 'unowned run' }], 1000, { userId: null, automated: true });
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'mine' }], 1000, { userId: 1 });
+    for (const [pageContext, contextId] of [['apk-analysis', '12'], ['devices', '']]) {
+      const res = await request(createApp(db, { userId: 1, scopes: ['core.apk:read'] }))
+        .get(`/v1/ai/conversations/latest?pageContext=${pageContext}&contextId=${contextId}`);
+      expect(res.status).toBe(403);
+      expect(JSON.stringify(res.body)).not.toContain('unowned run');
+      expect(JSON.stringify(res.body)).not.toContain('mine');
+    }
+  });
+});
+
+describe('GET /v1/ai/usage, who can read what', () => {
+  let db: BetterSQLite3Database<typeof schema>;
+  const NO_CHAT: TestUser = { userId: 1, scopes: ['core.apk:read'] };
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertConversation(db, 'devices', '', [], 1000, { userId: 1, title: 'Mine', inputTokens: 100, outputTokens: 10 });
+    insertConversation(db, 'devices', '', [], 2000, { userId: 2, title: 'Private plan for user two', inputTokens: 400, outputTokens: 40 });
+    insertConversation(db, 'apk-analysis', '5', [], 3000, { userId: null, title: 'Unowned run', inputTokens: 5, outputTokens: 1, automated: true });
+  });
+
+  it('answers 403 without the chat scope and 401 without an identity, returning no titles or totals', async () => {
+    const forbidden = await request(createApp(db, NO_CHAT)).get('/v1/ai/usage');
+    expect(forbidden.status).toBe(403);
+    expect(JSON.stringify(forbidden.body)).not.toContain('Private plan');
+    const anonymous = await request(createApp(db, null)).get('/v1/ai/usage');
+    expect(anonymous.status).toBe(401);
+    expect(JSON.stringify(anonymous.body)).not.toContain('Private plan');
+  });
+
+  it('counts only the caller\'s conversations and unowned ones, never another user\'s', async () => {
+    const res = await request(createApp(db, { userId: 1, scopes: ['core.ai:chat'] })).get('/v1/ai/usage');
+    expect(res.status).toBe(200);
+    expect(res.body.data.totalInputTokens).toBe(105);
+    expect(res.body.data.totalOutputTokens).toBe(11);
+    expect(res.body.data.conversationCount).toBe(2);
+    const titles = res.body.data.conversations.map((c: { title: string }) => c.title).sort();
+    expect(titles).toEqual(['Mine', 'Unowned run']);
+    expect(res.body.data.byContext.find((c: { pageContext: string }) => c.pageContext === 'devices').count).toBe(1);
+  });
+
+  it('shows the other user their own totals and not the first user\'s', async () => {
+    const res = await request(createApp(db, { userId: 2, scopes: ['core.ai:chat'] })).get('/v1/ai/usage');
+    expect(res.body.data.totalInputTokens).toBe(405);
+    const titles = res.body.data.conversations.map((c: { title: string }) => c.title);
+    expect(titles).not.toContain('Mine');
+  });
+
+  it('keeps the other user out of a filtered query too', async () => {
+    const res = await request(createApp(db, { userId: 1, scopes: ['core.ai:chat'] })).get('/v1/ai/usage?pageContext=devices');
+    expect(res.body.data.conversationCount).toBe(1);
+    expect(res.body.data.conversations.map((c: { title: string }) => c.title)).toEqual(['Mine']);
+  });
 });
 
 describe('GET /v1/ai/conversations (history list)', () => {

@@ -90,7 +90,7 @@ export function registerAiChatApiEndpoints(db: AppDatabase, getClaudeCliProvider
       .all()[0];
 
     res.json({ success: true, data: row ? toConversation(row) : null });
-  });
+  }, { requires: ['core.ai:chat'] });
 
   // GET /v1/ai/conversations?limit=&offset=&q=&pageContext=&contextId= (history list, newest activity first)
   registerEndpoint('GET', '/v1/ai/conversations', (req, res) => {
@@ -190,14 +190,19 @@ export function registerAiChatApiEndpoints(db: AppDatabase, getClaudeCliProvider
     res.json({ success: true });
   }, { requires: ['core.ai:chat'] });
 
-  // GET /v1/ai/usage?pageContext=X&from=timestamp&to=timestamp
+  // GET /v1/ai/usage?pageContext=X&from=timestamp&to=timestamp (the caller's conversations plus unowned ones)
   registerEndpoint('GET', '/v1/ai/usage', (req, res) => {
+    const userId = req.authUser?.userId;
+    if (userId == null) {
+      res.status(401).json({ success: false, error: 'Authentication required' });
+      return;
+    }
     const filterContext = req.query.pageContext as string | undefined;
     const fromTs = req.query.from ? Number(req.query.from) : undefined;
     const toTs = req.query.to ? Number(req.query.to) : undefined;
 
     // Build filter conditions
-    const conditions = [];
+    const conditions: SQL[] = [visibleTo(userId)];
     if (filterContext) {
       conditions.push(eq(aiConversations.pageContext, filterContext));
     }
@@ -208,7 +213,7 @@ export function registerAiChatApiEndpoints(db: AppDatabase, getClaudeCliProvider
       conditions.push(lte(aiConversations.createdAt, new Date(toTs)));
     }
 
-    const where = conditions.length > 0 ? and(...conditions) : undefined;
+    const where = and(...conditions);
 
     // Aggregate totals
     const totals = db
@@ -265,5 +270,5 @@ export function registerAiChatApiEndpoints(db: AppDatabase, getClaudeCliProvider
         conversations: recentConversations,
       },
     });
-  });
+  }, { requires: ['core.ai:chat'] });
 }

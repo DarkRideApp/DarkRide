@@ -74,6 +74,16 @@ export class AiToolRegistry implements IAiToolRegistry {
     return defs;
   }
 
+  /** Every distinct tool the given scopes may run (all tools when `userScopes` is unset), without `execute`. */
+  listTools(userScopes?: Set<string>): Array<{ name: string; description: string; contexts: string[] }> {
+    const tools: Array<{ name: string; description: string; contexts: string[] }> = [];
+    for (const tool of this.tools.values()) {
+      if (!this.toolPassesFilter(tool, userScopes)) continue;
+      tools.push({ name: tool.name, description: tool.description, contexts: tool.context });
+    }
+    return tools;
+  }
+
   /** Check if a tool requires user confirmation. */
   requiresConfirmation(name: string): boolean {
     return this.tools.get(name)?.requiresConfirmation === true;

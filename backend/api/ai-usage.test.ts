@@ -108,6 +108,10 @@ describe('GET /v1/ai/usage/report', () => {
     registerAiUsageEndpoints(db as any);
     const app = express();
     app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).authUser = { userId, effectiveScopes: new Set(['core.ai:chat', 'core.settings:read']) };
+      next();
+    });
     app.use(getApiRouter());
 
     const keys = getRegisteredEndpoints().map(e => `${e.method} ${e.path}`);

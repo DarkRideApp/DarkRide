@@ -15,6 +15,31 @@ function makeTool(overrides: Partial<AiToolRegistration> = {}): AiToolRegistrati
 }
 
 describe('AiToolRegistry', () => {
+  // ── listTools ──────────────────────────────────────────────────
+
+  it('lists every tool once, without execute, when no scopes are given', () => {
+    const registry = new AiToolRegistry();
+    registry.register(makeTool({ name: 'a', context: ['devices', 'frida'] }));
+    registry.register(makeTool({ name: 'b', context: ['frida'], requiredScope: 'core.frida:manage' }));
+
+    const result = registry.listTools();
+    expect(result).toEqual([
+      { name: 'a', description: 'A test tool', contexts: ['devices', 'frida'] },
+      { name: 'b', description: 'A test tool', contexts: ['frida'] },
+    ]);
+  });
+
+  it('leaves out tools whose required scope the caller lacks, and keeps ones a wildcard covers', () => {
+    const registry = new AiToolRegistry();
+    registry.register(makeTool({ name: 'open' }));
+    registry.register(makeTool({ name: 'read', requiredScope: 'core.frida:read' }));
+    registry.register(makeTool({ name: 'manage', requiredScope: 'core.frida:manage' }));
+
+    expect(registry.listTools(new Set()).map(t => t.name)).toEqual(['open']);
+    expect(registry.listTools(new Set(['core.frida:read'])).map(t => t.name)).toEqual(['open', 'read']);
+    expect(registry.listTools(new Set(['core.frida:*'])).map(t => t.name)).toEqual(['open', 'read', 'manage']);
+  });
+
   // ── getToolsForContext ─────────────────────────────────────────
 
   it('returns tools registered for a given context', () => {
