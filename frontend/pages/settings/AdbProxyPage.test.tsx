@@ -69,6 +69,8 @@ function mount(opts: { snapshot?: StatusSnapshot; scopes?: string[]; failWith?: 
 
 const writes = (calls: Array<{ method: string }>) => calls.filter((c) => c.method !== 'GET');
 const confirm = () => fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+// The page subscribes to the clock in an effect that can run after findBy resolves; moving the fake clock first would skip every tick.
+const whenTicking = () => vi.waitFor(() => expect(vi.getTimerCount()).toBeGreaterThan(0));
 
 describe('AdbProxyPage', () => {
   it('denies access without the read scope', async () => {
@@ -818,6 +820,7 @@ describe('AdbProxyPage', () => {
       const connections = await screen.findByTestId('adb-proxy-connections');
       const request = screen.getByTestId('adb-proxy-request');
       const approved = screen.getByTestId('adb-proxy-approved');
+      await whenTicking();
       expect(within(connections).getByText('5 s')).toBeInTheDocument();
       expect(within(request).getByText('just now')).toBeInTheDocument();
       expect(within(approved).getByText(/just now from 10\.0\.0\.7/)).toBeInTheDocument();
@@ -850,7 +853,7 @@ describe('AdbProxyPage', () => {
         }),
       });
       await screen.findByTestId('adb-proxy-connections');
-      expect(vi.getTimerCount()).toBeGreaterThan(0);
+      await whenTicking();
       cleanup();
       expect(vi.getTimerCount()).toBe(0);
     });
