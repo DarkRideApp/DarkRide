@@ -12,6 +12,7 @@ function deps() {
       injectMitmproxyCaCert: vi.fn().mockResolvedValue(undefined),
       activateWireGuardTunnel: vi.fn().mockResolvedValue(undefined),
       setupEmulatorHttpProxy: vi.fn().mockResolvedValue(undefined),
+      waitForEmulatorProxyReachable: vi.fn().mockResolvedValue(true),
     },
     spawnContainerHttpForwarder: vi.fn().mockResolvedValue(undefined),
     getActiveDockerClient: vi.fn().mockReturnValue({}),
@@ -176,6 +177,42 @@ describe('capture handlers', () => {
     expect(d.spawnContainerHttpForwarder).toHaveBeenCalled();
     expect(d.deviceManager.setupEmulatorHttpProxy).toHaveBeenCalledWith('localhost:32770', '10.0.2.2', 8081);
     expect(r).toEqual({ tunnelActivated: false, emuHttpProxy: { host: '10.0.2.2', port: 8081 } });
+  });
+
+  it('emu-http-proxy: returns only once the guest can reach the proxy, and reports connectivity ok', async () => {
+    // Regression: a freshly booted emulator is "running" a few seconds before
+    // its wifi is up. capture/start used to return at once with connectivity
+    // ok, and an app launched right after got "Network is unreachable".
+    const d = deps();
+    const order: string[] = [];
+    d.deviceManager.setupEmulatorHttpProxy = vi.fn().mockImplementation(async () => { order.push('setup'); });
+    let release!: (reachable: boolean) => void;
+    d.deviceManager.waitForEmulatorProxyReachable = vi.fn().mockImplementation(
+      () => { order.push('wait'); return new Promise<boolean>((resolve) => { release = resolve; }); },
+    );
+    const c = ctx({ mode: 'emu-http-proxy' });
+    let done = false;
+    const pending = makeCaptureHandlers(d as any)['emu-http-proxy'](c).then((r) => { done = true; return r; });
+
+    await vi.waitFor(() => expect(d.deviceManager.waitForEmulatorProxyReachable).toHaveBeenCalled());
+    expect(order).toEqual(['setup', 'wait']);
+    expect(d.deviceManager.waitForEmulatorProxyReachable).toHaveBeenCalledWith('localhost:32770', '10.0.2.2', 8081);
+    expect(done).toBe(false);
+
+    release(true);
+    const r = await pending;
+    expect(r.emuHttpProxy).toEqual({ host: '10.0.2.2', port: 8081 });
+    expect(c.setSubsystem).toHaveBeenCalledWith('connectivity', 'ok');
+  });
+
+  it('emu-http-proxy: still succeeds with a connectivity warning when the guest never reaches the proxy', async () => {
+    const d = deps();
+    d.deviceManager.waitForEmulatorProxyReachable = vi.fn().mockResolvedValue(false);
+    const c = ctx({ mode: 'emu-http-proxy' });
+    const r = await makeCaptureHandlers(d as any)['emu-http-proxy'](c);
+    expect(r).toEqual({ tunnelActivated: false, emuHttpProxy: { host: '10.0.2.2', port: 8081 } });
+    expect(c.setSubsystem).toHaveBeenCalledWith('connectivity', 'warning');
+    expect(c.setSubsystem).not.toHaveBeenCalledWith('connectivity', 'ok');
   });
 
   it('emu-http-proxy: throws when no docker client/runtimeId', async () => {

@@ -28,7 +28,7 @@ export interface CaptureHandlerDeps {
   mitmproxyManager: Pick<MitmproxyManager, 'startCapture' | 'startHttpProxyCapture' | 'isCapturing'>;
   deviceManager: Pick<
     DeviceManager,
-    'injectMitmproxyCaCert' | 'activateWireGuardTunnel' | 'setupEmulatorHttpProxy'
+    'injectMitmproxyCaCert' | 'activateWireGuardTunnel' | 'setupEmulatorHttpProxy' | 'waitForEmulatorProxyReachable'
   >;
   spawnContainerHttpForwarder: (
     d: DockerLike,
@@ -257,11 +257,18 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
     // than failing.
     ctx.setSubsystem('wireguard', 'skipped');
 
+    // A booting emulator is ready for adb before its wifi is up; return only
+    // once an app launched next can actually reach the proxy.
+    const reachable = await deviceManager.waitForEmulatorProxyReachable(ctx.deviceId, emuHttpProxyEndpoint.host, port);
+
     if (!mitmproxyManager.isCapturing(ctx.deviceId)) {
       ctx.setSubsystem('mitmproxy', 'error');
       throw new Error('mitmproxy process exited during capture startup');
     }
-    ctx.setSubsystem('connectivity', 'ok');
+    ctx.setSubsystem('connectivity', reachable ? 'ok' : 'warning');
+    if (!reachable) {
+      log(`Emulator ${ctx.deviceId} cannot reach the capture proxy yet, capture continues`);
+    }
 
     return { tunnelActivated: false, emuHttpProxy: emuHttpProxyEndpoint };
   };
