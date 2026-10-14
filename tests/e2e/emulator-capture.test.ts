@@ -17,7 +17,7 @@
  * cached across runs via the workflow's image cache step.
  */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { resolve } from 'path';
 import { existsSync } from 'fs';
 import http from 'http';
@@ -67,6 +67,27 @@ async function waitFor<T>(fn: () => Promise<T | undefined>, timeoutMs: number, i
   throw new Error(`waitFor: timeout after ${timeoutMs}ms`);
 }
 
+/**
+ * Print what the host knows about the emulator containers. A failed boot
+ * leaves no trace once the test tears the container down, and the emulator's
+ * own output is the only place the reason shows.
+ */
+function dumpEmulatorDiagnostics(): void {
+  const run = (label: string, cmd: string, args: string[]) => {
+    const r = spawnSync(cmd, args, { encoding: 'utf8' });
+    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim().split('\n').slice(-120).join('\n');
+    console.log(`[E2E diag] ${label}:\n${out || (r.error?.message ?? '(no output)')}`);
+  };
+  run('/dev/kvm', 'ls', ['-l', '/dev/kvm']);
+  run('cpu virtualization flag', 'sh', ['-c', "grep -o -m1 -E 'vmx|svm' /proc/cpuinfo || echo none"]);
+  run('adb devices', 'adb', ['devices', '-l']);
+  const ids = (spawnSync('docker', ['ps', '-aq', '--filter', 'label=darkride.emulator=true'], { encoding: 'utf8' }).stdout ?? '')
+    .split('\n').filter(Boolean);
+  for (const id of ids) {
+    run(`docker logs ${id.slice(0, 12)}`, 'docker', ['logs', '--tail', '120', id]);
+  }
+}
+
 describe('E2E — emulator capture', () => {
   it(
     'spawns docker-android, installs fixture, captures the ping, asserts the trace',
@@ -89,6 +110,7 @@ describe('E2E — emulator capture', () => {
       expect(create.status).toBe(200);
       const instanceId = create.body?.data?.instance?.id as number;
       expect(instanceId).toBeDefined();
+      let passed = false;
 
       try {
         // The create call answers at once with state "pulling" and no
@@ -225,7 +247,9 @@ describe('E2E — emulator capture', () => {
         const capturedUrl = new URL(captured.requestUrl);
         expect(capturedUrl.hostname).toBe('example.com');
         expect(capturedUrl.searchParams.get('darkride-e2e')).toBe('ping');
+        passed = true;
       } finally {
+        if (!passed) dumpEmulatorDiagnostics();
         // 8. Tear down — stop + delete the container even if assertions failed
         await rest(
           'POST',
