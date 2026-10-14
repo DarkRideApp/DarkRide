@@ -347,6 +347,38 @@ describe('docker-android provider', () => {
     await expect(p.deleteInstance!('container-test-emu')).rejects.toThrow(/running/i);
   });
 
+  describe('an instance with no container yet (empty runtime id)', () => {
+    // Docker answers a path with an empty id segment by redirecting, and
+    // docker-modem follows the redirect to a bogus host. Never send it.
+    it('stopInstance is a no-op and never asks Docker for a container', async () => {
+      const d = makeDockerMock();
+      const p = makeProvider(d);
+      await expect(p.stopInstance('')).resolves.toBeUndefined();
+      expect(d.getContainer).not.toHaveBeenCalled();
+    });
+
+    it('deleteInstance is a no-op and never asks Docker for a container', async () => {
+      const d = makeDockerMock();
+      const p = makeProvider(d);
+      await expect(p.deleteInstance!('')).resolves.toBeUndefined();
+      expect(d.getContainer).not.toHaveBeenCalled();
+    });
+
+    it('startInstance rejects with a plain message and never asks Docker for a container', async () => {
+      const d = makeDockerMock();
+      const p = makeProvider(d);
+      await expect(p.startInstance('')).rejects.toThrow(/no container/i);
+      expect(d.getContainer).not.toHaveBeenCalled();
+    });
+
+    it('getGrpcEndpoint rejects and never asks Docker for a container', async () => {
+      const d = makeDockerMock();
+      const p = makeProvider(d);
+      await expect(p.getGrpcEndpoint!('')).rejects.toThrow(/no container/i);
+      expect(d.getContainer).not.toHaveBeenCalled();
+    });
+  });
+
   it('getNetworkConfig returns emu-http-proxy mode (HTTP forward proxy via adb reverse)', () => {
     const p = makeProvider(makeDockerMock());
     expect(p.getNetworkConfig('any')).toEqual({ mode: 'emu-http-proxy' });

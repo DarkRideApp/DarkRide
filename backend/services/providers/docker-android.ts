@@ -55,6 +55,12 @@ const LABEL_KEY = 'darkride.emulator';
 // processes.
 const GRPC_PORT = 8554;
 
+// An instance row has an empty runtime id until its container exists. An empty
+// id makes a `/containers//…` path, which Docker redirects and docker-modem
+// follows to a host named "containers"; that failed lookup is uncaught and
+// ends the process. Methods that take an id check for it before calling Docker.
+const NO_CONTAINER = 'This instance has no container yet (it is still being created, or creating it failed)';
+
 // WebRTC media can't traverse Docker NAT on its own — the emulator's media
 // track reaches `connected` then drops. DarkRide launches a coturn relay
 // (see coturn-manager.ts) and points the emulator at it with `-turncfg`,
@@ -505,6 +511,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     },
 
     async startInstance(id: string): Promise<RunningInstance> {
+      if (!id) throw new Error(NO_CONTAINER);
       const container = d.getContainer(id);
       await container.start();
       const info = await container.inspect();
@@ -564,6 +571,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     },
 
     async stopInstance(id: string): Promise<void> {
+      if (!id) return;
       const container = d.getContainer(id);
       try {
         await container.stop({ t: 10 });
@@ -574,6 +582,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     },
 
     async deleteInstance(id: string): Promise<void> {
+      if (!id) return;
       const container = d.getContainer(id);
       const info = await container.inspect();
       if (info?.State?.Running) {
@@ -583,6 +592,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     },
 
     async getGrpcEndpoint(id: string): Promise<{ host: string; port: number; token?: string }> {
+      if (!id) throw new Error(NO_CONTAINER);
       const container = d.getContainer(id);
       const info = await container.inspect();
       if (!info?.State?.Running) {
