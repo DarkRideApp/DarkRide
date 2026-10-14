@@ -1,12 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync, statSync } from 'fs';
 import { Readable } from 'stream';
 import { tmpdir } from 'os';
 import path from 'path';
 import { findPosixShell, toShellPath } from '../test-utils/posix-shell';
 import {
   buildTurncfgScript,
+  buildTurnConfig,
+  writeTurncfgScript,
+  TURN_CONFIG_ENV,
   buildCoturnContainerSpec,
   loadOrCreateCoturnCreds,
   ensureCoturn,
@@ -16,34 +19,48 @@ const CREDS = { username: 'darkride', password: 'deadbeefcafef00d0123456789abcde
 
 /**
  * Run the turncfg script through a POSIX shell exactly as the emulator does and
- * return the parsed JSON it prints. Executing the real script (rather than
- * string-matching the printf body) is the only way to verify the contract:
- * the emitted stdout must be valid iceServers JSON with the values
- * substituted in.
+ * return what it prints. Executing the real script (rather than string-matching
+ * the body) is the only way to verify the contract: the stdout must be the
+ * iceServers JSON the emulator was handed through its environment.
  */
-function runTurncfg(lanIp: string, creds = CREDS): any {
+function runTurncfgRaw(env: Record<string, string>): string {
   const dir = mkdtempSync(path.join(tmpdir(), 'turncfg-'));
   try {
     const file = path.join(dir, 'turncfg.sh');
-    writeFileSync(file, buildTurncfgScript(lanIp, creds));
+    writeFileSync(file, buildTurncfgScript());
     chmodSync(file, 0o755);
     const sh = findPosixShell();
     if (!sh) throw new Error('no POSIX shell available to run the script');
-    const stdout = execFileSync(sh, [toShellPath(file)], { encoding: 'utf-8' });
-    return JSON.parse(stdout);
+    return execFileSync(sh, [toShellPath(file)], { encoding: 'utf-8', env });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 }
 
+function runTurncfg(lanIp: string, creds = CREDS): any {
+  return JSON.parse(runTurncfgRaw({ [TURN_CONFIG_ENV]: buildTurnConfig(lanIp, creds) }));
+}
+
 describe('buildTurncfgScript', () => {
-  it('emits a sh script whose stdout is valid iceServers JSON', () => {
-    expect(buildTurncfgScript('192.168.1.50', CREDS).startsWith('#!/bin/sh')).toBe(true);
+  it('emits a sh script whose stdout is the iceServers JSON from the environment', () => {
+    expect(buildTurncfgScript().startsWith('#!/bin/sh')).toBe(true);
     const parsed = runTurncfg('192.168.1.50');
     expect(Array.isArray(parsed.iceServers)).toBe(true);
     expect(parsed.iceServers).toHaveLength(1);
   });
 
+  it('holds no credential: the secret travels in the environment, not on disk', () => {
+    const script = buildTurncfgScript();
+    expect(script).not.toContain(CREDS.password);
+    expect(script).not.toContain(CREDS.username);
+  });
+
+  it('prints nothing when the environment variable is not set', () => {
+    expect(runTurncfgRaw({})).toBe('');
+  });
+});
+
+describe('buildTurnConfig', () => {
   it('emits the DUAL-URL array (LAN IP url AND host.docker.internal url)', () => {
     const urls = runTurncfg('192.168.1.50').iceServers[0].urls;
     expect(urls).toEqual([
@@ -52,10 +69,26 @@ describe('buildTurncfgScript', () => {
     ]);
   });
 
-  it('bakes in the username and credential', () => {
-    const server = runTurncfg('10.0.0.7').iceServers[0];
+  it('carries the username and credential', () => {
+    const server = JSON.parse(buildTurnConfig('10.0.0.7', CREDS)).iceServers[0];
     expect(server.username).toBe('darkride');
     expect(server.credential).toBe(CREDS.password);
+  });
+});
+
+describe('writeTurncfgScript', () => {
+  it('leaves a file the emulator user can read and run, whoever owns it on the host', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'turncfg-write-'));
+    try {
+      const file = path.join(dir, 'data', 'turncfg.sh');
+      expect(writeTurncfgScript(file)).toBe(file);
+      // The emulator runs as uid 1300, not the DarkRide user; 0700 made the
+      // script unreadable to it and the emulator never finished booting.
+      expect(statSync(file).mode & 0o005).toBe(0o005);
+      expect(readFileSync(file, 'utf-8')).toBe(buildTurncfgScript());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

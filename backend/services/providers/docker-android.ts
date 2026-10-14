@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'fs';
-import { dirname, resolve } from 'path';
+import { existsSync } from 'fs';
+import { resolve } from 'path';
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import type {
@@ -10,7 +10,7 @@ import { type DockerLike, detectDockerDaemon, listDarkrideContainers } from './d
 import { createLoggers } from '../../logs';
 import { getServerIp } from '../wireguard-config';
 import {
-  loadOrCreateCoturnCreds, buildTurncfgScript, ensureCoturn, type CoturnCreds,
+  loadOrCreateCoturnCreds, buildTurnConfig, writeTurncfgScript, ensureCoturn, TURN_CONFIG_ENV, type CoturnCreds,
 } from '../coturn-manager';
 
 const execFile = promisify(execFileCb);
@@ -293,17 +293,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   // stubs to assert the emulator args deterministically without Docker.
   const coturn = opts.coturn ?? {
     ensure: ensureCoturn,
-    writeTurncfg: (lanIp: string, creds: CoturnCreds, hostPath: string): string | null => {
-      mkdirSync(dirname(hostPath), { recursive: true });
-      writeFileSync(hostPath, buildTurncfgScript(lanIp, creds));
-      // 0700, NOT 0755: this script embeds the long-term TURN credential, so a
-      // world-readable mode would leak the LAN-reachable relay's secret to
-      // every local user. The budtmo emulator container runs as root and reads
-      // it through the bind mount regardless of host ownership, so owner-only
-      // (rwx for the DarkRide user) keeps it functional while host-private.
-      chmodSync(hostPath, 0o700);
-      return hostPath;
-    },
+    writeTurncfg: (_lanIp: string, _creds: CoturnCreds, hostPath: string): string | null => writeTurncfgScript(hostPath),
   };
 
   return {
@@ -388,6 +378,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       // turncfg value is a mounted script path, not an inline command.
       const emulatorArgs = ['-no-skin', `-grpc ${GRPC_PORT}`];
       const binds: string[] = [];
+      let turnConfigEnv: string | null = null;
       // Set up the TURN relay: launch (or reuse) coturn, and ONLY when it's
       // actually up, generate + mount the turncfg script pointing at it.
       // Mounting -turncfg toward a relay that failed to start is pointless, so
@@ -403,6 +394,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
         if (mountPath) {
           emulatorArgs.push(`-turncfg ${TURN_CFG_CONTAINER_PATH}`);
           binds.push(`${mountPath}:${TURN_CFG_CONTAINER_PATH}:ro`);
+          turnConfigEnv = `${TURN_CONFIG_ENV}=${buildTurnConfig(lanIp, creds)}`;
           log(`docker-android: WebRTC TURN enabled (coturn external-ip ${lanIp}, mounting ${mountPath})`);
         } else {
           log('docker-android: coturn relay unavailable — skipping -turncfg; WebRTC media may not traverse Docker NAT (png fallback still works)');
@@ -448,6 +440,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             // loopback below. `-turncfg` (when the script is mounted) supplies
             // the WebRTC TURN relay. Built above.
             `EMULATOR_ADDITIONAL_ARGS=${emulatorArgs.join(' ')}`,
+            ...(turnConfigEnv ? [turnConfigEnv] : []),
             // Disable nvidia-container-cli's legacy mode entirely. When the
             // nvidia-container-toolkit is installed in the host environment
             // (e.g. Docker Desktop with GPU support enabled on Windows/WSL),
