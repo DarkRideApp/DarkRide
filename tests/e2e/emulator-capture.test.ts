@@ -37,7 +37,10 @@ async function rest(method: string, path: string, body?: any): Promise<{ status:
   // workflow exports it as DARKRIDE_API_KEY. Without auth, the
   // core.devices:manage + core.traffic:manage scoped endpoints reject.
   if (API_KEY) headers['Authorization'] = `Bearer ${API_KEY}`;
-  const opts: http.RequestOptions = { method, headers };
+  // No pooled connection: `adb install` blocks this process for several seconds,
+  // long enough for the server to close an idle keep-alive socket that the next
+  // request would reuse, which fails with "socket hang up".
+  const opts: http.RequestOptions = { method, headers, agent: false };
   return new Promise<{ status: number; body: any }>((resolveP, rejectP) => {
     const req = http.request(url, opts, (res) => {
       const chunks: Buffer[] = [];
