@@ -107,21 +107,23 @@ jobs:
         uses: actions/cache@v6
         id: image-cache
         with:
-          path: /tmp/docker-image-cache
+          # Not /tmp: it is a RAM-backed tmpfs capped at about 8 GB on ubuntu-26.04,
+          # and this tarball is 5.4 GB.
+          path: ~/docker-image-cache
           # Static key — we always want budtmo/docker-android:emulator_14.0.
           # Bump the suffix here to invalidate the cache when changing tags.
-          key: docker-android-budtmo-emulator_14.0-v1
+          key: docker-android-budtmo-emulator_14.0-v2
 
       - name: Pull or restore budtmo/docker-android:emulator_14.0
         run: |
-          mkdir -p /tmp/docker-image-cache
-          if [ -f /tmp/docker-image-cache/docker-android-budtmo-14.tar ]; then
+          mkdir -p ~/docker-image-cache
+          if [ -f ~/docker-image-cache/docker-android-budtmo-14.tar ]; then
             echo "Restoring image from cache"
-            docker load -i /tmp/docker-image-cache/docker-android-budtmo-14.tar
+            docker load -i ~/docker-image-cache/docker-android-budtmo-14.tar
           else
             echo "Pulling fresh image from Docker Hub"
             docker pull budtmo/docker-android:emulator_14.0
-            docker save budtmo/docker-android:emulator_14.0 -o /tmp/docker-image-cache/docker-android-budtmo-14.tar
+            docker save budtmo/docker-android:emulator_14.0 -o ~/docker-image-cache/docker-android-budtmo-14.tar
           fi
 
       # 6. Start DarkRide backend in the background.

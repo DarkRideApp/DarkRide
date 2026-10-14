@@ -34,7 +34,18 @@ function actionsBelowNode24(source: string): string[] {
   return outdated;
 }
 
+// /tmp is a RAM-backed tmpfs capped at about 8 GB on ubuntu-26.04 (it is on the disk on 24.04),
+// so a cache path there fills it and tar writes a truncated file while the cache step reports success.
+function tmpfsPaths(source: string): string[] {
+  return [...source.matchAll(/^\s*path:\s*(\/tmp\S*)/gm)].map((m) => m[1]);
+}
+
 describe('workflow runtime helpers', () => {
+  it('flags a path under /tmp and accepts one in the home directory', () => {
+    expect(tmpfsPaths('          path: /tmp/docker-image-cache\n')).toEqual(['/tmp/docker-image-cache']);
+    expect(tmpfsPaths('          path: ~/docker-image-cache\n')).toEqual([]);
+  });
+
   it('flags a floating runner label and accepts a pinned one', () => {
     expect(floatingRunners('    runs-on: ubuntu-latest\n')).toEqual(['ubuntu-latest']);
     expect(floatingRunners('    runs-on: ubuntu-26.04\n')).toEqual([]);
@@ -61,6 +72,10 @@ describe('workflow runtime', () => {
 
     it(`${file} uses only action versions that run on Node 24`, () => {
       expect(actionsBelowNode24(source)).toEqual([]);
+    });
+
+    it(`${file} keeps no cache or artifact path under /tmp`, () => {
+      expect(tmpfsPaths(source)).toEqual([]);
     });
   }
 });
