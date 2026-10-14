@@ -40,7 +40,23 @@ function tmpfsPaths(source: string): string[] {
   return [...source.matchAll(/^\s*path:\s*(\/tmp\S*)/gm)].map((m) => m[1]);
 }
 
+// A cached .venv holds site-packages for the Python that built it. Restored under a different
+// Python, `.venv/bin/python` resolves but imports fail ("No module named ..."), so the key must
+// carry the Python version.
+function venvCacheKeysWithoutPython(source: string): string[] {
+  return [...source.matchAll(/^\s*path:\s*\.venv\s*\n\s*key:\s*([^\n]+)/gm)]
+    .map((m) => m[1].trim())
+    .filter((key) => !key.includes('python-version'));
+}
+
 describe('workflow runtime helpers', () => {
+  it('flags a .venv cache key without the Python version', () => {
+    const bad = "          path: .venv\n          key: python-venv-${{ hashFiles('python/requirements.txt') }}\n";
+    const good = "          path: .venv\n          key: python-venv-${{ steps.py.outputs.python-version }}-${{ hashFiles('r.txt') }}\n";
+    expect(venvCacheKeysWithoutPython(bad)).toEqual(["python-venv-${{ hashFiles('python/requirements.txt') }}"]);
+    expect(venvCacheKeysWithoutPython(good)).toEqual([]);
+  });
+
   it('flags a path under /tmp and accepts one in the home directory', () => {
     expect(tmpfsPaths('          path: /tmp/docker-image-cache\n')).toEqual(['/tmp/docker-image-cache']);
     expect(tmpfsPaths('          path: ~/docker-image-cache\n')).toEqual([]);
@@ -76,6 +92,10 @@ describe('workflow runtime', () => {
 
     it(`${file} keeps no cache or artifact path under /tmp`, () => {
       expect(tmpfsPaths(source)).toEqual([]);
+    });
+
+    it(`${file} keys a cached .venv by the Python version`, () => {
+      expect(venvCacheKeysWithoutPython(source)).toEqual([]);
     });
   }
 });

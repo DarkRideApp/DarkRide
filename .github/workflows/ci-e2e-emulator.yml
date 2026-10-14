@@ -138,12 +138,20 @@ jobs:
       # + frida wheel builds are the dominant cost. Pre-warming flips them
       # from the boot critical path to a cached workflow step (~90s, then
       # ~5s on subsequent runs via actions/cache).
+      # Pinned like ci.yml: the image's own python3 changes between runner
+      # images, and a cached venv only works under the Python that built it.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        id: py
+        with:
+          python-version: '3.13'
+
       - name: Cache Python venv
         uses: actions/cache@v6
         id: venv-cache
         with:
           path: .venv
-          key: python-venv-${{ hashFiles('python/requirements.txt') }}
+          key: python-venv-${{ runner.os }}-${{ steps.py.outputs.python-version }}-${{ hashFiles('python/requirements.txt') }}
 
       - name: Pre-warm Python venv
         if: steps.venv-cache.outputs.cache-hit != 'true'
