@@ -34,6 +34,8 @@ const MIN_BATTERY_LEVEL = 50;
 // device (no su, or su denied) still errors within a second regardless, so a
 // generous value here only costs time on the "waiting for a real grant" path.
 const ROOT_GRANT_TIMEOUT = 30_000;
+// Under the frontend's 30s abort of the capture-start call.
+const EMULATOR_PROXY_WAIT_MS = 15_000;
 
 export interface DeviceStatus {
   id: string;
@@ -1918,6 +1920,46 @@ export class DeviceManager {
     // pick it up even though HttpURLConnection ignores it.
     log(`Setting global http_proxy=${proxyHost}:${proxyPort} on ${deviceId}`);
     await adbShell(deviceId, `settings put global http_proxy ${proxyHost}:${proxyPort}`, 5_000);
+  }
+
+  /**
+   * Wait until the emulator can open a TCP connection to `host:port` from inside
+   * the guest. A fresh emulator reports sys.boot_completed several seconds before
+   * its wifi is up, and until then every connect fails with "Network is
+   * unreachable". Resolves false on timeout; the caller decides if that is fatal.
+   */
+  async waitForEmulatorProxyReachable(
+    deviceId: string,
+    host: string,
+    port: number,
+    opts: { timeoutMs?: number; intervalMs?: number } = {},
+  ): Promise<boolean> {
+    if (!/^[\d.]+$/.test(host) || !Number.isInteger(port)) {
+      throw new Error(`Invalid proxy endpoint ${host}:${port}`);
+    }
+    const deadline = Date.now() + (opts.timeoutMs ?? EMULATOR_PROXY_WAIT_MS);
+    const intervalMs = opts.intervalMs ?? 500;
+    // Always exits 0 so the probe's own exit status arrives in stdout.
+    const probe = `out=$(timeout 3 toybox nc -w 2 ${host} ${port} </dev/null 2>&1); echo "rc=$? $out"`;
+    for (;;) {
+      let out = '';
+      try {
+        out = await adbShell(deviceId, probe, 8_000);
+      } catch {
+        // adb hiccup: treat as not reachable yet
+      }
+      const rc = /^rc=(\d+)/.exec(out)?.[1];
+      if (rc === '0') return true;
+      if (rc === '127') {
+        log(`No toybox nc on ${deviceId}, cannot probe ${host}:${port}`);
+        return true;
+      }
+      if (Date.now() >= deadline) {
+        log(`Guest ${deviceId} could not reach ${host}:${port} in time: ${out.replace(/^rc=\d+\s*/, '') || 'no answer'}`);
+        return false;
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
   }
 
   /**

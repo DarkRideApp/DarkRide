@@ -62,6 +62,7 @@ function createMockDeviceManager() {
     deactivateWireGuardTunnel: vi.fn().mockResolvedValue(undefined),
     testTunnelConnectivity: vi.fn().mockResolvedValue({ success: true }),
     setupEmulatorHttpProxy: vi.fn().mockResolvedValue(undefined),
+    waitForEmulatorProxyReachable: vi.fn().mockResolvedValue(true),
   };
 }
 

@@ -668,6 +668,65 @@ describe('DeviceManager', () => {
     });
   });
 
+  describe('waitForEmulatorProxyReachable', () => {
+    let execMock: ReturnType<typeof vi.fn>;
+    const probes = () => execMock.mock.calls.filter(([cmd]) => String(cmd).includes('toybox nc'));
+    const answer = (...outs: string[]) => {
+      let i = 0;
+      execMock.mockImplementation((_cmd: string, _opts: any, cb: any) => {
+        cb(null, outs[Math.min(i++, outs.length - 1)], '');
+      });
+    };
+    beforeEach(async () => {
+      const cp = await import('child_process');
+      execMock = cp.exec as unknown as ReturnType<typeof vi.fn>;
+      execMock.mockReset();
+    });
+
+    it('probes the proxy host and port from inside the guest and resolves true when it connects', async () => {
+      answer('rc=0 ');
+      expect(await manager.waitForEmulatorProxyReachable('DEV001', '10.0.2.2', 4242)).toBe(true);
+      expect(probes()).toHaveLength(1);
+      expect(String(probes()[0][0])).toContain('10.0.2.2 4242');
+    });
+
+    it('keeps polling while the guest has no network, then resolves true (a booting emulator is up before its wifi)', async () => {
+      answer(
+        'rc=1 nc: connect: Network is unreachable',
+        'rc=1 nc: connect: Network is unreachable',
+        'rc=0 ',
+      );
+      const ok = await manager.waitForEmulatorProxyReachable('DEV001', '10.0.2.2', 4242, { intervalMs: 5 });
+      expect(ok).toBe(true);
+      expect(probes()).toHaveLength(3);
+    });
+
+    it('resolves false once the timeout passes without a connection', async () => {
+      answer('rc=1 nc: connect: Network is unreachable');
+      const ok = await manager.waitForEmulatorProxyReachable('DEV001', '10.0.2.2', 4242, { timeoutMs: 60, intervalMs: 10 });
+      expect(ok).toBe(false);
+      expect(probes().length).toBeGreaterThan(1);
+    });
+
+    it('treats an adb failure as not reachable yet and keeps polling', async () => {
+      let n = 0;
+      execMock.mockImplementation((_cmd: string, _opts: any, cb: any) => {
+        if (n++ === 0) cb(new Error('device offline'), '', '');
+        else cb(null, 'rc=0 ', '');
+      });
+      expect(await manager.waitForEmulatorProxyReachable('DEV001', '10.0.2.2', 4242, { intervalMs: 5 })).toBe(true);
+      expect(probes()).toHaveLength(2);
+    });
+
+    it('does not wait out the timeout on an image that has no toybox nc', async () => {
+      answer('rc=127 sh: toybox: inaccessible or not found');
+      const start = Date.now();
+      expect(await manager.waitForEmulatorProxyReachable('DEV001', '10.0.2.2', 4242, { timeoutMs: 5_000, intervalMs: 10 })).toBe(true);
+      expect(probes()).toHaveLength(1);
+      expect(Date.now() - start).toBeLessThan(1_000);
+    });
+  });
+
   describe('deactivateWireGuardTunnel', () => {
     let execMock: ReturnType<typeof vi.fn>;
 
