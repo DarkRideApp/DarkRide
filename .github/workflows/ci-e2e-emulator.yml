@@ -70,6 +70,14 @@ jobs:
           restore-keys: |
             gradle-e2e-fixture-
 
+      # The runner image's own Gradle moves between image releases (9.8 on
+      # image 20261004). The fixture's Kotlin plugin does not resolve on
+      # Gradle 9, so install the version the wrapper below is generated from.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10'
+          cache-disabled: true
+
       - name: Build fixture APK
         working-directory: tests/e2e/fixtures/hello-world
         run: |
