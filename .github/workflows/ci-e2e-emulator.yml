@@ -48,6 +48,8 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # Runner hardware varies between jobs; record it for the post-mortem.
+          lscpu | grep -E 'Vendor ID|Model name' || true
 
       # 2. JDK 17 + Android SDK to build the fixture APK.
       - uses: actions/setup-java@v4
@@ -69,6 +71,14 @@ jobs:
           key: gradle-e2e-fixture-${{ hashFiles('tests/e2e/fixtures/hello-world/**/*.gradle.kts', 'tests/e2e/fixtures/hello-world/gradle.properties') }}
           restore-keys: |
             gradle-e2e-fixture-
+
+      # The runner image's own Gradle moves between image releases (9.8 on
+      # image 20261004). The fixture's Kotlin plugin does not resolve on
+      # Gradle 9, so install the version the wrapper below is generated from.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10'
+          cache-disabled: true
 
       - name: Build fixture APK
         working-directory: tests/e2e/fixtures/hello-world

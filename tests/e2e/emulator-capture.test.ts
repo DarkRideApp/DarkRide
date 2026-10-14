@@ -17,16 +17,19 @@
  * cached across runs via the workflow's image cache step.
  */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'child_process';
-import { resolve } from 'path';
-import { existsSync } from 'fs';
+import { execFileSync, spawnSync } from 'child_process';
+import path, { resolve } from 'path';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'fs';
+import { tmpdir } from 'os';
 import http from 'http';
 
 const APK = resolve('./tests/e2e/fixtures/hello-world/app/build/outputs/apk/debug/app-debug.apk');
 const HOST = process.env.DARKRIDE_HOST ?? 'http://localhost:3001';
 const API_KEY = process.env.DARKRIDE_API_KEY;
 const TIMEOUT_BOOT_MS = 5 * 60_000;
-const TIMEOUT_CAPTURE_MS = 60_000;
+const PING_LAUNCHES = 4;
+const PING_WAIT_MS = 15_000;
+const FIXTURE_PACKAGE = 'wiki.themeparks.darkride.e2efixture';
 
 async function rest(method: string, path: string, body?: any): Promise<{ status: number; body: any }> {
   const url = new URL(path, HOST);
@@ -36,7 +39,10 @@ async function rest(method: string, path: string, body?: any): Promise<{ status:
   // workflow exports it as DARKRIDE_API_KEY. Without auth, the
   // core.devices:manage + core.traffic:manage scoped endpoints reject.
   if (API_KEY) headers['Authorization'] = `Bearer ${API_KEY}`;
-  const opts: http.RequestOptions = { method, headers };
+  // No pooled connection: `adb install` blocks this process for several seconds,
+  // long enough for the server to close an idle keep-alive socket that the next
+  // request would reuse, which fails with "socket hang up".
+  const opts: http.RequestOptions = { method, headers, agent: false };
   return new Promise<{ status: number; body: any }>((resolveP, rejectP) => {
     const req = http.request(url, opts, (res) => {
       const chunks: Buffer[] = [];
@@ -67,6 +73,42 @@ async function waitFor<T>(fn: () => Promise<T | undefined>, timeoutMs: number, i
   throw new Error(`waitFor: timeout after ${timeoutMs}ms`);
 }
 
+/**
+ * Print what the host knows about the emulator containers. A failed boot
+ * leaves no trace once the test tears the container down, and the emulator's
+ * own output is the only place the reason shows.
+ */
+function dumpEmulatorDiagnostics(): void {
+  const run = (label: string, cmd: string, args: string[]) => {
+    const r = spawnSync(cmd, args, { encoding: 'utf8' });
+    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim().split('\n').slice(-120).join('\n');
+    console.log(`[E2E diag] ${label}:\n${out || (r.error?.message ?? '(no output)')}`);
+  };
+  run('/dev/kvm', 'ls', ['-l', '/dev/kvm']);
+  run('cpu virtualization flag', 'sh', ['-c', "grep -o -m1 -E 'vmx|svm' /proc/cpuinfo || echo none"]);
+  run('adb devices', 'adb', ['devices', '-l']);
+  const ids = (spawnSync('docker', ['ps', '-aq', '--filter', 'label=darkride.emulator=true'], { encoding: 'utf8' }).stdout ?? '')
+    .split('\n').filter(Boolean);
+  for (const id of ids) {
+    run(`docker logs ${id.slice(0, 12)}`, 'docker', ['logs', '--tail', '120', id]);
+    // The emulator writes its own log files; they survive a stopped container.
+    for (const dir of ['/home/androidusr/logs', '/var/log/supervisor']) {
+      const dest = mkdtempSync(path.join(tmpdir(), 'emu-logs-'));
+      const cp = spawnSync('docker', ['cp', `${id}:${dir}/.`, dest], { encoding: 'utf8' });
+      if (cp.status !== 0) {
+        console.log(`[E2E diag] docker cp ${dir} failed: ${(cp.stderr ?? '').trim().slice(0, 200)}`);
+        continue;
+      }
+      for (const name of readdirSync(dest)) {
+        const file = path.join(dest, name);
+        if (!statSync(file).isFile()) continue;
+        const tail = readFileSync(file, 'utf8').trim().split('\n').slice(-60).join('\n');
+        console.log(`[E2E diag] ${dir}/${name}:\n${tail}`);
+      }
+    }
+  }
+}
+
 describe('E2E — emulator capture', () => {
   it(
     'spawns docker-android, installs fixture, captures the ping, asserts the trace',
@@ -89,8 +131,21 @@ describe('E2E — emulator capture', () => {
       expect(create.status).toBe(200);
       const instanceId = create.body?.data?.instance?.id as number;
       expect(instanceId).toBeDefined();
+      let passed = false;
 
       try {
+        // The create call answers at once with state "pulling" and no
+        // container; the container is made in the background. Starting
+        // before it exists sends Docker an empty container id.
+        step('polling listInstances until the container exists (state!==pulling)');
+        const created = await waitFor(async () => {
+          const r = await rest('GET', `/v1/devices/providers/docker-android/instances`);
+          const inst = r.body?.data?.instances?.find((i: any) => i.id === instanceId);
+          return inst && inst.state !== 'pulling' ? inst : undefined;
+        }, TIMEOUT_BOOT_MS);
+        expect(created.state, `instance creation failed: ${created.lastError}`).toBe('created');
+        step('container created');
+
         // 2. Start the container — response carries the resolved serial
         //    (docker picks a free host port; serial = "localhost:<port>")
         step(`POST /v1/devices/providers/docker-android/instances/${instanceId}/start (this blocks for up to ~240s while emulator cold-boots)`);
@@ -138,41 +193,44 @@ describe('E2E — emulator capture', () => {
         // the fixture's own logcat lines after the activity launches.
 
         // 6. Launch the fixture activity — it fires https://example.com/?darkride-e2e=ping
-        //    from onCreate(), routed through DarkRide's mitmproxy bridge.
-        // Clear logcat first so the post-mortem only shows our app's lines.
-        execFileSync('adb', ['-s', serial, 'logcat', '-c'], { stdio: 'inherit' });
-        step(`adb -s ${serial} shell am start ... --es proxy_url ${proxyUrl}`);
-        execFileSync(
-          'adb',
-          [
-            '-s', serial,
-            'shell', 'am', 'start',
-            '-n', 'wiki.themeparks.darkride.e2efixture/.MainActivity',
-            '--es', 'proxy_url', proxyUrl,
-          ],
-          { stdio: 'inherit' },
-        );
-        step('app launched; polling traffic store for the captured request');
-
-        // Wait for the fixture's HTTPS request to fire, then dump its
-        // logcat lines. The fixture's MainActivity logs Log.i(TAG="e2efixture")
-        // for both the opening attempt and the result — so even if mitmproxy
-        // never sees the request, we know whether the app made the call,
-        // hit a TLS error, got a connect refused, etc.
-        // `-s e2efixture` filters to that tag specifically at default
-        // (INFO+) priority — without it `*:F` would mute everything.
-        await new Promise((r) => setTimeout(r, 8000));
-        try {
-          const lc = execFileSync(
+        //    once from onCreate(), routed through DarkRide's mitmproxy bridge.
+        //    Just after boot the emulator's route to the proxy is not always up
+        //    yet, and the fixture's single request then fails at once with a
+        //    ConnectException; a later launch succeeds. So launch it again if
+        //    the ping has not been captured shortly after.
+        const launchApp = () => {
+          execFileSync('adb', ['-s', serial, 'shell', 'am', 'force-stop', FIXTURE_PACKAGE], { stdio: 'inherit' });
+          // Clear logcat first so the post-mortem only shows this launch.
+          execFileSync('adb', ['-s', serial, 'logcat', '-c'], { stdio: 'inherit' });
+          execFileSync(
             'adb',
-            ['-s', serial, 'logcat', '-d',
-             '-s', 'e2efixture:V', 'AndroidRuntime:E', 'System.err:V'],
-            { encoding: 'utf8' },
+            [
+              '-s', serial,
+              'shell', 'am', 'start',
+              '-n', `${FIXTURE_PACKAGE}/.MainActivity`,
+              '--es', 'proxy_url', proxyUrl,
+            ],
+            { stdio: 'inherit' },
           );
-          step(`logcat (e2efixture + errors):\n${lc.split('\n').slice(0, 40).join('\n')}`);
-        } catch (e: any) {
-          step(`logcat dump failed: ${e.message?.slice(0, 200) ?? e}`);
-        }
+        };
+
+        // The fixture's MainActivity logs Log.i(TAG="e2efixture") for both the
+        // opening attempt and the result — so even if mitmproxy never sees the
+        // request, we know whether the app made the call, hit a TLS error, got
+        // a connect refused, etc. `-s e2efixture` filters to that tag at
+        // default (INFO+) priority — without it `*:F` would mute everything.
+        const dumpFixtureLogcat = () => {
+          try {
+            const lc = execFileSync(
+              'adb',
+              ['-s', serial, 'logcat', '-d', '-s', 'e2efixture:V', 'AndroidRuntime:E', 'System.err:V'],
+              { encoding: 'utf8' },
+            );
+            step(`logcat (e2efixture + errors):\n${lc.split('\n').slice(0, 40).join('\n')}`);
+          } catch (e: any) {
+            step(`logcat dump failed: ${e.message?.slice(0, 200) ?? e}`);
+          }
+        };
 
         // 7. Poll the traffic store until the captured request appears.
         //    Endpoint: GET /v1/traffic/list?deviceId=<serial>&hostname=example.com
@@ -182,12 +240,12 @@ describe('E2E — emulator capture', () => {
         //    request gets captured + decrypted. The query param marks the
         //    request as ours so we don't false-positive on other example.com
         //    traffic (there shouldn't be any in CI, but be defensive).
-        const captured = await waitFor(async () => {
+        const findPing = async () => {
           const r = await rest(
             'GET',
             `/v1/traffic/list?deviceId=${encodeURIComponent(serial)}&hostname=example.com`,
           );
-          const found = (r.body?.data?.items as any[] | undefined)?.find(
+          return (r.body?.data?.items as any[] | undefined)?.find(
             (t: any) => {
               try {
                 const u = new URL(t.requestUrl);
@@ -197,23 +255,36 @@ describe('E2E — emulator capture', () => {
               }
             },
           );
-          return found;
-        }, TIMEOUT_CAPTURE_MS).catch(async (err) => {
+        };
+
+        let captured: any;
+        let launches = 0;
+        for (let launch = 1; launch <= PING_LAUNCHES && !captured; launch++) {
+          launches = launch;
+          step(`launch ${launch}/${PING_LAUNCHES}: adb -s ${serial} shell am start ... --es proxy_url ${proxyUrl}`);
+          launchApp();
+          captured = await waitFor(findPing, PING_WAIT_MS, 2000).catch(() => undefined);
+          if (!captured) dumpFixtureLogcat();
+        }
+        if (!captured) {
           // Dump everything the traffic store knows about this device so
           // we can tell whether the webhook fired at all and what shape
           // got persisted. Helps debug capture-pipeline issues without
           // another iteration.
           const dumpAll = await rest('GET', `/v1/traffic/list?deviceId=${encodeURIComponent(serial)}`);
           step(`traffic store dump (all for device): status=${dumpAll.status} total=${dumpAll.body?.data?.total ?? '?'} items=${JSON.stringify((dumpAll.body?.data?.items as any[] | undefined)?.slice(0, 5)?.map((t: any) => ({ url: t.requestUrl, host: t.hostname, status: t.responseStatus, dev: t.deviceId })))?.slice(0, 800)}`);
-          throw err;
-        });
+          throw new Error(`the fixture's ping was not captured after ${PING_LAUNCHES} launches`);
+        }
+        step(`captured after ${launches} launch(es)`);
         step(`captured: ${JSON.stringify(captured).slice(0, 300)}`);
 
         expect(captured).toBeDefined();
         const capturedUrl = new URL(captured.requestUrl);
         expect(capturedUrl.hostname).toBe('example.com');
         expect(capturedUrl.searchParams.get('darkride-e2e')).toBe('ping');
+        passed = true;
       } finally {
+        if (!passed) dumpEmulatorDiagnostics();
         // 8. Tear down — stop + delete the container even if assertions failed
         await rest(
           'POST',
