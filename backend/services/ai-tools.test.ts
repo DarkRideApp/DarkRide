@@ -306,6 +306,30 @@ describe('AiToolRegistry', () => {
 
   // ── Large scale ─────────────────────────────────────────────────
 
+  // ── assertScope ─────────────────────────────────────────────────
+
+  it('assertScope throws the executeTool message when the scopes do not cover the tool', () => {
+    const registry = new AiToolRegistry();
+    registry.register(makeTool({ name: 'shell', requiredScope: 'core.devices:shell' }));
+
+    expect(() => registry.assertScope('shell', new Set(['core.devices:read'])))
+      .toThrow('Insufficient scope: core.devices:shell required for tool shell');
+  });
+
+  it('assertScope passes for a covering grant or wildcard, and for a tool with no required scope', () => {
+    const registry = new AiToolRegistry();
+    registry.register(makeTool({ name: 'shell', requiredScope: 'core.devices:shell' }));
+    registry.register(makeTool({ name: 'open' }));
+
+    expect(() => registry.assertScope('shell', new Set(['core.devices:shell']))).not.toThrow();
+    expect(() => registry.assertScope('shell', new Set(['core.devices:*']))).not.toThrow();
+    expect(() => registry.assertScope('open', new Set())).not.toThrow();
+  });
+
+  it('assertScope throws for an unknown tool', () => {
+    expect(() => new AiToolRegistry().assertScope('nope', new Set())).toThrow('Unknown tool: nope');
+  });
+
   // ── Scope-gating (executeTool) ──────────────────────────────────
 
   it('executeTool succeeds when userScopes include the required scope', async () => {

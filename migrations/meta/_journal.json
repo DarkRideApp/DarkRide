@@ -610,6 +610,13 @@
       "when": 1791872734092,
       "tag": "0103_ai_conversation_history",
       "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1791968514150,
+      "tag": "0104_automation_authors",
+      "breakpoints": true
     }
   ]
 }
