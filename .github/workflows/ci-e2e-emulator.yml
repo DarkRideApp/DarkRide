@@ -48,6 +48,8 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # Runner hardware varies between jobs; record it for the post-mortem.
+          lscpu | grep -E 'Vendor ID|Model name' || true
 
       # 2. JDK 17 + Android SDK to build the fixture APK.
       - uses: actions/setup-java@v4
