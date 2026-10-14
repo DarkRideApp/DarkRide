@@ -18,8 +18,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'child_process';
-import { resolve } from 'path';
-import { existsSync } from 'fs';
+import path, { resolve } from 'path';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'fs';
+import { tmpdir } from 'os';
 import http from 'http';
 
 const APK = resolve('./tests/e2e/fixtures/hello-world/app/build/outputs/apk/debug/app-debug.apk');
@@ -85,6 +86,21 @@ function dumpEmulatorDiagnostics(): void {
     .split('\n').filter(Boolean);
   for (const id of ids) {
     run(`docker logs ${id.slice(0, 12)}`, 'docker', ['logs', '--tail', '120', id]);
+    // The emulator writes its own log files; they survive a stopped container.
+    for (const dir of ['/home/androidusr/logs', '/var/log/supervisor']) {
+      const dest = mkdtempSync(path.join(tmpdir(), 'emu-logs-'));
+      const cp = spawnSync('docker', ['cp', `${id}:${dir}/.`, dest], { encoding: 'utf8' });
+      if (cp.status !== 0) {
+        console.log(`[E2E diag] docker cp ${dir} failed: ${(cp.stderr ?? '').trim().slice(0, 200)}`);
+        continue;
+      }
+      for (const name of readdirSync(dest)) {
+        const file = path.join(dest, name);
+        if (!statSync(file).isFile()) continue;
+        const tail = readFileSync(file, 'utf8').trim().split('\n').slice(-60).join('\n');
+        console.log(`[E2E diag] ${dir}/${name}:\n${tail}`);
+      }
+    }
   }
 }
 
