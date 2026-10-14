@@ -240,6 +240,7 @@ jobs:
             cat /tmp/key-response.json
             exit 1
           fi
+          echo "::add-mask::$API_KEY"
           echo "DARKRIDE_API_KEY=$API_KEY" >> "$GITHUB_ENV"
           echo "::notice::E2E admin + API key provisioned"
 
