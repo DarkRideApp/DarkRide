@@ -141,6 +141,51 @@ describe('/v1/devices/providers endpoints', () => {
     expect(repo.updateState).toHaveBeenCalledWith(99, 'error', expect.stringContaining('boot timeout'));
   });
 
+  describe('an instance that is still being created', () => {
+    const pullingRow = { id: 99, providerId: 'docker-android', runtimeId: '', state: 'pulling' };
+
+    function setup() {
+      const provider = {
+        startInstance: vi.fn(),
+        stopInstance: vi.fn(),
+        deleteInstance: vi.fn(),
+      };
+      const repo = {
+        getById: vi.fn().mockReturnValue(pullingRow),
+        updateState: vi.fn(),
+        updateSerial: vi.fn(),
+        delete: vi.fn(),
+      };
+      const app = createApp({ get: () => provider }, repo);
+      return { provider, repo, app };
+    }
+
+    it('POST .../start answers 409 and leaves the row alone', async () => {
+      const { provider, repo, app } = setup();
+      const res = await request(app).post('/v1/devices/providers/docker-android/instances/99/start');
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/still being created/i);
+      expect(provider.startInstance).not.toHaveBeenCalled();
+      expect(repo.updateState).not.toHaveBeenCalled();
+    });
+
+    it('POST .../stop answers 409 and leaves the row alone', async () => {
+      const { provider, repo, app } = setup();
+      const res = await request(app).post('/v1/devices/providers/docker-android/instances/99/stop');
+      expect(res.status).toBe(409);
+      expect(provider.stopInstance).not.toHaveBeenCalled();
+      expect(repo.updateState).not.toHaveBeenCalled();
+    });
+
+    it('DELETE answers 409 and keeps the row', async () => {
+      const { provider, repo, app } = setup();
+      const res = await request(app).delete('/v1/devices/providers/docker-android/instances/99');
+      expect(res.status).toBe(409);
+      expect(provider.deleteInstance).not.toHaveBeenCalled();
+      expect(repo.delete).not.toHaveBeenCalled();
+    });
+  });
+
   it('DELETE removes the instance', async () => {
     const remove = vi.fn().mockResolvedValue(undefined);
     const reg = { get: () => ({ deleteInstance: remove }) };
