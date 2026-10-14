@@ -27,7 +27,9 @@ const APK = resolve('./tests/e2e/fixtures/hello-world/app/build/outputs/apk/debu
 const HOST = process.env.DARKRIDE_HOST ?? 'http://localhost:3001';
 const API_KEY = process.env.DARKRIDE_API_KEY;
 const TIMEOUT_BOOT_MS = 5 * 60_000;
-const TIMEOUT_CAPTURE_MS = 60_000;
+const PING_LAUNCHES = 4;
+const PING_WAIT_MS = 15_000;
+const FIXTURE_PACKAGE = 'wiki.themeparks.darkride.e2efixture';
 
 async function rest(method: string, path: string, body?: any): Promise<{ status: number; body: any }> {
   const url = new URL(path, HOST);
@@ -191,41 +193,44 @@ describe('E2E — emulator capture', () => {
         // the fixture's own logcat lines after the activity launches.
 
         // 6. Launch the fixture activity — it fires https://example.com/?darkride-e2e=ping
-        //    from onCreate(), routed through DarkRide's mitmproxy bridge.
-        // Clear logcat first so the post-mortem only shows our app's lines.
-        execFileSync('adb', ['-s', serial, 'logcat', '-c'], { stdio: 'inherit' });
-        step(`adb -s ${serial} shell am start ... --es proxy_url ${proxyUrl}`);
-        execFileSync(
-          'adb',
-          [
-            '-s', serial,
-            'shell', 'am', 'start',
-            '-n', 'wiki.themeparks.darkride.e2efixture/.MainActivity',
-            '--es', 'proxy_url', proxyUrl,
-          ],
-          { stdio: 'inherit' },
-        );
-        step('app launched; polling traffic store for the captured request');
-
-        // Wait for the fixture's HTTPS request to fire, then dump its
-        // logcat lines. The fixture's MainActivity logs Log.i(TAG="e2efixture")
-        // for both the opening attempt and the result — so even if mitmproxy
-        // never sees the request, we know whether the app made the call,
-        // hit a TLS error, got a connect refused, etc.
-        // `-s e2efixture` filters to that tag specifically at default
-        // (INFO+) priority — without it `*:F` would mute everything.
-        await new Promise((r) => setTimeout(r, 8000));
-        try {
-          const lc = execFileSync(
+        //    once from onCreate(), routed through DarkRide's mitmproxy bridge.
+        //    Just after boot the emulator's route to the proxy is not always up
+        //    yet, and the fixture's single request then fails at once with a
+        //    ConnectException; a later launch succeeds. So launch it again if
+        //    the ping has not been captured shortly after.
+        const launchApp = () => {
+          execFileSync('adb', ['-s', serial, 'shell', 'am', 'force-stop', FIXTURE_PACKAGE], { stdio: 'inherit' });
+          // Clear logcat first so the post-mortem only shows this launch.
+          execFileSync('adb', ['-s', serial, 'logcat', '-c'], { stdio: 'inherit' });
+          execFileSync(
             'adb',
-            ['-s', serial, 'logcat', '-d',
-             '-s', 'e2efixture:V', 'AndroidRuntime:E', 'System.err:V'],
-            { encoding: 'utf8' },
+            [
+              '-s', serial,
+              'shell', 'am', 'start',
+              '-n', `${FIXTURE_PACKAGE}/.MainActivity`,
+              '--es', 'proxy_url', proxyUrl,
+            ],
+            { stdio: 'inherit' },
           );
-          step(`logcat (e2efixture + errors):\n${lc.split('\n').slice(0, 40).join('\n')}`);
-        } catch (e: any) {
-          step(`logcat dump failed: ${e.message?.slice(0, 200) ?? e}`);
-        }
+        };
+
+        // The fixture's MainActivity logs Log.i(TAG="e2efixture") for both the
+        // opening attempt and the result — so even if mitmproxy never sees the
+        // request, we know whether the app made the call, hit a TLS error, got
+        // a connect refused, etc. `-s e2efixture` filters to that tag at
+        // default (INFO+) priority — without it `*:F` would mute everything.
+        const dumpFixtureLogcat = () => {
+          try {
+            const lc = execFileSync(
+              'adb',
+              ['-s', serial, 'logcat', '-d', '-s', 'e2efixture:V', 'AndroidRuntime:E', 'System.err:V'],
+              { encoding: 'utf8' },
+            );
+            step(`logcat (e2efixture + errors):\n${lc.split('\n').slice(0, 40).join('\n')}`);
+          } catch (e: any) {
+            step(`logcat dump failed: ${e.message?.slice(0, 200) ?? e}`);
+          }
+        };
 
         // 7. Poll the traffic store until the captured request appears.
         //    Endpoint: GET /v1/traffic/list?deviceId=<serial>&hostname=example.com
@@ -235,12 +240,12 @@ describe('E2E — emulator capture', () => {
         //    request gets captured + decrypted. The query param marks the
         //    request as ours so we don't false-positive on other example.com
         //    traffic (there shouldn't be any in CI, but be defensive).
-        const captured = await waitFor(async () => {
+        const findPing = async () => {
           const r = await rest(
             'GET',
             `/v1/traffic/list?deviceId=${encodeURIComponent(serial)}&hostname=example.com`,
           );
-          const found = (r.body?.data?.items as any[] | undefined)?.find(
+          return (r.body?.data?.items as any[] | undefined)?.find(
             (t: any) => {
               try {
                 const u = new URL(t.requestUrl);
@@ -250,16 +255,27 @@ describe('E2E — emulator capture', () => {
               }
             },
           );
-          return found;
-        }, TIMEOUT_CAPTURE_MS).catch(async (err) => {
+        };
+
+        let captured: any;
+        let launches = 0;
+        for (let launch = 1; launch <= PING_LAUNCHES && !captured; launch++) {
+          launches = launch;
+          step(`launch ${launch}/${PING_LAUNCHES}: adb -s ${serial} shell am start ... --es proxy_url ${proxyUrl}`);
+          launchApp();
+          captured = await waitFor(findPing, PING_WAIT_MS, 2000).catch(() => undefined);
+          if (!captured) dumpFixtureLogcat();
+        }
+        if (!captured) {
           // Dump everything the traffic store knows about this device so
           // we can tell whether the webhook fired at all and what shape
           // got persisted. Helps debug capture-pipeline issues without
           // another iteration.
           const dumpAll = await rest('GET', `/v1/traffic/list?deviceId=${encodeURIComponent(serial)}`);
           step(`traffic store dump (all for device): status=${dumpAll.status} total=${dumpAll.body?.data?.total ?? '?'} items=${JSON.stringify((dumpAll.body?.data?.items as any[] | undefined)?.slice(0, 5)?.map((t: any) => ({ url: t.requestUrl, host: t.hostname, status: t.responseStatus, dev: t.deviceId })))?.slice(0, 800)}`);
-          throw err;
-        });
+          throw new Error(`the fixture's ping was not captured after ${PING_LAUNCHES} launches`);
+        }
+        step(`captured after ${launches} launch(es)`);
         step(`captured: ${JSON.stringify(captured).slice(0, 300)}`);
 
         expect(captured).toBeDefined();
