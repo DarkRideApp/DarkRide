@@ -89,6 +89,17 @@ export class AiToolRegistry implements IAiToolRegistry {
     return this.tools.get(name)?.requiresConfirmation === true;
   }
 
+  /** Throw unless `userScopes` covers the tool's required scope (a tool with none always passes). */
+  assertScope(name: string, userScopes: Set<string>): void {
+    const tool = this.tools.get(name);
+    if (!tool) {
+      throw new Error(`Unknown tool: ${name}`);
+    }
+    if (tool.requiredScope && !scopeMatches(userScopes, tool.requiredScope)) {
+      throw new Error(`Insufficient scope: ${tool.requiredScope} required for tool ${name}`);
+    }
+  }
+
   /**
    * Execute a registered tool by name.
    * When `userScopes` is provided, the tool's `requiredScope` is checked first.
@@ -100,9 +111,7 @@ export class AiToolRegistry implements IAiToolRegistry {
     if (!tool) {
       throw new Error(`Unknown tool: ${name}`);
     }
-    if (userScopes && tool.requiredScope && !scopeMatches(userScopes, tool.requiredScope)) {
-      throw new Error(`Insufficient scope: ${tool.requiredScope} required for tool ${name}`);
-    }
+    if (userScopes) this.assertScope(name, userScopes);
     if (unattended && tool.allowUnattended === false) {
       throw new Error(`Tool ${name} is not available in unattended mode`);
     }

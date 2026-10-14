@@ -4,6 +4,7 @@ import { automations } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import type { AutomationScheduler } from '../services/automation-scheduler';
 import { validateScheduleConfig } from '../services/schedule-validator';
+import { claimAutomation, clearAuthor } from '../services/automation-authors';
 import type { ScheduleConfig } from '../../shared/types/api';
 
 /**
@@ -145,12 +146,15 @@ export function registerManagedAutomationEndpoints(
     const baseUpdate = row.isOverridden
       ? {}
       : { baseDefaultCode: row.currentDefaultCode };
-    db.update(automations).set({
-      code,
-      ...baseUpdate,
-      isOverridden: true,
-      updatedAt: new Date(),
-    }).where(eq(automations.id, row.id)).run();
+    db.transaction((tx) => {
+      tx.update(automations).set({
+        code,
+        ...baseUpdate,
+        isOverridden: true,
+        updatedAt: new Date(),
+      }).where(eq(automations.id, row.id)).run();
+      claimAutomation(tx, row.id, req.authUser);
+    });
     res.json({ success: true, data: buildView(loadManaged(db, pluginKey, scriptKey)!) });
   }, { requires: ['core.automations:edit'] });
 
@@ -171,12 +175,16 @@ export function registerManagedAutomationEndpoints(
       res.status(409).json({ success: false, error: 'No default code available (plugin no longer declares this script)' });
       return;
     }
-    db.update(automations).set({
-      code: row.currentDefaultCode,
-      baseDefaultCode: null,
-      isOverridden: false,
-      updatedAt: new Date(),
-    }).where(eq(automations.id, row.id)).run();
+    const defaultCode = row.currentDefaultCode;
+    db.transaction((tx) => {
+      tx.update(automations).set({
+        code: defaultCode,
+        baseDefaultCode: null,
+        isOverridden: false,
+        updatedAt: new Date(),
+      }).where(eq(automations.id, row.id)).run();
+      clearAuthor(tx, row.id);
+    });
     res.json({ success: true, data: buildView(loadManaged(db, pluginKey, scriptKey)!) });
   }, { requires: ['core.automations:edit'] });
 

@@ -6,6 +6,8 @@ import { AutomationRunner } from './automation-runner';
 import { AutomationCompiler } from './automation-compiler';
 import { PythonBridgeManager } from './python-bridge';
 import { TrafficHookRegistry } from './traffic-hook-registry';
+import { AiToolRegistry } from './ai-tools';
+import { recordAuthor, clearAuthor } from './automation-authors';
 import type { AppDatabase } from '../db/index';
 import { createTestDb } from '../test-utils/create-test-db';
 
@@ -426,6 +428,241 @@ describe('AutomationRunner', () => {
       ).rejects.toThrow('Device test-device is busy');
 
       expect(mockDm.markIdle).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('tools access from scripts', () => {
+    const SHELL = 'core.devices:shell';
+    const script = `
+      declare const tools: any;
+      export default async function(device: any) {
+        await tools.needs_shell({ x: 1 });
+      }
+    `;
+    let shellTool: ReturnType<typeof vi.fn>;
+    let openTool: ReturnType<typeof vi.fn>;
+    let userCount = 0;
+
+    beforeEach(() => {
+      shellTool = vi.fn(async () => ({ ok: true }));
+      openTool = vi.fn(async () => ({ ok: true }));
+      const registry = new AiToolRegistry();
+      registry.register({ name: 'needs_shell', description: 'd', inputSchema: { type: 'object', properties: {} }, context: ['x'], requiredScope: SHELL, execute: shellTool });
+      registry.register({ name: 'open_tool', description: 'd', inputSchema: { type: 'object', properties: {} }, context: ['x'], execute: openTool });
+      runner.setToolRegistry(registry);
+    });
+
+    function addUser(scopes: string[], enabled = true) {
+      const now = new Date();
+      db.insert(schema.users).values({
+        username: `author${++userCount}`, providerId: 'core.local', scopes, enabled, createdAt: now, updatedAt: now,
+      }).run();
+      return db.select().from(schema.users).all().pop()!;
+    }
+
+    function author(automationId: number, userScopes: string[], snapshot: string[], enabled = true) {
+      const user = addUser(userScopes, enabled);
+      recordAuthor(db, automationId, { userId: user.id, effectiveScopes: new Set(snapshot) });
+    }
+
+    it('refuses a script nobody has claimed, without running the tool', async () => {
+      const auto = createAutomation(script);
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/no author on record/i);
+      expect(shellTool).not.toHaveBeenCalled();
+    });
+
+    it('runs the tool when the saving credential and the author both hold the scope', async () => {
+      const auto = createAutomation(script);
+      author(auto.id, [SHELL], [SHELL]);
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(true);
+      expect(shellTool).toHaveBeenCalledWith({ x: 1 });
+    });
+
+    it('accepts a wildcard grant on either side', async () => {
+      const auto = createAutomation(script);
+      author(auto.id, ['core.devices:*'], ['core.devices:*']);
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(true);
+      expect(shellTool).toHaveBeenCalled();
+    });
+
+    it('refuses when the author no longer holds the scope, even though the saved snapshot did', async () => {
+      const auto = createAutomation(script);
+      author(auto.id, ['core.apk:read'], [SHELL]);
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Insufficient scope: core.devices:shell required for tool needs_shell');
+      expect(shellTool).not.toHaveBeenCalled();
+    });
+
+    it('refuses when the author holds the scope but the key that saved the script did not', async () => {
+      const auto = createAutomation(script);
+      author(auto.id, [SHELL], ['core.automations:edit']);
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Insufficient scope: core.devices:shell required for tool needs_shell');
+      expect(shellTool).not.toHaveBeenCalled();
+    });
+
+    it('refuses when the author\'s account is disabled', async () => {
+      const auto = createAutomation(script);
+      author(auto.id, [SHELL], [SHELL], false);
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/disabled/i);
+      expect(shellTool).not.toHaveBeenCalled();
+    });
+
+    it('lets the script catch the refusal and carry on', async () => {
+      const auto = createAutomation(`
+        declare const tools: any;
+        export default async function(device: any) {
+          try { await tools.needs_shell({}); } catch (e) { await tools.open_tool({ after: 'refusal' }); }
+        }
+      `);
+      author(auto.id, ['core.apk:read'], ['core.apk:read']);
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(true);
+      expect(shellTool).not.toHaveBeenCalled();
+      expect(openTool).toHaveBeenCalledWith({ after: 'refusal' });
+    });
+
+    it('still needs an author for a tool that asks for no scope', async () => {
+      const auto = createAutomation(`
+        declare const tools: any;
+        export default async function(device: any) { await tools.open_tool({}); }
+      `);
+      expect((await runner.runAutomation(auto.id, 'test-device', 'manual')).success).toBe(false);
+      expect(openTool).not.toHaveBeenCalled();
+
+      author(auto.id, [], []);
+      expect((await runner.runAutomation(auto.id, 'test-device', 'manual')).success).toBe(true);
+      expect(openTool).toHaveBeenCalled();
+    });
+
+    // The reconciler keeps a managed script's code equal to the default the plugin ships.
+    function createManaged(code: string) {
+      const auto = createAutomation(code, { managedBy: 'some-plugin', managedKey: 'k' });
+      db.update(schema.automations).set({ currentDefaultCode: code }).where(eq(schema.automations.id, auto.id)).run();
+      return auto;
+    }
+
+    it('trusts a plugin-managed script that the operator has not overridden', async () => {
+      const auto = createManaged(script);
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(true);
+      expect(shellTool).toHaveBeenCalled();
+    });
+
+    it('stops trusting a managed script whose code was rewritten without the override flag', async () => {
+      const auto = createManaged(script);
+      db.update(schema.automations).set({ code: script.replace('x: 1', 'x: 2') }).where(eq(schema.automations.id, auto.id)).run();
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/no author on record/i);
+      expect(shellTool).not.toHaveBeenCalled();
+    });
+
+    it('stops trusting a managed script once the operator overrides it', async () => {
+      const auto = createManaged(script);
+      db.update(schema.automations).set({ isOverridden: true }).where(eq(schema.automations.id, auto.id)).run();
+      const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+      expect(result.success).toBe(false);
+      expect(shellTool).not.toHaveBeenCalled();
+    });
+
+    describe('when the script is saved while a run is in flight', () => {
+      // The proxy is built when a run starts and used for the whole run.
+      const proxyFor = (id: number) => (runner as any).buildToolsProxy(id) as Record<string, (p: any) => Promise<any>>;
+
+      it('refuses further calls once someone else has saved the script, so old code never inherits their authority', async () => {
+        const auto = createAutomation(script);
+        author(auto.id, ['core.apk:read'], ['core.apk:read']);
+        const proxy = proxyFor(auto.id);
+
+        author(auto.id, [SHELL], [SHELL]);
+
+        await expect(proxy.needs_shell({})).rejects.toThrow(/saved by someone else while it was running/i);
+        expect(shellTool).not.toHaveBeenCalled();
+      });
+
+      it('refuses further calls once the author was removed mid-run', async () => {
+        const auto = createAutomation(script);
+        author(auto.id, [SHELL], [SHELL]);
+        const proxy = proxyFor(auto.id);
+
+        clearAuthor(db, auto.id);
+
+        await expect(proxy.needs_shell({})).rejects.toThrow();
+        expect(shellTool).not.toHaveBeenCalled();
+      });
+
+      it('keeps working when the same person saves it again', async () => {
+        const auto = createAutomation(script);
+        const user = addUser([SHELL]);
+        recordAuthor(db, auto.id, { userId: user.id, effectiveScopes: new Set([SHELL]) });
+        const proxy = proxyFor(auto.id);
+
+        recordAuthor(db, auto.id, { userId: user.id, effectiveScopes: new Set([SHELL]) });
+
+        await expect(proxy.needs_shell({ x: 1 })).resolves.toEqual({ ok: true });
+      });
+    });
+
+    it('applies the same check to rules', async () => {
+      const rule = createAutomation(script, { isRule: true });
+      const device = {
+        getDeviceId: vi.fn().mockReturnValue('test-device'),
+        getDOM: vi.fn().mockResolvedValue({ className: 'FrameLayout', text: '', resourceId: '', description: '', bounds: [0, 0, 1, 1], clickable: false, enabled: true, children: [] }),
+        setCachedDOM: vi.fn(),
+        clearCachedDOM: vi.fn(),
+      } as any;
+
+      await runner.runRules(device);
+      expect(shellTool).not.toHaveBeenCalled();
+
+      author(rule.id, [SHELL], [SHELL]);
+      await runner.runRules(device);
+      expect(shellTool).toHaveBeenCalledTimes(1);
+    });
+
+    it('applies the same check to capture rules', async () => {
+      const rule = createAutomation(script, { isCaptureRule: true });
+      db.insert(schema.automationSessions).values({ deviceId: 'test-device', status: 'running', triggerType: 'capture', startedAt: new Date() }).run();
+      const session = db.select().from(schema.automationSessions).all().pop()!;
+
+      await runner.runCaptureRules('test-device', session.id);
+      expect(shellTool).not.toHaveBeenCalled();
+
+      author(rule.id, [SHELL], [SHELL]);
+      await runner.runCaptureRules('test-device', session.id);
+      expect(shellTool).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not apply the unattended restriction to scripts', async () => {
+      const registry = new AiToolRegistry();
+      const execute = vi.fn(async () => ({ ok: true }));
+      registry.register({ name: 'needs_shell', description: 'd', inputSchema: { type: 'object', properties: {} }, context: ['x'], requiredScope: SHELL, allowUnattended: false, execute });
+      runner.setToolRegistry(registry);
+      const auto = createAutomation(script);
+      author(auto.id, [SHELL], [SHELL]);
+
+      const result = await runner.runAutomation(auto.id, 'test-device', 'schedule');
+      expect(result.success).toBe(true);
+      expect(execute).toHaveBeenCalled();
     });
   });
 

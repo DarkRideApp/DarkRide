@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import express from 'express';
+import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { registerAutomationEndpoints } from './automations';
 import { AutomationRunner } from '../services/automation-runner';
@@ -191,6 +192,122 @@ describe('Automation API', () => {
         .send({ name: 'Updated' });
 
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe('recording who wrote a script', () => {
+    let userCount = 0;
+
+    function addUser(scopes: string[]) {
+      const now = new Date();
+      db.insert(schema.users).values({
+        username: `writer${++userCount}`, providerId: 'core.local', scopes, createdAt: now, updatedAt: now,
+      }).run();
+      return db.select().from(schema.users).all().pop()!;
+    }
+
+    // Mounts the same router behind an identity, as the auth middleware does in production.
+    function appAs(userId: number, scopes: string[]) {
+      const a = express();
+      a.use(express.json());
+      a.use((req, _res, next) => {
+        req.authUser = { userId, username: 'writer', via: 'apikey', effectiveScopes: new Set(scopes) };
+        next();
+      });
+      a.use(getApiRouter());
+      return a;
+    }
+
+    const EDIT = 'core.automations:edit';
+    const authorOf = (id: number) =>
+      db.select().from(schema.automationAuthors).where(eq(schema.automationAuthors.automationId, id)).all()[0];
+
+    it('records the creator and the scopes of the credential used', async () => {
+      const user = addUser(['core.admin:*']);
+      const res = await request(appAs(user.id, [EDIT, 'core.devices:shell']))
+        .post('/v1/automation/create').send({ name: 'a', code: 'code' });
+
+      expect(res.status).toBe(201);
+      const row = authorOf(res.body.data.id);
+      expect(row.userId).toBe(user.id);
+      expect([...row.scopes].sort()).toEqual(['core.automations:edit', 'core.devices:shell']);
+    });
+
+    it('moves the author to whoever saves the code next', async () => {
+      const first = addUser(['core.admin:*']);
+      const second = addUser([EDIT]);
+      const created = await request(appAs(first.id, [EDIT, 'core.devices:shell']))
+        .post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+
+      await request(appAs(second.id, [EDIT])).put(`/v1/automation/update/${id}`).send({ code: 'two' });
+
+      const row = authorOf(id);
+      expect(row.userId).toBe(second.id);
+      expect(row.scopes).toEqual([EDIT]);
+    });
+
+    it('also claims the script when the code sent is unchanged', async () => {
+      const first = addUser(['core.admin:*']);
+      const second = addUser([EDIT]);
+      const created = await request(appAs(first.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'same' });
+      const id = created.body.data.id;
+
+      await request(appAs(second.id, [EDIT])).put(`/v1/automation/update/${id}`).send({ code: 'same' });
+
+      expect(authorOf(id).userId).toBe(second.id);
+    });
+
+    it('leaves the author alone when the update does not send code', async () => {
+      const first = addUser(['core.admin:*']);
+      const second = addUser([EDIT]);
+      const created = await request(appAs(first.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+
+      await request(appAs(second.id, [EDIT])).put(`/v1/automation/update/${id}`).send({ name: 'renamed', enabled: false, timeoutMs: 5000 });
+
+      expect(authorOf(id).userId).toBe(first.id);
+    });
+
+    it('records no author when the request carries no identity, and drops an existing one on a code save', async () => {
+      const user = addUser([EDIT]);
+      const created = await request(appAs(user.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+      expect(authorOf(id)).toBeDefined();
+
+      await request(app).put(`/v1/automation/update/${id}`).send({ code: 'two' });
+      expect(authorOf(id)).toBeUndefined();
+
+      const anonymous = await request(app).post('/v1/automation/create').send({ name: 'b', code: 'code' });
+      expect(authorOf(anonymous.body.data.id)).toBeUndefined();
+    });
+
+    it('keeps the author out of every response', async () => {
+      const user = addUser([EDIT]);
+      const created = await request(appAs(user.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+      const responses = [
+        created,
+        await request(appAs(user.id, [EDIT, 'core.automations:read'])).put(`/v1/automation/update/${id}`).send({ code: 'two' }),
+        await request(appAs(user.id, [EDIT, 'core.automations:read'])).get(`/v1/automation/view/${id}`),
+        await request(appAs(user.id, [EDIT, 'core.automations:read'])).get('/v1/automation/list'),
+      ];
+
+      for (const res of responses) {
+        expect(res.status).toBeLessThan(300);
+        expect(JSON.stringify(res.body)).not.toMatch(/author/i);
+      }
+    });
+
+    it('removes the author row when the automation is deleted', async () => {
+      const user = addUser([EDIT]);
+      const created = await request(appAs(user.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+
+      const res = await request(appAs(user.id, [EDIT])).delete(`/v1/automation/delete/${id}`);
+
+      expect(res.status).toBe(200);
+      expect(authorOf(id)).toBeUndefined();
     });
   });
 

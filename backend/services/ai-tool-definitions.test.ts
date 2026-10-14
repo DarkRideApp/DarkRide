@@ -7,6 +7,7 @@ import os from 'os';
 import * as schema from '../db/schema';
 import { AiToolRegistry } from './ai-tools';
 import { registerAllTools } from './ai-tool-definitions';
+import { recordAuthor } from './automation-authors';
 import { createTestDb } from '../test-utils/create-test-db';
 
 const mockBroadcastToAll = vi.fn();
@@ -2558,6 +2559,50 @@ class AuthManager {
         id: created.id, oldText: 'foo', newText: 'bar',
       });
       expect(result).toMatchObject({ error: expect.stringContaining('multiple locations') });
+    });
+
+    describe('script authorship', () => {
+      const authorOf = (id: number) =>
+        db.select().from(schema.automationAuthors).where(eq(schema.automationAuthors.automationId, id)).all()[0];
+
+      async function authoredScript() {
+        const now = new Date();
+        db.insert(schema.users).values({ username: 'admin', providerId: 'core.local', scopes: ['core.admin:*'], createdAt: now, updatedAt: now }).run();
+        const user = db.select().from(schema.users).all().pop()!;
+        const created = await registry.executeTool('create_automation', { name: 'a', code: 'line A\nline B\n' }) as any;
+        recordAuthor(db as any, created.id, { userId: user.id, effectiveScopes: new Set(['core.devices:shell']) });
+        expect(authorOf(created.id)).toBeDefined();
+        return created.id as number;
+      }
+
+      it('create_automation leaves the script without an author', async () => {
+        const created = await registry.executeTool('create_automation', { name: 'a', code: 'x' }) as any;
+        expect(authorOf(created.id)).toBeUndefined();
+      });
+
+      it('update_automation_code drops the author', async () => {
+        const id = await authoredScript();
+        await registry.executeTool('update_automation_code', { id, code: 'rewritten' });
+        expect(authorOf(id)).toBeUndefined();
+      });
+
+      it('patch_automation_code drops the author', async () => {
+        const id = await authoredScript();
+        await registry.executeTool('patch_automation_code', { id, oldText: 'line B', newText: 'line C' });
+        expect(authorOf(id)).toBeUndefined();
+      });
+
+      it('keeps the author when a patch does not apply', async () => {
+        const id = await authoredScript();
+        await registry.executeTool('patch_automation_code', { id, oldText: 'no such text', newText: 'x' });
+        expect(authorOf(id)).toBeDefined();
+      });
+
+      it('update_automation_config keeps the author, since it never touches the code', async () => {
+        const id = await authoredScript();
+        await registry.executeTool('update_automation_config', { id, name: 'renamed', enabled: false });
+        expect(authorOf(id)).toBeDefined();
+      });
     });
 
     it('validate_automation returns valid:true for clean code', async () => {

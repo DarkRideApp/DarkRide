@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { eq } from 'drizzle-orm';
-import { automations } from '../../db/schema';
+import { automations, automationAuthors, users } from '../../db/schema';
 import { createTestDb } from '../../test-utils/create-test-db';
 import { clearEndpoints, getApiRouter } from '../api-service';
 import { registerManagedAutomationEndpoints } from '../managed-automations';
@@ -477,6 +477,66 @@ describe('managed-automations REST endpoints', () => {
       expect(item.baseDefaultCode).toBeUndefined();
       expect(item.schedule).toBeUndefined();
       expect(item.deviceFilter).toBeUndefined();
+    });
+  });
+
+  describe('who may call tools from an operator override', () => {
+    function appAs(userId: number, scopes: string[]) {
+      clearEndpoints();
+      registerManagedAutomationEndpoints(db);
+      const a = express();
+      a.use(express.json());
+      a.use((req, _res, next) => {
+        req.authUser = { userId, username: 'operator', via: 'session', effectiveScopes: new Set(scopes) };
+        next();
+      });
+      a.use(getApiRouter());
+      return a;
+    }
+
+    function addUser(scopes: string[]) {
+      const now = new Date();
+      db.insert(users).values({ username: 'operator', providerId: 'core.local', scopes, createdAt: now, updatedAt: now }).run();
+      return db.select().from(users).all().pop()!;
+    }
+
+    const authorOf = (id: number) =>
+      db.select().from(automationAuthors).where(eq(automationAuthors.automationId, id)).all()[0];
+
+    it('makes the operator who saves an override the author', async () => {
+      const row = seedManaged(db);
+      const user = addUser(['core.automations:edit']);
+
+      const res = await request(appAs(user.id, ['core.automations:edit']))
+        .put('/v1/managed-automations/plugin-x/poller/code').send({ code: 'mine\n' });
+
+      expect(res.status).toBe(200);
+      expect(authorOf(row.id).userId).toBe(user.id);
+      expect(authorOf(row.id).scopes).toEqual(['core.automations:edit']);
+    });
+
+    it('drops the author when the operator resets to the plugin default', async () => {
+      const row = seedManaged(db);
+      const user = addUser(['core.automations:edit']);
+      const operator = appAs(user.id, ['core.automations:edit']);
+      await request(operator).put('/v1/managed-automations/plugin-x/poller/code').send({ code: 'mine\n' });
+
+      const res = await request(operator).post('/v1/managed-automations/plugin-x/poller/reset');
+
+      expect(res.status).toBe(200);
+      expect(authorOf(row.id)).toBeUndefined();
+    });
+
+    it('leaves the author alone for keep-mine, schedule and enabled changes', async () => {
+      const row = seedManaged(db);
+      const user = addUser(['core.automations:edit']);
+      const operator = appAs(user.id, ['core.automations:edit']);
+      await request(operator).put('/v1/managed-automations/plugin-x/poller/code').send({ code: 'mine\n' });
+
+      await request(operator).post('/v1/managed-automations/plugin-x/poller/keep-mine');
+      await request(operator).put('/v1/managed-automations/plugin-x/poller/enabled').send({ enabled: false });
+
+      expect(authorOf(row.id).userId).toBe(user.id);
     });
   });
 });

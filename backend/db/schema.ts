@@ -132,6 +132,19 @@ export const automations = sqliteTable('automations', {
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
 
+/**
+ * Who last saved a script's code, and the scopes of the credential they used.
+ * A script's `tools` calls are checked against this, never against whoever runs
+ * it. Kept out of `automations` so no automation response can carry it. No row
+ * means nobody has claimed the script.
+ */
+export const automationAuthors = sqliteTable('automation_authors', {
+  automationId: integer('automation_id').primaryKey().references(() => automations.id, { onDelete: 'cascade' }),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'set null' }),
+  scopes: text('scopes', { mode: 'json' }).$type<string[]>().notNull().default(sql`'[]'`),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+});
+
 export const automationSessions = sqliteTable('automation_sessions', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   automationId: integer('automation_id').references(() => automations.id),

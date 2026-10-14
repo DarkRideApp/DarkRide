@@ -19,6 +19,7 @@ import type { AutomationRunner as IAutomationRunner } from '@darkrideapp/plugin-
 import type { SessionStatusUpdate } from '../../shared/types/websocket';
 import type { TriggerType } from '../../shared/types/api';
 import { DocumentStore } from './document-store';
+import { currentAuthorId, resolveToolAccess } from './automation-authors';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
 
 const { log, error } = createLoggers('automation-runner');
@@ -87,12 +88,29 @@ export class AutomationRunner implements IAutomationRunner {
     this.toolRegistry = registry;
   }
 
-  private buildToolsProxy(): Record<string, (params: any) => Promise<any>> {
+  /**
+   * A script's tools run with its author's scopes, checked on every call so a revoked scope applies at once.
+   * Built when a run starts: if a different person saves the script mid-run, the old code must not inherit their authority.
+   */
+  private buildToolsProxy(automationId: number): Record<string, (params: any) => Promise<any>> {
     if (!this.toolRegistry) return {};
     const registry = this.toolRegistry;
+    const db = this.db;
+    const authorAtStart = currentAuthorId(db, automationId);
     return new Proxy({} as Record<string, (params: any) => Promise<any>>, {
       get(_target, prop: string) {
-        return (params: any) => registry.executeTool(prop, params);
+        return async (params: any) => {
+          if (currentAuthorId(db, automationId) !== authorAtStart) {
+            throw new Error('Tool access denied: the script was saved by someone else while it was running.');
+          }
+          const access = resolveToolAccess(db, automationId);
+          if (access.kind === 'denied') throw new Error(access.reason);
+          if (access.kind === 'scoped') {
+            registry.assertScope(prop, access.snapshot);
+            registry.assertScope(prop, access.current);
+          }
+          return registry.executeTool(prop, params);
+        };
       },
     });
   }
@@ -442,7 +460,7 @@ export class AutomationRunner implements IAutomationRunner {
       try {
         await Promise.race([
           this.compiler.execute(compiled.code, apiForExecution, {
-            documentStore, console: automationConsole, tools: this.buildToolsProxy(), httpAPI,
+            documentStore, console: automationConsole, tools: this.buildToolsProxy(automationId), httpAPI,
           }, { signal: abortController.signal }),
           timeoutPromise,
         ]);
@@ -656,7 +674,7 @@ export class AutomationRunner implements IAutomationRunner {
           const handle = await this.compiler.execute(
             compiled.code,
             deviceAPI,
-            { documentStore, tools: this.buildToolsProxy() },
+            { documentStore, tools: this.buildToolsProxy(rule.id) },
             { keepAlive: true },
           );
           const handles = this.captureRuleIsolates.get(deviceId) ?? [];
@@ -720,7 +738,7 @@ export class AutomationRunner implements IAutomationRunner {
             continue;
           }
 
-          await this.compiler.execute(compiled.code, deviceAPI, { documentStore, tools: this.buildToolsProxy() });
+          await this.compiler.execute(compiled.code, deviceAPI, { documentStore, tools: this.buildToolsProxy(rule.id) });
         } catch (err: any) {
           error(`Rule "${rule.name}" failed: ${err.message}`);
         }

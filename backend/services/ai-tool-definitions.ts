@@ -15,6 +15,7 @@ import type { AutomationRunner } from './automation-runner';
 import type { TriggerType } from '../../shared/types/api';
 import type { AutomationScheduler } from './automation-scheduler';
 import { validateScheduleConfig } from './schedule-validator';
+import { clearAuthor } from './automation-authors';
 import type { AutomationCompiler } from './automation-compiler';
 import type { CaptureSessionManager } from './capture-session-manager';
 import type { PluginStateManager } from './plugin-state-manager';
@@ -544,10 +545,14 @@ export function registerAllTools(
     async execute(params: { id: number; code: string }) {
       const existing = db.select().from(schema.automations).where(eq(schema.automations.id, params.id)).all()[0];
       if (!existing) return { error: 'Automation not found' };
-      db.update(schema.automations)
-        .set({ code: params.code, updatedAt: new Date() })
-        .where(eq(schema.automations.id, params.id))
-        .run();
+      // The tool cannot tell who asked, so the script loses its author until a person saves it.
+      db.transaction((tx) => {
+        tx.update(schema.automations)
+          .set({ code: params.code, updatedAt: new Date() })
+          .where(eq(schema.automations.id, params.id))
+          .run();
+        clearAuthor(tx, params.id);
+      });
       return { id: params.id, codeLength: params.code.length };
     },
   });
@@ -579,10 +584,13 @@ export function registerAllTools(
         return { error: 'oldText matches multiple locations — provide more surrounding context to disambiguate' };
       }
       const patched = code.slice(0, idx) + params.newText + code.slice(idx + params.oldText.length);
-      db.update(schema.automations)
-        .set({ code: patched, updatedAt: new Date() })
-        .where(eq(schema.automations.id, params.id))
-        .run();
+      db.transaction((tx) => {
+        tx.update(schema.automations)
+          .set({ code: patched, updatedAt: new Date() })
+          .where(eq(schema.automations.id, params.id))
+          .run();
+        clearAuthor(tx, params.id);
+      });
       return { id: params.id, replacedAt: idx, newLength: patched.length };
     },
   });

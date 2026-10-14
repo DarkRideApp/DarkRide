@@ -99,6 +99,19 @@ Classification comes from `shared/lib/traffic-classify.ts`, the same code the Tr
 | POST | /v1/automation/validate | Validate automation code |
 | GET | /v1/automation/types | Get TypeScript type definitions for editor |
 
+### Tool access from scripts
+
+A script's global `tools` object calls the same tools as the AI chat. Every call runs with the scopes of the script's **author**, the person who last saved its code, and never with the scopes of whoever starts the run. A call is allowed only when both of these cover the tool's scope: the scopes of the session or API key that saved the code, and the scopes the author holds now. Revoking a scope, or disabling the user, therefore applies on the next call. A refused call throws `Insufficient scope: <scope> required for tool <name>`, which the script can catch.
+
+- Saving a script with `code`, from the editor or through `POST /v1/automation/create` or `PUT /v1/automation/update/:id`, makes the caller its author, even if the code is unchanged. An update without `code` leaves the author alone.
+- Changing code through the AI chat or MCP (`update_automation_code`, `patch_automation_code`) removes the author, because those tools cannot tell who asked. `create_automation` leaves a new script without one.
+- A script with no author, or whose author's account is disabled or deleted, cannot call tools. The error says why; saving the automation in the editor claims it.
+- A script shipped by a plugin keeps full tool access while its code matches what the plugin ships. Once an operator saves an override, the operator becomes its author. Resetting to the plugin's default removes the author.
+- Starting a script (`core.automations:execute`) runs it as written, with its author's scopes. Scripts do not follow `allowUnattended`.
+- If a different person saves the script while a run is in flight, that run's remaining tool calls are refused, so the old code never takes on the new author's scopes. Saving it again yourself does not interrupt your own run.
+- The author is not part of any automation response.
+- Only `tools` is checked this way. The `device` object a script receives is not scope-checked.
+
 ### Sessions
 
 | Method | Path | Description |
