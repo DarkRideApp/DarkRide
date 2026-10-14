@@ -91,6 +91,18 @@ describe('E2E — emulator capture', () => {
       expect(instanceId).toBeDefined();
 
       try {
+        // The create call answers at once with state "pulling" and no
+        // container; the container is made in the background. Starting
+        // before it exists sends Docker an empty container id.
+        step('polling listInstances until the container exists (state!==pulling)');
+        const created = await waitFor(async () => {
+          const r = await rest('GET', `/v1/devices/providers/docker-android/instances`);
+          const inst = r.body?.data?.instances?.find((i: any) => i.id === instanceId);
+          return inst && inst.state !== 'pulling' ? inst : undefined;
+        }, TIMEOUT_BOOT_MS);
+        expect(created.state, `instance creation failed: ${created.lastError}`).toBe('created');
+        step('container created');
+
         // 2. Start the container — response carries the resolved serial
         //    (docker picks a free host port; serial = "localhost:<port>")
         step(`POST /v1/devices/providers/docker-android/instances/${instanceId}/start (this blocks for up to ~240s while emulator cold-boots)`);
