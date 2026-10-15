@@ -96,7 +96,8 @@ test.describe('Plugins workspace: install and uninstall through the UI', () => {
     await page.getByTestId('confirm-dialog-confirm').click();
 
     // The progress dialog reaches "done" and offers OK; a failure would offer Close instead.
-    await expect(page.getByText(`Installing "${REGISTRY_NAME}"`)).toBeVisible();
+    // The heading, not getByText: while the install runs the progress line repeats the name.
+    await expect(page.getByRole('heading', { name: `Installing "${REGISTRY_NAME}"` })).toBeVisible();
     await page.getByRole('button', { name: 'OK' }).click({ timeout: 150_000 });
     await expect(page.getByText(/installed\. Restart to activate\./)).toBeVisible();
     await expect(page.getByText('Server restart required')).toBeVisible();

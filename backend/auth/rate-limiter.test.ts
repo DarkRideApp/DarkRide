@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { checkIpRateLimit, resetRateLimiter } from './rate-limiter';
 
 describe('rate-limiter', () => {
@@ -22,6 +22,22 @@ describe('rate-limiter', () => {
     for (let i = 0; i < 30; i++) checkIpRateLimit('1.1.1.1');
     expect(checkIpRateLimit('1.1.1.1').allowed).toBe(false);
     expect(checkIpRateLimit('2.2.2.2').allowed).toBe(true);
+  });
+
+  describe('DARKRIDE_LOGIN_RATE_LIMIT', () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    it('sets how many attempts one IP gets in the window', () => {
+      vi.stubEnv('DARKRIDE_LOGIN_RATE_LIMIT', '100');
+      for (let i = 0; i < 100; i++) expect(checkIpRateLimit('4.4.4.4').allowed).toBe(true);
+      expect(checkIpRateLimit('4.4.4.4').allowed).toBe(false);
+    });
+
+    it.each(['', 'many', '0', '-5', '2.5'])('falls back to 30 for %j', (value) => {
+      vi.stubEnv('DARKRIDE_LOGIN_RATE_LIMIT', value);
+      for (let i = 0; i < 30; i++) expect(checkIpRateLimit('5.5.5.5').allowed).toBe(true);
+      expect(checkIpRateLimit('5.5.5.5').allowed).toBe(false);
+    });
   });
 
   it('resetRateLimiter clears all buckets', () => {

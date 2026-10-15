@@ -190,21 +190,28 @@ describe('NotificationService', () => {
       createdAt: new Date(),
     }).run();
 
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('Bad Request', { status: 400 }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('Bad Request', { status: 400 }));
 
-    await service.emit({
-      type: 'automation:failure',
-      title: 'Failed',
-      body: 'error',
-    });
-    // Wait for retries (3 attempts)
-    await new Promise(r => setTimeout(r, 15000));
+    vi.useFakeTimers();
+    try {
+      const emitted = service.emit({
+        type: 'automation:failure',
+        title: 'Failed',
+        body: 'error',
+      });
+      // Three attempts with 1 s, 3 s and 9 s waits between retries.
+      await vi.advanceTimersByTimeAsync(15000);
+      await emitted;
+    } finally {
+      vi.useRealTimers();
+    }
 
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
     const history = service.getHistory();
     expect(history.length).toBe(1);
     expect(history[0].success).toBe(false);
     expect(history[0].error).toContain('400');
-  }, 20000);
+  });
 
   it('should dispatch to slack channel', async () => {
     db.insert(notificationChannels).values({

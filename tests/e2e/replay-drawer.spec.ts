@@ -18,14 +18,7 @@
  */
 
 import { test, expect, type Page } from '@playwright/test';
-import { loginAsAdmin, waitForBackend } from './helpers/auth';
-
-async function getCsrfToken(page: Page): Promise<string> {
-  return page.evaluate(() => {
-    const m = document.cookie.match(/darkride_csrf=([^;]+)/);
-    return m ? decodeURIComponent(m[1]) : '';
-  });
-}
+import { getCsrfToken, loginAsAdmin, waitForBackend } from './helpers/auth';
 
 test.describe('Traffic page — in-place Repeater drawer', () => {
   test.beforeAll(async ({ browser }) => {

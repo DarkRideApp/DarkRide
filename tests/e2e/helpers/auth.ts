@@ -5,7 +5,7 @@
  * auto-bootstraps an admin user via env vars.
  */
 
-import { type Page, type APIRequestContext, expect } from '@playwright/test';
+import { type Cookie, type Page, type APIRequestContext, expect } from '@playwright/test';
 
 export const API_BASE = 'http://localhost:3199';
 export const ADMIN_USERNAME = 'e2e-admin';
@@ -78,6 +78,8 @@ export async function waitForAuthGuard(page: Page): Promise<'login' | 'app'> {
   return winner;
 }
 
+let adminSession: Cookie[] | null = null;
+
 /**
  * Log in as the bootstrapped admin user via the browser UI.
  *
@@ -86,6 +88,10 @@ export async function waitForAuthGuard(page: Page): Promise<'login' | 'app'> {
  * waits for the full app to load.
  */
 export async function loginAsAdmin(page: Page): Promise<void> {
+  // The server allows 30 logins per IP in 5 minutes and a full run makes about
+  // 100, so sign in through the form once and hand later pages the same session.
+  // A logout elsewhere ends it server-side; the form login below then replaces it.
+  if (adminSession) await page.context().addCookies(adminSession);
   await page.goto('/ui/');
 
   const state = await waitForAuthGuard(page);
@@ -101,13 +107,14 @@ export async function loginAsAdmin(page: Page): Promise<void> {
   // Wait for the authenticated app to load (WebSocket connects, startup screen clears).
   // The sidebar is the reliable indicator that the full app is loaded.
   await page.locator('[data-testid="sidebar"]').waitFor({ state: 'visible', timeout: 30_000 });
+  adminSession = await page.context().cookies();
 }
 
 /**
  * Log out via the UI logout button.
  */
 export async function logout(page: Page): Promise<void> {
-  const logoutBtn = page.locator('button.nav-logout');
+  const logoutBtn = page.getByRole('button', { name: /^Sign out/ });
   await logoutBtn.click();
   // Wait for the login page to appear (AuthGuard transitions through loading -> login)
   await page.locator('#login-username').waitFor({ state: 'visible', timeout: 30_000 });

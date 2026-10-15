@@ -6,21 +6,30 @@
  * Run: npx playwright test tests/e2e/settings.spec.ts
  */
 
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { loginAsAdmin, waitForBackend } from './helpers/auth';
 
-// Settings tabs as defined in SettingsNav component.
-// The admin user has all scopes, so every tab should be visible.
+// Settings pages as listed in SettingsSidebar. The admin user has all scopes, so every
+// link should be visible. Installing and enabling plugins lives in the Plugins
+// workspace (/ui/plugins); see plugin-management.spec.ts.
 const SETTINGS_TABS = [
-  { label: 'Settings', path: '/ui/settings' },
-  // Plugins and Marketplace are no longer Settings tabs: both live in the Plugins
-  // workspace (/ui/plugins), and the old URLs redirect there. See plugin-management.spec.ts.
+  { label: 'Notifications', path: '/ui/settings/notifications' },
+  { label: 'Integrations', path: '/ui/settings/integrations' },
+  { label: 'AI', path: '/ui/settings/ai' },
+  { label: 'APK Analysis', path: '/ui/settings/analysis' },
+  { label: 'Cloud Storage', path: '/ui/settings/cloud-storage' },
+  { label: 'Traffic', path: '/ui/settings/traffic' },
   { label: 'Proxies', path: '/ui/settings/proxies' },
+  { label: 'ADB Proxy', path: '/ui/settings/adb-proxy' },
   { label: 'Credentials', path: '/ui/settings/credentials' },
   { label: 'Jobs', path: '/ui/settings/jobs' },
-  { label: 'Utils', path: '/ui/settings/utils' },
-  { label: 'Cloud Storage', path: '/ui/settings/cloud' },
+  { label: 'MCP Server', path: '/ui/settings/mcp' },
+  { label: 'Utilities', path: '/ui/settings/utils' },
+  { label: 'SDK Catalog', path: '/ui/settings/sdk-catalog' },
+  { label: 'Changelog', path: '/ui/settings/changelog' },
 ];
+
+const activeLink = (page: Page) => page.locator('.settings-sidebar-link.active');
 
 test.describe('Settings', () => {
   test.beforeAll(async ({ browser }) => {
@@ -30,35 +39,34 @@ test.describe('Settings', () => {
     await ctx.close();
   });
 
-  test('settings page loads with section headings', async ({ page }) => {
+  test('settings page loads on Notifications with the sidebar groups', async ({ page }) => {
     await loginAsAdmin(page);
     await page.goto('/ui/settings');
     await page.waitForLoadState('networkidle');
 
-    // The page has a Settings heading (from SettingsNav)
-    await expect(page.locator('h1', { hasText: 'Settings' })).toBeVisible({ timeout: 15_000 });
-
-    // Wait for content to load (sections appear below the tabs)
-    await page.waitForTimeout(2000);
+    // /ui/settings redirects to the first page; the sidebar marks it active.
+    await expect(page).toHaveURL(/\/ui\/settings\/notifications$/);
+    await expect(activeLink(page)).toHaveText('Notifications', { timeout: 15_000 });
+    for (const group of ['General', 'Plugins', 'Advanced', 'About']) {
+      await expect(page.locator('.settings-sidebar-group-label', { hasText: group })).toBeVisible();
+    }
 
     // Should not be stuck on a spinner
     const authSpinner = await page.locator('.auth-spinner').isVisible().catch(() => false);
     expect(authSpinner).toBe(false);
   });
 
-  test('all settings tabs are visible for admin user', async ({ page }) => {
+  test('all settings pages are linked in the sidebar for admin user', async ({ page }) => {
     await loginAsAdmin(page);
     await page.goto('/ui/settings');
     await page.waitForLoadState('networkidle');
-    await expect(page.locator('h1', { hasText: 'Settings' })).toBeVisible({ timeout: 15_000 });
+    await expect(activeLink(page)).toBeVisible({ timeout: 15_000 });
 
-    // Check each tab link is visible in the SettingsNav tab bar.
-    // Scope to the page-content area to avoid matching the sidebar nav link for "Settings".
-    const pageContent = page.locator('.page-content');
+    const sidebar = page.locator('.settings-sidebar');
     for (const tab of SETTINGS_TABS) {
-      const tabLink = pageContent.locator(`a[href="${tab.path}"]`, { hasText: tab.label });
-      await expect(tabLink).toBeVisible({ timeout: 5_000 });
+      await expect(sidebar.locator(`a[href="${tab.path}"]`, { hasText: tab.label })).toBeVisible({ timeout: 5_000 });
     }
+    await expect(sidebar.locator('a[href="/ui/plugins"]', { hasText: 'Manage plugins' })).toBeVisible();
   });
 
   test('navigate each settings tab without errors', async ({ page }) => {
@@ -91,8 +99,8 @@ test.describe('Settings', () => {
         consoleErrors[i].tab = tab.label;
       }
 
-      // The Settings heading (from SettingsNav) should be present on every tab
-      await expect(page.locator('h1', { hasText: 'Settings' })).toBeVisible({ timeout: 10_000 });
+      // The sidebar marks the page we navigated to as active
+      await expect(activeLink(page)).toContainText(tab.label, { timeout: 10_000 });
 
       // Check for error toasts
       const toastSelectors = [
@@ -162,8 +170,8 @@ test.describe('Settings', () => {
     await page.goto('/ui/settings/jobs');
     await page.waitForLoadState('networkidle');
 
-    // Should have the Settings heading
-    await expect(page.locator('h1', { hasText: 'Settings' })).toBeVisible({ timeout: 15_000 });
+    // Jobs is the active sidebar page
+    await expect(activeLink(page)).toHaveText('Jobs', { timeout: 15_000 });
 
     // Wait for the jobs content to load.
     // The Jobs page either shows a table of jobs or an empty/loading state.
