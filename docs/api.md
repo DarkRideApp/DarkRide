@@ -98,6 +98,8 @@ Classification comes from `shared/lib/traffic-classify.ts`, the same code the Tr
 | POST | /v1/automation/run/:id/:passcode | External trigger (POST) |
 | POST | /v1/automation/validate | Validate automation code |
 | GET | /v1/automation/types | Get TypeScript type definitions for editor |
+| GET | /v1/automation/unclaimed | Count scripts with no author (`core.automations:read`) |
+| POST | /v1/automation/claim-all | Make the caller the author of every script with no author (`core.automations:edit`) |
 
 ### Tool access from scripts
 
@@ -105,12 +107,24 @@ A script's global `tools` object calls the same tools as the AI chat. Every call
 
 - Saving a script with `code`, from the editor or through `POST /v1/automation/create` or `PUT /v1/automation/update/:id`, makes the caller its author, even if the code is unchanged. An update without `code` leaves the author alone.
 - Changing code through the AI chat or MCP (`update_automation_code`, `patch_automation_code`) removes the author, because those tools cannot tell who asked. `create_automation` leaves a new script without one.
-- A script with no author, or whose author's account is disabled or deleted, cannot call tools. The error says why; saving the automation in the editor claims it.
+- A script with no author, or whose author's account is disabled or deleted, cannot call tools or the device calls listed below. The error says why. Saving the automation in the editor claims it, and so does **Claim all** (next list).
 - A script shipped by a plugin keeps full tool access while its code matches what the plugin ships. Once an operator saves an override, the operator becomes its author. Resetting to the plugin's default removes the author.
 - Starting a script (`core.automations:execute`) runs it as written, with its author's scopes. Scripts do not follow `allowUnattended`.
 - If a different person saves the script while a run is in flight, that run's remaining tool calls are refused, so the old code never takes on the new author's scopes. Saving it again yourself does not interrupt your own run.
 - The author is not part of any automation response.
-- Only `tools` is checked this way. The `device` object a script receives is not scope-checked.
+- Scripts saved before authors were recorded have none. The banner at the top of the Automations page counts them and **Claim all** (or `POST /v1/automation/claim-all`) makes the signed-in user the author of all of them at once, with the scopes of the session or key used. It only takes scripts that have no author, never one that already has an author, and the user is vouching for the code: the scripts then run with that user's permissions. A user who holds fewer scopes gives the scripts fewer.
+
+#### Device calls that need a scope
+
+These calls on the `device` and `http` objects a script receives are checked the same way as `tools`, against the author's scopes. A refused call throws `Insufficient scope: <scope> required for <object>.<method>`, which the script can catch.
+
+| Call | Scope the author needs |
+|---|---|
+| `device.getCredentials(appId)` | `core.credentials:read` |
+| `device.setProxy(mode)` | `core.proxies:manage` |
+| `http.setProxy(mode)` | `core.proxies:manage` |
+
+Everything else on `device` and `http` needs only `core.automations:execute` to start the run. That includes outbound requests (`device.httpGet`, `device.httpPost`, `http.get` and the rest), which are what an automation is for. A script an administrator saved keeps working. `device.frida` and the traffic hooks on `device.http` are not checked yet.
 
 ### Sessions
 

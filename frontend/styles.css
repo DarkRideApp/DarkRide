@@ -4688,6 +4688,21 @@ body.live-log-open .ai-chat-fab {
   padding: 24px;
 }
 
+/* Automations: scripts nobody has claimed */
+.claim-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius);
+  padding: 10px 16px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
 /* Tab bar */
 .tab-bar {
   display: flex;

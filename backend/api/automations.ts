@@ -6,7 +6,7 @@ import { join, resolve } from 'path';
 import { getDataRoot } from '../config/paths';
 import { registerEndpoint } from './api-service';
 import { automations, automationAuthors, automationSessions, screenshots, capturedTraffic, websocketMessages, apiEndpointSessions } from '../db/schema';
-import { claimAutomation } from '../services/automation-authors';
+import { claimAutomation, claimUnclaimed, listUnclaimed } from '../services/automation-authors';
 import type { AppDatabase } from '../db/index';
 import { AutomationRunner } from '../services/automation-runner';
 import { AutomationCompiler } from '../services/automation-compiler';
@@ -97,6 +97,22 @@ export function registerAutomationEndpoints(
 
     res.json({ success: true, data: results });
   }, { requires: ['core.automations:read'] });
+
+  // GET /v1/automation/unclaimed — how many scripts cannot use gated calls until someone claims them
+  registerEndpoint('GET', '/v1/automation/unclaimed', (_req, res) => {
+    res.json({ success: true, data: { count: listUnclaimed(db).length } });
+  }, { requires: ['core.automations:read'] });
+
+  // POST /v1/automation/claim-all — the caller becomes the author of every unclaimed script
+  registerEndpoint('POST', '/v1/automation/claim-all', (req, res) => {
+    const caller = req.authUser;
+    if (!caller) {
+      res.status(401).json({ success: false, error: 'Sign in to claim automations' });
+      return;
+    }
+    const claimed = db.transaction((tx) => claimUnclaimed(tx, caller));
+    res.json({ success: true, data: { claimed } });
+  }, { requires: ['core.automations:edit'] });
 
   // POST /v1/automation/create
   registerEndpoint('POST', '/v1/automation/create', (req, res) => {
