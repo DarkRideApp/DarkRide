@@ -8730,6 +8730,8 @@ body.live-log-open .ai-chat-fab {
 
 /* Network workspace — scope bar + pane tabs. */
 .network-workspace { display: flex; flex-direction: column; min-height: 0; }
+/* The traffic pane scrolls its own list inside a clipped .page-content, so the workspace must take that height instead of growing with the rows. */
+.network-workspace:has(.traffic-page) { height: 100%; }
 .network-topbar {
   display: flex;
   flex-direction: column;

@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { Devices } from './Devices';
-import { WebSocketContext, ToastProvider } from '@darkrideapp/plugin-sdk/react';
+import { AuthContext, WebSocketContext, ToastProvider } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
 
 // jsdom doesn't implement HTMLDialogElement methods
@@ -46,6 +46,28 @@ function renderDevices() {
 }
 
 describe('Devices', () => {
+  it.each([
+    { scopes: ['core.devices:read'], listsProviders: false },
+    { scopes: ['core.devices:read', 'core.devices:manage'], listsProviders: true },
+  ])('lists managed emulators only with core.devices:manage (scopes $scopes)', async ({ scopes, listsProviders }) => {
+    const ws = createMockWs();
+    const auth = { hasScope: (s: string) => scopes.includes(s) } as any;
+    render(
+      <AuthContext.Provider value={auth}>
+        <WebSocketContext.Provider value={ws}>
+          <ToastProvider>
+            <MemoryRouter>
+              <Devices />
+            </MemoryRouter>
+          </ToastProvider>
+        </WebSocketContext.Provider>
+      </AuthContext.Provider>,
+    );
+    await waitFor(() => expect(screen.getByText('Pixel 6')).toBeInTheDocument());
+    const paths = (ws.sendRestApi as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1]);
+    expect(paths.includes('/v1/devices/providers')).toBe(listsProviders);
+  });
+
   it('renders device list', async () => {
     renderDevices();
     await waitFor(() => {

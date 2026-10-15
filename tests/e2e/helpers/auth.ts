@@ -107,7 +107,7 @@ export async function loginAsAdmin(page: Page): Promise<void> {
  * Log out via the UI logout button.
  */
 export async function logout(page: Page): Promise<void> {
-  const logoutBtn = page.locator('button.nav-logout');
+  const logoutBtn = page.getByRole('button', { name: /^Sign out/ });
   await logoutBtn.click();
   // Wait for the login page to appear (AuthGuard transitions through loading -> login)
   await page.locator('#login-username').waitFor({ state: 'visible', timeout: 30_000 });

@@ -139,6 +139,9 @@ test.describe('Authentication flows', () => {
     // Fill the key name
     await page.locator('#key-name').fill('E2E Test Key');
 
+    // A key needs at least one scope
+    await page.locator('[data-testid="modal"] label', { hasText: 'core.devices:read' }).locator('input[type="checkbox"]').check();
+
     // Click Create in the modal footer
     const modalCreateBtn = page.locator('[data-testid="modal"] button.btn-primary', { hasText: 'Create' });
     await modalCreateBtn.click();

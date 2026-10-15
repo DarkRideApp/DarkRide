@@ -137,6 +137,26 @@ test.describe('Scope enforcement — limited user browsing', () => {
       }
     });
 
+    // A toast only says "Insufficient scope"; the frames name the call and the scope it needed.
+    const sent = new Map<string, string>();
+    const refusedCalls = new Set<string>();
+    page.on('websocket', (sock) => {
+      sock.on('framesent', (f) => {
+        try {
+          const m = JSON.parse(String(f.payload));
+          if (m.id) sent.set(m.id, `${m.method} ${m.path}`);
+        } catch { /* not a JSON frame */ }
+      });
+      sock.on('framereceived', (f) => {
+        try {
+          const m = JSON.parse(String(f.payload));
+          if (m.type === 'restapi' && m.status === 403) {
+            refusedCalls.add(`${sent.get(m.id) ?? m.id} needs ${(m.body?.required ?? []).join(', ')}`);
+          }
+        } catch { /* not a JSON frame */ }
+      });
+    });
+
     // Login as limited user via the UI
     await page.goto('/ui/');
     await page.waitForSelector('input[id="login-username"], [data-testid="login-username"], input[autocomplete="username"]', { timeout: 15_000 });
@@ -154,6 +174,10 @@ test.describe('Scope enforcement — limited user browsing', () => {
 
     // Now browse each accessible page
     const toastErrors: Array<{ page: string; text: string }> = [];
+    // The selectors below overlap, so one toast can match several of them.
+    const noteToast = (pageName: string, text: string) => {
+      if (!toastErrors.some(e => e.page === pageName && e.text === text)) toastErrors.push({ page: pageName, text });
+    };
 
     for (const { path, name } of ACCESSIBLE_PAGES) {
       await page.goto(path);
@@ -177,7 +201,7 @@ test.describe('Scope enforcement — limited user browsing', () => {
                 text.toLowerCase().includes('403') ||
                 text.toLowerCase().includes('forbidden') ||
                 text.toLowerCase().includes('insufficient')) {
-              toastErrors.push({ page: `${name} (${path})`, text: text.trim() });
+              noteToast(`${name} (${path})`, text.trim());
             }
           }
         }
@@ -187,10 +211,7 @@ test.describe('Scope enforcement — limited user browsing', () => {
       const genericErrors = await page.locator('[role="status"] >> text=/scope|403|Forbidden|Insufficient/i').all();
       for (const el of genericErrors) {
         if (await el.isVisible()) {
-          toastErrors.push({
-            page: `${name} (${path})`,
-            text: (await el.textContent())?.trim() || 'unknown error',
-          });
+          noteToast(`${name} (${path})`, (await el.textContent())?.trim() || 'unknown error');
         }
       }
     }
@@ -207,6 +228,7 @@ test.describe('Scope enforcement — limited user browsing', () => {
       expect.soft(consoleErrors, `Console 403/scope errors:\n${report}`).toHaveLength(0);
     }
 
+    expect.soft([...refusedCalls], 'Calls the server refused for lack of scope').toEqual([]);
     expect(toastErrors).toHaveLength(0);
   });
 });

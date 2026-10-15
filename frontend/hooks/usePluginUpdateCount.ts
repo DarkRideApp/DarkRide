@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
+import { useAuthOptional, useWebSocket } from '@darkrideapp/plugin-sdk/react';
 
 /**
  * Number of installed plugins with an update available. Drives the badge
@@ -7,14 +7,21 @@ import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
  * — the backend's plugin-update-check job refreshes the source cache every
  * 6 hours, so polling more often is wasted RTT.
  *
- * Returns 0 on failure (e.g. caller lacks `core.plugins:manage`) so the
- * badge silently disappears for users who couldn't act on it anyway.
+ * Returns 0 without calling the API when the caller lacks `core.plugins:manage`:
+ * the SDK toasts every failed call, so asking would show them a scope error
+ * on every page.
  */
 export function usePluginUpdateCount(): number {
   const ws = useWebSocket();
+  const auth = useAuthOptional();
+  const allowed = auth?.hasScope('core.plugins:manage') ?? true;
   const [count, setCount] = useState(0);
 
   useEffect(() => {
+    if (!allowed) {
+      setCount(0);
+      return;
+    }
     let cancelled = false;
 
     const refresh = async () => {
@@ -37,7 +44,7 @@ export function usePluginUpdateCount(): number {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [ws]);
+  }, [ws, allowed]);
 
   return count;
 }
