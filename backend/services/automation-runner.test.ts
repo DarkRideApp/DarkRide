@@ -844,7 +844,7 @@ describe('AutomationRunner', () => {
         expect(result.error).toBeUndefined();
         expect(result.success).toBe(true);
         // The runner makes its own requests to the device bridge; only the script's count here.
-        const scriptCalls = fetchSpy.mock.calls.filter(([url]) => String(url).startsWith('https://example.test'));
+        const scriptCalls = fetchSpy.mock.calls.filter(([url]) => new URL(String(url)).hostname === 'example.test');
         expect(scriptCalls).toHaveLength(4);
       });
     });
