@@ -62,6 +62,13 @@ jobs:
       - name: Build plugin SDK
         run: npm run build -w @darkrideapp/plugin-sdk
 
+      - name: Lint
+        run: npm run lint
+
+      # The local ESLint rules are plain scripts that vitest does not pick up.
+      - name: Lint rule tests
+        run: npm run lint:rules
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -231,3 +238,69 @@ jobs:
           docker logs smoke 2>&1 | tail -50
           docker rm -f smoke >/dev/null
           exit 1
+
+  e2e:
+    name: E2E (Playwright)
+    # Not ubuntu-26.04: Playwright 1.60 refuses to install chromium there
+    # ("does not support chromium on ubuntu26.04-x64").
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      # The backend builds its Python venv on first boot (pip, mitmproxy, frida
+      # wheels), which outlasts Playwright's server start timeout. Pre-warm it.
+      # The cached venv only works under the Python that built it, so the key
+      # carries the version, as in ci-e2e-emulator.yml.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        id: py
+        with:
+          python-version: '3.13'
+
+      - name: Cache Python venv
+        uses: actions/cache@v6
+        id: venv-cache
+        with:
+          path: .venv
+          key: python-venv-${{ runner.os }}-${{ steps.py.outputs.python-version }}-${{ hashFiles('python/requirements.txt') }}
+
+      - name: Pre-warm Python venv
+        if: steps.venv-cache.outputs.cache-hit != 'true'
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r python/requirements.txt
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build plugin SDK
+        run: npm run build -w @darkrideapp/plugin-sdk
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright tests
+        run: npx playwright test --reporter=list
+
+      # Traces of failed and retried specs, kept for a week.
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: playwright-test-results
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 7
