@@ -36,6 +36,8 @@ function createAnalysisDb(basePath: string): string {
   fs.mkdirSync(basePath, { recursive: true });
   const dbPath = path.join(basePath, 'source.db');
   const sqlite = new Database(dbPath);
+  // Every autocommit fsyncs; the seed below is a dozen of them and ran 2 s per test on a disk-backed /tmp.
+  sqlite.pragma('synchronous = OFF');
 
   sqlite.exec(`
     CREATE TABLE files (
