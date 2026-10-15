@@ -29,6 +29,14 @@ const { log, error } = createLoggers('apk-tracker');
 const DEFAULT_CHECK_INTERVAL = 30 * 60 * 1000; // 30 minutes
 
 /**
+ * Stored in `app_sources.last_error` when a version was recorded but its APK has
+ * not been tried yet. It reads as a status in the per-source health line, and
+ * the next scheduled cycle replaces it with the download's outcome. See
+ * {@link isDownloadOwed}.
+ */
+export const DOWNLOAD_PENDING_NOTE = 'APK not downloaded yet';
+
+/**
  * Is a remote download for `versionName` still owed?
  *
  * `app_sources.last_version` is what the STORE last told us, recorded even when
@@ -52,6 +60,12 @@ const DEFAULT_CHECK_INTERVAL = 30 * 60 * 1000; // 30 minutes
  * and the APK manifest spell the same release differently the version looks
  * un-held, and a stale lastError costs one redundant download that ingestVersion
  * dedups by versionCode, after which the error is cleared.
+ *
+ * `lastError` is also the only place this state lives (no schema change), so
+ * anything that stores a version WITHOUT downloading it, such as the
+ * sources/check probe, marks the download owed by writing
+ * {@link DOWNLOAD_PENDING_NOTE} there, and anything that merely re-checks the
+ * store must leave a set `lastError` alone while this returns true.
  */
 export function isDownloadOwed(
   db: AppDatabase,
@@ -292,12 +306,17 @@ export class ApkTracker {
    * `apk:analyzed` never fires and a subscriber would hear nothing at all. The
    * same goes for a download that FAILS: the store still reported the version.
    *
-   * One version can therefore be announced twice, and subscribers should treat
-   * the pair as idempotent: `analysed:false` the first time the store reports it
-   * (only when it differs from the recorded version, so a retry loop does not
-   * repeat it), then `analysed:true` if a later retry downloads it. The second
-   * carries `previousVersion === versionName`, which marks it as the completion
-   * of an earlier announcement rather than a new release.
+   * One version can therefore be announced more than once, and subscribers
+   * should treat repeats of the same `versionName` as idempotent. What is
+   * guaranteed: `analysed:false` when a source first reports a version that
+   * differs from the one it had recorded (so a retry loop does not repeat it),
+   * then `analysed:true` if a later download succeeds. Announcements are per
+   * source and `previousVersion` is that source's own previous version, so it
+   * cannot be used to tell the two apart or to recognise a completion.
+   *
+   * The scheduled cycle and the sources/check probe announce for enabled sources
+   * only. An explicit fetch-now (`force`) announces for the source it was asked
+   * to fetch whether or not it is enabled, on failure as it always has on success.
    *
    * Public so the sources/check endpoint, which stores a version without going
    * through checkRemoteSource, can announce it too.
@@ -483,7 +502,13 @@ export class ApkTracker {
     try {
       const versionInfo = await source.checkVersion(app.packageName);
       if (!versionInfo) {
-        markState({ lastCheckedAt: new Date(), lastError: null });
+        // "Not listed" is not "nothing owed": some sources return null for any
+        // lookup failure, so a blip on the store must not make us forget that a
+        // download for the recorded version is still owed.
+        const owed = isDownloadOwed(this.db, {
+          trackedAppId: app.id, versionName: row?.lastVersion ?? null, lastError: row?.lastError ?? null,
+        });
+        markState({ lastCheckedAt: new Date(), ...(owed ? {} : { lastError: null }) });
         return { newVersionId: null, notFound: true };
       }
 

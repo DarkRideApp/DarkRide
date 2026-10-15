@@ -9,6 +9,7 @@ import { clearEndpoints, getApiRouter } from './api-service';
 import { registerAppEndpoints } from './apps';
 import { SourceRegistry } from '../services/apk-sources/registry';
 import type { RemoteApkSource } from '../services/apk-sources/types';
+import { ApkTracker } from '../services/apk-tracker';
 import { createTestDb } from '../test-utils/create-test-db';
 
 vi.mock('../services/device-manager', async (importOriginal) => {
@@ -17,7 +18,7 @@ vi.mock('../services/device-manager', async (importOriginal) => {
 });
 vi.mock('../logs', () => ({ createLoggers: () => ({ log: vi.fn(), error: vi.fn(), warn: vi.fn() }) }));
 
-const { appSources } = schema;
+const { appSources, apkVersions } = schema;
 
 function fakeSource(id: string, defaultEnabled: boolean): RemoteApkSource {
   return {
@@ -308,6 +309,139 @@ describe('Apps source-config API', () => {
       await check(id);
 
       expect(rowOf(id, 'playstore').lastError).toBeNull();
+    });
+
+    // A subscriber that reads the row when the event fires (the usual way to
+    // describe a release) must find the NEW version's listing, not the old one.
+    // checkRemoteSource saves the listing metadata before it emits; this
+    // endpoint has to as well.
+    describe('listing metadata is saved before the announcement', () => {
+      const when = new Date('2026-09-17T08:47:07.000Z');
+      const newListing = {
+        versionName: '1.0.0', iconUrl: 'https://example.test/new.png',
+        releaseNotes: 'New notes', sizeLabel: '24M', storeUpdatedAt: when,
+      };
+      const oldListing = {
+        lastVersion: '0.9.0', lastIconUrl: 'https://example.test/old.png',
+        lastReleaseNotes: 'Old notes', lastSizeLabel: '10M', lastStoreUpdatedAt: new Date('2026-08-01T00:00:00.000Z'),
+      };
+
+      it('the row already holds the new listing when the event fires', async () => {
+        const id = await trackApp();
+        setRow(id, 'playstore', oldListing);
+        (h.registry.get('playstore')!.checkVersion as any).mockResolvedValueOnce(newListing);
+        let atEmit: ReturnType<typeof rowOf> | undefined;
+        h.apkTracker.emitVersionDetected.mockImplementation(() => { atEmit = { ...rowOf(id, 'playstore') }; });
+
+        await check(id);
+
+        expect(h.apkTracker.emitVersionDetected).toHaveBeenCalledTimes(1);
+        expect(atEmit, 'the event fired with the previous release notes and size still on the row').toMatchObject({
+          lastVersion: '1.0.0',
+          lastIconUrl: 'https://example.test/new.png',
+          lastReleaseNotes: 'New notes',
+          lastSizeLabel: '24M',
+        });
+        expect(atEmit!.lastStoreUpdatedAt?.getTime()).toBe(when.getTime());
+      });
+
+      it('keeps the stored listing when the probe carries none (never blanks it)', async () => {
+        const id = await trackApp();
+        setRow(id, 'playstore', oldListing);   // default probe reply is just { versionName: '1.0.0' }
+        await check(id);
+
+        expect(rowOf(id, 'playstore')).toMatchObject({
+          lastVersion: '1.0.0', lastIconUrl: 'https://example.test/old.png',
+          lastReleaseNotes: 'Old notes', lastSizeLabel: '10M',
+        });
+      });
+
+      it('saves the listing of a disabled source too (it is probed, just not announced)', async () => {
+        const id = await trackApp();
+        (h.registry.get('qq')!.checkVersion as any).mockResolvedValueOnce(newListing);
+        await check(id);
+
+        expect(rowOf(id, 'qq')).toMatchObject({ lastVersion: '1.0.0', lastReleaseNotes: 'New notes', lastSizeLabel: '24M' });
+      });
+    });
+
+    // The probe moves last_version onto a new release without downloading it.
+    // For an auto-analyse source, the scheduled cycle compares the store's
+    // version with last_version and would call the APK "already seen", so it
+    // would never be fetched and the announcement would never be followed by
+    // analysed:true. The probe has to leave that download owed.
+    describe('a new version on an auto-analyse source is left owed for the next cycle', () => {
+      const autoAnalyse = (id: number) =>
+        h.db.update(trackedApps).set({ autoAnalyse: true }).where(eq(trackedApps.id, id)).run();
+      const realTracker = () => {
+        const tracker = new ApkTracker(h.db as any, { getAllDeviceStatuses: vi.fn(async () => []) } as any);
+        tracker.setSourceRegistry(h.registry);
+        return tracker;
+      };
+
+      it('the endpoint, then a scheduled cycle, downloads the APK', async () => {
+        const id = await trackApp();
+        autoAnalyse(id);
+        setRow(id, 'playstore', { lastVersion: '0.9.0' });
+        const ps = h.registry.get('playstore')!;
+
+        await check(id);
+        expect(ps.downloadApk, 'the probe itself must not download').not.toHaveBeenCalled();
+        await realTracker().checkRemoteSource({ id, packageName: 'com.example.app', appName: null }, ps);
+
+        expect(ps.downloadApk, 'the cycle called the version "already seen" and never fetched the APK').toHaveBeenCalledTimes(1);
+      });
+
+      it('and once the cycle has fetched it, the next cycle leaves it alone', async () => {
+        const id = await trackApp();
+        autoAnalyse(id);
+        setRow(id, 'playstore', { lastVersion: '0.9.0' });
+        const ps = h.registry.get('playstore')!;
+        (ps.downloadApk as any).mockResolvedValue({ success: false, error: 'nope' });
+        const tracker = realTracker();
+        const app = { id, packageName: 'com.example.app', appName: null };
+
+        await check(id);
+        await tracker.checkRemoteSource(app, ps);   // fails: still owed, real error recorded
+        await tracker.checkRemoteSource(app, ps);   // retried, not skipped
+
+        expect(ps.downloadApk).toHaveBeenCalledTimes(2);
+        expect(rowOf(id, 'playstore').lastError).toBe('nope');
+        // ...and the failed cycle did not announce the same version a second time.
+        expect(h.apkTracker.emitVersionDetected).toHaveBeenCalledTimes(1);
+      });
+
+      it('does not mark an app that does not auto-analyse', async () => {
+        const id = await trackApp();
+        await check(id);
+        expect(rowOf(id, 'playstore').lastError).toBeNull();
+      });
+
+      it('does not mark a version whose APK is already held (from any source)', async () => {
+        const id = await trackApp();
+        autoAnalyse(id);
+        h.db.insert(apkVersions).values({
+          trackedAppId: id, versionCode: 100, versionName: '1.0.0',
+          filename: '100_1.0.0.apk', source: 'device', downloadedAt: new Date(),
+        }).run();
+        await check(id);
+        expect(rowOf(id, 'playstore').lastError).toBeNull();
+      });
+
+      it('does not mark a disabled source (the cycle never checks it)', async () => {
+        const id = await trackApp();
+        autoAnalyse(id);
+        await check(id);
+        expect(rowOf(id, 'qq').lastError).toBeNull();
+      });
+
+      it('does not mark a version that did not change', async () => {
+        const id = await trackApp();
+        autoAnalyse(id);
+        setRow(id, 'playstore', { lastVersion: '1.0.0' });
+        await check(id);
+        expect(rowOf(id, 'playstore').lastError).toBeNull();
+      });
     });
   });
 

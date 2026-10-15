@@ -15,7 +15,7 @@ import { adbShell, adbCommand, adbPull, suShell } from '../services/device-manag
 import type { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
 import type { ApkTracker } from '../services/apk-tracker';
-import { extractIconFromLocalApk, fetchIconFromGooglePlay, fetchIconFromSources, isDownloadOwed } from '../services/apk-tracker';
+import { extractIconFromLocalApk, fetchIconFromGooglePlay, fetchIconFromSources, isDownloadOwed, DOWNLOAD_PENDING_NOTE } from '../services/apk-tracker';
 import type { ApkAnalyzerService } from '../services/apk-analyzer';
 import type { FileStorageService } from '../services/file-storage';
 import type { AppDatabase } from '../db/index';
@@ -1046,18 +1046,32 @@ export function registerAppEndpoints(
           const row = db.select().from(appSources)
             .where(and(eq(appSources.trackedAppId, id), eq(appSources.source, source.id))).all()[0];
           const previousVersion = row?.lastVersion ?? null;
-          // A probe is a read, not a download. A successful one clears a stale
-          // error, but must not clear the error of a download that is still
-          // owed, or the scheduled cycle stops retrying it.
-          const owed = isDownloadOwed(db, {
-            trackedAppId: id, versionName: info.versionName, lastError: row?.lastError ?? null,
-          });
+          const changed = !!info.versionName && info.versionName !== previousVersion;
+          // A probe is a read, not a download, so it must leave the download
+          // side exactly as owed as it found it:
+          //  - it must not clear the error of a download that is still owed, or
+          //    the scheduled cycle stops retrying it;
+          //  - a NEW version on an enabled source has not been fetched either,
+          //    and now that last_version holds it the cycle would call it
+          //    "already seen" and never fetch it. So the probe marks it owed, using
+          //    isDownloadOwed's own definition (auto-analyse, and no APK of that
+          //    version held from any source) rather than a second one.
+          const pending = row?.lastError ?? (changed && row?.enabled ? DOWNLOAD_PENDING_NOTE : null);
+          const owed = isDownloadOwed(db, { trackedAppId: id, versionName: info.versionName, lastError: pending });
+          // The listing is saved with the version, as checkRemoteSource does, and
+          // BEFORE the announcement below: a subscriber that reads the row when the
+          // event fires would otherwise describe this release with the last one's
+          // notes and size. A probe that carries no listing never blanks a stored one.
           setState(source.id, {
             lastVersion: info.versionName,
             lastCheckedAt: new Date(),
-            ...(owed ? {} : { lastError: null }),
+            lastIconUrl: info.iconUrl ?? row?.lastIconUrl ?? null,
+            lastReleaseNotes: info.releaseNotes ?? row?.lastReleaseNotes ?? null,
+            lastSizeLabel: info.sizeLabel ?? row?.lastSizeLabel ?? null,
+            lastStoreUpdatedAt: info.storeUpdatedAt ?? row?.lastStoreUpdatedAt ?? null,
+            lastError: owed ? pending : null,
           });
-          if (row?.enabled && info.versionName && info.versionName !== previousVersion) {
+          if (row?.enabled && changed) {
             apkTracker?.emitVersionDetected({
               trackedAppId: id, packageName: app.packageName, appName: app.appName ?? null,
               source: source.id, versionName: info.versionName, previousVersion, analysed: false,

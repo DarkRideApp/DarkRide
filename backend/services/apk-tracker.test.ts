@@ -609,6 +609,62 @@ describe('ApkTracker', () => {
         expect(detected(emit)).toHaveLength(1);
       });
 
+      // Pins a documented choice: an explicit fetch-now is the user asking for
+      // THIS source, so it is announced whether or not the source is enabled,
+      // exactly as a forced fetch that succeeds already is. Only the passive
+      // paths (the scheduled cycle, the sources/check probe) respect `enabled`.
+      it('a forced fetch of a DISABLED source is announced too, on failure as on success', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { enabled: false, lastVersion: '2.0.0' });
+        const { emit, bus } = hookBus();
+
+        const failing = failingSource();
+        const failTracker = trackerWith(failing);
+        failTracker.setHookBus(bus);
+        await failTracker.checkRemoteSource(app(appId), failing, { force: true });
+        expect(detected(emit).map(p => p.analysed)).toEqual([false]);
+
+        const working = fakeSource();
+        const okTracker = trackerWith(working);
+        okTracker.setHookBus(bus);
+        await okTracker.checkRemoteSource(app(appId), working, { force: true });
+        expect(detected(emit).map(p => p.analysed)).toEqual([false, true]);
+      });
+
+      // `checkVersion` returning null means "not listed right now". Some sources
+      // return it for any lookup error, so a blip on the store must not make the
+      // tracker forget that a download is still owed.
+      it('a "not listed" reply does not abandon an owed download', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const listing = { versionName: '3.0.0', appName: 'Test App' };
+        const ps = failingSource({
+          checkVersion: vi.fn()
+            .mockResolvedValueOnce(listing)   // cycle 1: new version, download fails
+            .mockResolvedValueOnce(null)      // cycle 2: store blip
+            .mockResolvedValue(listing),      // cycle 3: listed again
+        });
+        const tracker = trackerWith(ps);
+
+        await tracker.checkRemoteSource(app(appId), ps);
+        await tracker.checkRemoteSource(app(appId), ps);
+        expect(sourceRow(appId)!.lastError, 'the null reply cleared the error that keeps the retry alive').toBe(DOWNLOAD_ERROR);
+        await tracker.checkRemoteSource(app(appId), ps);
+
+        expect(ps.downloadApk, 'the retry was abandoned after the store blip').toHaveBeenCalledTimes(2);
+      });
+
+      it('a "not listed" reply still clears an error when no download is owed', async () => {
+        const appId = addApp(false);   // track-only: nothing is ever owed
+        seedSource(appId, { lastVersion: '3.0.0', lastError: 'getaddrinfo ENOTFOUND play.google.com' });
+        const ps = failingSource({ checkVersion: vi.fn(async () => null) });
+
+        const result = await trackerWith(ps).checkRemoteSource(app(appId), ps);
+
+        expect(result.notFound).toBe(true);
+        expect(sourceRow(appId)!.lastError).toBeNull();
+      });
+
       // The retry must key on "the download for THIS version is still owed",
       // not on "lastError is set": check failures set lastError too.
       it('a transient check failure does not make an already-ingested version download again', async () => {
