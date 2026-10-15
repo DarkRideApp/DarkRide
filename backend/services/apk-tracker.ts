@@ -28,6 +28,53 @@ const execAsync = promisify(exec);
 const { log, error } = createLoggers('apk-tracker');
 const DEFAULT_CHECK_INTERVAL = 30 * 60 * 1000; // 30 minutes
 
+/**
+ * Is a remote download for `versionName` still owed?
+ *
+ * `app_sources.last_version` is what the STORE last told us, recorded even when
+ * the APK could not be fetched (a subscriber that only needs the version string
+ * must not wait on a download). So "last_version equals the store's version"
+ * no longer proves the APK was obtained, and the scheduled cycle needs a
+ * separate answer to "should I try the download again?".
+ *
+ * Owed means all of:
+ *  - `lastError` is set (the previous attempt failed), AND
+ *  - the app is auto-analyse (the only mode that downloads at all), AND
+ *  - no APK for that version is held yet, from ANY source.
+ *
+ * The last condition is what keeps this from degrading into "retry whenever
+ * lastError is set". `checkVersion` failures (a network blip) set lastError
+ * too, and a bare `!lastError` skip rule would then re-download an APK we
+ * already hold after every blip. It also ends the retry loop once a device pulls
+ * the same version that a store download kept failing to deliver.
+ *
+ * Matching is by versionName, which is how the store reports it. If a store
+ * and the APK manifest spell the same release differently the version looks
+ * un-held, and a stale lastError costs one redundant download that ingestVersion
+ * dedups by versionCode, after which the error is cleared.
+ *
+ * `lastError` is also the only place this state lives (no schema change), so
+ * anything that stores a version WITHOUT downloading it, such as the
+ * sources/check probe, marks the download owed by writing
+ * DOWNLOAD_PENDING_NOTE (shared/lib/download-pending.ts) there, and anything
+ * that merely re-checks the store must leave a set `lastError` alone while this
+ * returns true. That marker is a status, not a failure, so the UI draws it as
+ * pending; see isDownloadPendingNote.
+ */
+export function isDownloadOwed(
+  db: AppDatabase,
+  p: { trackedAppId: number; versionName: string | null; lastError: string | null },
+): boolean {
+  if (!p.lastError || !p.versionName) return false;
+  const autoAnalyse = db.select({ autoAnalyse: trackedApps.autoAnalyse })
+    .from(trackedApps).where(eq(trackedApps.id, p.trackedAppId)).all()[0]?.autoAnalyse ?? false;
+  if (!autoAnalyse) return false;
+  const held = db.select({ id: apkVersions.id }).from(apkVersions)
+    .where(and(eq(apkVersions.trackedAppId, p.trackedAppId), eq(apkVersions.versionName, p.versionName)))
+    .limit(1).all();
+  return held.length === 0;
+}
+
 /** Density preference order for mipmap icon extraction (highest first). */
 const DENSITY_ORDER = ['xxxhdpi', 'xxhdpi', 'xhdpi', 'hdpi', 'mdpi'] as const;
 
@@ -250,12 +297,28 @@ export class ApkTracker {
   /**
    * Announce a new version. Fires whether or not the APK is downloaded, which
    * is the point: with auto-analyse off nothing else in the pipeline runs, so
-   * `apk:analyzed` never fires and a subscriber would hear nothing at all.
+   * `apk:analyzed` never fires and a subscriber would hear nothing at all. The
+   * same goes for a download that FAILS: the store still reported the version.
+   *
+   * One version can therefore be announced more than once, and subscribers
+   * should treat repeats of the same `versionName` as idempotent. What is
+   * guaranteed: `analysed:false` when a source first reports a version that
+   * differs from the one it had recorded (so a retry loop does not repeat it),
+   * then `analysed:true` if a later download succeeds. Announcements are per
+   * source and `previousVersion` is that source's own previous version, so it
+   * cannot be used to tell the two apart or to recognise a completion.
+   *
+   * The scheduled cycle and the sources/check probe announce for enabled sources
+   * only. An explicit fetch-now (`force`) announces for the source it was asked
+   * to fetch whether or not it is enabled, on failure as it always has on success.
+   *
+   * Public so the sources/check endpoint, which stores a version without going
+   * through checkRemoteSource, can announce it too.
    *
    * Never allowed to break a check cycle — a throwing subscriber must not stop
    * us recording the version we just found.
    */
-  private emitVersionDetected(payload: {
+  emitVersionDetected(payload: {
     trackedAppId: number; packageName: string; appName: string | null;
     source: string; versionName: string; previousVersion: string | null;
     analysed: boolean;
@@ -433,7 +496,13 @@ export class ApkTracker {
     try {
       const versionInfo = await source.checkVersion(app.packageName);
       if (!versionInfo) {
-        markState({ lastCheckedAt: new Date(), lastError: null });
+        // "Not listed" is not "nothing owed": some sources return null for any
+        // lookup failure, so a blip on the store must not make us forget that a
+        // download for the recorded version is still owed.
+        const owed = isDownloadOwed(this.db, {
+          trackedAppId: app.id, versionName: row?.lastVersion ?? null, lastError: row?.lastError ?? null,
+        });
+        markState({ lastCheckedAt: new Date(), ...(owed ? {} : { lastError: null }) });
         return { newVersionId: null, notFound: true };
       }
 
@@ -450,7 +519,15 @@ export class ApkTracker {
       // Skip the download if the source reports the same version we last saw,
       // unless the caller forced a refresh. Metadata is still refreshed — a
       // store can edit an icon or release notes without shipping a new build.
-      if (!opts.force && versionInfo.versionName && versionInfo.versionName === row?.lastVersion) {
+      // `last_version` is recorded even when the download fails, so "same as
+      // last_version" is not enough on its own: a download that is still owed
+      // (see isDownloadOwed) keeps retrying every cycle until it succeeds.
+      if (
+        !opts.force && versionInfo.versionName && versionInfo.versionName === row?.lastVersion
+        && !isDownloadOwed(this.db, {
+          trackedAppId: app.id, versionName: versionInfo.versionName, lastError: row?.lastError ?? null,
+        })
+      ) {
         markState({ ...storeMeta, lastCheckedAt: new Date(), lastError: null });
         return { newVersionId: null };
       }
@@ -489,7 +566,29 @@ export class ApkTracker {
       const result = await source.downloadApk(app.packageName, appName);
       if (!result.success || !result.versionCode) {
         const msg = result.error || 'download failed';
-        markState({ lastCheckedAt: new Date(), lastError: msg });
+        // The store DID tell us the version, even though the APK can't be had
+        // right now. Record and announce it: anything that reads `last_version`
+        // or listens for apk:version-detected would otherwise wait indefinitely
+        // on a download that may keep failing. `lastError` stays set, which is
+        // what keeps the download owed so the next cycle retries it.
+        markState({
+          ...storeMeta,
+          lastVersion: versionInfo.versionName ?? row?.lastVersion ?? null,
+          lastCheckedAt: new Date(),
+          lastError: msg,
+        });
+        if (!app.appName && versionInfo.appName) {
+          this.db.update(trackedApps).set({ appName: versionInfo.appName }).where(eq(trackedApps.id, app.id)).run();
+          app.appName = versionInfo.appName;
+        }
+        // Only on a change: every retry cycle sees the same version again.
+        if (versionInfo.versionName && versionInfo.versionName !== previousVersion) {
+          this.emitVersionDetected({
+            trackedAppId: app.id, packageName: app.packageName, appName: app.appName,
+            source: source.id, versionName: versionInfo.versionName,
+            previousVersion, analysed: false,
+          });
+        }
         log(`${source.label} download skipped for ${app.packageName}: ${msg}`);
         return { newVersionId: null, error: msg };
       }
