@@ -15,7 +15,8 @@ import { adbShell, adbCommand, adbPull, suShell } from '../services/device-manag
 import type { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
 import type { ApkTracker } from '../services/apk-tracker';
-import { extractIconFromLocalApk, fetchIconFromGooglePlay, fetchIconFromSources, isDownloadOwed, DOWNLOAD_PENDING_NOTE } from '../services/apk-tracker';
+import { extractIconFromLocalApk, fetchIconFromGooglePlay, fetchIconFromSources, isDownloadOwed } from '../services/apk-tracker';
+import { DOWNLOAD_PENDING_NOTE } from '../../shared/lib/download-pending';
 import type { ApkAnalyzerService } from '../services/apk-analyzer';
 import type { FileStorageService } from '../services/file-storage';
 import type { AppDatabase } from '../db/index';

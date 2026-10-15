@@ -29,14 +29,6 @@ const { log, error } = createLoggers('apk-tracker');
 const DEFAULT_CHECK_INTERVAL = 30 * 60 * 1000; // 30 minutes
 
 /**
- * Stored in `app_sources.last_error` when a version was recorded but its APK has
- * not been tried yet. It reads as a status in the per-source health line, and
- * the next scheduled cycle replaces it with the download's outcome. See
- * {@link isDownloadOwed}.
- */
-export const DOWNLOAD_PENDING_NOTE = 'APK not downloaded yet';
-
-/**
  * Is a remote download for `versionName` still owed?
  *
  * `app_sources.last_version` is what the STORE last told us, recorded even when
@@ -64,8 +56,10 @@ export const DOWNLOAD_PENDING_NOTE = 'APK not downloaded yet';
  * `lastError` is also the only place this state lives (no schema change), so
  * anything that stores a version WITHOUT downloading it, such as the
  * sources/check probe, marks the download owed by writing
- * {@link DOWNLOAD_PENDING_NOTE} there, and anything that merely re-checks the
- * store must leave a set `lastError` alone while this returns true.
+ * DOWNLOAD_PENDING_NOTE (shared/lib/download-pending.ts) there, and anything
+ * that merely re-checks the store must leave a set `lastError` alone while this
+ * returns true. That marker is a status, not a failure, so the UI draws it as
+ * pending; see isDownloadPendingNote.
  */
 export function isDownloadOwed(
   db: AppDatabase,

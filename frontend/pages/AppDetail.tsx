@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Copy, Check, Upload, Syringe, ExternalLink } from 'lucide-react';
+import { Copy, Check, Upload, Syringe, ExternalLink, Clock } from 'lucide-react';
 import {
   Breadcrumbs, ConfirmDialog, SkeletonCard, SortableHeader, ActionMenu, ExtensionSlot,
   useSortableTable, useWebSocket, useToast, useDocumentTitle, useAuthOptional,
@@ -31,6 +31,7 @@ import { InstallDeviceModal, type OnlineDevice } from '../components/apks/Instal
 import { InjectGadgetConfirm } from '../components/apks/InjectGadgetConfirm';
 import { AvailabilityBadge, type AvailabilityState } from '../components/apks/AvailabilityBadge';
 import { formatBytes, formatDate, formatDateRelative } from '../utils/format';
+import { isDownloadPendingNote } from '../../shared/lib/download-pending';
 
 interface ApkVersionRow {
   id: number; trackedAppId: number; versionCode: number; versionName: string | null;
@@ -470,11 +471,25 @@ export function AppDetail() {
                 </button>
                 <span style={{ fontWeight: 500, minWidth: 160 }}>{s.label}</span>
                 <span data-testid={`source-availability-${s.source}`} style={{ fontSize: 12, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {s.lastError
-                    ? <span style={{ color: 'var(--danger, #f87171)' }} title={s.lastError}><span aria-hidden="true">⚠</span> {s.lastError}</span>
+                  {/* `lastError` also carries the "APK not downloaded yet" marker, which is a
+                      status and not a failure: the version is available and the next check
+                      fetches its APK. Only a real error replaces the availability line. */}
+                  {s.lastError && !isDownloadPendingNote(s.lastError)
+                    ? <span data-testid={`source-error-${s.source}`} style={{ color: 'var(--danger, #f87171)' }} title={s.lastError}><span aria-hidden="true">⚠</span> {s.lastError}</span>
                     : s.lastCheckedAt
                       ? (s.lastVersion
-                          ? <span style={{ color: 'var(--success, #4ade80)' }}>✓ Available v{s.lastVersion}</span>
+                          ? <>
+                              <span style={{ color: 'var(--success, #4ade80)' }}>✓ Available v{s.lastVersion}</span>
+                              {isDownloadPendingNote(s.lastError) && (
+                                <span
+                                  data-testid={`source-pending-${s.source}`}
+                                  style={{ color: 'var(--text-muted)', marginLeft: 8 }}
+                                  title="This version is recorded. Its APK is fetched on the next scheduled check."
+                                >
+                                  <Clock size={12} aria-hidden="true" style={{ verticalAlign: '-2px' }} /> {s.lastError}
+                                </span>
+                              )}
+                            </>
                           : <span style={{ color: 'var(--text-muted)' }}>✗ Not on this store</span>)
                       : <span style={{ color: 'var(--text-muted)' }}>Not checked</span>}
                 </span>
