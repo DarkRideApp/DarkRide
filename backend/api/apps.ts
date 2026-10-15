@@ -15,7 +15,7 @@ import { adbShell, adbCommand, adbPull, suShell } from '../services/device-manag
 import type { DeviceManager } from '../services/device-manager';
 import type { IosDeviceManager } from '../services/ios-device-manager';
 import type { ApkTracker } from '../services/apk-tracker';
-import { extractIconFromLocalApk, fetchIconFromGooglePlay, fetchIconFromSources } from '../services/apk-tracker';
+import { extractIconFromLocalApk, fetchIconFromGooglePlay, fetchIconFromSources, isDownloadOwed } from '../services/apk-tracker';
 import type { ApkAnalyzerService } from '../services/apk-analyzer';
 import type { FileStorageService } from '../services/file-storage';
 import type { AppDatabase } from '../db/index';
@@ -1011,6 +1011,12 @@ export function registerAppEndpoints(
   // the UI can show whether the app is actually on each store before you decide
   // to enable fetching. lastCheckedAt distinguishes "not on store" (checked, no
   // version, no error) from "not checked yet" (lastCheckedAt null).
+  //
+  // It stores `last_version` itself, outside checkRemoteSource, so it has to do
+  // what checkRemoteSource does when it stores one: announce a CHANGED version
+  // on `apk:version-detected`, or a subscriber only hears about it when its own
+  // periodic reconcile next runs. Enabled sources only: a disabled store is probed so the UI
+  // can show availability, not followed, so triggers must not fire for it.
   registerEndpoint('POST', '/v1/apps/track/:id/sources/check', async (req, res) => {
     const id = parseInt(req.params.id as string, 10);
     if (isNaN(id)) {
@@ -1037,7 +1043,26 @@ export function registerAppEndpoints(
       try {
         const info = await source.checkVersion(app.packageName);
         if (info) {
-          setState(source.id, { lastVersion: info.versionName, lastCheckedAt: new Date(), lastError: null });
+          const row = db.select().from(appSources)
+            .where(and(eq(appSources.trackedAppId, id), eq(appSources.source, source.id))).all()[0];
+          const previousVersion = row?.lastVersion ?? null;
+          // A probe is a read, not a download. A successful one clears a stale
+          // error, but must not clear the error of a download that is still
+          // owed, or the scheduled cycle stops retrying it.
+          const owed = isDownloadOwed(db, {
+            trackedAppId: id, versionName: info.versionName, lastError: row?.lastError ?? null,
+          });
+          setState(source.id, {
+            lastVersion: info.versionName,
+            lastCheckedAt: new Date(),
+            ...(owed ? {} : { lastError: null }),
+          });
+          if (row?.enabled && info.versionName && info.versionName !== previousVersion) {
+            apkTracker?.emitVersionDetected({
+              trackedAppId: id, packageName: app.packageName, appName: app.appName ?? null,
+              source: source.id, versionName: info.versionName, previousVersion, analysed: false,
+            });
+          }
           return { source: source.id, available: true, version: info.versionName, error: null };
         }
         // null = genuinely not on this store (a normal, non-error outcome).

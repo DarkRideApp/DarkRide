@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import fs from 'fs';
 import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
-import { ApkTracker } from './apk-tracker';
+import { ApkTracker, isDownloadOwed } from './apk-tracker';
 
 const { trackedApps, apkVersions } = schema;
 
@@ -343,12 +343,13 @@ describe('ApkTracker', () => {
       return db.select().from(trackedApps).all()[0].id;
     }
 
-    function seedSource(appId: number, opts: { enabled?: boolean; lastVersion?: string | null } = {}) {
+    function seedSource(appId: number, opts: { enabled?: boolean; lastVersion?: string | null; lastError?: string | null } = {}) {
       db.insert(appSources).values({
         trackedAppId: appId,
         source: 'playstore',
         enabled: opts.enabled ?? true,
         lastVersion: opts.lastVersion ?? null,
+        lastError: opts.lastError ?? null,
         createdAt: new Date(),
       }).run();
     }
@@ -462,6 +463,203 @@ describe('ApkTracker', () => {
         ).resolves.toBeTruthy();
         // The version still got recorded despite the subscriber throwing.
         expect(sourceRow(appId)!.lastVersion).toBe('3.0.0');
+      });
+    });
+
+    // ── a failed download must not hide the version the store reported ────
+    // Regression: a store listing moved to a new version but the APK download
+    // kept failing. The version was only recorded AFTER a successful download,
+    // so app_sources.last_version stayed on the old release indefinitely and
+    // apk:version-detected never fired. Consumers that only need the version
+    // string must not wait on a download that may never succeed.
+    describe('a failed download still records and announces the store version', () => {
+      const DOWNLOAD_ERROR = 'apkeep produced no downloadable files (APKPure)';
+      const app = (appId: number) => ({ id: appId, packageName: 'com.example.app', appName: null });
+
+      function hookBus() {
+        const emit = vi.fn();
+        return { emit, bus: { define: vi.fn(), on: vi.fn(), off: vi.fn(), emit } as any };
+      }
+
+      function failingSource(overrides: Record<string, any> = {}) {
+        return fakeSource({
+          downloadApk: vi.fn(async () => ({ success: false, error: DOWNLOAD_ERROR })),
+          ...overrides,
+        });
+      }
+
+      const detected = (emit: ReturnType<typeof vi.fn>) =>
+        emit.mock.calls.filter(c => c[0] === 'apk:version-detected').map(c => c[1]);
+
+      it('writes last_version and emits analysed:false when the download fails', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = failingSource();
+        const tracker = trackerWith(ps);
+        const { emit, bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        const result = await tracker.checkRemoteSource(app(appId), ps);
+
+        expect(result).toMatchObject({ newVersionId: null, error: DOWNLOAD_ERROR });
+        expect(sourceRow(appId)!.lastVersion, 'last_version stayed behind the store').toBe('3.0.0');
+        // The failure is still surfaced: it is also what keeps the retry alive.
+        expect(sourceRow(appId)!.lastError).toBe(DOWNLOAD_ERROR);
+        expect(db.select().from(apkVersions).all()).toHaveLength(0);
+        expect(detected(emit)).toEqual([expect.objectContaining({
+          trackedAppId: appId,
+          packageName: 'com.example.app',
+          source: 'playstore',
+          versionName: '3.0.0',
+          previousVersion: '2.0.0',
+          analysed: false,
+        })]);
+      });
+
+      it('persists the store listing metadata alongside the version, so a consumer can describe the release', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const when = new Date('2026-09-17T08:47:07.000Z');
+        const ps = failingSource({
+          checkVersion: vi.fn(async () => ({
+            versionName: '3.0.0', appName: 'Test App', iconUrl: 'https://example.test/icon.png',
+            releaseNotes: 'Bug fixes', sizeLabel: '24M', storeUpdatedAt: when,
+          })),
+        });
+
+        await trackerWith(ps).checkRemoteSource(app(appId), ps);
+
+        const row = sourceRow(appId)!;
+        expect(row.lastIconUrl).toBe('https://example.test/icon.png');
+        expect(row.lastReleaseNotes).toBe('Bug fixes');
+        expect(row.lastSizeLabel).toBe('24M');
+        expect(row.lastStoreUpdatedAt?.getTime()).toBe(when.getTime());
+      });
+
+      it('records the version before announcing it, even if a subscriber throws', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = failingSource();
+        const tracker = trackerWith(ps);
+        tracker.setHookBus({
+          define: vi.fn(), on: vi.fn(), off: vi.fn(),
+          emit: vi.fn(() => { throw new Error('subscriber exploded'); }),
+        } as any);
+
+        await expect(tracker.checkRemoteSource(app(appId), ps)).resolves.toMatchObject({ error: DOWNLOAD_ERROR });
+        expect(sourceRow(appId)!.lastVersion).toBe('3.0.0');
+      });
+
+      it('retries the download on the next cycle, and does not re-announce the same version', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = failingSource();
+        const tracker = trackerWith(ps);
+        const { emit, bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        await tracker.checkRemoteSource(app(appId), ps);
+        await tracker.checkRemoteSource(app(appId), ps);
+        await tracker.checkRemoteSource(app(appId), ps);
+
+        // last_version already equals the store version from cycle 1, so the
+        // OLD skip rule would have stopped retrying after the first failure.
+        expect(ps.downloadApk, 'gave up retrying after the first failure').toHaveBeenCalledTimes(3);
+        expect(detected(emit), 'announced the same stuck version every cycle').toHaveLength(1);
+        expect(sourceRow(appId)!.lastError).toBe(DOWNLOAD_ERROR);
+      });
+
+      it('announces again with analysed:true when a retry finally succeeds, ingests once, then goes quiet', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = fakeSource({
+          downloadApk: vi.fn()
+            .mockResolvedValueOnce({ success: false, error: DOWNLOAD_ERROR })
+            .mockResolvedValue({
+              success: true, versionCode: 300, versionName: '3.0.0', filePath: '/tmp/test.apk', fileSize: 12345,
+            }),
+        });
+        const tracker = trackerWith(ps);
+        const { emit, bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        await tracker.checkRemoteSource(app(appId), ps);   // fails: announced as analysed:false
+        const retry = await tracker.checkRemoteSource(app(appId), ps);   // succeeds
+        await tracker.checkRemoteSource(app(appId), ps);   // settled: skipped
+
+        expect(retry.newVersionId).not.toBeNull();
+        expect(ps.downloadApk).toHaveBeenCalledTimes(2);
+        expect(db.select().from(apkVersions).all(), 'ingested more than once').toHaveLength(1);
+        expect(sourceRow(appId)!.lastError).toBeNull();
+        expect(detected(emit).map(p => p.analysed)).toEqual([false, true]);
+        expect(detected(emit)[1]).toMatchObject({ versionName: '3.0.0' });
+      });
+
+      it('a forced fetch that fails also records and announces the version', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = failingSource();
+        const tracker = trackerWith(ps);
+        const { emit, bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        await tracker.checkRemoteSource(app(appId), ps, { force: true });
+
+        expect(sourceRow(appId)!.lastVersion).toBe('3.0.0');
+        expect(detected(emit)).toHaveLength(1);
+      });
+
+      // The retry must key on "the download for THIS version is still owed",
+      // not on "lastError is set": check failures set lastError too.
+      it('a transient check failure does not make an already-ingested version download again', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '3.0.0', lastError: 'getaddrinfo ENOTFOUND play.google.com' });
+        db.insert(apkVersions).values({
+          trackedAppId: appId, versionCode: 300, versionName: '3.0.0',
+          filename: '300_3.0.0.apk', source: 'playstore', downloadedAt: new Date(),
+        }).run();
+        const ps = failingSource();
+        const tracker = trackerWith(ps);
+        const { emit, bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        await tracker.checkRemoteSource(app(appId), ps);
+
+        expect(ps.downloadApk, 'redownloaded a version we already hold').not.toHaveBeenCalled();
+        expect(sourceRow(appId)!.lastError, 'stale check error was not cleared').toBeNull();
+        expect(emit).not.toHaveBeenCalled();
+      });
+
+      it('stops retrying once another source (a device) has ingested that version', async () => {
+        const appId = addApp(true);
+        seedSource(appId, { lastVersion: '2.0.0' });
+        const ps = failingSource();
+        const tracker = trackerWith(ps);
+
+        await tracker.checkRemoteSource(app(appId), ps);   // remote download fails
+        db.insert(apkVersions).values({                    // the device pulls the same version
+          trackedAppId: appId, versionCode: 300, versionName: '3.0.0',
+          filename: '300_3.0.0.apk', source: 'device', downloadedAt: new Date(),
+        }).run();
+        await tracker.checkRemoteSource(app(appId), ps);
+
+        expect(ps.downloadApk).toHaveBeenCalledTimes(1);
+        expect(sourceRow(appId)!.lastError).toBeNull();
+      });
+
+      it('auto-analyse off ignores a stale lastError: no download, no spurious announcement', async () => {
+        const appId = addApp(false);
+        seedSource(appId, { lastVersion: '3.0.0', lastError: 'getaddrinfo ENOTFOUND play.google.com' });
+        const ps = failingSource();
+        const tracker = trackerWith(ps);
+        const { emit, bus } = hookBus();
+        tracker.setHookBus(bus);
+
+        await tracker.checkRemoteSource(app(appId), ps);
+
+        expect(ps.downloadApk).not.toHaveBeenCalled();
+        expect(emit).not.toHaveBeenCalled();
+        expect(sourceRow(appId)!.lastError).toBeNull();
       });
     });
 
@@ -708,6 +906,49 @@ describe('ApkTracker', () => {
 
       expect(vi.mocked(fs.rmSync)).toHaveBeenCalledWith('/tmp/split', { recursive: true, force: true });
       expect(vi.mocked(fs.renameSync)).not.toHaveBeenCalled();
+    });
+  });
+
+
+  // The retry rule behind "a failed download is retried". Each row flips ONE
+  // input from the first (the only combination that is owed), so a regression in
+  // any single condition shows up as a named failure.
+  describe('isDownloadOwed', () => {
+    const ERR = 'apkeep produced no downloadable files (APKPure)';
+
+    function setup(opts: { autoAnalyse: boolean; held?: string | null }) {
+      db.insert(trackedApps).values({ packageName: 'com.example.app', autoAnalyse: opts.autoAnalyse, createdAt: new Date() }).run();
+      const appId = db.select().from(trackedApps).all()[0].id;
+      if (opts.held) {
+        db.insert(apkVersions).values({
+          trackedAppId: appId, versionCode: 300, versionName: opts.held,
+          filename: '300.apk', source: 'device', downloadedAt: new Date(),
+        }).run();
+      }
+      return appId;
+    }
+
+    it.each([
+      ['owed: error set, auto-analyse, no APK held', { autoAnalyse: true, held: null, lastError: ERR, versionName: '3.0.0' }, true],
+      ['not owed: no error (the last attempt did not fail)', { autoAnalyse: true, held: null, lastError: null, versionName: '3.0.0' }, false],
+      ['not owed: auto-analyse off (nothing is ever downloaded)', { autoAnalyse: false, held: null, lastError: ERR, versionName: '3.0.0' }, false],
+      ['not owed: an APK of that version is already held', { autoAnalyse: true, held: '3.0.0', lastError: ERR, versionName: '3.0.0' }, false],
+      ['owed: a DIFFERENT version is held', { autoAnalyse: true, held: '2.0.0', lastError: ERR, versionName: '3.0.0' }, true],
+      ['not owed: the store reported no version', { autoAnalyse: true, held: null, lastError: ERR, versionName: null }, false],
+    ])('%s', (_name, c, expected) => {
+      const appId = setup(c);
+      expect(isDownloadOwed(db as any, { trackedAppId: appId, versionName: c.versionName, lastError: c.lastError })).toBe(expected);
+    });
+
+    it('is scoped to the app: another app holding that version does not count', () => {
+      const appId = setup({ autoAnalyse: true });
+      db.insert(trackedApps).values({ packageName: 'com.other.app', autoAnalyse: true, createdAt: new Date() }).run();
+      const otherId = db.select().from(trackedApps).all().find(a => a.packageName === 'com.other.app')!.id;
+      db.insert(apkVersions).values({
+        trackedAppId: otherId, versionCode: 300, versionName: '3.0.0',
+        filename: '300.apk', source: 'device', downloadedAt: new Date(),
+      }).run();
+      expect(isDownloadOwed(db as any, { trackedAppId: appId, versionName: '3.0.0', lastError: ERR })).toBe(true);
     });
   });
 

@@ -299,6 +299,8 @@ ctx.hooks.define('my-plugin:item-created', { id: 'number', title: 'string' });
 
 `apk:version-detected` fires when a tracked app's source reports a version it has not seen before, **whether or not the APK is downloaded**. If you want to react to a release, subscribe to this one — `apk:analyzed` only fires for apps with auto-analyse enabled, so on a version-watch-only app it never fires at all. Payload: `{ trackedAppId, packageName, appName, source, versionName, previousVersion, analysed }`, where `analysed` tells you whether an analysis pipeline followed.
 
+A version can be announced twice. If the APK download fails, the version is announced right away with `analysed: false` and the download is retried on later check cycles; when a retry succeeds the same version is announced again with `analysed: true` and `previousVersion` equal to `versionName`, which marks it as the completion of the earlier announcement rather than a new release. Treat repeats for the same `versionName` as idempotent. The matching `app_sources.last_version` is written before the first announcement, so a subscriber that reads it back sees the new version.
+
 Low-level network traffic events (per-packet, per-request) are not on the lifecycle hook bus — they're routed through a separate, host-internal `TrafficHookRegistry` that today is only reachable from plugins that ship in-tree with the host repo. If your standalone plugin needs to inspect captured traffic, [open an issue](https://github.com/DarkRideApp/DarkRide/issues) describing the use case so the right surface can be added to `ctx`.
 
 ## File Storage
