@@ -77,12 +77,14 @@ function wireRegistry(
   mockMitm: ReturnType<typeof createMockMitmproxyManager>,
   mockDm: ReturnType<typeof createMockDeviceManager>,
   spawnContainerHttpForwarder: ReturnType<typeof vi.fn>,
+  stopContainerHttpForwarders: ReturnType<typeof vi.fn>,
 ): CaptureSessionManager {
   const registry = createCaptureModeRegistry();
   const handlers = makeCaptureHandlers({
     mitmproxyManager: mockMitm as any,
     deviceManager: mockDm as any,
     spawnContainerHttpForwarder: spawnContainerHttpForwarder as any,
+    stopContainerHttpForwarders: stopContainerHttpForwarders as any,
     getActiveDockerClient: () => ({} as any),
     lookupRuntimeId: (deviceId: string) => (deviceId === DEVICE ? RUNTIME_ID : undefined),
     waitForTunnelReady: (serial: string) => manager.waitForTunnelReady(serial),
@@ -133,6 +135,7 @@ describe('CaptureSessionManager — emu-http-proxy (docker-android)', () => {
   let mockMitm: ReturnType<typeof createMockMitmproxyManager>;
   let mockDm: ReturnType<typeof createMockDeviceManager>;
   let spawnContainerHttpForwarder: ReturnType<typeof vi.fn>;
+  let stopContainerHttpForwarders: ReturnType<typeof vi.fn>;
   let manager: CaptureSessionManager;
   let provider: { getNetworkConfig: ReturnType<typeof vi.fn> };
 
@@ -141,11 +144,13 @@ describe('CaptureSessionManager — emu-http-proxy (docker-android)', () => {
     mockMitm = createMockMitmproxyManager();
     mockDm = createMockDeviceManager();
     spawnContainerHttpForwarder = vi.fn().mockResolvedValue(undefined);
+    stopContainerHttpForwarders = vi.fn().mockResolvedValue(undefined);
     manager = wireRegistry(
       new CaptureSessionManager(db, mockMitm as any, mockDm as any),
       mockMitm,
       mockDm,
       spawnContainerHttpForwarder,
+      stopContainerHttpForwarders,
     );
 
     const reg = createDockerAndroidProviderRegistry();
@@ -213,6 +218,42 @@ describe('CaptureSessionManager — emu-http-proxy (docker-android)', () => {
     expect(sessions).toHaveLength(1);
     expect(sessions[0].deviceId).toBe(DEVICE);
     expect(sessions[0].status).toBe('running');
+  });
+
+  it('stopCapture stops the in-container forwarder once, after mitmproxy', async () => {
+    await manager.startCapture(DEVICE);
+    expect(stopContainerHttpForwarders).not.toHaveBeenCalled();
+
+    await manager.stopCapture(DEVICE);
+
+    expect(stopContainerHttpForwarders).toHaveBeenCalledTimes(1);
+    expect(stopContainerHttpForwarders).toHaveBeenCalledWith(expect.anything(), RUNTIME_ID);
+    expect(mockMitm.stopCapture.mock.invocationCallOrder[0])
+      .toBeLessThan(stopContainerHttpForwarders.mock.invocationCallOrder[0]);
+
+    await manager.stopCapture(DEVICE);
+    expect(stopContainerHttpForwarders).toHaveBeenCalledTimes(1);
+  });
+
+  it('stopCapture still completes the session when the forwarder cannot be stopped', async () => {
+    stopContainerHttpForwarders.mockRejectedValue(new Error('container is not running'));
+    const { sessionId } = await manager.startCapture(DEVICE);
+
+    await manager.stopCapture(DEVICE);
+
+    expect(manager.isCapturing(DEVICE)).toBe(false);
+    expect(mockDm.markIdle).toHaveBeenCalledWith(DEVICE);
+    const row = db.select().from(schema.automationSessions).all().find((s) => s.id === sessionId);
+    expect(row?.status).toBe('success');
+  });
+
+  it('a capture that fails after the forwarder was spawned leaves no forwarder behind', async () => {
+    mockDm.setupEmulatorHttpProxy.mockRejectedValue(new Error('adb root failed'));
+
+    await expect(manager.startCapture(DEVICE)).rejects.toThrow('adb root failed');
+
+    expect(stopContainerHttpForwarders).toHaveBeenCalledTimes(1);
+    expect(manager.isCapturing(DEVICE)).toBe(false);
   });
 
   it('prefers the running docker-android row over a stale adb-device row sharing the serial', async () => {
