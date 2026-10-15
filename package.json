@@ -48,6 +48,7 @@
     "test:adb-proxy-conformance": "vitest run --config vitest.adb-proxy.config.ts",
     "test:e2e:adb-proxy": "playwright test --config playwright.adb-proxy.config.ts",
     "lint": "eslint backend/ shared/ plugins/ --ext .ts,.js",
+    "lint:rules": "node eslint-rules/no-direct-handle-message.test.js",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",

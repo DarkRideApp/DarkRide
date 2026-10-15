@@ -312,3 +312,25 @@ jobs:
             kill -TERM "$(cat /tmp/darkride.pid)" 2>/dev/null || true
           fi
           docker ps -aq --filter "label=darkride.emulator=true" | xargs -r docker rm -f
+
+  # Keeps one tracking issue in step with the nightly result. Scheduled runs only, so a
+  # hand-dispatched run on a throwaway ref never opens or closes it.
+  report:
+    name: Report nightly result
+    needs: [e2e]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Open, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RESULT: ${{ needs.e2e.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/report-nightly-result.sh

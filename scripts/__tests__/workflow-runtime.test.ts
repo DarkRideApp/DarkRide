@@ -11,6 +11,7 @@ const MIN_NODE24_MAJOR: Record<string, number> = {
   'actions/setup-node': 5,
   'actions/cache': 5,
   'actions/setup-python': 6,
+  'actions/upload-artifact': 6,
   'actions/setup-java': 5,
   'gradle/actions/setup-gradle': 5,
   'docker/setup-buildx-action': 4,

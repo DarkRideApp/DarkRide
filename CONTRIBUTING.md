@@ -44,11 +44,16 @@ npx vitest run plugins/
 # Python tests
 .venv/bin/python -m pytest python/ -v
 
-# End-to-end tests (Playwright — spawns browser + real server)
+# End-to-end tests (Playwright — spawns browser + real server on ports 3199 and 5199)
+# CI runs the whole suite on every pull request.
 npx playwright test
 
 # TypeScript type checking
 npx tsc --noEmit
+
+# Lint, and the tests for the local ESLint rules (CI runs both)
+npm run lint
+npm run lint:rules
 ```
 
 ## Code Style

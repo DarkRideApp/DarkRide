@@ -13,7 +13,8 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1, // Sequential — tests share server state (plugin enable/disable, auth)
   forbidOnly: !!process.env.CI,
-  retries: 0,
+  // One retry in CI: a spec that only passes the second time is reported as flaky and its trace is kept.
+  retries: process.env.CI ? 1 : 0,
   reporter: 'list',
   timeout: 60_000,
   use: {
