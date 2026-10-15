@@ -37,6 +37,7 @@ export interface CaptureHandlerDeps {
     targetHost: string,
     targetPort: number,
   ) => Promise<void>;
+  stopContainerHttpForwarders: (d: DockerLike, containerId: string) => Promise<void>;
   getActiveDockerClient: () => DockerLike | null;
   /** Resolve the docker runtime (container) id for a device, if it has one. */
   lookupRuntimeId: (deviceId: string) => string | undefined;
@@ -79,6 +80,7 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
     mitmproxyManager,
     deviceManager,
     spawnContainerHttpForwarder,
+    stopContainerHttpForwarders,
     getActiveDockerClient,
     lookupRuntimeId,
     waitForTunnelReady,
@@ -239,38 +241,46 @@ export function makeCaptureHandlers(deps: CaptureHandlerDeps): Record<CaptureMod
         `docker-android device ${ctx.deviceId} has no container handle (docker=${!!docker} runtimeId=${runtimeId ?? 'null'})`,
       );
     }
+    const stopForwarder = () => stopContainerHttpForwarders(docker, runtimeId);
     log(`Spawning in-container TCP forwarder for ${ctx.deviceId}: 0.0.0.0:${port} -> ${gateway}:${port}`);
-    await spawnContainerHttpForwarder(docker, runtimeId, port, gateway, port);
-    // The forwarder listens on the container's interfaces; the
-    // emulator reaches it via 10.0.2.2 (QEMU's pseudonym for the
-    // container).
-    const emuHttpProxyEndpoint = { host: '10.0.2.2', port };
-    ctx.setSubsystem('mitmproxy', 'ok');
+    try {
+      await spawnContainerHttpForwarder(docker, runtimeId, port, gateway, port);
+      // The forwarder listens on the container's interfaces; the
+      // emulator reaches it via 10.0.2.2 (QEMU's pseudonym for the
+      // container).
+      const emuHttpProxyEndpoint = { host: '10.0.2.2', port };
+      ctx.setSubsystem('mitmproxy', 'ok');
 
-    // adb root, push user CA cert, set system http_proxy. The system
-    // setting is best-effort (HttpURLConnection ignores it) — the
-    // E2E fixture targets the proxy explicitly via Intent extra.
-    await deviceManager.setupEmulatorHttpProxy(ctx.deviceId, '10.0.2.2', port);
-    ctx.setSubsystem('certInjection', 'ok');
-    // WireGuard is conceptually skipped here, but the subsystems shape
-    // is shared with physical-device flows — mark it as skipped rather
-    // than failing.
-    ctx.setSubsystem('wireguard', 'skipped');
+      // adb root, push user CA cert, set system http_proxy. The system
+      // setting is best-effort (HttpURLConnection ignores it) — the
+      // E2E fixture targets the proxy explicitly via Intent extra.
+      await deviceManager.setupEmulatorHttpProxy(ctx.deviceId, '10.0.2.2', port);
+      ctx.setSubsystem('certInjection', 'ok');
+      // WireGuard is conceptually skipped here, but the subsystems shape
+      // is shared with physical-device flows — mark it as skipped rather
+      // than failing.
+      ctx.setSubsystem('wireguard', 'skipped');
 
-    // A booting emulator is ready for adb before its wifi is up; return only
-    // once an app launched next can actually reach the proxy.
-    const reachable = await deviceManager.waitForEmulatorProxyReachable(ctx.deviceId, emuHttpProxyEndpoint.host, port);
+      // A booting emulator is ready for adb before its wifi is up; return only
+      // once an app launched next can actually reach the proxy.
+      const reachable = await deviceManager.waitForEmulatorProxyReachable(ctx.deviceId, emuHttpProxyEndpoint.host, port);
 
-    if (!mitmproxyManager.isCapturing(ctx.deviceId)) {
-      ctx.setSubsystem('mitmproxy', 'error');
-      throw new Error('mitmproxy process exited during capture startup');
+      if (!mitmproxyManager.isCapturing(ctx.deviceId)) {
+        ctx.setSubsystem('mitmproxy', 'error');
+        throw new Error('mitmproxy process exited during capture startup');
+      }
+      ctx.setSubsystem('connectivity', reachable ? 'ok' : 'warning');
+      if (!reachable) {
+        log(`Emulator ${ctx.deviceId} cannot reach the capture proxy yet, capture continues`);
+      }
+
+      return { tunnelActivated: false, emuHttpProxy: emuHttpProxyEndpoint, teardown: stopForwarder };
+    } catch (err) {
+      // The capture is not registered yet, so nothing else will stop the relay.
+      try { await stopForwarder(); }
+      catch (e: any) { log(`Failed to stop the forwarder for ${ctx.deviceId}: ${e?.message ?? e}`); }
+      throw err;
     }
-    ctx.setSubsystem('connectivity', reachable ? 'ok' : 'warning');
-    if (!reachable) {
-      log(`Emulator ${ctx.deviceId} cannot reach the capture proxy yet, capture continues`);
-    }
-
-    return { tunnelActivated: false, emuHttpProxy: emuHttpProxyEndpoint };
   };
 
   const iosBridge: CaptureHandler = async (ctx: CaptureModeContext): Promise<CaptureModeResult> => {

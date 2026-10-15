@@ -79,6 +79,43 @@ let activeDockerClient: DockerLike | null = null;
 export function setActiveDockerClient(d: DockerLike): void { activeDockerClient = d; }
 export function getActiveDockerClient(): DockerLike | null { return activeDockerClient; }
 
+// budtmo's docker-android image doesn't have an /etc/passwd entry for root, so
+// dockerode's default User="root" username lookup fails. The image runs as
+// androidusr (UID 1300); the forwarder needs no privilege (binds an
+// unprivileged port, opens TCP).
+const CONTAINER_USER = 'androidusr';
+
+// A relay is found by its own `LISTEN_PORT=<n>` argv line. The `[0-9]` keeps this
+// command's own argv, which holds the pattern text, from matching itself.
+const STOP_FORWARDERS_SCRIPT = `for d in /proc/[0-9]*; do
+  grep -qa 'LISTEN_PORT=[0-9]' "$d/cmdline" 2>/dev/null && kill "\${d#/proc/}" 2>/dev/null
+done
+rm -f /tmp/darkride-forwarder-*.log
+true`;
+
+async function runInContainer(container: any, cmd: string[]): Promise<string> {
+  const exec = await container.exec({
+    Cmd: cmd,
+    User: CONTAINER_USER,
+    AttachStdout: true,
+    AttachStderr: true,
+    Tty: false,
+  });
+  const stream: any = await exec.start({ hijack: true, stdin: false });
+  const chunks: Buffer[] = await new Promise((resolve, reject) => {
+    const out: Buffer[] = [];
+    stream.on('data', (c: Buffer) => out.push(c));
+    stream.on('end', () => resolve(out));
+    stream.on('error', reject);
+  });
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/** Stop every forwarder relay in the container and remove their logs. Safe when none is running. */
+export async function stopContainerHttpForwarders(d: DockerLike, containerId: string): Promise<void> {
+  await runInContainer(d.getContainer(containerId), ['sh', '-c', STOP_FORWARDERS_SCRIPT]);
+}
+
 /**
  * Spawn a TCP forwarder inside the named container. Returns once the
  * forwarder is listening (or rejects on exec failure). Useful for the
@@ -89,8 +126,9 @@ export function getActiveDockerClient(): DockerLike | null { return activeDocker
  * forwards to targetHost:targetPort on the docker host.
  *
  * Implementation: detached `python3 -c "..."` using stdlib only (every
- * budtmo-derived image ships Python 3). The forwarder process exits when
- * the container does — no separate cleanup needed.
+ * budtmo-derived image ships Python 3). One relay runs per container:
+ * starting one stops any earlier one, and {@link stopContainerHttpForwarders}
+ * ends it when the capture stops.
  */
 export async function spawnContainerHttpForwarder(
   d: DockerLike,
@@ -107,6 +145,7 @@ export async function spawnContainerHttpForwarder(
     'srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)',
     'srv.bind(("0.0.0.0", LISTEN_PORT))',
     'srv.listen(16)',
+    'print("FWD_BOUND", flush=True)',
     'def shovel(a, b):',
     '    try:',
     '        while True:',
@@ -131,13 +170,9 @@ export async function spawnContainerHttpForwarder(
     '    threading.Thread(target=fwd, args=(c,), daemon=True).start()',
   ].join('\n');
 
+  await stopContainerHttpForwarders(d, containerId);
+
   const container = d.getContainer(containerId);
-  // budtmo's docker-android image doesn't have an /etc/passwd entry for
-  // root — dockerode's default User="root" username lookup fails. The
-  // image runs as androidusr (UID 1300); the forwarder doesn't need any
-  // privileged operation (binds an unprivileged port, opens TCP), so
-  // androidusr is fine.
-  //
   // Wrap the python invocation in a shell that redirects stdout/stderr to
   // a known file so post-mortem diagnostics survive (the exec is detached
   // so we can't read streams directly). Background it via `nohup` so the
@@ -145,7 +180,7 @@ export async function spawnContainerHttpForwarder(
   const wrapped = `nohup python3 -c "$1" > /tmp/darkride-forwarder-${listenPort}.log 2>&1 &`;
   const exec = await container.exec({
     Cmd: ['sh', '-c', wrapped, 'sh', script],
-    User: 'androidusr',
+    User: CONTAINER_USER,
     AttachStdout: false,
     AttachStderr: false,
     Detach: true,
@@ -154,11 +189,13 @@ export async function spawnContainerHttpForwarder(
 
   // Verify the listener is actually bound before returning. Without this,
   // callers proceed under the assumption it's up and only find out it
-  // crashed when the device-side traffic fails to be captured.
+  // crashed when the device-side traffic fails to be captured. The relay's
+  // own FWD_BOUND line is required so another process already listening on
+  // the port cannot pass for it.
   const verifyCmd = [
     'sh', '-c',
     `for i in $(seq 1 20); do
-       python3 -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', ${listenPort})); s.close()" 2>/dev/null && echo FWD_READY && exit 0
+       grep -q FWD_BOUND /tmp/darkride-forwarder-${listenPort}.log 2>/dev/null && python3 -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', ${listenPort})); s.close()" 2>/dev/null && echo FWD_READY && exit 0
        sleep 0.25
      done
      echo FWD_FAILED
@@ -166,21 +203,7 @@ export async function spawnContainerHttpForwarder(
      cat /tmp/darkride-forwarder-${listenPort}.log 2>/dev/null || echo "(no log)"
      exit 1`,
   ];
-  const verifyExec = await container.exec({
-    Cmd: verifyCmd,
-    User: 'androidusr',
-    AttachStdout: true,
-    AttachStderr: true,
-    Tty: false,
-  });
-  const stream: any = await verifyExec.start({ hijack: true, stdin: false });
-  const output: Buffer[] = await new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    stream.on('data', (c: Buffer) => chunks.push(c));
-    stream.on('end', () => resolve(chunks));
-    stream.on('error', reject);
-  });
-  const text = Buffer.concat(output).toString('utf8');
+  const text = await runInContainer(container, verifyCmd);
   if (!text.includes('FWD_READY')) {
     throw new Error(`in-container forwarder failed to start on :${listenPort}\n${text.slice(0, 2000)}`);
   }
