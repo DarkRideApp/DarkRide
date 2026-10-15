@@ -1,5 +1,11 @@
 const WINDOW_MS = 5 * 60 * 1000;
-const MAX_ATTEMPTS = 30;
+const DEFAULT_MAX_ATTEMPTS = 30;
+
+// Read per call so a test or an operator behind one shared proxy IP can raise it.
+function maxAttempts(): number {
+  const n = Number(process.env.DARKRIDE_LOGIN_RATE_LIMIT);
+  return Number.isInteger(n) && n > 0 ? n : DEFAULT_MAX_ATTEMPTS;
+}
 
 const buckets = new Map<string, { count: number; resetAt: number }>();
 
@@ -11,7 +17,7 @@ export function checkIpRateLimit(ip: string): { allowed: boolean; retryAfterMs?:
     buckets.set(ip, bucket);
   }
   bucket.count++;
-  if (bucket.count > MAX_ATTEMPTS) {
+  if (bucket.count > maxAttempts()) {
     return { allowed: false, retryAfterMs: bucket.resetAt - now };
   }
   return { allowed: true };

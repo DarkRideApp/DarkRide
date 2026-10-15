@@ -39,6 +39,9 @@ export default defineConfig({
       // this, every WS-dependent spec hangs on "Connecting to server..." and
       // times out (403 on the WS upgrade). Allow the E2E dev origin explicitly.
       WEBSOCKET_ALLOWED_ORIGINS: 'http://localhost:5199',
+      // Every spec logs in from the same address, and the default 30 logins per
+      // 5 minutes is below what a full run needs on a fast machine.
+      DARKRIDE_LOGIN_RATE_LIMIT: '1000',
     },
   },
 });
