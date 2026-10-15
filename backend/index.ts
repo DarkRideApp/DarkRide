@@ -145,7 +145,7 @@ import { createProviderRegistry } from './services/providers';
 import { createAdbDeviceProvider } from './services/providers/adb-device';
 import { createIosDeviceProvider } from './services/providers/ios-device';
 import { createDockerAndroidProvider } from './services/providers/docker-android';
-import { createDockerClient, setActiveDockerClient, getActiveDockerClient, spawnContainerHttpForwarder } from './services/providers/docker-helpers';
+import { createDockerClient, setActiveDockerClient, getActiveDockerClient, spawnContainerHttpForwarder, stopContainerHttpForwarders } from './services/providers/docker-helpers';
 import { createAvdProvider } from './services/providers/avd';
 import { createCaptureModeRegistry } from './services/capture-mode-registry';
 import { makeCaptureHandlers } from './services/capture-handlers';
@@ -347,6 +347,7 @@ const captureHandlers = makeCaptureHandlers({
   mitmproxyManager,
   deviceManager,
   spawnContainerHttpForwarder,
+  stopContainerHttpForwarders,
   getActiveDockerClient,
   // Running-first + recency selection so a stale adb-device row sharing the
   // serial can't shadow the live emulator (mirrors resolveCaptureMode's H3 fix).

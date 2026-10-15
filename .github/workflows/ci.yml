@@ -10,11 +10,6 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Opt JavaScript-based actions (checkout/setup-node/setup-python) onto the
-  # Node 24 runtime ahead of GitHub's forced switch on 2026-06-02.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-
 # All jobs only read source code; none push, comment, or modify GitHub state.
 # Setting top-level permissions to read-only follows least-privilege for the
 # GITHUB_TOKEN (CodeQL js/actions/missing-workflow-permissions).
@@ -24,10 +19,10 @@ permissions:
 jobs:
   lockfile-hygiene:
     name: Lockfile hygiene (workspaces match repo)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The plugins/* workspace glob in package.json pulls any plugin
       # checked into plugins/ into package-lock.json. The only public
       # in-tree plugin is kitchen-sink — anything else (symlinked plugin
@@ -48,12 +43,12 @@ jobs:
 
   backend:
     name: Backend (typecheck + tests + build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'npm'
@@ -80,12 +75,12 @@ jobs:
 
   frontend:
     name: Frontend tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'npm'
@@ -104,13 +99,13 @@ jobs:
 
   python:
     name: Python bridge tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.13'
           cache: 'pip'
@@ -129,7 +124,7 @@ jobs:
   docker:
     name: Docker image (build + smoke + publish on main)
     needs: [backend, frontend, python]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     # The smoke step starts a container and curls a public endpoint —
     # straightforward read-only on GITHUB_TOKEN. The push step needs
@@ -145,10 +140,10 @@ jobs:
       # lowercased form — the org name is fixed.
       IMAGE: ghcr.io/darkrideapp/darkride
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Only authenticate to ghcr.io on push events. On PRs from forks
       # the GITHUB_TOKEN can't write to packages anyway; on PRs from
@@ -156,7 +151,7 @@ jobs:
       # registry space on doomed branches.
       - name: Log in to ghcr.io
         if: github.event_name == 'push'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -179,7 +174,7 @@ jobs:
           fi
 
       - name: Build (and push on main)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           # `load: true` puts the image into the local docker daemon so

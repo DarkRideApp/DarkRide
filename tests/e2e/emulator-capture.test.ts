@@ -7,7 +7,8 @@
  *   3. Start capture session for the device
  *   4. Launch the app — it fires https://example.com/?darkride-e2e=ping
  *   5. Assert the request appears in DarkRide's captured traffic
- *   6. Tear down
+ *   6. Stop the capture and assert the in-container relay is gone
+ *   7. Tear down
  *
  * Designed to run only in the ci-e2e-emulator.yml workflow. NOT included
  * in the standard backend vitest suite — excluded via vitest.config.ts.
@@ -70,6 +71,18 @@ async function waitFor<T>(fn: () => Promise<T | undefined>, timeoutMs: number, i
     await new Promise((r) => setTimeout(r, intervalMs));
   }
   throw new Error(`waitFor: timeout after ${timeoutMs}ms`);
+}
+
+/** Capture start runs one TCP relay inside the emulator container; this counts them. */
+function countForwarderRelays(): number {
+  const id = execFileSync('docker', ['ps', '-q', '--filter', 'label=darkride.emulator=true'], { encoding: 'utf8' })
+    .split('\n').filter(Boolean)[0];
+  const out = execFileSync(
+    'docker',
+    ['exec', '-u', 'androidusr', id, 'sh', '-c', "grep -la 'LISTEN_PORT=[0-9]' /proc/[0-9]*/cmdline 2>/dev/null | wc -l"],
+    { encoding: 'utf8' },
+  );
+  return Number(out.trim());
 }
 
 /**
@@ -264,10 +277,18 @@ describe('E2E — emulator capture', () => {
         const capturedUrl = new URL(captured.requestUrl);
         expect(capturedUrl.hostname).toBe('example.com');
         expect(capturedUrl.searchParams.get('darkride-e2e')).toBe('ping');
+
+        // 8. Capture runs exactly one in-container relay and stopping it ends it.
+        expect(countForwarderRelays()).toBe(1);
+        step(`POST /v1/capture/stop { deviceId: ${serial} }`);
+        const stopCapture = await rest('POST', '/v1/capture/stop', { deviceId: serial });
+        expect(stopCapture.status).toBe(200);
+        await waitFor(async () => (countForwarderRelays() === 0 ? true : undefined), 15_000, 500);
+        step('no forwarder relay left in the container');
         passed = true;
       } finally {
         if (!passed) dumpEmulatorDiagnostics();
-        // 8. Tear down — stop + delete the container even if assertions failed
+        // 9. Tear down — stop + delete the container even if assertions failed
         await rest(
           'POST',
           `/v1/devices/providers/docker-android/instances/${instanceId}/stop`,

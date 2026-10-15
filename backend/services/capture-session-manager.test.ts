@@ -26,6 +26,7 @@ function wireRegistry(
     mitmproxyManager: mockMitm as any,
     deviceManager: mockDm as any,
     spawnContainerHttpForwarder: vi.fn().mockResolvedValue(undefined) as any,
+    stopContainerHttpForwarders: vi.fn().mockResolvedValue(undefined) as any,
     getActiveDockerClient: () => null,
     lookupRuntimeId: () => undefined,
     waitForTunnelReady: (serial: string) => manager.waitForTunnelReady(serial),
