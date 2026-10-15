@@ -64,6 +64,9 @@ export function Automations() {
   const [templateCategory, setTemplateCategory] = useState<string>('all');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<Automation | null>(null);
+  const [unclaimed, setUnclaimed] = useState(0);
+  const [claimConfirm, setClaimConfirm] = useState(false);
+  const canEdit = !auth || auth.hasScope('core.automations:edit');
 
   const tabParam = searchParams.get('tab') as AutomationTab | null;
   const activeTab: AutomationTab = tabParam && AUTOMATION_TABS.includes(tabParam) ? tabParam : 'automation';
@@ -81,6 +84,29 @@ export function Automations() {
       setLoading(false);
     }
   }, [ws]);
+
+  // Only editors can claim, so only they are asked (a failed call would toast "Insufficient scope" for everyone else).
+  const fetchUnclaimed = useCallback(async () => {
+    if (!canEdit) return;
+    try {
+      const res = await ws.sendRestApi('GET', '/v1/automation/unclaimed');
+      setUnclaimed(res.body?.data?.count ?? 0);
+    } catch {
+      // the banner is a convenience
+    }
+  }, [ws, canEdit]);
+
+  const claimAll = async () => {
+    setClaimConfirm(false);
+    try {
+      const res = await ws.sendRestApi('POST', '/v1/automation/claim-all');
+      const claimed: number = res.body?.data?.claimed ?? 0;
+      toast.success(`Claimed ${claimed} ${claimed === 1 ? 'automation' : 'automations'}`);
+      fetchUnclaimed();
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to claim automations');
+    }
+  };
 
   const fetchQueueStatus = useCallback(async () => {
     try {
@@ -106,10 +132,11 @@ export function Automations() {
     if (ws.connected) {
       fetchAutomations();
       fetchTemplates();
+      fetchUnclaimed();
       // Fetch queue count for badge on all tabs
       fetchQueueStatus();
     }
-  }, [ws.connected, fetchAutomations, fetchTemplates, fetchQueueStatus]);
+  }, [ws.connected, fetchAutomations, fetchTemplates, fetchUnclaimed, fetchQueueStatus]);
 
   // Poll queue status when on queue tab
   useEffect(() => {
@@ -153,8 +180,8 @@ export function Automations() {
   if (auth && !auth.hasScope('core.automations:read')) return <AccessDenied scope="core.automations:read" />;
   if (loading) return <div className="table-card"><SkeletonTable rows={4} columns={5} /></div>;
 
-  const canEdit = !auth || auth.hasScope('core.automations:edit');
   const canExecute = !auth || auth.hasScope('core.automations:execute');
+  const one = unclaimed === 1;
 
   return (
     <div data-testid="automations-page">
@@ -165,6 +192,15 @@ export function Automations() {
           <button className="btn btn-danger" onClick={clearQueue}>Clear Queue</button>
         ) : undefined
       } />
+
+      {canEdit && unclaimed > 0 && (activeTab === 'automation' || activeTab === 'rule' || activeTab === 'captureRule') && (
+        <div className="claim-banner" data-testid="automations-claim-banner">
+          <span>
+            {`${unclaimed} ${one ? 'automation has' : 'automations have'} no author on record, so ${one ? 'it cannot' : 'they cannot'} read credentials, change proxies or call tools. Saving a script in the editor claims it.`}
+          </span>
+          <button className="btn btn-sm" data-testid="claim-all-button" onClick={() => setClaimConfirm(true)}>Claim all</button>
+        </div>
+      )}
 
       <div className="tab-bar">
         <button className={`tab-btn ${activeTab === 'automation' ? 'active' : ''}`} onClick={() => setActiveTab('automation')}>Automations</button>
@@ -287,6 +323,16 @@ export function Automations() {
             fetchAutomations();
           }}
           onCancel={() => setDeleteConfirm(null)}
+        />
+      )}
+      {claimConfirm && (
+        <ConfirmDialog
+          title="Claim all automations"
+          message={`Claim ${unclaimed} ${one ? 'automation' : 'automations'}? ${one ? 'It' : 'They'} will run with your permissions, so claim only scripts you trust.`}
+          confirmLabel="Claim all"
+          danger={false}
+          onConfirm={claimAll}
+          onCancel={() => setClaimConfirm(false)}
         />
       )}
     </div>

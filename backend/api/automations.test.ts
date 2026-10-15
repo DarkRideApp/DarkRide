@@ -8,6 +8,7 @@ import { AutomationRunner } from '../services/automation-runner';
 import { AutomationCompiler } from '../services/automation-compiler';
 import { AutomationScheduler } from '../services/automation-scheduler';
 import { PythonBridgeManager } from '../services/python-bridge';
+import { resolveToolAccess } from '../services/automation-authors';
 import { clearEndpoints, getApiRouter } from './api-service';
 import type { AppDatabase } from '../db/index';
 import { createTestDb } from '../test-utils/create-test-db';
@@ -308,6 +309,102 @@ describe('Automation API', () => {
 
       expect(res.status).toBe(200);
       expect(authorOf(id)).toBeUndefined();
+    });
+
+    describe('claiming scripts nobody has claimed', () => {
+      const READ = 'core.automations:read';
+
+      // Scripts saved before authors were recorded have no row; the anonymous route leaves none.
+      async function createUnclaimed(name: string) {
+        const res = await request(app).post('/v1/automation/create').send({ name, code: 'code' });
+        expect(authorOf(res.body.data.id)).toBeUndefined();
+        return res.body.data.id as number;
+      }
+
+      it('counts the scripts that have no author', async () => {
+        const user = addUser([EDIT, READ]);
+        await createUnclaimed('one');
+        await createUnclaimed('two');
+        await request(appAs(user.id, [EDIT])).post('/v1/automation/create').send({ name: 'claimed', code: 'code' });
+
+        const res = await request(appAs(user.id, [READ])).get('/v1/automation/unclaimed');
+
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ success: true, data: { count: 2 } });
+      });
+
+      it('needs the read scope to count', async () => {
+        const user = addUser([]);
+        const res = await request(appAs(user.id, [])).get('/v1/automation/unclaimed');
+        expect(res.status).toBe(403);
+      });
+
+      it('makes the caller the author of every unclaimed script, with the scopes of the credential used', async () => {
+        const user = addUser(['core.admin:*']);
+        const a = await createUnclaimed('one');
+        const b = await createUnclaimed('two');
+
+        const res = await request(appAs(user.id, [EDIT, 'core.credentials:read'])).post('/v1/automation/claim-all').send({});
+
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ success: true, data: { claimed: 2 } });
+        for (const id of [a, b]) {
+          expect(authorOf(id).userId).toBe(user.id);
+          expect([...authorOf(id).scopes].sort()).toEqual([EDIT, 'core.credentials:read']);
+        }
+      });
+
+      it('leaves a script that already has an author with that author', async () => {
+        const owner = addUser(['core.admin:*']);
+        const caller = addUser([EDIT]);
+        const owned = await request(appAs(owner.id, [EDIT])).post('/v1/automation/create').send({ name: 'owned', code: 'code' });
+        const loose = await createUnclaimed('loose');
+
+        const res = await request(appAs(caller.id, [EDIT])).post('/v1/automation/claim-all').send({});
+
+        expect(res.body.data.claimed).toBe(1);
+        expect(authorOf(owned.body.data.id).userId).toBe(owner.id);
+        expect(authorOf(loose).userId).toBe(caller.id);
+      });
+
+      it('has nothing left to claim the second time', async () => {
+        const user = addUser([EDIT]);
+        await createUnclaimed('one');
+        await request(appAs(user.id, [EDIT])).post('/v1/automation/claim-all').send({});
+
+        const again = await request(appAs(user.id, [EDIT])).post('/v1/automation/claim-all').send({});
+
+        expect(again.body.data.claimed).toBe(0);
+      });
+
+      it('needs the edit scope', async () => {
+        const user = addUser([READ]);
+        const id = await createUnclaimed('one');
+
+        const res = await request(appAs(user.id, [READ])).post('/v1/automation/claim-all').send({});
+
+        expect(res.status).toBe(403);
+        expect(authorOf(id)).toBeUndefined();
+      });
+
+      it('refuses a request with no identity, since there would be nobody to claim for', async () => {
+        const id = await createUnclaimed('one');
+
+        const res = await request(app).post('/v1/automation/claim-all').send({});
+
+        expect(res.status).toBe(401);
+        expect(authorOf(id)).toBeUndefined();
+      });
+
+      it('lets the claimed script use a gated call afterwards', async () => {
+        const user = addUser(['core.admin:*']);
+        const id = await createUnclaimed('one');
+        expect(resolveToolAccess(db, id).kind).toBe('denied');
+
+        await request(appAs(user.id, ['core.admin:*'])).post('/v1/automation/claim-all').send({});
+
+        expect(resolveToolAccess(db, id).kind).toBe('scoped');
+      });
     });
   });
 

@@ -83,7 +83,7 @@ export interface HttpAPI {
    * Route subsequent `http.*` requests (and any `device.httpGet`/`httpPost`
    * back-compat aliases) through a proxy. Scope is the current automation
    * run only — each run gets its own HttpAPI instance, so state never
-   * leaks across automations.
+   * leaks across automations. The script author needs core.proxies:manage.
    *
    *  - `'none'`     — clear the proxy, requests go direct.
    *  - `'normal'`   — use the first enabled proxy from the host's proxy list.
@@ -277,10 +277,10 @@ export interface DeviceAPI {
   httpGet(url: string, options?: HttpRequestOptions): Promise<HttpResponse>;
   httpPost(url: string, body: any, options?: HttpRequestOptions): Promise<HttpResponse>;
 
-  // Credentials
+  // Credentials (the script author needs core.credentials:read)
   getCredentials(appId: string): Promise<{ username: string; password: string; customFields: Record<string, string> }>;
 
-  // Proxy
+  // Proxy (the script author needs core.proxies:manage)
   setProxy(mode: 'none' | 'normal' | 'nordvpn', options?: { country?: string }): Promise<void>;
 
   // TLS profile

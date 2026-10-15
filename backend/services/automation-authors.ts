@@ -17,7 +17,13 @@ export type ToolAccess =
   /** Both sets must cover a tool's scope: what the credential held when it saved, and what the author holds now. */
   | { kind: 'scoped'; snapshot: Set<string>; current: Set<string> };
 
-const CLAIM_HINT = 'Save the automation in the editor to claim it.';
+const CLAIM_HINT = 'Save the automation in the editor, or use Claim all on the Automations page.';
+
+// A plugin's own script is the plugin's code. The override flag alone is not proof: the generic
+// update route and the AI code tools rewrite `code` without setting it, so the code must still match what the plugin ships.
+function isShippedByPlugin(a: { managedBy: string | null; isOverridden: boolean | null; code: string; currentDefaultCode: string | null }): boolean {
+  return a.managedBy != null && !a.isOverridden && a.currentDefaultCode != null && a.code === a.currentDefaultCode;
+}
 
 export function recordAuthor(db: Db, automationId: number, author: AuthorIdentity): void {
   const scopes = [...author.effectiveScopes];
@@ -44,6 +50,35 @@ export function claimAutomation(db: Db, automationId: number, caller?: AuthorIde
   else clearAuthor(db, automationId);
 }
 
+/**
+ * Scripts that cannot use gated calls until someone claims them: no author on record, or an author whose account is gone.
+ * A plugin's own unmodified script needs none.
+ */
+export function listUnclaimed(db: Db): number[] {
+  const authorOf = new Map(
+    db.select({ automationId: automationAuthors.automationId, userId: automationAuthors.userId }).from(automationAuthors).all()
+      .map((row) => [row.automationId, row.userId] as const),
+  );
+  const accounts = new Set(db.select({ id: users.id }).from(users).all().map((row) => row.id));
+  return db
+    .select({ id: automations.id, managedBy: automations.managedBy, isOverridden: automations.isOverridden, code: automations.code, currentDefaultCode: automations.currentDefaultCode })
+    .from(automations)
+    .all()
+    .filter((a) => {
+      if (isShippedByPlugin(a)) return false;
+      const userId = authorOf.get(a.id);
+      return userId == null || !accounts.has(userId);
+    })
+    .map((a) => a.id);
+}
+
+/** Make the caller the author of every unclaimed script; scripts that already have an author are left alone. Returns how many. */
+export function claimUnclaimed(db: Db, caller: AuthorIdentity): number {
+  const ids = listUnclaimed(db);
+  for (const id of ids) recordAuthor(db, id, caller);
+  return ids.length;
+}
+
 // Older rows can hold the JSON text of the array instead of the array.
 function toScopeSet(raw: unknown): Set<string> {
   const list = Array.isArray(raw) ? raw : JSON.parse(String(raw ?? '[]'));
@@ -62,24 +97,18 @@ export function resolveToolAccess(db: Db, automationId: number): ToolAccess {
     .from(automations)
     .where(eq(automations.id, automationId))
     .get();
-  if (!automation) return { kind: 'denied', reason: 'Tool access denied: the automation no longer exists.' };
+  if (!automation) return { kind: 'denied', reason: 'Access denied: the automation no longer exists.' };
 
-  // A plugin's own script is the plugin's code. The override flag alone is not proof: the generic
-  // update route and the AI code tools rewrite `code` without setting it, so the code must still match what the plugin ships.
-  const shippedByPlugin = automation.managedBy != null
-    && !automation.isOverridden
-    && automation.currentDefaultCode != null
-    && automation.code === automation.currentDefaultCode;
-  if (shippedByPlugin) return { kind: 'trusted' };
+  if (isShippedByPlugin(automation)) return { kind: 'trusted' };
 
   const author = db.select().from(automationAuthors).where(eq(automationAuthors.automationId, automationId)).get();
-  if (!author) return { kind: 'denied', reason: `Tool access denied: this automation has no author on record. ${CLAIM_HINT}` };
+  if (!author) return { kind: 'denied', reason: `Access denied: this automation has no author on record. ${CLAIM_HINT}` };
 
-  const removed: ToolAccess = { kind: 'denied', reason: `Tool access denied: the author's account was removed. ${CLAIM_HINT}` };
+  const removed: ToolAccess = { kind: 'denied', reason: `Access denied: the author's account was removed. ${CLAIM_HINT}` };
   if (author.userId == null) return removed;
   const user = db.select({ scopes: users.scopes, enabled: users.enabled }).from(users).where(eq(users.id, author.userId)).get();
   if (!user) return removed;
-  if (!user.enabled) return { kind: 'denied', reason: "Tool access denied: the author's account is disabled." };
+  if (!user.enabled) return { kind: 'denied', reason: "Access denied: the author's account is disabled." };
 
   return { kind: 'scoped', snapshot: toScopeSet(author.scopes), current: toScopeSet(user.scopes) };
 }

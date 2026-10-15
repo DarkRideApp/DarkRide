@@ -3,7 +3,7 @@ import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { createTestDb } from '../test-utils/create-test-db';
 import type { AppDatabase } from '../db/index';
-import { recordAuthor, clearAuthor, resolveToolAccess } from './automation-authors';
+import { recordAuthor, clearAuthor, resolveToolAccess, listUnclaimed, claimUnclaimed } from './automation-authors';
 
 describe('automation authors', () => {
   let db: AppDatabase;
@@ -161,6 +161,107 @@ describe('automation authors', () => {
     it('is a no-op when there is no author', () => {
       const a = addAutomation();
       expect(() => clearAuthor(db, a.id)).not.toThrow();
+    });
+  });
+
+  describe('unclaimed scripts', () => {
+    const SHELL = 'core.devices:shell';
+    const claimer = () => ({ userId: addUser([SHELL]).id, effectiveScopes: new Set([SHELL]) });
+
+    describe('listUnclaimed', () => {
+      it('lists a script nobody has claimed', () => {
+        const a = addAutomation();
+        expect(listUnclaimed(db)).toEqual([a.id]);
+      });
+
+      it('lists a script whose author account was removed', () => {
+        const user = addUser([SHELL]);
+        const a = addAutomation();
+        recordAuthor(db, a.id, { userId: user.id, effectiveScopes: new Set([SHELL]) });
+        db.update(schema.automationAuthors).set({ userId: null }).where(eq(schema.automationAuthors.automationId, a.id)).run();
+
+        expect(listUnclaimed(db)).toEqual([a.id]);
+      });
+
+      it('leaves out a script that has an author, even a disabled one', () => {
+        const active = addAutomation();
+        const disabled = addAutomation();
+        recordAuthor(db, active.id, { userId: addUser([SHELL]).id, effectiveScopes: new Set([SHELL]) });
+        recordAuthor(db, disabled.id, { userId: addUser([SHELL], false).id, effectiveScopes: new Set([SHELL]) });
+
+        expect(listUnclaimed(db)).toEqual([]);
+      });
+
+      it('leaves out a plugin script the operator has not changed, since it needs no author', () => {
+        addAutomation({ managedBy: 'some-plugin' });
+        expect(listUnclaimed(db)).toEqual([]);
+      });
+
+      it('lists a plugin script once its code differs from what the plugin ships', () => {
+        const changed = addAutomation({ managedBy: 'some-plugin', code: 'export default async function() { /* edited */ }' });
+        const overridden = addAutomation({ managedBy: 'some-plugin', isOverridden: true });
+
+        expect(listUnclaimed(db).sort()).toEqual([changed.id, overridden.id].sort());
+      });
+
+      it('returns nothing when there are no scripts', () => {
+        expect(listUnclaimed(db)).toEqual([]);
+      });
+    });
+
+    describe('claimUnclaimed', () => {
+      it('makes the caller the author of every unclaimed script, with the scopes of the credential used', () => {
+        const a = addAutomation();
+        const b = addAutomation();
+        const caller = claimer();
+
+        expect(claimUnclaimed(db, caller)).toBe(2);
+
+        for (const id of [a.id, b.id]) {
+          expect(authorRow(id).userId).toBe(caller.userId);
+          expect(authorRow(id).scopes).toEqual([SHELL]);
+        }
+        expect(resolveToolAccess(db, a.id).kind).toBe('scoped');
+      });
+
+      it('leaves scripts that already have an author with that author', () => {
+        const owner = addUser(['core.admin:*']);
+        const owned = addAutomation();
+        recordAuthor(db, owned.id, { userId: owner.id, effectiveScopes: new Set(['core.admin:*']) });
+        const loose = addAutomation();
+        const caller = claimer();
+
+        expect(claimUnclaimed(db, caller)).toBe(1);
+
+        expect(authorRow(owned.id).userId).toBe(owner.id);
+        expect(authorRow(loose.id).userId).toBe(caller.userId);
+      });
+
+      it('takes over a script whose author account was removed', () => {
+        const gone = addUser([SHELL]);
+        const a = addAutomation();
+        recordAuthor(db, a.id, { userId: gone.id, effectiveScopes: new Set([SHELL]) });
+        db.update(schema.automationAuthors).set({ userId: null }).where(eq(schema.automationAuthors.automationId, a.id)).run();
+        const caller = claimer();
+
+        expect(claimUnclaimed(db, caller)).toBe(1);
+        expect(authorRow(a.id).userId).toBe(caller.userId);
+      });
+
+      it('does not claim an unchanged plugin script', () => {
+        const managed = addAutomation({ managedBy: 'some-plugin' });
+
+        expect(claimUnclaimed(db, claimer())).toBe(0);
+        expect(authorRow(managed.id)).toBeUndefined();
+      });
+
+      it('claims nothing the second time', () => {
+        addAutomation();
+        const caller = claimer();
+        claimUnclaimed(db, caller);
+
+        expect(claimUnclaimed(db, caller)).toBe(0);
+      });
     });
   });
 });

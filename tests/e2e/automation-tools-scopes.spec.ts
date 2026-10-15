@@ -5,57 +5,15 @@
  * Run: npx playwright test tests/e2e/automation-tools-scopes.spec.ts
  */
 
-import { test, expect, type APIRequestContext, type Browser } from '@playwright/test';
-import {
-  API_BASE,
-  ADMIN_USERNAME,
-  ADMIN_PASSWORD,
-  waitForBackend,
-  apiLogin,
-  createLimitedUser,
-  claimUser,
-} from './helpers/auth';
+import { test, expect } from '@playwright/test';
+import { API_BASE, waitForBackend } from './helpers/auth';
+import { signInAdmin, signInWriter, send, runScript, waitForTool } from './helpers/script-sessions';
 
 // list_devices needs core.devices:read, which the limited user does not hold.
 const SCRIPT = `declare const tools: any;
 export default async function() {
   await tools.list_devices({});
 }`;
-const WRITER_SCOPES = ['core.automations:read', 'core.automations:edit', 'core.automations:execute'];
-
-interface Session { request: APIRequestContext; csrf: string }
-
-async function signInAdmin(browser: Browser): Promise<Session> {
-  const request = (await browser.newContext()).request;
-  return { request, csrf: await apiLogin(request, ADMIN_USERNAME, ADMIN_PASSWORD) };
-}
-
-async function signInWriter(browser: Browser, adminSession: Session): Promise<Session> {
-  const username = `script-writer-${Date.now()}`;
-  const password = 'script-writer-pw-789';
-  const claimToken = await createLimitedUser(adminSession.request, adminSession.csrf, username, WRITER_SCOPES);
-  const request = (await browser.newContext()).request;
-  return { request, csrf: await claimUser(request, claimToken, password) };
-}
-
-async function send(s: Session, method: 'post' | 'put' | 'delete', path: string, data?: unknown) {
-  const res = await s.request[method](`${API_BASE}${path}`, { data, headers: { 'X-CSRF-Token': s.csrf } });
-  return { status: res.status(), body: await res.json() };
-}
-
-async function runScript(s: Session, id: number) {
-  const res = await send(s, 'post', `/v1/automation/run/${id}`, {});
-  expect(res.status).toBe(200);
-  return res.body.data as { success: boolean; error?: string };
-}
-
-// The runner gets its tool registry late in startup, right after the tool list route appears.
-async function waitForTools(s: Session) {
-  await expect.poll(async () => {
-    const res = await s.request.get(`${API_BASE}/v1/tools`);
-    return res.ok() && JSON.stringify(await res.json()).includes('list_devices');
-  }, { timeout: 90_000, intervals: [500, 1000, 2000] }).toBe(true);
-}
 
 test.describe('Script tool access', () => {
   test.beforeAll(async ({ browser }) => {
@@ -67,7 +25,7 @@ test.describe('Script tool access', () => {
   test('follows the person who last saved the code', async ({ browser }) => {
     test.setTimeout(150_000);
     const admin = await signInAdmin(browser);
-    await waitForTools(admin);
+    await waitForTool(admin, 'list_devices');
     const writer = await signInWriter(browser, admin);
     const ids: number[] = [];
 

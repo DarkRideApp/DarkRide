@@ -72,6 +72,21 @@ describe('AutomationRunner', () => {
     return db.select().from(schema.automations).all().pop()!;
   }
 
+  let userCount = 0;
+
+  function addUser(scopes: string[], enabled = true) {
+    const now = new Date();
+    db.insert(schema.users).values({
+      username: `author${++userCount}`, providerId: 'core.local', scopes, enabled, createdAt: now, updatedAt: now,
+    }).run();
+    return db.select().from(schema.users).all().pop()!;
+  }
+
+  function author(automationId: number, userScopes: string[], snapshot: string[], enabled = true) {
+    const user = addUser(userScopes, enabled);
+    recordAuthor(db, automationId, { userId: user.id, effectiveScopes: new Set(snapshot) });
+  }
+
   describe('runAutomation', () => {
     it('creates session and runs automation successfully', async () => {
       const auto = createAutomation(`
@@ -441,8 +456,6 @@ describe('AutomationRunner', () => {
     `;
     let shellTool: ReturnType<typeof vi.fn>;
     let openTool: ReturnType<typeof vi.fn>;
-    let userCount = 0;
-
     beforeEach(() => {
       shellTool = vi.fn(async () => ({ ok: true }));
       openTool = vi.fn(async () => ({ ok: true }));
@@ -451,19 +464,6 @@ describe('AutomationRunner', () => {
       registry.register({ name: 'open_tool', description: 'd', inputSchema: { type: 'object', properties: {} }, context: ['x'], execute: openTool });
       runner.setToolRegistry(registry);
     });
-
-    function addUser(scopes: string[], enabled = true) {
-      const now = new Date();
-      db.insert(schema.users).values({
-        username: `author${++userCount}`, providerId: 'core.local', scopes, enabled, createdAt: now, updatedAt: now,
-      }).run();
-      return db.select().from(schema.users).all().pop()!;
-    }
-
-    function author(automationId: number, userScopes: string[], snapshot: string[], enabled = true) {
-      const user = addUser(userScopes, enabled);
-      recordAuthor(db, automationId, { userId: user.id, effectiveScopes: new Set(snapshot) });
-    }
 
     it('refuses a script nobody has claimed, without running the tool', async () => {
       const auto = createAutomation(script);
@@ -663,6 +663,273 @@ describe('AutomationRunner', () => {
       const result = await runner.runAutomation(auto.id, 'test-device', 'schedule');
       expect(result.success).toBe(true);
       expect(execute).toHaveBeenCalled();
+    });
+  });
+
+  describe('device API access from scripts', () => {
+    const CREDENTIALS = 'core.credentials:read';
+    const PROXIES = 'core.proxies:manage';
+    const credentialScript = `
+      export default async function(device: any) {
+        const c = await device.getCredentials('com.example');
+        if (c.password !== 's3cret') throw new Error('wrong credential');
+      }
+    `;
+    const deviceProxyScript = `export default async function(device: any) { await device.setProxy('none'); }`;
+    const httpProxyScript = `declare const http: any; export default async function(device: any) { await http.setProxy('none'); }`;
+    const deviceless = (code: string) => {
+      const auto = createAutomation(code);
+      db.update(schema.automations).set({ requiresDevice: false }).where(eq(schema.automations.id, auto.id)).run();
+      return auto;
+    };
+
+    function addCredential() {
+      const now = new Date();
+      db.insert(schema.credentials).values({ appId: 'com.example', username: 'alice', password: 's3cret', createdAt: now, updatedAt: now }).run();
+    }
+    const credentialLastUsed = () => db.select().from(schema.credentials).all()[0].lastUsedAt;
+
+    beforeEach(() => addCredential());
+
+    describe('getCredentials', () => {
+      it('refuses a script nobody has claimed, without reading the credential', async () => {
+        const auto = createAutomation(credentialScript);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(/no author on record/i);
+        expect(credentialLastUsed()).toBeNull();
+      });
+
+      it('refuses when the author does not hold the credentials scope', async () => {
+        const auto = createAutomation(credentialScript);
+        author(auto.id, ['core.automations:edit'], ['core.automations:edit']);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Insufficient scope: core.credentials:read required for device.getCredentials');
+        expect(credentialLastUsed()).toBeNull();
+      });
+
+      it('refuses when the author holds the scope now but the key that saved the script did not', async () => {
+        const auto = createAutomation(credentialScript);
+        author(auto.id, [CREDENTIALS], ['core.automations:edit']);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Insufficient scope: core.credentials:read');
+      });
+
+      it('refuses when the author lost the scope after saving', async () => {
+        const auto = createAutomation(credentialScript);
+        author(auto.id, [], [CREDENTIALS]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Insufficient scope: core.credentials:read');
+      });
+
+      it('refuses when the author\'s account is disabled', async () => {
+        const auto = createAutomation(credentialScript);
+        author(auto.id, [CREDENTIALS], [CREDENTIALS], false);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(/disabled/i);
+      });
+
+      it('returns the credential to a script whose author holds the scope', async () => {
+        const auto = createAutomation(credentialScript);
+        author(auto.id, [CREDENTIALS], [CREDENTIALS]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.error).toBeUndefined();
+        expect(result.success).toBe(true);
+        expect(credentialLastUsed()).not.toBeNull();
+      });
+
+      it('keeps working for a script saved by an administrator', async () => {
+        const auto = createAutomation(credentialScript);
+        author(auto.id, ['core.admin:*'], ['core.admin:*']);
+        expect((await runner.runAutomation(auto.id, 'test-device', 'manual')).success).toBe(true);
+      });
+
+      it('lets the script catch the refusal and carry on', async () => {
+        const auto = createAutomation(`
+          export default async function(device: any) {
+            try { await device.getCredentials('com.example'); } catch (e: any) { if (!/Insufficient scope/.test(e.message)) throw e; }
+          }
+        `);
+        author(auto.id, [], []);
+        expect((await runner.runAutomation(auto.id, 'test-device', 'manual')).success).toBe(true);
+        expect(credentialLastUsed()).toBeNull();
+      });
+
+      it('trusts a plugin-managed script the operator has not changed', async () => {
+        const auto = createAutomation(credentialScript, { managedBy: 'some-plugin', managedKey: 'k' });
+        db.update(schema.automations).set({ currentDefaultCode: credentialScript }).where(eq(schema.automations.id, auto.id)).run();
+
+        expect((await runner.runAutomation(auto.id, 'test-device', 'manual')).success).toBe(true);
+      });
+    });
+
+    describe('setProxy', () => {
+      it('refuses device.setProxy for a script nobody has claimed', async () => {
+        const auto = createAutomation(deviceProxyScript);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(/no author on record/i);
+      });
+
+      it('refuses device.setProxy when the author does not hold the proxies scope', async () => {
+        const auto = createAutomation(deviceProxyScript);
+        author(auto.id, ['core.automations:edit'], ['core.automations:edit']);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Insufficient scope: core.proxies:manage required for device.setProxy');
+      });
+
+      it('lets device.setProxy through when the author holds the proxies scope', async () => {
+        const auto = createAutomation(deviceProxyScript);
+        author(auto.id, [PROXIES], [PROXIES]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.error).toBeUndefined();
+        expect(result.success).toBe(true);
+      });
+
+      it('refuses http.setProxy for a script nobody has claimed', async () => {
+        const auto = deviceless(httpProxyScript);
+        const result = await runner.runAutomation(auto.id, undefined, 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(/no author on record/i);
+      });
+
+      it('refuses http.setProxy when the author does not hold the proxies scope', async () => {
+        const auto = deviceless(httpProxyScript);
+        author(auto.id, ['core.automations:edit'], ['core.automations:edit']);
+        const result = await runner.runAutomation(auto.id, undefined, 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Insufficient scope: core.proxies:manage required for http.setProxy');
+      });
+
+      it('lets http.setProxy through when the author holds the proxies scope', async () => {
+        const auto = deviceless(httpProxyScript);
+        author(auto.id, [PROXIES], [PROXIES]);
+        const result = await runner.runAutomation(auto.id, undefined, 'manual');
+
+        expect(result.error).toBeUndefined();
+        expect(result.success).toBe(true);
+      });
+    });
+
+    describe('outbound HTTP', () => {
+      it('stays open to a script nobody has claimed, because it is what automations are for', async () => {
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('ok'));
+        const auto = createAutomation(`
+          declare const http: any;
+          export default async function(device: any) {
+            await device.httpGet('https://example.test/a');
+            await device.httpPost('https://example.test/b', { x: 1 });
+            await http.get('https://example.test/c');
+            await http.post('https://example.test/d', { x: 1 });
+          }
+        `);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.error).toBeUndefined();
+        expect(result.success).toBe(true);
+        // The runner makes its own requests to the device bridge; only the script's count here.
+        const scriptCalls = fetchSpy.mock.calls.filter(([url]) => String(url).startsWith('https://example.test'));
+        expect(scriptCalls).toHaveLength(4);
+      });
+    });
+
+    describe('ordinary device calls', () => {
+      it('do not need an author', async () => {
+        const auto = createAutomation(`export default async function(device: any) { await device.sleep(1); }`);
+        expect((await runner.runAutomation(auto.id, 'test-device', 'manual')).success).toBe(true);
+      });
+    });
+
+    describe('when the script is saved while a run is in flight', () => {
+      const gateFor = (id: number) => (runner as any).buildHostGate(id) as (target: string, method: string) => void;
+
+      it('refuses further gated calls once someone else has saved the script', () => {
+        const auto = createAutomation(credentialScript);
+        author(auto.id, [CREDENTIALS], [CREDENTIALS]);
+        const gate = gateFor(auto.id);
+
+        author(auto.id, ['core.admin:*'], ['core.admin:*']);
+
+        expect(() => gate('device', 'getCredentials')).toThrow(/saved by someone else while it was running/i);
+      });
+
+      it('refuses further gated calls once the author was removed mid-run', () => {
+        const auto = createAutomation(credentialScript);
+        author(auto.id, [CREDENTIALS], [CREDENTIALS]);
+        const gate = gateFor(auto.id);
+
+        clearAuthor(db, auto.id);
+
+        expect(() => gate('device', 'getCredentials')).toThrow();
+      });
+
+      it('keeps working when the same person saves it again', () => {
+        const auto = createAutomation(credentialScript);
+        const user = addUser([CREDENTIALS]);
+        recordAuthor(db, auto.id, { userId: user.id, effectiveScopes: new Set([CREDENTIALS]) });
+        const gate = gateFor(auto.id);
+
+        recordAuthor(db, auto.id, { userId: user.id, effectiveScopes: new Set([CREDENTIALS]) });
+
+        expect(() => gate('device', 'getCredentials')).not.toThrow();
+      });
+
+      it('does not look anything up for a call that needs no scope', () => {
+        const auto = createAutomation(credentialScript);
+        const gate = gateFor(auto.id);
+
+        clearAuthor(db, auto.id);
+
+        expect(() => gate('device', 'click')).not.toThrow();
+        expect(() => gate('device', 'httpGet')).not.toThrow();
+      });
+    });
+
+    it('applies the same check to rules', async () => {
+      const rule = createAutomation(credentialScript, { isRule: true });
+      const device = {
+        getDeviceId: vi.fn().mockReturnValue('test-device'),
+        getDOM: vi.fn().mockResolvedValue({ className: 'FrameLayout', text: '', resourceId: '', description: '', bounds: [0, 0, 1, 1], clickable: false, enabled: true, children: [] }),
+        setCachedDOM: vi.fn(),
+        clearCachedDOM: vi.fn(),
+        getCredentials: vi.fn(),
+      } as any;
+
+      await runner.runRules(device);
+      expect(device.getCredentials).not.toHaveBeenCalled();
+
+      author(rule.id, [CREDENTIALS], [CREDENTIALS]);
+      await runner.runRules(device);
+      expect(device.getCredentials).toHaveBeenCalledTimes(1);
+    });
+
+    it('applies the same check to capture rules', async () => {
+      const rule = createAutomation(credentialScript, { isCaptureRule: true });
+      db.insert(schema.automationSessions).values({ deviceId: 'test-device', status: 'running', triggerType: 'capture', startedAt: new Date() }).run();
+      const session = db.select().from(schema.automationSessions).all().pop()!;
+
+      await runner.runCaptureRules('test-device', session.id);
+      expect(credentialLastUsed()).toBeNull();
+
+      author(rule.id, [CREDENTIALS], [CREDENTIALS]);
+      await runner.runCaptureRules('test-device', session.id);
+      expect(credentialLastUsed()).not.toBeNull();
     });
   });
 
@@ -912,6 +1179,13 @@ describe('AutomationRunner', () => {
     describe('script-started capture (device.setProxy)', () => {
       const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+      // setProxy needs an author who holds the proxies scope.
+      function createAdminScript(code: string, opts?: Parameters<typeof createAutomation>[1]) {
+        const auto = createAutomation(code, opts);
+        author(auto.id, ['core.admin:*'], ['core.admin:*']);
+        return auto;
+      }
+
       function setup() {
         const mockMitm = createMockMitmproxyManager();
         const mockDm = createMockDeviceManager();
@@ -921,7 +1195,7 @@ describe('AutomationRunner', () => {
 
       it('stops the capture when the script throws after setProxy', async () => {
         const { mockMitm, mockDm, captureRunner } = setup();
-        const auto = createAutomation(`
+        const auto = createAdminScript(`
           export default async function(d: any) {
             await d.setProxy('normal');
             throw new Error('script failed mid-capture');
@@ -939,7 +1213,7 @@ describe('AutomationRunner', () => {
 
       it('deactivates the tunnel before stopping a script-started capture', async () => {
         const { mockMitm, mockDm, captureRunner } = setup();
-        const auto = createAutomation(`
+        const auto = createAdminScript(`
           export default async function(d: any) {
             await d.setProxy('normal');
             throw new Error('boom');
@@ -956,7 +1230,7 @@ describe('AutomationRunner', () => {
 
       it('stops the capture when the script times out after setProxy', async () => {
         const { mockMitm, captureRunner } = setup();
-        const auto = createAutomation(`
+        const auto = createAdminScript(`
           export default async function(d: any) {
             await d.setProxy('normal');
             await new Promise(r => setTimeout(r, 60000));
@@ -972,7 +1246,7 @@ describe('AutomationRunner', () => {
 
       it('stops the capture when the run is cancelled after setProxy', async () => {
         const { mockMitm, captureRunner } = setup();
-        const auto = createAutomation(`
+        const auto = createAdminScript(`
           export default async function(d: any) {
             await d.setProxy('normal');
             await new Promise(r => setTimeout(r, 60000));
@@ -995,7 +1269,7 @@ describe('AutomationRunner', () => {
 
       it('does not stop again when the script already called setProxy("none")', async () => {
         const { mockMitm, captureRunner } = setup();
-        const auto = createAutomation(`
+        const auto = createAdminScript(`
           export default async function(d: any) {
             await d.setProxy('normal');
             await d.setProxy('none');
@@ -1010,7 +1284,7 @@ describe('AutomationRunner', () => {
 
       it('kills a timed-out script so it cannot start a capture after cleanup', async () => {
         const { mockMitm, captureRunner } = setup();
-        const auto = createAutomation(`
+        const auto = createAdminScript(`
           export default async function(d: any) {
             await new Promise(r => setTimeout(r, 400));
             await d.setProxy('normal');
@@ -1042,7 +1316,7 @@ describe('AutomationRunner', () => {
           capturing = true;
           return mockTunnelInfo;
         });
-        const auto = createAutomation(`
+        const auto = createAdminScript(`
           export default async function(d: any) {
             await d.setProxy('normal');
           }
