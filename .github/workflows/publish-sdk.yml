@@ -17,11 +17,6 @@ on:
     tags:
       - 'sdk-v*'
 
-env:
-  # Opt JS-based actions onto Node 24 ahead of GitHub's forced switch on
-  # 2026-06-02. Matches ci.yml.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-
 # Top-level: contents read only. The publish job overrides with id-token
 # write for OIDC.
 permissions:
@@ -30,13 +25,13 @@ permissions:
 jobs:
   publish:
     name: Publish @darkrideapp/plugin-sdk
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Fail fast if someone tags a commit where package.json's version
       # doesn't match the tag. Prevents accidental "tag says 1.5.0 but we
@@ -51,7 +46,7 @@ jobs:
           fi
           echo "Publishing @darkrideapp/plugin-sdk@${PKG_VERSION}"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'

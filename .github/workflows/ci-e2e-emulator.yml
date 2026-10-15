@@ -20,11 +20,6 @@ on:
     - cron: '17 2 * * *'
   workflow_dispatch:
 
-env:
-  # Opt JS-based actions onto Node 24 ahead of GitHub's forced switch.
-  # Matches the existing ci.yml convention.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-
 permissions:
   contents: read
 
@@ -34,10 +29,10 @@ concurrency:
 
 jobs:
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 1. Enable KVM so the emulator can use hardware acceleration.
       #    Without this, the emulator runs in software mode and may not
@@ -52,18 +47,18 @@ jobs:
           lscpu | grep -E 'Vendor ID|Model name' || true
 
       # 2. JDK 17 + Android SDK to build the fixture APK.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
       # 3. Build the fixture APK. Cached separately from npm install.
       - name: Cache Gradle
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches
@@ -75,7 +70,7 @@ jobs:
       # The runner image's own Gradle moves between image releases (9.8 on
       # image 20261004). The fixture's Kotlin plugin does not resolve on
       # Gradle 9, so install the version the wrapper below is generated from.
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v5
         with:
           gradle-version: '8.10'
           cache-disabled: true
@@ -92,7 +87,7 @@ jobs:
             || { echo "::error::fixture APK build did not produce app-debug.apk"; exit 1; }
 
       # 4. Node 24 + npm install + SDK build (same pattern as ci.yml).
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
 
@@ -109,24 +104,26 @@ jobs:
       #    needed). Saves an ~8 GB image from our hosting plus a CI
       #    publish job. Docker Hub allows anonymous pulls; no login.
       - name: Cache docker-android image
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         id: image-cache
         with:
-          path: /tmp/docker-image-cache
+          # Not /tmp: it is a RAM-backed tmpfs capped at about 8 GB on ubuntu-26.04,
+          # and this tarball is 5.4 GB.
+          path: ~/docker-image-cache
           # Static key — we always want budtmo/docker-android:emulator_14.0.
           # Bump the suffix here to invalidate the cache when changing tags.
-          key: docker-android-budtmo-emulator_14.0-v1
+          key: docker-android-budtmo-emulator_14.0-v2
 
       - name: Pull or restore budtmo/docker-android:emulator_14.0
         run: |
-          mkdir -p /tmp/docker-image-cache
-          if [ -f /tmp/docker-image-cache/docker-android-budtmo-14.tar ]; then
+          mkdir -p ~/docker-image-cache
+          if [ -f ~/docker-image-cache/docker-android-budtmo-14.tar ]; then
             echo "Restoring image from cache"
-            docker load -i /tmp/docker-image-cache/docker-android-budtmo-14.tar
+            docker load -i ~/docker-image-cache/docker-android-budtmo-14.tar
           else
             echo "Pulling fresh image from Docker Hub"
             docker pull budtmo/docker-android:emulator_14.0
-            docker save budtmo/docker-android:emulator_14.0 -o /tmp/docker-image-cache/docker-android-budtmo-14.tar
+            docker save budtmo/docker-android:emulator_14.0 -o ~/docker-image-cache/docker-android-budtmo-14.tar
           fi
 
       # 6. Start DarkRide backend in the background.
@@ -141,12 +138,20 @@ jobs:
       # + frida wheel builds are the dominant cost. Pre-warming flips them
       # from the boot critical path to a cached workflow step (~90s, then
       # ~5s on subsequent runs via actions/cache).
+      # Pinned like ci.yml: the image's own python3 changes between runner
+      # images, and a cached venv only works under the Python that built it.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        id: py
+        with:
+          python-version: '3.13'
+
       - name: Cache Python venv
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         id: venv-cache
         with:
           path: .venv
-          key: python-venv-${{ hashFiles('python/requirements.txt') }}
+          key: python-venv-${{ runner.os }}-${{ steps.py.outputs.python-version }}-${{ hashFiles('python/requirements.txt') }}
 
       - name: Pre-warm Python venv
         if: steps.venv-cache.outputs.cache-hit != 'true'
