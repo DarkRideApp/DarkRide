@@ -239,7 +239,7 @@ For an OpenAI-compatible API that takes a bearer token, add one entry to `AI_PRO
   id: 'groq', label: 'Groq', shortName: 'Groq', kind: 'http', dialect: 'openai-chat',
   defaultBaseUrl: 'https://api.groq.com/openai/v1', defaultPath: '/openai/v1', baseUrl: 'optional',
   auth: { scheme: 'bearer', required: true, label: 'API Key' },
-  rateLimitScheme: 'none', listModels: { path: '/models' }, capabilities: { tools: true },
+  rateLimitScheme: 'none', listModels: { path: '/models' },
 },
 ```
 

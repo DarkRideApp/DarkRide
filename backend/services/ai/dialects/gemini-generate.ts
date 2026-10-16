@@ -1,5 +1,6 @@
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
+import { toolNamesById } from '../format';
 import { authHeaders, parseSSEStream, safeText } from '../http';
 import { AiProviderError, AuthError, ModelRefusedError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
@@ -48,8 +49,7 @@ function headers(ctx: DialectContext): Record<string, string> {
  * functionCall part of each model turn carries the documented stand-in; parallel calls after it carry none.
  */
 function formatContents(messages: AiMessage[], model: string): any[] {
-  const names = new Map<string, string>();
-  for (const m of messages) if (m.role === 'assistant') for (const b of m.content) if (b.type === 'tool_use') names.set(b.id, b.name);
+  const names = toolNamesById(messages);
   const signCalls = isGemini3(model);
 
   const contents: any[] = [];
@@ -161,14 +161,13 @@ function classifyError(status: number, _headers: Headers, bodyText: string, ctx:
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   const shortName = ctx.descriptor.shortName;
-  if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
   const provider = ctx.descriptor.id;
   let usage: { input: number; output: number; cached: number } | undefined;
   let sawChunk = false;
   let finished = false;
   let produced = false;   // any visible text or tool call so far
 
-  for await (const sse of parseSSEStream(res.body, signal)) {
+  for await (const sse of parseSSEStream(res.body!, signal)) {
     if (sse.data === '[DONE]') break;
     let p: any;
     try { p = JSON.parse(sse.data); } catch { continue; }

@@ -101,7 +101,7 @@ export class DialectProvider implements AiProvider {
    */
   async complete(req: AiCompleteRequest): Promise<string> {
     const ctx = this.ctx();
-    const fim = this.descriptor.capabilities.fim;
+    const fim = this.descriptor.capabilities?.fim;
     const d = this.dialect;
     if (fim && d.buildFim && d.parseFim && new RegExp(fim.modelPattern, 'i').test(ctx.model)) {
       const buildFim = d.buildFim.bind(d);

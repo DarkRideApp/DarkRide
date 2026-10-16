@@ -6,7 +6,7 @@ import type { AppDatabase } from '../db/index';
 import type { AiModelRouter } from '../services/ai-model-router';
 import { createProvider } from '../services/ai/registry';
 import { AiProviderError, NoModelsConfiguredError } from '../services/ai/errors';
-import { redact } from '../services/ai/http';
+import { safeText } from '../services/ai/http';
 import type { AiCompleteRequest, AiProvider } from '../services/ai/dialect';
 import { getProviderDescriptor } from '../../shared/lib/ai-provider-catalog';
 import { createLoggers } from '../logs';
@@ -138,7 +138,7 @@ export function completeHandler(db: AppDatabase, router: AiModelRouter) {
       }
       // Not a classified provider failure, so the message may hold anything: keep it in the server log only.
       // Masked and capped anyway, since log lines are streamed to live log viewers.
-      error(`Completion failed unexpectedly: ${err?.name ?? 'Error'}: ${redact(String(err?.message ?? err)).slice(0, 500)}`);
+      error(`Completion failed unexpectedly: ${err?.name ?? 'Error'}: ${safeText(err?.message ?? err, {})}`);
       res.status(500).json({ success: false, error: 'Inline completion failed' });
     }
   };

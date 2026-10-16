@@ -56,11 +56,12 @@ export interface BuiltRequest { url: string; headers: Record<string, string>; bo
 export interface Dialect {
   id: DialectId;
   buildChat(ctx: DialectContext, req: AiRequest, opts: { stream: boolean }): BuiltRequest;
+  // DialectProvider rejects a response with no body before it gets here.
   parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncIterable<AiStreamEvent>;
   buildFim?(ctx: DialectContext, req: AiCompleteRequest): BuiltRequest;
   parseFim?(json: unknown): string;
-  buildListModels?(ctx: DialectContext, page?: string): { url: string; headers: Record<string, string> };
-  parseModels?(json: unknown): { models: { id: string; name: string }[]; next?: string };
+  buildListModels(ctx: DialectContext, page?: string): { url: string; headers: Record<string, string> };
+  parseModels(json: unknown): { models: { id: string; name: string }[]; next?: string };
   // ctx supplies shortName and the key for redaction: build the message with safeText, and set provider and status.
   classifyError?(status: number, headers: Headers, bodyText: string, ctx: DialectContext): AiProviderError | undefined;
   classifyStreamError?(payload: unknown, ctx: DialectContext): AiProviderError;

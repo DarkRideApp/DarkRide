@@ -50,7 +50,6 @@ function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   const shortName = ctx.descriptor.shortName;
-  if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
 
   let toolId = '', toolName = '', toolJson = '';
   let messageStopped = false;
@@ -61,7 +60,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   // the partial answer stays and the message is appended, because a fallback would duplicate what the caller already has.
   let produced = false;
 
-  for await (const sse of parseSSEStream(res.body, signal)) {
+  for await (const sse of parseSSEStream(res.body!, signal)) {
     if (!sse.data || sse.data === '[DONE]') continue;
     let p: any;
     try { p = JSON.parse(sse.data); } catch { continue; }

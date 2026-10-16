@@ -69,7 +69,6 @@ export async function listModels(row: ProviderEndpoint): Promise<{ id: string; n
   requireKey(d, row);
   const dialect = getDialect(d.dialect);
   const { buildListModels, parseModels } = dialect;
-  if (!buildListModels || !parseModels) return [];
   const ctx = ctxFor(row, d.defaultModel ?? 'unused');
   const all: { id: string; name: string }[] = [];
   let page: string | undefined;
