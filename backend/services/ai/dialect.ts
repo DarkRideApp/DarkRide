@@ -2,7 +2,7 @@ import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../shared
 import type { AiProviderDescriptor, DialectId } from '../../../shared/lib/ai-provider-catalog';
 import type { AiProviderError } from './errors';
 
-export interface AiProviderConfig { apiKey?: string; baseUrl?: string; model?: string }
+export interface ProviderSettings { apiKey?: string; baseUrl?: string; model?: string }
 
 export interface AiRequest {
   messages: AiMessage[];

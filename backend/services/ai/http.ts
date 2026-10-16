@@ -205,7 +205,7 @@ export function safeText(msg: unknown, ctx: { apiKey?: string }): string {
 }
 
 /** Extract the provider's message from an error body, redact `apiKey` (if given), then cap at 500 chars. */
-export function upstreamMessage(bodyText: string, apiKey?: string): string {
+function upstreamMessage(bodyText: string, apiKey?: string): string {
   const trimmed = bodyText.trim();
   try {
     const parsed = JSON.parse(trimmed);
@@ -371,7 +371,7 @@ function abortError(signal?: AbortSignal): unknown {
   return signal?.reason ?? new DOMException('This operation was aborted', 'AbortError');
 }
 
-export async function sendBuilt(
+async function sendBuilt(
   built: BuiltRequest,
   ctx: DialectContext,
   signal?: AbortSignal,

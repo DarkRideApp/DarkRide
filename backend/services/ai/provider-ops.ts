@@ -10,7 +10,7 @@ import { getDialect } from './registry';
 import type { DialectContext } from './dialect';
 
 export type TestResult = { success: true; model: string } | { success: false; error: string };
-export interface ProviderRow { type: string; apiKey: string | null; baseUrl: string | null }
+export interface ProviderEndpoint { type: string; apiKey: string | null; baseUrl: string | null }
 
 const MAX_PAGES = 10;
 /** More models than any real catalogue offers; a longer list is treated as a broken or hostile endpoint. */
@@ -21,18 +21,18 @@ const message = (err: unknown): string => (err instanceof Error ? err.message : 
 /** A stored value with surrounding whitespace removed; only whitespace counts as not set. */
 const clean = (v: string | null | undefined): string | undefined => v?.trim() || undefined;
 
-function httpDescriptor(row: ProviderRow): AiProviderDescriptor {
+function httpDescriptor(row: ProviderEndpoint): AiProviderDescriptor {
   const d = getProviderDescriptor(row.type);
   if (!d || d.kind !== 'http' || !d.dialect) throw new AiProviderError(`Unknown provider type: ${row.type}`);
   return d;
 }
 
-function ctxFor(row: ProviderRow, model: string): DialectContext {
+function ctxFor(row: ProviderEndpoint, model: string): DialectContext {
   // Ids are never synthesised here: listing and the probe do not parse tool calls.
   return resolveContext(httpDescriptor(row), { apiKey: row.apiKey, baseUrl: row.baseUrl, model }, () => 'unused');
 }
 
-function requireKey(d: AiProviderDescriptor, row: ProviderRow): void {
+function requireKey(d: AiProviderDescriptor, row: ProviderEndpoint): void {
   if (d.auth.required && !clean(row.apiKey)) throw new AiProviderError(`No ${d.shortName} API key configured`, { provider: d.id });
 }
 
@@ -61,7 +61,7 @@ async function withTimeout<T>(ctx: DialectContext, run: (signal: AbortSignal) =>
  * most 10 pages and 50,000 models. A failed listing is classified like any other request, so a bad key reads as a typed AuthError
  * with the provider's hint, and a 200 that is not JSON is an AiProviderError rather than a SyntaxError.
  */
-export async function listModels(row: ProviderRow): Promise<{ id: string; name: string }[]> {
+export async function listModels(row: ProviderEndpoint): Promise<{ id: string; name: string }[]> {
   const d = getProviderDescriptor(row.type);
   if (!d?.listModels) return [];
   if ('static' in d.listModels) return d.listModels.static.map((m) => ({ id: m.id, name: m.name }));
@@ -107,7 +107,7 @@ function cliVersionOk(token: string | undefined): Promise<boolean> {
  * odd, or empty stream cannot fail the test, and no parser runs. A 2xx or a rate limit (the key works, the
  * account is just busy) is success.
  */
-async function probe(row: ProviderRow, model: string): Promise<TestResult> {
+async function probe(row: ProviderEndpoint, model: string): Promise<TestResult> {
   const d = httpDescriptor(row);
   try {
     const ctx = ctxFor(row, model);
@@ -129,7 +129,7 @@ async function probe(row: ProviderRow, model: string): Promise<TestResult> {
  * APIs list models even with a bad key or no credit. Otherwise (no default model, or no auth at all, such as a
  * local Ollama whose default model may not be pulled) a listing, reporting the model count.
  */
-export async function testProvider(row: ProviderRow): Promise<TestResult> {
+export async function testProvider(row: ProviderEndpoint): Promise<TestResult> {
   const d = getProviderDescriptor(row.type);
   if (!d) return { success: false, error: `Unknown provider type: ${row.type}` };
   if (isCliProvider(row.type)) {
@@ -147,7 +147,7 @@ export async function testProvider(row: ProviderRow): Promise<TestResult> {
 }
 
 /** Test one model row: a one-turn generation capped at 16 output tokens, or the CLI's version and tool self-test. */
-export async function testModel(row: ProviderRow, modelRow: { model: string | null }): Promise<TestResult> {
+export async function testModel(row: ProviderEndpoint, modelRow: { model: string | null }): Promise<TestResult> {
   const d = getProviderDescriptor(row.type);
   if (!d) return { success: false, error: `Unknown provider: ${row.type}` };
   const chosen = clean(modelRow.model);

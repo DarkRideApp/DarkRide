@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
-  classifyHttpError, redact, safeText, upstreamMessage, sendChat, sendChecked, parseSSEStream, parseNDJSONStream, readJson,
+  classifyHttpError, redact, safeText, sendChat, sendChecked, parseSSEStream, parseNDJSONStream, readJson,
   MAX_JSON_BODY_BYTES, MAX_STREAM_LINE_CHARS, LineTooLongError,
 } from '../http';
 import {
@@ -182,19 +182,23 @@ describe('redact', () => {
   });
 });
 
-describe('upstreamMessage', () => {
+describe('the upstream text in a classified HTTP error', () => {
+  const PREFIX = 'OpenAI API error (500): ';
+  const upstream = (body: string, apiKey?: string) =>
+    classifyHttpError(nullDialect, ctxFor('openai', { apiKey }), 500, new Headers(), body).message.slice(PREFIX.length);
+
   it('prefers error.message, then error string, then raw text', () => {
-    expect(upstreamMessage('{"error":{"message":"a"}}')).toBe('a');
-    expect(upstreamMessage('{"error":"b"}')).toBe('b');
-    expect(upstreamMessage('plain text')).toBe('plain text');
+    expect(upstream('{"error":{"message":"a"}}')).toBe('a');
+    expect(upstream('{"error":"b"}')).toBe('b');
+    expect(upstream('plain text')).toBe('plain text');
   });
   it('redacts the optional key before capping, for both JSON and plain bodies', () => {
     const key = 'sk-test-placeholder';
-    expect(upstreamMessage(`{"error":{"message":"bad ${key} here"}}`, key)).toBe('bad *** here');
-    expect(upstreamMessage(`oops ${key}`, key)).toBe('oops ***');
-    expect(upstreamMessage('x'.repeat(494) + key, key)).not.toContain(key.slice(0, 6));
-    expect(upstreamMessage(JSON.stringify({ error: { message: 'x'.repeat(494) + key } }), key)).not.toContain(key.slice(0, 6));
-    expect(upstreamMessage('y'.repeat(900), key)).toHaveLength(500);
+    expect(upstream(`{"error":{"message":"bad ${key} here"}}`, key)).toBe('bad *** here');
+    expect(upstream(`oops ${key}`, key)).toBe('oops ***');
+    expect(upstream('x'.repeat(494) + key, key)).not.toContain(key.slice(0, 6));
+    expect(upstream(JSON.stringify({ error: { message: 'x'.repeat(494) + key } }), key)).not.toContain(key.slice(0, 6));
+    expect(upstream('y'.repeat(900), key)).toHaveLength(500);
   });
 });
 

@@ -15,7 +15,7 @@ import {
 } from './ai/errors';
 import { parseRateLimitHeaders, type ParsedRateLimitHeaders } from './ai/rate-limit';
 import { createProvider } from './ai/registry';
-import type { AiCompleteRequest, AiProvider, AiProviderConfig, AiStreamingProvider, AiStreamOptions } from './ai/dialect';
+import type { AiCompleteRequest, AiProvider, ProviderSettings, AiStreamingProvider, AiStreamOptions } from './ai/dialect';
 import { isCliProvider, isKnownProviderType } from '../../shared/lib/ai-provider-catalog';
 import type {
   AiMessage,
@@ -108,11 +108,11 @@ export class RateLimitCache {
 // ── AiModelRouter ────────────────────────────────────────────────────
 
 export interface AiModelRouterOptions {
-  providerFactory?: (typeId: string, config: AiProviderConfig) => AiProvider;
+  providerFactory?: (typeId: string, config: ProviderSettings) => AiProvider;
 }
 
 export class AiModelRouter {
-  private makeProvider: (typeId: string, config: AiProviderConfig) => AiProvider;
+  private makeProvider: (typeId: string, config: ProviderSettings) => AiProvider;
 
   constructor(
     private db: AppDatabase,
@@ -488,7 +488,7 @@ export class AiModelRouter {
   }
 
   private createProviderForModel(model: ModelRow, providerRow: ProviderRow): AiProvider {
-    const config: AiProviderConfig = {
+    const config: ProviderSettings = {
       apiKey: providerRow.apiKey ?? undefined,
       baseUrl: providerRow.baseUrl ?? undefined,
       model: model.model ?? undefined,
