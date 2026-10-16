@@ -36,6 +36,27 @@ const CLI_SKIP_REASON = 'uses claude-cli which does not support HTTP streaming';
 /** True when the caller's own signal has fired: whatever the provider threw or returned, it is not a provider failure. */
 const callerAborted = (signal: AbortSignal | undefined): boolean => signal?.aborted === true;
 
+/** What one pass over a tier's models has seen: why each model was skipped or failed, and how the models that ran ended. */
+class FallbackWalk {
+  readonly attempts: Attempt[] = [];
+  private lastError: unknown;
+  private failures = 0;
+  private readonly refusals: ModelRefusedError[] = [];
+
+  failed(model: string, reason: string, err: unknown): void {
+    this.attempts.push({ model, error: reason });
+    this.lastError = err;
+    this.failures++;
+    if (err instanceof ModelRefusedError) this.refusals.push(err);
+  }
+
+  /** The error for a pass nobody served. When every model that ran refused, the first refusal is the useful message. */
+  exhausted(): Error {
+    if (this.failures > 0 && this.refusals.length === this.failures) return this.refusals[0];
+    return new AllModelsFailedError(this.attempts, this.lastError !== undefined ? { cause: this.lastError } : {});
+  }
+}
+
 /** True when two reads of a provider row describe the same credential and endpoint. */
 const sameCredential = (a: ProviderRow, b: ProviderRow): boolean =>
   a.type === b.type
@@ -305,6 +326,13 @@ export class AiModelRouter {
     return err instanceof Error ? err.message : String(err);
   }
 
+  /** A fallback-eligible failure: log it, start the cooldown it calls for, and note it for the all-failed message. */
+  private noteFailure(walk: FallbackWalk, model: ModelRow, row: ProviderRow, err: unknown): void {
+    log(`Model "${model.name}" (${row.type}) failed with ${(err as Error).name}, trying next...`);
+    this.recordFailure(model, row, err);
+    walk.failed(model.name, this.describeAttempt(err), err);
+  }
+
   /**
    * Stream from the first usable model of the tier, falling back to the next on a quota, rate-limit,
    * overload, auth, permission, refusal, or connection failure, but only while nothing has been yielded: once text or a
@@ -323,18 +351,15 @@ export class AiModelRouter {
     const signal = options?.signal;
     signal?.throwIfAborted();
     const models = this.getModelsForTier(options?.tier ?? 'High');
-    const attempts: Attempt[] = [];
-    let lastError: unknown;
-    let failures = 0;
-    const refusals: ModelRefusedError[] = [];
+    const walk = new FallbackWalk();
 
-    for (const { model, row, provider } of this.candidates(models, attempts, options?.refusedModels)) {
+    for (const { model, row, provider } of this.candidates(models, walk.attempts, options?.refusedModels)) {
       signal?.throwIfAborted();
       let yielded = false;
       const held: AiStreamEvent[] = [];
       // The models passed over before this one, attached to every usage event it reports so the
       // fallback chain can be recorded with the request. Absent when the first candidate serves.
-      const passedOver = attempts.slice();
+      const passedOver = walk.attempts.slice();
       const withChain = (e: AiStreamEvent): AiStreamEvent =>
         e.type === 'usage' && passedOver.length > 0 ? { ...e, fallbacks: passedOver.map((a) => ({ ...a })) } : e;
       try {
@@ -353,15 +378,8 @@ export class AiModelRouter {
         // timeout), never as the provider error that raced the abort.
         signal?.throwIfAborted();
         if (yielded || !isFallbackEligible(err)) throw err;
-        log(`Model "${model.name}" (${row.type}) failed with ${(err as Error).name}, trying next...`);
-        this.recordFailure(model, row, err);
-        attempts.push({ model: model.name, error: this.describeAttempt(err) });
-        lastError = err;
-        failures++;
-        if (err instanceof ModelRefusedError) {
-          refusals.push(err);
-          options?.refusedModels?.add(model.id);
-        }
+        this.noteFailure(walk, model, row, err);
+        if (err instanceof ModelRefusedError) options?.refusedModels?.add(model.id);
         continue;
       }
       // A stream that stopped because the caller aborted says nothing about the provider, and the
@@ -374,10 +392,9 @@ export class AiModelRouter {
     }
 
     signal?.throwIfAborted();
-    // Every model that was tried refused: the first refusal is the useful message (it names the safeguard and what to do
-    // about it), where "all models are rate-limited or unavailable" would send the user looking at the wrong thing.
-    if (failures > 0 && refusals.length === failures) throw refusals[0];
-    throw new AllModelsFailedError(attempts, lastError !== undefined ? { cause: lastError } : {});
+    // When every model that ran refused, the first refusal names the safeguard and what to do about it, where "all models
+    // are rate-limited or unavailable" would send the user looking at the wrong thing.
+    throw walk.exhausted();
   }
 
   /**
@@ -405,17 +422,14 @@ export class AiModelRouter {
     const signal = req.signal;
     signal?.throwIfAborted();
     const models = this.getModelsForTier(opts.tier, { strict: opts.strict });
-    const attempts: Attempt[] = [];
-    let lastError: unknown;
-    let failures = 0;
-    const refusals: ModelRefusedError[] = [];
+    const walk = new FallbackWalk();
 
-    for (const { model, row, provider } of this.candidates(models, attempts)) {
+    for (const { model, row, provider } of this.candidates(models, walk.attempts)) {
       signal?.throwIfAborted();
       // The factory seam allows streaming-only providers; those cannot complete, so try the next model.
       const complete = (provider as Partial<AiProvider>).complete;
       if (typeof complete !== 'function') {
-        attempts.push({ model: model.name, error: 'does not support completion' });
+        walk.attempts.push({ model: model.name, error: 'does not support completion' });
         continue;
       }
       try {
@@ -428,19 +442,12 @@ export class AiModelRouter {
       } catch (err) {
         signal?.throwIfAborted();
         if (!isFallbackEligible(err)) throw err;
-        log(`Model "${model.name}" (${row.type}) failed with ${(err as Error).name}, trying next...`);
-        this.recordFailure(model, row, err);
-        attempts.push({ model: model.name, error: this.describeAttempt(err) });
-        lastError = err;
-        failures++;
-        if (err instanceof ModelRefusedError) refusals.push(err);
+        this.noteFailure(walk, model, row, err);
       }
     }
 
     signal?.throwIfAborted();
-    // Same rule as streaming: when every model that ran refused, the first refusal is the useful message.
-    if (failures > 0 && refusals.length === failures) throw refusals[0];
-    throw new AllModelsFailedError(attempts, lastError !== undefined ? { cause: lastError } : {});
+    throw walk.exhausted();
   }
 
   /**
