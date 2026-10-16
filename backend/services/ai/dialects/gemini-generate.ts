@@ -17,7 +17,8 @@ const BLOCK_FINISH = new Set([
 ]);
 /** Documented stand-in for a thought signature we do not have (a replayed or injected call). */
 const SKIP_SIGNATURE = 'skip_thought_signature_validator';
-const isGemini3 = (model: string): boolean => /^gemini-3/i.test(model);
+/** Gemini 3 and every later generation: `gemini-3.8-flash` and `gemini-4-argon` count, `gemini-2.5-pro` and `gemma-3-27b-it` do not. */
+const isGemini3OrLater = (model: string): boolean => Number(/^gemini-(\d+)/i.exec(model)?.[1] ?? 0) >= 3;
 
 /**
  * Tool-call ids this dialect generated itself (Gemini sent none). Gemini must only ever see ids it issued, so
@@ -63,13 +64,13 @@ function headers(ctx: DialectContext): Record<string, string> {
 }
 
 /**
- * Gemini 3 rejects a replayed function call without a thought signature. A call that kept the real one sends it back in
+ * Gemini 3 and later reject a replayed function call without a thought signature. A call that kept the real one sends it back in
  * the part it came from. For the first functionCall part of a model turn that has none (history from before signatures
  * were kept, or from another model) the documented stand-in is sent instead; parallel calls after it carry none.
  */
 function formatContents(messages: AiMessage[], model: string): any[] {
   const names = toolNamesById(messages);
-  const signCalls = isGemini3(model);
+  const signCalls = isGemini3OrLater(model);
 
   const contents: any[] = [];
   for (const msg of messages) {
@@ -101,13 +102,14 @@ function formatContents(messages: AiMessage[], model: string): any[] {
 
 /**
  * The least thinking each model family accepts (https://ai.google.dev/gemini-api/docs/generate-content/thinking):
- * 2.5 Flash and Flash-Lite turn it off with a budget of 0, 2.5 Pro cannot turn it off (minimum 128), Gemini 3 takes
- * a level. Other models get nothing, since an unknown field could be rejected.
+ * 2.5 Flash and Flash-Lite turn it off with a budget of 0, 2.5 Pro cannot turn it off (minimum 128), Gemini 3 and later
+ * take a level (`low` is accepted by all of them, `minimal` is an error on Gemini 4 and 3.8 Flash). Other models get
+ * nothing, since an unknown field could be rejected.
  */
 function lowThinking(model: string): Record<string, unknown> | undefined {
   if (/^gemini-2\.5-flash/i.test(model)) return { thinkingBudget: 0 };
   if (/^gemini-2\.5-pro/i.test(model)) return { thinkingBudget: 128 };
-  if (isGemini3(model)) return { thinkingLevel: 'low' };
+  if (isGemini3OrLater(model)) return { thinkingLevel: 'low' };
   return undefined;
 }
 
