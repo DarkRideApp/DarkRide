@@ -1,4 +1,4 @@
-import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
+import type { AiMessage, AiProviderData, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
 import { toolNamesById } from '../format';
 import { authHeaders, parseSSEStream, safeText } from '../http';
@@ -40,13 +40,32 @@ function serverId(id: string): string | undefined {
   return id && !generatedIds.has(id) && !GENERATED_ID_SHAPE.test(id) ? id : undefined;
 }
 
+/** The thought signature on a response part. Gemini sends camelCase; the docs also spell it snake_case. */
+function signatureOf(part: any): string | undefined {
+  const sig = part.thoughtSignature ?? part.thought_signature;
+  return typeof sig === 'string' && sig ? sig : undefined;
+}
+
+/** The signature as provider data for the block it arrived on, tagged with the model that sent it. */
+function signatureData(ctx: DialectContext, sig: string | undefined): { providerData?: AiProviderData } {
+  return sig ? { providerData: { dialect: 'gemini-generate', model: ctx.model, data: { thoughtSignature: sig } } } : {};
+}
+
+/** A stored signature, only when this dialect wrote it for this very model. */
+function storedSignature(data: AiProviderData | undefined, model: string): string | undefined {
+  if (data?.dialect !== 'gemini-generate' || data.model !== model) return undefined;
+  const sig = data.data.thoughtSignature;
+  return typeof sig === 'string' && sig ? sig : undefined;
+}
+
 function headers(ctx: DialectContext): Record<string, string> {
   return { 'Content-Type': 'application/json', ...authHeaders(ctx) };
 }
 
 /**
- * Gemini 3 rejects a replayed function call without a thought signature. We do not keep the real one, so the first
- * functionCall part of each model turn carries the documented stand-in; parallel calls after it carry none.
+ * Gemini 3 rejects a replayed function call without a thought signature. A call that kept the real one sends it back in
+ * the part it came from. For the first functionCall part of a model turn that has none (history from before signatures
+ * were kept, or from another model) the documented stand-in is sent instead; parallel calls after it carry none.
  */
 function formatContents(messages: AiMessage[], model: string): any[] {
   const names = toolNamesById(messages);
@@ -60,10 +79,12 @@ function formatContents(messages: AiMessage[], model: string): any[] {
       const parts: any[] = [];
       let signed = false;
       for (const b of msg.content) {
-        if (b.type === 'text') { if (b.text) parts.push({ text: b.text }); continue; }
+        const sig = storedSignature(b.providerData, model);
+        if (b.type === 'text') { if (b.text) parts.push(sig ? { text: b.text, thoughtSignature: sig } : { text: b.text }); continue; }
         const id = serverId(b.id);
         const part: any = { functionCall: { ...(id ? { id } : {}), name: b.name, args: b.input } };
-        if (signCalls && !signed) { part.thoughtSignature = SKIP_SIGNATURE; signed = true; }
+        if (sig) { part.thoughtSignature = sig; signed = true; }
+        else if (signCalls && !signed) { part.thoughtSignature = SKIP_SIGNATURE; signed = true; }
         parts.push(part);
       }
       if (parts.length > 0) contents.push({ role: 'model', parts });
@@ -184,14 +205,17 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     const cand = p.candidates?.[0];
     for (const part of cand?.content?.parts ?? []) {
       if (!part || part.thought) continue;
-      if (part.text) { produced = true; yield { type: 'text', text: part.text }; }
+      const sig = signatureOf(part);
+      if (part.text) { produced = true; yield { type: 'text', text: part.text, ...signatureData(ctx, sig) }; }
       else if (part.functionCall) {
         // Gemini 3 sends an id with every call and expects it back on the result; older models send none.
         const fc = part.functionCall;
         const id = typeof fc.id === 'string' && fc.id ? fc.id : generateId(ctx);
         produced = true;
-        yield { type: 'tool_use', id, name: fc.name, input: toolInput(fc.args) };
+        yield { type: 'tool_use', id, name: fc.name, input: toolInput(fc.args), ...signatureData(ctx, sig) };
       }
+      // While streaming, the signature of a text answer can arrive on a part with no text.
+      else if (sig) yield { type: 'text', text: '', ...signatureData(ctx, sig) };
     }
     const fr: unknown = cand?.finishReason;
     if (fr) {

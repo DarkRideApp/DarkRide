@@ -12,7 +12,9 @@ import type {
   AiToolUseBlock,
   AiTextBlock,
   AiToolDefinition,
+  AiProviderData,
   AiStreamEvent,
+  AiStreamToolUseEvent,
   AiStreamUsageEvent,
 } from '../../shared/types/ai-chat';
 
@@ -138,6 +140,10 @@ function requestUsageRecorder(requests: AgentRequestUsage[]): (event: AiStreamUs
     if (event.fallbacks?.length && !entry.fallbacks) entry.fallbacks = event.fallbacks.map((f) => ({ ...f }));
   };
 }
+
+/** A tool_use event as a block of the assistant message, with the provider data it arrived with. */
+const toolUseBlock = (e: AiStreamToolUseEvent): AiToolUseBlock =>
+  ({ type: 'tool_use', id: e.id, name: e.name, input: e.input, ...(e.providerData ? { providerData: e.providerData } : {}) });
 
 /** A refusal event drops the text and tool calls before it and makes its message the turn's text; usage stays, that output was billed. */
 function applyRefusal(events: AiStreamEvent[]): AiStreamEvent[] {
@@ -471,6 +477,7 @@ export class AiAgent implements AiAgentInterface {
         : turnTimeoutSignal;
 
       let textChunks: string[];
+      let textProviderData: AiProviderData | undefined;
       let toolUses: AiToolUseBlock[];
       let turnInputTokens: number;
       runUsage.turns++;
@@ -481,6 +488,7 @@ export class AiAgent implements AiAgentInterface {
           tierConfig, messages, systemPrompt, tools, totalUsage, runUsage.requests, { signal: turnSignal },
         );
         textChunks = tiered.textChunks;
+        textProviderData = tiered.textProviderData;
         toolUses = tiered.toolUses;
         turnInputTokens = tiered.turnInputTokens;
         if (turnSignal.aborted) {
@@ -510,20 +518,20 @@ export class AiAgent implements AiAgentInterface {
 
           switch (event.type) {
             case 'text':
-              textChunks.push(event.text);
-              pendingText.push(event.text);
+              // A provider can send data on a part that has no text; it belongs to the turn's text block all the same.
+              if (event.text) {
+                textChunks.push(event.text);
+                pendingText.push(event.text);
+              }
+              if (event.providerData) textProviderData = event.providerData;
               break;
             case 'tool_use':
-              toolUses.push({
-                type: 'tool_use',
-                id: event.id,
-                name: event.name,
-                input: event.input,
-              });
+              toolUses.push(toolUseBlock(event));
               break;
             case 'refusal':
               // Nothing of this turn is shown before the stream ends, so the discarded output never reaches the client.
               textChunks = [event.message];
+              textProviderData = undefined;
               pendingText.length = 0;
               pendingText.push(event.message);
               toolUses.length = 0;
@@ -553,6 +561,7 @@ export class AiAgent implements AiAgentInterface {
             log(`Detected ${textToolUses.length} text-based tool call(s) — parsing instead of emitting as text`);
             toolUses.push(...textToolUses);
             textChunks = []; // Don't store raw tool-call XML in conversation history
+            textProviderData = undefined;
           } else {
             if (containsUnparsedToolCallAttempt(fullPending, validNames)) {
               // No write provider available in the non-tiered path — log so new
@@ -576,7 +585,7 @@ export class AiAgent implements AiAgentInterface {
       const assistantContent: Array<AiTextBlock | AiToolUseBlock> = [];
       const fullText = textChunks.join('');
       if (fullText) {
-        assistantContent.push({ type: 'text', text: fullText });
+        assistantContent.push({ type: 'text', text: fullText, ...(textProviderData ? { providerData: textProviderData } : {}) });
       }
       for (const tu of toolUses) {
         assistantContent.push(tu);
@@ -718,7 +727,7 @@ export class AiAgent implements AiAgentInterface {
     totalUsage: { inputTokens: number; outputTokens: number },
     requests: AgentRequestUsage[],
     options?: { signal?: AbortSignal },
-  ): Promise<{ textChunks: string[]; toolUses: AiToolUseBlock[]; turnInputTokens: number; parseMissAttempt: boolean }> {
+  ): Promise<{ textChunks: string[]; textProviderData?: AiProviderData; toolUses: AiToolUseBlock[]; turnInputTokens: number; parseMissAttempt: boolean }> {
     // Phase 1: Run cheap research model, buffering all events. Usage is recorded for the call log as it
     // arrives, whichever response is used later: a discarded response was still billed.
     let buffered: AiStreamEvent[] = [];
@@ -749,16 +758,18 @@ export class AiAgent implements AiAgentInterface {
     if (!hasWriteTool) {
       // No write tool — replay buffered events
       const textChunks: string[] = [];
+      let textProviderData: AiProviderData | undefined;
       const toolUses: AiToolUseBlock[] = [];
       let turnInputTokens = 0;
 
       for (const event of buffered) {
         switch (event.type) {
           case 'text':
-            textChunks.push(event.text);
+            if (event.text) textChunks.push(event.text);
+            if (event.providerData) textProviderData = event.providerData;
             break;
           case 'tool_use':
-            toolUses.push({ type: 'tool_use', id: event.id, name: event.name, input: event.input });
+            toolUses.push(toolUseBlock(event));
             break;
           case 'usage':
             if (event.inputTokens > 0) turnInputTokens = event.inputTokens;
@@ -794,7 +805,7 @@ export class AiAgent implements AiAgentInterface {
       }
 
       if (!parseMissAttempt && !hasWriteTool) {
-        return { textChunks, toolUses, turnInputTokens, parseMissAttempt: false };
+        return { textChunks, textProviderData, toolUses, turnInputTokens, parseMissAttempt: false };
       }
     }
 
@@ -864,16 +875,18 @@ export class AiAgent implements AiAgentInterface {
 
     // Replay the chosen response
     const textChunks: string[] = [];
+    let textProviderData: AiProviderData | undefined;
     const toolUses: AiToolUseBlock[] = [];
     let turnInputTokens = 0;
 
     for (const event of eventsToUse) {
       switch (event.type) {
         case 'text':
-          textChunks.push(event.text);
+          if (event.text) textChunks.push(event.text);
+          if (event.providerData) textProviderData = event.providerData;
           break;
         case 'tool_use':
-          toolUses.push({ type: 'tool_use', id: event.id, name: event.name, input: event.input });
+          toolUses.push(toolUseBlock(event));
           break;
         case 'usage':
           if (event.inputTokens > 0) turnInputTokens = event.inputTokens;
@@ -883,7 +896,7 @@ export class AiAgent implements AiAgentInterface {
       }
     }
 
-    return { textChunks, toolUses, turnInputTokens, parseMissAttempt };
+    return { textChunks, textProviderData, toolUses, turnInputTokens, parseMissAttempt };
   }
 
   private async compactMessages(

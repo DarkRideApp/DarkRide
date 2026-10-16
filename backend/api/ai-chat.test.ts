@@ -427,6 +427,54 @@ describe('GET /v1/ai/conversations/:id', () => {
     expect((await get(id, { userId: 9, scopes: ['core.ai:chat'] })).status).toBe(200);
   });
 
+  describe('provider data stays on the server', () => {
+    const data = { dialect: 'gemini-generate', model: 'gemini-3-pro-preview', data: { thoughtSignature: 'SIG-SECRET' } };
+    const stored = [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: [
+        { type: 'text', text: 'Reading.', providerData: data },
+        { type: 'tool_use', id: 'fc1', name: 'read_notes', input: { id: 3 }, providerData: data },
+      ] },
+      { role: 'tool_result', toolUseId: 'fc1', content: 'done' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Here.', providerData: data }] },
+    ];
+    const shown = [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: [
+        { type: 'text', text: 'Reading.' },
+        { type: 'tool_use', id: 'fc1', name: 'read_notes', input: { id: 3 } },
+      ] },
+      { role: 'tool_result', toolUseId: 'fc1', content: 'done' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Here.' }] },
+    ];
+
+    it('is left out of a conversation fetched by id, and everything else is returned as stored', async () => {
+      const id = insertConversation(db, 'devices', '', stored, 1000, { userId: 1 });
+      const res = await get(id);
+      expect(res.body.data.messages).toEqual(shown);
+      expect(JSON.stringify(res.body)).not.toContain('SIG-SECRET');
+    });
+
+    it('is left out of the latest conversation for a page too', async () => {
+      insertConversation(db, 'devices', '7', stored, 1000, { userId: 1 });
+      const res = await request(createApp(db)).get('/v1/ai/conversations/latest?pageContext=devices&contextId=7');
+      expect(res.body.data.messages).toEqual(shown);
+      expect(JSON.stringify(res.body)).not.toContain('SIG-SECRET');
+    });
+
+    it('leaves the stored copy alone', async () => {
+      const id = insertConversation(db, 'devices', '', stored, 1000, { userId: 1 });
+      await get(id);
+      expect(JSON.parse(db.select().from(schema.aiConversations).get()!.messages)).toEqual(stored);
+    });
+
+    it('returns messages without any blocks, or with a string body, untouched', async () => {
+      const plain = [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'legacy string body' }, { role: 'assistant', content: [] }];
+      const id = insertConversation(db, 'devices', '', plain, 1000, { userId: 1 });
+      expect((await get(id)).body.data.messages).toEqual(plain);
+    });
+  });
+
   it('answers 404 for another user\'s conversation and for a missing one', async () => {
     const id = insertConversation(db, 'devices', '', [], 1000, { userId: 2 });
     expect((await get(id)).status).toBe(404);

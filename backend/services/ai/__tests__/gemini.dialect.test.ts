@@ -173,6 +173,168 @@ describe('function call ids and thought signatures', () => {
   });
 });
 
+// https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures: Gemini 3 puts the signature on the first
+// functionCall part of a step (mandatory to return), on the last part of a response without function calls (recommended),
+// and while streaming that part can have empty text. Gemini 2.5 puts it on the first part and returning it is optional.
+describe('thought signatures travel as provider data', () => {
+  const MODEL = 'gemini-3-pro-preview';
+  const SKIP = 'skip_thought_signature_validator';
+  const ctx = makeCtx('gemini', { model: MODEL });
+  const collectEvents = (events: any[]) => collect(geminiDialect.parseStream(sseResponse(events), ctx));
+  const written = (sig: string, model = MODEL) => ({ dialect: 'gemini-generate' as const, model, data: { thoughtSignature: sig } });
+
+  describe('read from the response', () => {
+    it('attaches the signature of a functionCall part to its tool_use event', async () => {
+      const events = await collectEvents([parts([{ functionCall: { id: 'c1', name: 'f', args: { a: 1 } }, thoughtSignature: 'SIG-A' }], { finishReason: 'STOP' })]);
+      expect(events).toEqual([{ type: 'tool_use', id: 'c1', name: 'f', input: { a: 1 }, providerData: written('SIG-A') }]);
+    });
+
+    it('gives only the first of parallel calls its signature, as Gemini sends it', async () => {
+      const events: any[] = await collectEvents([parts([
+        { functionCall: { id: 'c1', name: 'f', args: {} }, thoughtSignature: 'SIG-A' },
+        { functionCall: { id: 'c2', name: 'g', args: {} } },
+      ], { finishReason: 'STOP' })]);
+      expect(events[0].providerData).toEqual(written('SIG-A'));
+      expect('providerData' in events[1]).toBe(false);
+    });
+
+    it('attaches the signature of the last text part to its text event', async () => {
+      const events = await collectEvents([
+        parts([{ text: 'Hello ' }]),
+        parts([{ text: 'world', thoughtSignature: 'SIG-T' }], { finishReason: 'STOP' }),
+      ]);
+      expect(events).toEqual([
+        { type: 'text', text: 'Hello ' },
+        { type: 'text', text: 'world', providerData: written('SIG-T') },
+      ]);
+    });
+
+    it('keeps a signature that streams in a part with empty text, as an empty text event', async () => {
+      const events = await collectEvents([
+        parts([{ text: 'Hello' }]),
+        parts([{ text: '', thoughtSignature: 'SIG-T' }], { finishReason: 'STOP' }),
+      ]);
+      expect(events).toEqual([
+        { type: 'text', text: 'Hello' },
+        { type: 'text', text: '', providerData: written('SIG-T') },
+      ]);
+    });
+
+    it('reads the snake_case spelling too', async () => {
+      const events = await collectEvents([parts([{ functionCall: { id: 'c1', name: 'f', args: {} }, thought_signature: 'SIG-S' }], { finishReason: 'STOP' })]);
+      expect((events[0] as any).providerData).toEqual(written('SIG-S'));
+    });
+
+    it('adds no providerData key when there is no signature, or an empty or non-string one', async () => {
+      const events: any[] = await collectEvents([parts([
+        { text: 'a' },
+        { text: 'b', thoughtSignature: '' },
+        { functionCall: { id: 'c1', name: 'f', args: {} }, thoughtSignature: 5 },
+      ], { finishReason: 'STOP' })]);
+      expect(events.map((e) => 'providerData' in e)).toEqual([false, false, false]);
+    });
+
+    it('tags the data with the model the request ran on', async () => {
+      const other = makeCtx('gemini', { model: 'gemini-2.5-flash' });
+      const [ev] = await collect(geminiDialect.parseStream(
+        sseResponse([parts([{ functionCall: { id: 'c1', name: 'f', args: {} }, thoughtSignature: 'SIG-A' }], { finishReason: 'STOP' })]), other,
+      ));
+      expect((ev as any).providerData).toEqual(written('SIG-A', 'gemini-2.5-flash'));
+    });
+
+    it('does not take a signature from a thought summary part', async () => {
+      const events: any[] = await collectEvents([parts([
+        { text: 'thinking...', thought: true, thoughtSignature: 'SIG-HIDDEN' },
+        { text: 'answer' },
+      ], { finishReason: 'STOP' })]);
+      expect(events).toEqual([{ type: 'text', text: 'answer' }]);
+    });
+  });
+
+  describe('sent back on a later turn', () => {
+    const call = (id: string, name: string, providerData?: object) => ({ type: 'tool_use' as const, id, name, input: {}, ...(providerData ? { providerData } : {}) });
+    const text = (t: string, providerData?: object) => ({ type: 'text' as const, text: t, ...(providerData ? { providerData } : {}) });
+    const replay = (model: string, turns: any[][]) => {
+      const messages: any[] = [{ role: 'user', content: 'go' }];
+      for (const content of turns) {
+        messages.push({ role: 'assistant', content });
+        for (const b of content) if (b.type === 'tool_use') messages.push({ role: 'tool_result', toolUseId: b.id, content: `r-${b.id}` });
+      }
+      return (geminiDialect.buildChat(makeCtx('gemini', { model }), { ...req, messages }, { stream: true }).body as any).contents;
+    };
+
+    it('puts the stored signature on the functionCall part it came from, in place of the stand-in', () => {
+      const contents = replay(MODEL, [[call('s1', 'a', written('SIG-A')), call('s2', 'b')]]);
+      expect(contents[1].parts).toEqual([
+        { functionCall: { id: 's1', name: 'a', args: {} }, thoughtSignature: 'SIG-A' },
+        { functionCall: { id: 's2', name: 'b', args: {} } },
+      ]);
+    });
+
+    it('keeps each step its own signature across a multi-step loop', () => {
+      const contents = replay(MODEL, [[call('s1', 'a', written('SIG-A'))], [call('s2', 'b', written('SIG-B'))]]);
+      expect(contents[1].parts[0].thoughtSignature).toBe('SIG-A');
+      expect(contents[3].parts[0].thoughtSignature).toBe('SIG-B');
+    });
+
+    it('still gives the stand-in to a first call that has no stored signature', () => {
+      const contents = replay(MODEL, [[call('s1', 'a')], [call('s2', 'b', written('SIG-B'))]]);
+      expect(contents[1].parts[0].thoughtSignature).toBe(SKIP);
+      expect(contents[3].parts[0].thoughtSignature).toBe('SIG-B');
+    });
+
+    it('puts a stored text signature on its text part, ahead of nothing else', () => {
+      const contents = replay(MODEL, [[text('the answer', written('SIG-T'))]]);
+      expect(contents[1]).toEqual({ role: 'model', parts: [{ text: 'the answer', thoughtSignature: 'SIG-T' }] });
+    });
+
+    it('keeps a text part with a signature next to the calls of its step', () => {
+      const contents = replay(MODEL, [[text('checking', written('SIG-T')), call('s1', 'a', written('SIG-A'))]]);
+      expect(contents[1].parts).toEqual([
+        { text: 'checking', thoughtSignature: 'SIG-T' },
+        { functionCall: { id: 's1', name: 'a', args: {} }, thoughtSignature: 'SIG-A' },
+      ]);
+    });
+
+    it('does not use data that was written for another model: Gemini 3 falls back to the stand-in', () => {
+      const contents = replay(MODEL, [[call('s1', 'a', written('SIG-A', 'gemini-3-flash-preview'))]]);
+      expect(contents[1].parts).toEqual([{ functionCall: { id: 's1', name: 'a', args: {} }, thoughtSignature: SKIP }]);
+    });
+
+    it('does not send another model a text signature either', () => {
+      const contents = replay(MODEL, [[text('the answer', written('SIG-T', 'gemini-3-flash-preview'))]]);
+      expect(contents[1]).toEqual({ role: 'model', parts: [{ text: 'the answer' }] });
+    });
+
+    it('ignores data from another dialect', () => {
+      const foreign = { dialect: 'anthropic-messages', model: MODEL, data: { thoughtSignature: 'NOT-OURS' } };
+      const contents = replay(MODEL, [[call('s1', 'a', foreign)]]);
+      expect(contents[1].parts[0].thoughtSignature).toBe(SKIP);
+      expect(JSON.stringify(contents)).not.toContain('NOT-OURS');
+    });
+
+    it('ignores data without a usable signature', () => {
+      const bad = { dialect: 'gemini-generate', model: MODEL, data: { thoughtSignature: 5 } };
+      const contents = replay(MODEL, [[call('s1', 'a', bad)]]);
+      expect(contents[1].parts[0].thoughtSignature).toBe(SKIP);
+    });
+
+    it('sends a stored signature to the older model that wrote it, which treats it as optional', () => {
+      const contents = replay('gemini-2.5-pro', [[call('s1', 'a', written('SIG-A', 'gemini-2.5-pro'))]]);
+      expect(contents[1].parts).toEqual([{ functionCall: { id: 's1', name: 'a', args: {} }, thoughtSignature: 'SIG-A' }]);
+    });
+
+    it('leaves blocks without data exactly as before', () => {
+      const withData = replay(MODEL, [[text('checking'), call('s1', 'a'), call('s2', 'b')]]);
+      expect(withData[1].parts).toEqual([
+        { text: 'checking' },
+        { functionCall: { id: 's1', name: 'a', args: {} }, thoughtSignature: SKIP },
+        { functionCall: { id: 's2', name: 'b', args: {} } },
+      ]);
+    });
+  });
+});
+
 // https://ai.google.dev/gemini-api/docs/generate-content/thinking: 2.5 Flash and Flash-Lite turn thinking off with a
 // budget of 0, 2.5 Pro cannot turn it off (minimum 128), Gemini 3 takes a thinkingLevel.
 describe('low effort limits thinking so it cannot eat a small output budget', () => {

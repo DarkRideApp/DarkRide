@@ -1,9 +1,24 @@
+import type { DialectId } from '../lib/ai-provider-catalog';
+
 // ── Message content blocks ──────────────────────────────────────────
+
+/**
+ * Data a provider needs back on a later turn, kept with the block it arrived with and stored with the conversation.
+ * Only the dialect named in `dialect` reads it, and only for the model that wrote it; every other consumer passes it on
+ * untouched or ignores it.
+ */
+export interface AiProviderData {
+  dialect: DialectId;
+  /** Model id the data was written for. A different model gets none of it. */
+  model: string;
+  data: Record<string, unknown>;
+}
 
 /** Plain text block inside an assistant message */
 export interface AiTextBlock {
   type: 'text';
   text: string;
+  providerData?: AiProviderData;
 }
 
 /** Tool invocation block inside an assistant message */
@@ -12,6 +27,7 @@ export interface AiToolUseBlock {
   id: string;
   name: string;
   input: Record<string, any>;
+  providerData?: AiProviderData;
 }
 
 // ── Conversation messages (stored in DB, sent to LLM) ───────────────
@@ -54,6 +70,8 @@ export interface AiToolDefinition {
 export interface AiStreamTextEvent {
   type: 'text';
   text: string;
+  /** Data for the turn's text block. A turn keeps the last one it sees; the text can be empty when only the data arrives. */
+  providerData?: AiProviderData;
 }
 
 export interface AiStreamToolUseEvent {
@@ -61,6 +79,7 @@ export interface AiStreamToolUseEvent {
   id: string;
   name: string;
   input: Record<string, any>;
+  providerData?: AiProviderData;
 }
 
 export interface AiStreamUsageEvent {
