@@ -335,8 +335,47 @@ describe('thought signatures travel as provider data', () => {
   });
 });
 
+// https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures: Gemini 4 and Gemini 3 both reject a replayed
+// function call without a signature and both document the same stand-in. The check follows the model's major version,
+// so the next generation is covered without another edit.
+describe('Gemini 3 and later need a signature on a replayed function call', () => {
+  const SKIP = 'skip_thought_signature_validator';
+  const firstCallPart = (model: string, providerData?: object) => {
+    const messages: any[] = [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 's1', name: 'a', input: {}, ...(providerData ? { providerData } : {}) }] },
+      { role: 'tool_result', toolUseId: 's1', content: 'r' },
+    ];
+    return (geminiDialect.buildChat(makeCtx('gemini', { model }), { ...req, messages }, { stream: true }).body as any).contents[1].parts[0];
+  };
+  const written = (sig: string, model: string) => ({ dialect: 'gemini-generate', model, data: { thoughtSignature: sig } });
+
+  it.each([
+    'gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-pro-preview', 'gemini-3.5-flash-lite', 'gemini-3.8-flash',
+    'gemini-4-argon', 'Gemini-4-Argon', 'gemini-5-pro', 'gemini-12-pro',
+  ])('%s gets the stand-in on a call that has no signature', (model) => {
+    expect(firstCallPart(model)).toEqual({ functionCall: { id: 's1', name: 'a', args: {} }, thoughtSignature: SKIP });
+  });
+
+  it.each([
+    'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemma-3-27b-it', 'gemini-embedding-001', 'learnlm-2.0-flash',
+  ])('%s gets none', (model) => {
+    expect(firstCallPart(model)).toEqual({ functionCall: { id: 's1', name: 'a', args: {} } });
+  });
+
+  it('Gemini 4 gets back the signature it wrote', () => {
+    expect(firstCallPart('gemini-4-argon', written('SIG-A', 'gemini-4-argon')).thoughtSignature).toBe('SIG-A');
+  });
+
+  it('Gemini 4 gets the stand-in for a signature another model wrote', () => {
+    expect(firstCallPart('gemini-4-argon', written('SIG-A', 'gemini-3.8-flash')).thoughtSignature).toBe(SKIP);
+    expect(firstCallPart('gemini-3.8-flash', written('SIG-A', 'gemini-4-argon')).thoughtSignature).toBe(SKIP);
+  });
+});
+
 // https://ai.google.dev/gemini-api/docs/generate-content/thinking: 2.5 Flash and Flash-Lite turn thinking off with a
-// budget of 0, 2.5 Pro cannot turn it off (minimum 128), Gemini 3 takes a thinkingLevel.
+// budget of 0, 2.5 Pro cannot turn it off (minimum 128), Gemini 3 and later take a thinkingLevel (`low` works on all of
+// them; `minimal` is an error on Gemini 4 and 3.8 Flash).
 describe('low effort limits thinking so it cannot eat a small output budget', () => {
   const gen = (model: string, effort?: 'low') =>
     (geminiDialect.buildChat(makeCtx('gemini', { model }), { ...req, maxOutputTokens: 256, effort }, { stream: true }).body as any).generationConfig;
@@ -347,6 +386,10 @@ describe('low effort limits thinking so it cannot eat a small output budget', ()
     ['gemini-2.5-pro', { thinkingBudget: 128 }],
     ['gemini-3-pro-preview', { thinkingLevel: 'low' }],
     ['gemini-3-flash-preview', { thinkingLevel: 'low' }],
+    ['gemini-3.5-flash-lite', { thinkingLevel: 'low' }],
+    ['gemini-3.6-flash', { thinkingLevel: 'low' }],
+    ['gemini-3.8-flash', { thinkingLevel: 'low' }],
+    ['gemini-4-argon', { thinkingLevel: 'low' }],
   ])('%s gets %o', (model, thinkingConfig) => {
     expect(gen(model, 'low')).toEqual({ maxOutputTokens: 256, thinkingConfig });
   });

@@ -12,7 +12,7 @@ an optional Base URL. A model row picks a provider, a model id, and a tier.
 | Type | Dialect | Default base URL | Default model | Notes |
 |---|---|---|---|---|
 | `anthropic` | Anthropic Messages | `https://api.anthropic.com` | `claude-sonnet-5-5` | Chat and agent requests use prompt caching. Inline completion and connection tests do not. See [Claude plans and API credits](#claude-plans-and-api-credits). |
-| `gemini` | Gemini `generateContent` | `https://generativelanguage.googleapis.com` | `gemini-2.5-flash` | Thought signatures are kept with the conversation and sent back, which Gemini 3.x function calling requires; see [Provider data on stored messages](#provider-data-on-stored-messages). |
+| `gemini` | Gemini `generateContent` | `https://generativelanguage.googleapis.com` | `gemini-2.5-flash` | Thought signatures are kept with the conversation and sent back, which function calling on Gemini 3 and later (Gemini 4 included) requires; see [Provider data on stored messages](#provider-data-on-stored-messages). |
 | `ollama` | Ollama `/api/chat` | `http://localhost:11434` | `llama3.1` | No key. Waits up to 180 s for response headers (60 s for the other types). |
 | `openrouter` | OpenAI chat completions | `https://openrouter.ai/api/v1` | `openrouter/auto` | `openrouter/auto` lets OpenRouter choose the model for each request. Choose a model to pin one. |
 | `openai` | OpenAI chat completions | `https://api.openai.com/v1` | none | A model must be chosen. Sends `max_completion_tokens` and no stop sequences. |
@@ -42,7 +42,14 @@ as exhausted credits and moves on to the next model.
 - **Gemini**: the key goes in the `x-goog-api-key` header, never the URL. Omits
   `systemInstruction` when the system prompt is empty. Tool results carry the real function
   name. `thought` parts are not shown, and thinking tokens count as output tokens. An invalid
-  key (HTTP 400 `API_KEY_INVALID`) is treated as a rejected key.
+  key (HTTP 400 `API_KEY_INVALID`) is treated as a rejected key. Inline completion limits
+  thinking so the 256-token budget is not spent on it: a budget of 0 on 2.5 Flash and
+  Flash-Lite, 128 on 2.5 Pro, and level `low` on Gemini 3 and later (Gemini 4 cannot turn
+  thinking off). Chat and agent requests set no thinking option. "Gemini 3 and later" is
+  decided by the model id: a number of 3 or more right after `gemini-` (`gemini-3.8-flash`,
+  `gemini-4-argon`). Aliases such as `gemini-flash-latest` have no number, so they are
+  treated as older models; choose the versioned id (for example `gemini-3.8-flash`) to get
+  the Gemini 3 handling.
 - **Ollama**: tool-call arguments are sent as a JSON object.
 - **OpenAI chat completions** (`openai`, `openrouter`, `mistral`, `codestral`,
   `openai-compatible`): token usage is requested with `stream_options.include_usage`. `openai`
@@ -303,7 +310,7 @@ its own. The browser never gets it: the conversation endpoints leave it out. Com
 the history with new messages, so the data goes with the blocks it belonged to.
 
 Gemini uses it for thought signatures. A response puts the signature on the first function call
-of a step (Gemini 3 requires it back) and on the last part of an answer without calls (optional),
+of a step (Gemini 3 and later require it back) and on the last part of an answer without calls (optional),
 and while streaming that part can have empty text. The dialect keeps each one and sends it back in
 the part it came from. A first function call with no stored signature still gets Google's documented
 placeholder, as does one whose signature was written for a different model, for example after a
