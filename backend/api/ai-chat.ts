@@ -41,8 +41,16 @@ function toSummary(row: SummaryRow) {
   };
 }
 
+/** Stored messages as the browser gets them: the opaque provider data on assistant blocks is for the server only. */
+function forClient(messages: unknown): unknown {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map((m) => (m?.role === 'assistant' && Array.isArray(m.content)
+    ? { ...m, content: m.content.map(({ providerData: _serverOnly, ...block }: Record<string, unknown>) => block) }
+    : m));
+}
+
 function toConversation(row: ConversationRow) {
-  return { ...toSummary(row), messages: JSON.parse(row.messages) };
+  return { ...toSummary(row), messages: forClient(JSON.parse(row.messages)) };
 }
 
 export function registerAiChatApiEndpoints(db: AppDatabase, getClaudeCliProvider?: () => ClaudeCliProvider | null): void {

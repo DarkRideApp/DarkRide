@@ -12,7 +12,7 @@ an optional Base URL. A model row picks a provider, a model id, and a tier.
 | Type | Dialect | Default base URL | Default model | Notes |
 |---|---|---|---|---|
 | `anthropic` | Anthropic Messages | `https://api.anthropic.com` | `claude-sonnet-5-5` | Chat and agent requests use prompt caching. Inline completion and connection tests do not. See [Claude plans and API credits](#claude-plans-and-api-credits). |
-| `gemini` | Gemini `generateContent` | `https://generativelanguage.googleapis.com` | `gemini-2.5-flash` | Gemini 3.x function calling needs thought signatures, which are not supported yet. Use a 2.5 model. |
+| `gemini` | Gemini `generateContent` | `https://generativelanguage.googleapis.com` | `gemini-2.5-flash` | Thought signatures are kept with the conversation and sent back, which Gemini 3.x function calling requires; see [Provider data on stored messages](#provider-data-on-stored-messages). |
 | `ollama` | Ollama `/api/chat` | `http://localhost:11434` | `llama3.1` | No key. Waits up to 180 s for response headers (60 s for the other types). |
 | `openrouter` | OpenAI chat completions | `https://openrouter.ai/api/v1` | `openrouter/auto` | `openrouter/auto` lets OpenRouter choose the model for each request. Choose a model to pin one. |
 | `openai` | OpenAI chat completions | `https://api.openai.com/v1` | none | A model must be chosen. Sends `max_completion_tokens` and no stop sequences. |
@@ -292,9 +292,30 @@ required for `openai` and `mistral`, which have no default. With nothing set, ev
 skipped and no request is made. The lane spends tokens, is excluded from `npm test` and from
 CI, and prints no keys or response bodies.
 
+## Provider data on stored messages
+
+Some responses carry data a provider wants back on a later turn. The dialect attaches it to the
+text or tool call it arrived with as `providerData` (`{ dialect, model, data }`), and it is stored
+with the conversation. Only the dialect named in `dialect` reads it, and only when the request
+is for the model that wrote it: another model, another dialect, or history that has none behaves
+as before. A turn's text block keeps the last data its text events carried, and a tool call keeps
+its own. The browser never gets it: the conversation endpoints leave it out. Compaction replaces
+the history with new messages, so the data goes with the blocks it belonged to.
+
+Gemini uses it for thought signatures. A response puts the signature on the first function call
+of a step (Gemini 3 requires it back) and on the last part of an answer without calls (optional),
+and while streaming that part can have empty text. The dialect keeps each one and sends it back in
+the part it came from. A first function call with no stored signature still gets Google's documented
+placeholder, as does one whose signature was written for a different model, for example after a
+fallback or when the compaction request runs on another model of the tier.
+
 ## Known limits
 
-- Anthropic `thinking` blocks and Gemini thought signatures are not carried between tool
-  turns, so models that think lose their earlier reasoning at each tool step.
+- Anthropic `thinking` blocks are not carried between tool turns, so models that think lose
+  their earlier reasoning at each tool step. The API rejects a thinking block that is sent back
+  after anything before it changed (the system prompt, the tool list or an earlier message) on
+  accounts created on or after 2026-08-31, and the agent changes the tool list when it loads
+  more tools and rewrites the history when it compacts. Sending them needs a way to know the
+  history is unchanged, so they are dropped, which the API allows.
 - The tiered research/write path does not fall back across models.
 - The built-in agent assumes a 200k-token context window when deciding to compact.
