@@ -20,7 +20,7 @@ import type { SessionStatusUpdate } from '../../shared/types/websocket';
 import type { TriggerType } from '../../shared/types/api';
 import { DocumentStore } from './document-store';
 import { currentAuthorId, resolveToolAccess, type ToolAccess } from './automation-authors';
-import { requiredHostScope } from './automation-host-scopes';
+import { isScriptCallable, requiredHostScope } from './automation-host-scopes';
 import { scopeMatches } from '../auth/scope-matcher';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
 
@@ -122,10 +122,11 @@ export class AutomationRunner implements IAutomationRunner {
     });
   }
 
-  /** Refuses the host calls listed in automation-host-scopes unless the script's author holds their scope. */
+  /** Refuses a host call that automation-host-scopes does not list, and one whose scope the script's author lacks. */
   private buildHostGate(automationId: number): (target: string, method: string) => void {
     const authorAtStart = currentAuthorId(this.db, automationId);
     return (target, method) => {
+      if (!isScriptCallable(target, method)) throw new Error(`${target}.${method} is not available to scripts`);
       const scope = requiredHostScope(target, method);
       if (!scope) return;
       const access = this.authorAccess(automationId, authorAtStart);

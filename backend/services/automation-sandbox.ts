@@ -260,6 +260,8 @@ export async function executeInSandbox(
       onRequestRef: ivm.Reference<Function> | null,
       onResponseRef: ivm.Reference<Function> | null,
     ) => {
+      // Hooks register here, not through __callHost, so they are checked here.
+      authorizeHostCall?.('device.http', 'hook');
       if (!deviceAPI) throw new Error('No device API available');
       // applySync with {arguments: {reference: true}} wraps every arg including
       // the filter string; normalize back to a primitive before parsing.
