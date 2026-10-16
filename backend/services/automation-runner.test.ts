@@ -8,6 +8,7 @@ import { PythonBridgeManager } from './python-bridge';
 import { TrafficHookRegistry } from './traffic-hook-registry';
 import { AiToolRegistry } from './ai-tools';
 import { recordAuthor, clearAuthor } from './automation-authors';
+import { DeviceFridaImpl } from './device-frida';
 import type { AppDatabase } from '../db/index';
 import { createTestDb } from '../test-utils/create-test-db';
 
@@ -827,6 +828,226 @@ describe('AutomationRunner', () => {
       });
     });
 
+    describe('Frida', () => {
+      const FRIDA = 'core.frida:manage';
+      const FRIDA_READ = 'core.frida:read';
+      const runScript = `export default async function(device: any) { await device.frida.run('com.example', 'hook-script'); }`;
+      const messagesScript = `export default async function(device: any) { await device.frida.getMessages(); }`;
+      let run: ReturnType<typeof vi.spyOn>;
+      let getMessages: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        run = vi.spyOn(DeviceFridaImpl.prototype, 'run').mockResolvedValue();
+        getMessages = vi.spyOn(DeviceFridaImpl.prototype, 'getMessages').mockResolvedValue([]);
+      });
+
+      it('refuses a script nobody has claimed, without running Frida', async () => {
+        const auto = createAutomation(runScript);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(/no author on record/i);
+        expect(run).not.toHaveBeenCalled();
+      });
+
+      it('refuses when the author does not hold the Frida scope', async () => {
+        const auto = createAutomation(runScript);
+        author(auto.id, ['core.automations:edit', FRIDA_READ], ['core.automations:edit', FRIDA_READ]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Insufficient scope: core.frida:manage required for device.frida.run');
+        expect(run).not.toHaveBeenCalled();
+      });
+
+      it('refuses when the author holds the scope now but the key that saved the script did not', async () => {
+        const auto = createAutomation(runScript);
+        author(auto.id, [FRIDA], ['core.automations:edit']);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Insufficient scope: core.frida:manage');
+        expect(run).not.toHaveBeenCalled();
+      });
+
+      it('runs Frida for a script whose author holds the scope', async () => {
+        const auto = createAutomation(runScript);
+        author(auto.id, [FRIDA], [FRIDA]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.error).toBeUndefined();
+        expect(result.success).toBe(true);
+        expect(run).toHaveBeenCalledWith('com.example', 'hook-script');
+      });
+
+      it('needs only the read scope to read Frida output, and the manage scope alone is not enough', async () => {
+        const reader = createAutomation(messagesScript);
+        author(reader.id, [FRIDA_READ], [FRIDA_READ]);
+        expect((await runner.runAutomation(reader.id, 'test-device', 'manual')).success).toBe(true);
+        expect(getMessages).toHaveBeenCalledTimes(1);
+
+        const manager = createAutomation(messagesScript);
+        author(manager.id, [FRIDA], [FRIDA]);
+        const result = await runner.runAutomation(manager.id, 'test-device', 'manual');
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Insufficient scope: core.frida:read required for device.frida.getMessages');
+        expect(getMessages).toHaveBeenCalledTimes(1);
+      });
+
+      it('trusts a plugin-managed script the operator has not changed', async () => {
+        const auto = createAutomation(runScript, { managedBy: 'some-plugin', managedKey: 'k' });
+        db.update(schema.automations).set({ currentDefaultCode: runScript }).where(eq(schema.automations.id, auto.id)).run();
+
+        expect((await runner.runAutomation(auto.id, 'test-device', 'manual')).success).toBe(true);
+        expect(run).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('traffic hooks and interception', () => {
+      const TRAFFIC = 'core.traffic:manage';
+      // [call, the host call it makes, what the host says once the call gets past the gate (no capture is running in these tests)]
+      const calls: Array<[string, string, RegExp]> = [
+        [`device.http.hook({ hostname: 'example.test' }, async (r: any) => r)`, 'hook', /Traffic hooks require HTTPS capture/],
+        [`device.http.hookRequest({ hostname: 'example.test' }, async (r: any) => r)`, 'hook', /Traffic hooks require HTTPS capture/],
+        [`device.http.hookResponse({ hostname: 'example.test' }, async (r: any) => r)`, 'hook', /Traffic hooks require HTTPS capture/],
+        [`device.http.intercept({ hostname: 'example.test', phase: 'request', actions: [] })`, 'intercept', /intercept\(\) requires HTTPS capture/],
+        [`device.http.useClientCert({ hostnames: ['example.test'], certPath: '/c', keyPath: '/k' })`, 'useClientCert', /useClientCert\(\) requires HTTPS capture/],
+      ];
+      const scriptFor = (call: string) => `export default async function(device: any) { ${call}; }`;
+
+      it.each(calls)('refuses %s for a script nobody has claimed', async (call) => {
+        const auto = createAutomation(scriptFor(call));
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(/no author on record/i);
+      });
+
+      it.each(calls)('refuses %s when the author does not hold the traffic scope', async (call, hostCall) => {
+        const auto = createAutomation(scriptFor(call));
+        author(auto.id, ['core.automations:edit', 'core.traffic:read'], ['core.automations:edit', 'core.traffic:read']);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain(`Insufficient scope: core.traffic:manage required for device.http.${hostCall}`);
+      });
+
+      it.each(calls)('lets %s reach the host when the author holds the traffic scope', async (call, _hostCall, hostSays) => {
+        const auto = createAutomation(scriptFor(call));
+        author(auto.id, [TRAFFIC], [TRAFFIC]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(hostSays);
+      });
+
+      it('leaves removing the script\'s own hooks open to a script nobody has claimed', async () => {
+        const auto = createAutomation(`export default async function(device: any) { device.http.unhookAll(); }`);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.error).toBeUndefined();
+        expect(result.success).toBe(true);
+      });
+    });
+
+    describe('methods that exist only for the runner', () => {
+      const ADMIN = 'core.admin:*';
+      let fetchSpy: ReturnType<typeof vi.spyOn>;
+      const bridgeMethods = () => fetchSpy.mock.calls.map(([, init]) => {
+        try { return JSON.parse(String((init as any)?.body ?? '{}')).method as string; } catch { return ''; }
+      });
+      const viaDispatcher = (target: string, method: string, args = '[]') => `
+        declare const __callHost: any;
+        export default async function(device: any) {
+          await __callHost.apply(undefined, ['${target}', '${method}', '${args}'], { result: { promise: true, copy: true } });
+        }
+      `;
+
+      beforeEach(() => {
+        fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 'x', result: {} })));
+      });
+
+      it.each([
+        [`await (device as any).callBridge('frida_start_server', {})`, 'device.callBridge'],
+        [`await (device as any).setProxyHandler('x')`, 'device.setProxyHandler'],
+        [`await (device as any).setRulesRunner('x')`, 'device.setRulesRunner'],
+        [`await (device as any).getExecutionLog()`, 'device.getExecutionLog'],
+      ])('refuses %s for an administrator', async (call, name) => {
+        const auto = createAutomation(`export default async function(device: any) { ${call}; }`);
+        author(auto.id, [ADMIN], [ADMIN]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain(`${name} is not available to scripts`);
+        expect(bridgeMethods()).not.toContain('frida_start_server');
+      });
+
+      it('refuses the bridge function on device.frida when a script calls the dispatcher directly', async () => {
+        const auto = createAutomation(viaDispatcher('device.frida', 'callBridge', '["frida_start_server",{}]'));
+        author(auto.id, [ADMIN], [ADMIN]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('device.frida.callBridge is not available to scripts');
+        expect(bridgeMethods()).not.toContain('frida_start_server');
+      });
+
+      it('refuses the bridge function on device when a script calls the dispatcher directly', async () => {
+        const auto = createAutomation(viaDispatcher('device', 'callBridge', '["frida_start_server",{}]'));
+        author(auto.id, [ADMIN], [ADMIN]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('device.callBridge is not available to scripts');
+        expect(bridgeMethods()).not.toContain('frida_start_server');
+      });
+
+      it('refuses a method every object inherits', async () => {
+        const auto = createAutomation(viaDispatcher('device', 'constructor'));
+        author(auto.id, [ADMIN], [ADMIN]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('device.constructor is not available to scripts');
+      });
+
+      it('refuses disposing the http client a run shares', async () => {
+        const auto = createAutomation(viaDispatcher('http', 'dispose'));
+        author(auto.id, [ADMIN], [ADMIN]);
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('http.dispose is not available to scripts');
+      });
+
+      it('refuses them for a plugin-managed script too, because its scopes are trusted but its reach is not wider', async () => {
+        const code = viaDispatcher('device', 'callBridge', '["frida_start_server",{}]');
+        const auto = createAutomation(code, { managedBy: 'some-plugin', managedKey: 'k' });
+        db.update(schema.automations).set({ currentDefaultCode: code }).where(eq(schema.automations.id, auto.id)).run();
+        const result = await runner.runAutomation(auto.id, 'test-device', 'manual');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('device.callBridge is not available to scripts');
+        expect(bridgeMethods()).not.toContain('frida_start_server');
+      });
+
+      it('refuses them in rules as well', async () => {
+        const rule = createAutomation(viaDispatcher('device', 'callBridge', '["frida_start_server",{}]'), { isRule: true });
+        author(rule.id, [ADMIN], [ADMIN]);
+        const device = {
+          getDeviceId: vi.fn().mockReturnValue('test-device'),
+          getDOM: vi.fn().mockResolvedValue({ className: 'FrameLayout', text: '', resourceId: '', description: '', bounds: [0, 0, 1, 1], clickable: false, enabled: true, children: [] }),
+          setCachedDOM: vi.fn(),
+          clearCachedDOM: vi.fn(),
+          callBridge: vi.fn(),
+        } as any;
+
+        await runner.runRules(device);
+
+        expect(device.callBridge).not.toHaveBeenCalled();
+      });
+    });
+
     describe('outbound HTTP', () => {
       it('stays open to a script nobody has claimed, because it is what automations are for', async () => {
         const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('ok'));
@@ -1383,17 +1604,17 @@ describe('AutomationRunner', () => {
       const ruleOrder: number[] = [];
       createAutomation(`
         export default async function(d: any) {
-          await d.trackRule(2);
+          await d.pressKey('2');
         }
       `, { isRule: true, priority: 2 });
 
       createAutomation(`
         export default async function(d: any) {
-          await d.trackRule(1);
+          await d.pressKey('1');
         }
       `, { isRule: true, priority: 1 });
 
-      const mockDevice = createMockDevice({ trackRule: vi.fn(async (n: number) => { ruleOrder.push(n); }) });
+      const mockDevice = createMockDevice({ pressKey: vi.fn(async (key: string) => { ruleOrder.push(Number(key)); }) });
       await runner.runRules(mockDevice);
 
       expect(ruleOrder).toEqual([1, 2]);
@@ -1432,11 +1653,11 @@ describe('AutomationRunner', () => {
       let callCount = 0;
       createAutomation(`
         export default async function(d: any) {
-          await d.trackCall();
+          await d.pressKey('go');
         }
       `, { isRule: true, priority: 1 });
 
-      const mockDevice = createMockDevice({ trackCall: vi.fn(async () => { callCount++; }) });
+      const mockDevice = createMockDevice({ pressKey: vi.fn(async () => { callCount++; }) });
 
       // Simulate concurrent rule execution
       await Promise.all([
@@ -1458,11 +1679,11 @@ describe('AutomationRunner', () => {
 
       createAutomation(`
         export default async function(d: any) {
-          await d.trackRule2();
+          await d.pressKey('rule2');
         }
       `, { isRule: true, priority: 2 });
 
-      const mockDevice = createMockDevice({ trackRule2: vi.fn(async () => { rule2Ran = true; }) });
+      const mockDevice = createMockDevice({ pressKey: vi.fn(async () => { rule2Ran = true; }) });
       await runner.runRules(mockDevice);
 
       expect(rule2Ran).toBe(true);

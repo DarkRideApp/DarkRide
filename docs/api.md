@@ -116,15 +116,20 @@ A script's global `tools` object calls the same tools as the AI chat. Every call
 
 #### Device calls that need a scope
 
-These calls on the `device` and `http` objects a script receives are checked the same way as `tools`, against the author's scopes. A refused call throws `Insufficient scope: <scope> required for <object>.<method>`, which the script can catch.
+These calls on the objects a script receives (`device`, `device.http`, `device.frida`, `http`) are checked the same way as `tools`, against the author's scopes. They are the scopes the same operations need over REST. A refused call throws `Insufficient scope: <scope> required for <object>.<method>`, which the script can catch.
 
 | Call | Scope the author needs |
 |---|---|
 | `device.getCredentials(appId)` | `core.credentials:read` |
 | `device.setProxy(mode)` | `core.proxies:manage` |
 | `http.setProxy(mode)` | `core.proxies:manage` |
+| `device.frida.run`, `inject`, `loadScript`, `send`, `stop` | `core.frida:manage` |
+| `device.frida.getMessages()` | `core.frida:read` |
+| `device.http.hook`, `hookRequest`, `hookResponse`, `intercept`, `useClientCert` | `core.traffic:manage` |
 
-Everything else on `device` and `http` needs only `core.automations:execute` to start the run. That includes outbound requests (`device.httpGet`, `device.httpPost`, `http.get` and the rest), which are what an automation is for. A script an administrator saved keeps working. `device.frida` and the traffic hooks on `device.http` are not checked yet.
+Everything else in the automation API needs only `core.automations:execute` to start the run. That includes outbound requests (`device.httpGet`, `device.httpPost`, `http.get` and the rest), which are what an automation is for, and `device.http.unhook` and `unhookAll`, which only remove hooks the script registered. A script an administrator saved keeps working.
+
+A script can call only the methods in the automation API reference (`shared/types/automation.ts`). The objects a script receives have other functions that the server uses to run it, and a call to one of those is refused with `<object>.<method> is not available to scripts`, whoever wrote the script. A script shipped by a plugin gets the same refusal: it is trusted with scopes, not with a wider API. Adding a public method to one of these objects makes a test fail until the method is listed as callable or runner-only.
 
 ### Sessions
 
