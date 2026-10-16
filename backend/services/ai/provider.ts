@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../shared/types/ai-chat';
 import { normalizeBaseUrl, type AiProviderDescriptor } from '../../../shared/lib/ai-provider-catalog';
-import { AiProviderError, ConnectionError, OutputLimitError } from './errors';
+import { AiProviderError, ConnectionError, ModelRefusedError, OutputLimitError } from './errors';
 import { LineTooLongError, StreamReadError, readJson, redactedCause, sendChat, sendChecked } from './http';
 import type {
   AiCompleteRequest, AiProvider, AiProviderConfig, AiRequest, AiStreamOptions, Dialect, DialectContext,
@@ -117,6 +117,7 @@ export class DialectProvider implements AiProvider {
         temperature: req.temperature, effort: 'low', cache: false,
       })) {
         if (e.type === 'text') text += e.text;
+        else if (e.type === 'refusal') throw new ModelRefusedError(e.message, { provider: this.descriptor.id });
       }
     } catch (err) {
       if (!(err instanceof OutputLimitError)) throw err;

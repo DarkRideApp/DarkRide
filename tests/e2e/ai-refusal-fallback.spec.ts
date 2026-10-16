@@ -6,8 +6,9 @@
  * seeing a silent empty reply. Drives real chat runs through provider, router, agent and the chat drawer
  * against a local stub of the Anthropic Messages API on 127.0.0.1.
  *
- * The stub answers every request for REFUSING_MODEL_ID with a refusal stop and every request for
- * GOOD_MODEL_ID with a normal reply. No real API key is used.
+ * The stub answers every request for REFUSING_MODEL_ID with a refusal stop, every request for GOOD_MODEL_ID with a
+ * normal reply, and every request for MIDSTREAM_MODEL_ID with text and a finished tool call followed by a refusal stop.
+ * No real API key is used.
  *
  * Run: npx playwright test tests/e2e/ai-refusal-fallback.spec.ts --retries=2
  */
@@ -20,13 +21,16 @@ import { loginAsAdmin, waitForBackend, apiLogin, API_BASE, ADMIN_USERNAME, ADMIN
 const PROVIDER_NAME = 'E2E Refusal Stub';
 const REFUSING_MODEL_NAME = 'E2E Refusing';
 const GOOD_MODEL_NAME = 'E2E Refusal Fallback';
+const MIDSTREAM_MODEL_NAME = 'E2E Refusing Midstream';
 // Model ids no other AI spec uses: the usage-monitor spec attributes runs to itself by model id and start time, so sharing
 // an id with it would make this spec's runs count as that spec's.
 const REFUSING_MODEL_ID = 'claude-sonnet-4-6';
 const GOOD_MODEL_ID = 'claude-opus-5-5';
+const MIDSTREAM_MODEL_ID = 'claude-sonnet-5';
 const PLACEHOLDER_KEY = 'sk-test-placeholder';
 const REPLY_TEXT = 'Stub reply from the refusal fallback test.';
 const REFUSAL_TEXT = 'Claude declined this request (category: cyber).';
+const PARTIAL_TEXT = 'Partial answer streamed before the refusal arrived.';
 
 interface StubRequest { model: string; refused: boolean }
 
@@ -52,7 +56,8 @@ function startStub(): Promise<void> {
       let body: any = {};
       try { body = JSON.parse(raw); } catch { /* answered below as a normal request */ }
       const model = String(body.model ?? '');
-      const refused = model === REFUSING_MODEL_ID;
+      const midstream = model === MIDSTREAM_MODEL_ID;
+      const refused = model === REFUSING_MODEL_ID || midstream;
       requests.push({ model, refused });
 
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -60,7 +65,16 @@ function startStub(): Promise<void> {
         type: 'message_start',
         message: { id: `msg_stub_${requests.length}`, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 100, output_tokens: 1 } },
       });
-      if (refused) {
+      if (midstream) {
+        // Text and a finished tool call stream out, then the stream ends in a refusal.
+        sse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+        sse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: PARTIAL_TEXT } });
+        sse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+        sse(res, 'content_block_start', { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_01E2EStub', name: 'list_devices', input: {} } });
+        sse(res, 'content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{}' } });
+        sse(res, 'content_block_stop', { type: 'content_block_stop', index: 1 });
+        sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber' } }, usage: { output_tokens: 20 } });
+      } else if (refused) {
         sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber' } }, usage: { output_tokens: 0 } });
       } else {
         sse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
@@ -92,7 +106,7 @@ async function cleanup(browser: Browser): Promise<void> {
     expect(modelsRes.ok()).toBe(true);
     const models: Array<{ id: number; name: string; providerName: string | null }> = (await modelsRes.json()).data ?? [];
     for (const m of models) {
-      if (m.providerName === PROVIDER_NAME || m.name === GOOD_MODEL_NAME || m.name === REFUSING_MODEL_NAME) {
+      if (m.providerName === PROVIDER_NAME || m.name === GOOD_MODEL_NAME || m.name === REFUSING_MODEL_NAME || m.name === MIDSTREAM_MODEL_NAME) {
         const del = await ctx.request.delete(`${API_BASE}/v1/ai/models/${m.id}`, { headers });
         expect(del.ok(), `delete model ${m.id}: ${del.status()}`).toBe(true);
       }
@@ -198,6 +212,51 @@ test.describe('AI refusal fallback', () => {
       await chat(page, 4, 'Third refusal fallback question', REFUSAL_TEXT);
       await expect(page.getByTestId('ai-chat-message-5')).toContainText('Cyber Verification Program');
       expect(requests.map((r) => [r.model, r.refused])).toEqual([[REFUSING_MODEL_ID, true]]);
+    } finally {
+      await api.close();
+    }
+  });
+
+  test('a refusal that arrives after text and a tool call leaves only the refusal message, live and after a reload', async ({ page, browser }) => {
+    test.setTimeout(120_000);
+    // The first test leaves its models behind; this one needs the midstream model to be the only one asked.
+    await cleanup(browser);
+    requests.length = 0;
+
+    const api = await browser.newContext();
+    try {
+      const csrf = await apiLogin(api.request, ADMIN_USERNAME, ADMIN_PASSWORD);
+      const provider = await postJson(api.request, csrf, 'post', '/v1/ai/providers', {
+        name: PROVIDER_NAME, type: 'anthropic', apiKey: PLACEHOLDER_KEY, baseUrl: `http://127.0.0.1:${port}`,
+      });
+      const midstream = await postJson(api.request, csrf, 'post', '/v1/ai/models', {
+        name: MIDSTREAM_MODEL_NAME, providerId: provider.id, model: MIDSTREAM_MODEL_ID,
+      });
+      const allModels: Array<{ id: number }> = (await (await api.request.get(`${API_BASE}/v1/ai/models`)).json()).data;
+      await postJson(api.request, csrf, 'put', '/v1/ai/models/reorder', {
+        ids: [midstream.id, ...allModels.map((m) => m.id).filter((id) => id !== midstream.id)],
+      });
+
+      await loginAsAdmin(page);
+      await page.goto('/ui/settings/proxies');
+      await page.waitForLoadState('networkidle');
+      await page.getByTestId('ai-chat-fab').click();
+      await expect(page.getByTestId('ai-chat-panel')).toBeVisible({ timeout: 10_000 });
+      await page.getByTestId('ai-chat-new-btn').click();
+
+      const chatPanel = page.getByTestId('ai-chat-panel');
+      await chat(page, 0, 'Midstream refusal question', REFUSAL_TEXT);
+      await expect(chatPanel).not.toContainText(PARTIAL_TEXT);
+      await expect(page.getByTestId('ai-chat-tool-group')).toHaveCount(0);
+      // The refusal ended the run: one request, no fallback to another model, no second turn after a tool call.
+      expect(requests.map((r) => [r.model, r.refused])).toEqual([[MIDSTREAM_MODEL_ID, true]]);
+
+      await page.reload();
+      await page.waitForLoadState('networkidle');
+      await page.getByTestId('ai-chat-fab').click();
+      await expect(chatPanel).toContainText(REFUSAL_TEXT, { timeout: 15_000 });
+      await expect(chatPanel).not.toContainText(PARTIAL_TEXT);
+      await expect(page.getByTestId('ai-chat-tool-group')).toHaveCount(0);
     } finally {
       await api.close();
     }

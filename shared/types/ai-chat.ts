@@ -80,11 +80,22 @@ export interface AiStreamUsageEvent {
   fallbacks?: Array<{ model: string; error: string }>;
 }
 
+/**
+ * The model declined after it had already streamed output. Last event of the stream. A consumer drops the text and tool
+ * calls it received before this event, because they are incomplete, and shows `message` in their place. A refusal before
+ * any output is a ModelRefusedError instead.
+ */
+export interface AiStreamRefusalEvent {
+  type: 'refusal';
+  message: string;
+}
+
 /** Events emitted by the LLM provider during streaming */
 export type AiStreamEvent =
   | AiStreamTextEvent
   | AiStreamToolUseEvent
-  | AiStreamUsageEvent;
+  | AiStreamUsageEvent
+  | AiStreamRefusalEvent;
 
 // ── WebSocket events (backend ↔ frontend) ───────────────────────────
 

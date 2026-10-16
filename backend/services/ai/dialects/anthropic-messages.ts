@@ -58,7 +58,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   let refusalCategory: string | undefined;
   let emittedOut = 0;
   // Whether any text or tool call has gone out. A refusal before that is an error the router can fall back on; after it,
-  // the partial answer stays and the message is appended, because a fallback would duplicate what the caller already has.
+  // a refusal event tells the consumer to drop what it received, because a fallback would duplicate output it already has.
   let produced = false;
 
   for await (const sse of parseSSEStream(res.body, signal)) {
@@ -133,7 +133,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     const cat = refusalCategory ? ` (category: ${safeText(refusalCategory, ctx)})` : '';
     const message = `Claude declined this request${cat}.${refusalCategory === 'cyber' ? CYBER_NOTE : ''}`;
     if (!produced) throw new ModelRefusedError(message, { provider: ctx.descriptor.id });
-    yield { type: 'text', text: message };
+    yield { type: 'refusal', message };
   }
 }
 

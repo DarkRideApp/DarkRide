@@ -139,6 +139,16 @@ function requestUsageRecorder(requests: AgentRequestUsage[]): (event: AiStreamUs
   };
 }
 
+/** A refusal event drops the text and tool calls before it and makes its message the turn's text; usage stays, that output was billed. */
+function applyRefusal(events: AiStreamEvent[]): AiStreamEvent[] {
+  let settled: AiStreamEvent[] = [];
+  for (const event of events) {
+    if (event.type === 'refusal') settled = [...settled.filter((e) => e.type === 'usage'), { type: 'text', text: event.message }];
+    else settled.push(event);
+  }
+  return settled;
+}
+
 // ── Constants ────────────────────────────────────────────────────────
 
 export const DEFAULT_MAX_TURNS = 25;
@@ -504,15 +514,19 @@ export class AiAgent implements AiAgentInterface {
               pendingText.push(event.text);
               break;
             case 'tool_use':
-              // Flush buffered text before an API tool call
-              for (const chunk of pendingText) onToken(chunk);
-              pendingText.length = 0;
               toolUses.push({
                 type: 'tool_use',
                 id: event.id,
                 name: event.name,
                 input: event.input,
               });
+              break;
+            case 'refusal':
+              // Nothing of this turn is shown before the stream ends, so the discarded output never reaches the client.
+              textChunks = [event.message];
+              pendingText.length = 0;
+              pendingText.push(event.message);
+              toolUses.length = 0;
               break;
             case 'usage':
               recordUsage(event);
@@ -707,7 +721,7 @@ export class AiAgent implements AiAgentInterface {
   ): Promise<{ textChunks: string[]; toolUses: AiToolUseBlock[]; turnInputTokens: number; parseMissAttempt: boolean }> {
     // Phase 1: Run cheap research model, buffering all events. Usage is recorded for the call log as it
     // arrives, whichever response is used later: a discarded response was still billed.
-    const buffered: AiStreamEvent[] = [];
+    let buffered: AiStreamEvent[] = [];
     const researchStream = tierConfig.researchProvider.createStreamingRequest(
       messages, systemPrompt, tools, options,
     );
@@ -716,6 +730,7 @@ export class AiAgent implements AiAgentInterface {
       if (event.type === 'usage') recordResearch(event);
       buffered.push(event);
     }
+    buffered = applyRefusal(buffered);
 
     // Check if any tool_use targets a write tool. Mutable so the text-based
     // parser path below can flip it true when it extracts a write-class call
@@ -820,6 +835,7 @@ export class AiAgent implements AiAgentInterface {
         throw writeErr;
       }
     }
+    writeBuffered = applyRefusal(writeBuffered);
 
     // If write model didn't actually use a write tool, fall back to cheap model's response
     // (which did want to write). This avoids repeated false escalations where the expensive
@@ -888,6 +904,7 @@ export class AiAgent implements AiAgentInterface {
     ];
 
     const summaryChunks: string[] = [];
+    let refused = false;
     try {
       const stream = (provider ?? this.provider).createStreamingRequest(
         compactionPrompt,
@@ -897,6 +914,7 @@ export class AiAgent implements AiAgentInterface {
       const recordUsage = requestUsageRecorder(requests);
       for await (const event of stream) {
         if (event.type === 'text') summaryChunks.push(event.text);
+        if (event.type === 'refusal') refused = true;
         if (event.type === 'usage') {
           recordUsage(event);
           totalUsage.inputTokens += event.inputTokens;
@@ -909,6 +927,10 @@ export class AiAgent implements AiAgentInterface {
     }
 
     const summary = summaryChunks.join('');
+    if (refused) {
+      log('Compaction summary was refused, continuing with existing context');
+      return messages;
+    }
     if (!summary) return messages;
 
     log(`Compaction complete (${summary.length} chars summary)`);
