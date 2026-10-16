@@ -1,6 +1,7 @@
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
-import { parseSSEStream, safeText } from '../http';
+import { toolNamesById } from '../format';
+import { authHeaders, parseSSEStream, safeText } from '../http';
 import { AiProviderError, AuthError, ModelRefusedError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 import { toolInput } from '../tool-input';
@@ -40,7 +41,7 @@ function serverId(id: string): string | undefined {
 }
 
 function headers(ctx: DialectContext): Record<string, string> {
-  return { 'Content-Type': 'application/json', ...(ctx.apiKey ? { 'x-goog-api-key': ctx.apiKey } : {}) };
+  return { 'Content-Type': 'application/json', ...authHeaders(ctx) };
 }
 
 /**
@@ -48,8 +49,7 @@ function headers(ctx: DialectContext): Record<string, string> {
  * functionCall part of each model turn carries the documented stand-in; parallel calls after it carry none.
  */
 function formatContents(messages: AiMessage[], model: string): any[] {
-  const names = new Map<string, string>();
-  for (const m of messages) if (m.role === 'assistant') for (const b of m.content) if (b.type === 'tool_use') names.set(b.id, b.name);
+  const names = toolNamesById(messages);
   const signCalls = isGemini3(model);
 
   const contents: any[] = [];
@@ -146,7 +146,7 @@ function isBadKeyBody(bodyText: string): boolean {
  * RateLimitError).
  * Everything else returns undefined and takes the generic path, which keeps Retry-After for a plain 429.
  */
-function classifyError(status: number, _headers: Headers, bodyText: string): AiProviderError | undefined {
+function classifyError(status: number, _headers: Headers, bodyText: string, ctx: DialectContext): AiProviderError | undefined {
   const { error } = parseErrorBody(bodyText);
   const quota = status === 429 && isQuotaExhausted(error);
   // A 403 PERMISSION_DENIED is about the key itself (leaked, disabled, restricted, or the API is off for its project),
@@ -154,23 +154,20 @@ function classifyError(status: number, _headers: Headers, bodyText: string): AiP
   const deniedKey = status === 403 && error?.status === 'PERMISSION_DENIED';
   if (!quota && !deniedKey && !(status === 400 && isBadKeyBody(bodyText))) return undefined;
   const msg = typeof error?.message === 'string' && error.message ? error.message : bodyText.trim();
-  // Deliberately the raw upstream text: the hook has no DialectContext (no key to redact with). classifyHttpError
-  // redacts the key first and only then caps the length, so a key straddling a cap can never leave a prefix behind.
-  // Capping here would run before that redaction and cut a key in half.
-  const text = `Gemini API error (${status}): ${msg}`;
-  return quota ? new QuotaExhaustedError(text, { status }) : new AuthError(text, { status });
+  const text = `${ctx.descriptor.shortName} API error (${status}): ${safeText(msg, ctx)}`;
+  const opts = { status, provider: ctx.descriptor.id };
+  return quota ? new QuotaExhaustedError(text, opts) : new AuthError(text, opts);
 }
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   const shortName = ctx.descriptor.shortName;
-  if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
   const provider = ctx.descriptor.id;
   let usage: { input: number; output: number; cached: number } | undefined;
   let sawChunk = false;
   let finished = false;
   let produced = false;   // any visible text or tool call so far
 
-  for await (const sse of parseSSEStream(res.body, signal)) {
+  for await (const sse of parseSSEStream(res.body!, signal)) {
     if (sse.data === '[DONE]') break;
     let p: any;
     try { p = JSON.parse(sse.data); } catch { continue; }

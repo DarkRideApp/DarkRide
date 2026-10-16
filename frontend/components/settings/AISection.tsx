@@ -13,8 +13,8 @@ import {
 import type { AiModelConfig } from '../../../shared/types/ai-models';
 import type { AiProviderConfig, AiProviderType } from '../../../shared/types/ai-providers';
 import type { AiTier } from '@darkrideapp/plugin-sdk/react';
-import { AI_PROVIDER_CATALOG, getProviderDescriptor, isKnownProviderType, sameEffectiveBaseUrl } from '../../../shared/lib/ai-provider-catalog';
-import { providerFormShape, validateProviderForm } from '../../../shared/lib/ai-provider-form';
+import { AI_PROVIDER_CATALOG, isKnownProviderType } from '../../../shared/lib/ai-provider-catalog';
+import { providerFormShape, savingClearsKey, validateProviderForm } from '../../../shared/lib/ai-provider-form';
 
 export function AISection() {
   const ws = useWebSocket();
@@ -440,15 +440,9 @@ export function AISection() {
     ? { ok: true as const }
     : validateProviderForm(providerForm.type, providerForm.baseUrl);
   const baseUrlError = baseUrlCheck.ok ? null : baseUrlCheck.error;
-  // Mirrors the server: PUT clears the stored key when the type or the
-  // effective Base URL changes and no new key is supplied.
-  const editDescriptor = getProviderDescriptor(providerForm.type);
-  const keyWillBeCleared = !!editingProvider && editingProvider.hasApiKey && (
-    providerForm.type !== editingProvider.type
-    || (editDescriptor
-      ? !sameEffectiveBaseUrl(editDescriptor, providerForm.baseUrl, editingProvider.baseUrl)
-      : providerForm.baseUrl.trim() !== savedBaseUrl.trim())
-  );
+  // The same rule the server applies on PUT when no new key is supplied.
+  const keyWillBeCleared = !!editingProvider && editingProvider.hasApiKey
+    && savingClearsKey(editingProvider, { type: providerForm.type, baseUrl: providerForm.baseUrl });
 
   // ── Model form: a provider without a default model needs one chosen ──
   const modelShape = providerFormShape(aiProvidersList.find(p => p.id === modelForm.providerId)?.type ?? '');

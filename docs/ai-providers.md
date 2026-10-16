@@ -248,7 +248,7 @@ For an OpenAI-compatible API that takes a bearer token, add one entry to `AI_PRO
   id: 'groq', label: 'Groq', shortName: 'Groq', kind: 'http', dialect: 'openai-chat',
   defaultBaseUrl: 'https://api.groq.com/openai/v1', defaultPath: '/openai/v1', baseUrl: 'optional',
   auth: { scheme: 'bearer', required: true, label: 'API Key' },
-  rateLimitScheme: 'none', listModels: { path: '/models' }, capabilities: { tools: true },
+  rateLimitScheme: 'none', listModels: { path: '/models' },
 },
 ```
 
@@ -258,10 +258,11 @@ Then add one row to the golden table in
 streaming, error classification, and key redaction for every catalog entry. Nothing else
 changes: the settings form, model listing, connection test, and router all read the catalog.
 
-Only the `openai-chat` dialect reads `auth.scheme`, and it sends a bearer token. The Anthropic
-and Gemini dialects set their own key header and Ollama sends none, so a host that needs a
-different auth header or a key in the query string needs a change in the dialect, plus a
-golden-table row.
+Every dialect sends the key through `authHeaders` in `backend/services/ai/http.ts`, which reads
+`auth.scheme`: `bearer` sends `Authorization: Bearer <key>`, `x-api-key` and `x-goog-api-key`
+send the key in a header of that name, and `none` sends nothing. A host that needs another
+header name or a key in the query string needs a new scheme in `authHeaders` or a change in
+the dialect, plus a golden-table row.
 
 Keep provider ids out of comparisons everywhere except the catalog and the dialects. A test
 (`backend/services/ai/__tests__/provider-branch-guard.test.ts`) catches direct comparisons such

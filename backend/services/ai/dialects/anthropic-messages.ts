@@ -1,6 +1,6 @@
 // backend/services/ai/dialects/anthropic-messages.ts
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
-import { parseSSEStream, safeText } from '../http';
+import { authHeaders, parseSSEStream, safeText } from '../http';
 import { AiProviderError, ModelRefusedError, OutputLimitError, OverloadedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 import { toolInput } from '../tool-input';
@@ -35,7 +35,7 @@ function formatMessages(messages: AiMessage[]): any[] {
 }
 
 function headers(ctx: DialectContext): Record<string, string> {
-  return { 'Content-Type': 'application/json', ...(ctx.apiKey ? { 'x-api-key': ctx.apiKey } : {}), ...(ctx.descriptor.extraHeaders ?? {}) };
+  return { 'Content-Type': 'application/json', ...authHeaders(ctx), ...(ctx.descriptor.extraHeaders ?? {}) };
 }
 
 function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError {
@@ -50,7 +50,6 @@ function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   const shortName = ctx.descriptor.shortName;
-  if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
 
   let toolId = '', toolName = '', toolJson = '';
   let messageStopped = false;
@@ -61,7 +60,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   // a refusal event tells the consumer to drop what it received, because a fallback would duplicate output it already has.
   let produced = false;
 
-  for await (const sse of parseSSEStream(res.body, signal)) {
+  for await (const sse of parseSSEStream(res.body!, signal)) {
     if (!sse.data || sse.data === '[DONE]') continue;
     let p: any;
     try { p = JSON.parse(sse.data); } catch { continue; }

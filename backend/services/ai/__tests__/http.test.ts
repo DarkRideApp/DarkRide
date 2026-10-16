@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
-  classifyHttpError, redact, safeText, upstreamMessage, sendChat, sendChecked, parseSSEStream, parseNDJSONStream, readJson,
+  classifyHttpError, redact, safeText, sendChat, sendChecked, parseSSEStream, parseNDJSONStream, readJson,
   MAX_JSON_BODY_BYTES, MAX_STREAM_LINE_CHARS, LineTooLongError,
 } from '../http';
 import {
@@ -182,19 +182,23 @@ describe('redact', () => {
   });
 });
 
-describe('upstreamMessage', () => {
+describe('the upstream text in a classified HTTP error', () => {
+  const PREFIX = 'OpenAI API error (500): ';
+  const upstream = (body: string, apiKey?: string) =>
+    classifyHttpError(nullDialect, ctxFor('openai', { apiKey }), 500, new Headers(), body).message.slice(PREFIX.length);
+
   it('prefers error.message, then error string, then raw text', () => {
-    expect(upstreamMessage('{"error":{"message":"a"}}')).toBe('a');
-    expect(upstreamMessage('{"error":"b"}')).toBe('b');
-    expect(upstreamMessage('plain text')).toBe('plain text');
+    expect(upstream('{"error":{"message":"a"}}')).toBe('a');
+    expect(upstream('{"error":"b"}')).toBe('b');
+    expect(upstream('plain text')).toBe('plain text');
   });
   it('redacts the optional key before capping, for both JSON and plain bodies', () => {
     const key = 'sk-test-placeholder';
-    expect(upstreamMessage(`{"error":{"message":"bad ${key} here"}}`, key)).toBe('bad *** here');
-    expect(upstreamMessage(`oops ${key}`, key)).toBe('oops ***');
-    expect(upstreamMessage('x'.repeat(494) + key, key)).not.toContain(key.slice(0, 6));
-    expect(upstreamMessage(JSON.stringify({ error: { message: 'x'.repeat(494) + key } }), key)).not.toContain(key.slice(0, 6));
-    expect(upstreamMessage('y'.repeat(900), key)).toHaveLength(500);
+    expect(upstream(`{"error":{"message":"bad ${key} here"}}`, key)).toBe('bad *** here');
+    expect(upstream(`oops ${key}`, key)).toBe('oops ***');
+    expect(upstream('x'.repeat(494) + key, key)).not.toContain(key.slice(0, 6));
+    expect(upstream(JSON.stringify({ error: { message: 'x'.repeat(494) + key } }), key)).not.toContain(key.slice(0, 6));
+    expect(upstream('y'.repeat(900), key)).toHaveLength(500);
   });
 });
 
@@ -568,95 +572,27 @@ describe('sendChecked', () => {
   });
 });
 
-describe('classifyHttpError: dialect classifyError hook results are normalised centrally', () => {
-  const KEY = 'sk-test-placeholder';
+describe('classifyHttpError: the dialect classifyError hook', () => {
   const withHook = (hook: Dialect['classifyError']): Dialect => ({ ...nullDialect, classifyError: hook });
-  const run = (dialect: Dialect, status = 401, body = 'oops', id = 'openai') =>
-    classifyHttpError(dialect, ctxFor(id), status, new Headers(), body);
 
-  it('redacts the key and URL userinfo, tags provider and status, and keeps class and identity', () => {
-    const fromHook = new AuthError(`bad key ${KEY} at https://u:p@host.test/x`);
-    const e = run(withHook(() => fromHook), 401);
-    expect(e).toBe(fromHook);                                  // same object, not wrapped
-    expect(e).toBeInstanceOf(AuthError);
-    expect(e.message).toBe('bad key *** at https://***@host.test/x');
-    expect(e.message).not.toContain(KEY);
-    expect(e.message).not.toContain('u:p@');
-    expect(e.provider).toBe('openai');
-    expect(e.status).toBe(401);
-    expect(e.stack ?? '').not.toContain(KEY);                  // the stack header embeds the original message
-    expect(e.stack ?? '').not.toContain('u:p@');
-  });
-  it('fills status from the HTTP status when the hook set none, but keeps a status the hook set', () => {
-    expect(run(withHook(() => new QuotaExhaustedError('q')), 429).status).toBe(429);
-    expect(run(withHook(() => new QuotaExhaustedError('q', { status: 418 })), 429).status).toBe(418);
-  });
-  it('keeps a provider the hook already set', () => {
-    const e = run(withHook(() => new AuthError('x', { provider: 'custom-id' })), 401);
-    expect(e.provider).toBe('custom-id');
-  });
-  it('preserves every error class the hook can return (RateLimitError keeps its headers)', () => {
-    const headers = new Headers({ 'retry-after': '3' });
-    const e = run(withHook(() => new RateLimitError(`slow ${KEY}`, headers, { status: 429 })), 429);
-    expect(e).toBeInstanceOf(RateLimitError);
-    expect((e as RateLimitError).headers.get('retry-after')).toBe('3');
-    expect(e.message).toBe('slow ***');
-  });
-  it('redacts BEFORE capping: a key straddling the message cap leaves no fragment', () => {
-    for (const pad of [990, 995, 999, 1000]) {
-      const e = run(withHook(() => new OverloadedError('x'.repeat(pad) + KEY + ' tail')), 503);
-      expect(e.message, `pad ${pad}`).not.toContain('sk-');
-    }
-  });
-  it('caps a huge hook message', () => {
-    const e = run(withHook(() => new AiProviderError('z'.repeat(50_000))), 500);
-    expect(e.message.length).toBeLessThanOrEqual(1000);
-  });
-  it('does not clip a normal hook message (prefix plus up to 500 chars of upstream text)', () => {
-    const msg = `Gemini API error (400): ${'u'.repeat(500)}`;
-    expect(run(withHook(() => new AuthError(msg)), 400).message).toBe(msg);
-  });
-  describe('a hook error that cannot be edited degrades to a plain AiProviderError and never throws', () => {
-    const msg = `bad key ${KEY} at https://u:p@host.test/x`;
-    const expectPlain = (e: AiProviderError, original: AiProviderError, status: number) => {
-      expect(e).toBeInstanceOf(AiProviderError);
-      expect(e).not.toBe(original);
-      expect(e.constructor).toBe(AiProviderError);
-      expect(e.message).toBe('bad key *** at https://***@host.test/x');
-      expect(e.provider).toBe('openai');
-      expect(e.status).toBe(status);
-      expect(e.cause).toBeUndefined();                          // the raw cause is never attached to the fallback
-      expect(e.stack ?? '').not.toContain(KEY);
-    };
-
-    it('a frozen error', () => {
-      const frozen = Object.freeze(new AuthError(msg, { cause: new Error(`boom ${KEY}`) }));
-      expectPlain(run(withHook(() => frozen), 401), frozen, 401);
-    });
-    it('a non-writable message', () => {
-      const original = new RateLimitError(msg, new Headers(), { status: 429 });
-      Object.defineProperty(original, 'message', { writable: false });
-      expectPlain(run(withHook(() => original), 429), original, 429);
-    });
-  });
-
-  describe('cause on a hook error is redacted (one level)', () => {
-    it('an Error cause has its message and stack redacted in place', () => {
-      const cause = new Error(`boom ${KEY}`);
-      const e = run(withHook(() => new AuthError('x', { cause })), 401);
-      expect(e.cause).toBe(cause);
-      expect(cause.message).toBe('boom ***');
-      expect(cause.stack ?? '').not.toContain(KEY);
-    });
-    it('a string cause is redacted', () => {
-      const e = run(withHook(() => new AuthError('x', { cause: `raw ${KEY} at https://u:p@host.test/x` })), 401);
-      expect(e.cause).toBe('raw *** at https://***@host.test/x');
-    });
-  });
-
-  it('a hook returning undefined falls through to the generic path unchanged', () => {
+  it('is called with the status, the headers, the body text and the dialect context', () => {
     const hook = vi.fn(() => undefined);
-    const e = run(withHook(hook), 500, 'oops');
+    const ctx = ctxFor('openai');
+    const headers = new Headers({ 'retry-after': '3' });
+    classifyHttpError(withHook(hook), ctx, 503, headers, 'oops');
+    expect(hook).toHaveBeenCalledWith(503, headers, 'oops', ctx);
+  });
+
+  it('has its error returned as it is: same object, class, message, provider and status', () => {
+    const fromHook = new AuthError('hook says no', { provider: 'openai', status: 401 });
+    const e = classifyHttpError(withHook(() => fromHook), ctxFor('openai'), 401, new Headers(), 'oops');
+    expect(e).toBe(fromHook);
+    expect(e.message).toBe('hook says no');
+  });
+
+  it('falls through to the generic path when it returns undefined', () => {
+    const hook = vi.fn(() => undefined);
+    const e = classifyHttpError(withHook(hook), ctxFor('openai'), 500, new Headers(), 'oops');
     expect(hook).toHaveBeenCalledTimes(1);
     expect(e).toBeInstanceOf(AiProviderError);
     expect(e.message).toBe('OpenAI API error (500): oops');

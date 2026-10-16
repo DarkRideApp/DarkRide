@@ -4,13 +4,13 @@ import { normalizeBaseUrl, type AiProviderDescriptor } from '../../../shared/lib
 import { AiProviderError, ConnectionError, ModelRefusedError, OutputLimitError } from './errors';
 import { LineTooLongError, StreamReadError, readJson, redactedCause, sendChat, sendChecked } from './http';
 import type {
-  AiCompleteRequest, AiProvider, AiProviderConfig, AiRequest, AiStreamOptions, Dialect, DialectContext,
+  AiCompleteRequest, AiProvider, ProviderSettings, AiRequest, AiStreamOptions, Dialect, DialectContext,
 } from './dialect';
 
 const TRIPLE_NEWLINE = /\n\n\n[\s\S]*$/;
 
 /** Completion output stops at the first blank-blank line, whether or not the server honoured `stop`. */
-export const trimCompletion = (s: string): string => s.replace(TRIPLE_NEWLINE, '');
+const trimCompletion = (s: string): string => s.replace(TRIPLE_NEWLINE, '');
 
 const defaultNewId = (): string => `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
 
@@ -41,7 +41,7 @@ export class DialectProvider implements AiProvider {
   constructor(
     private readonly descriptor: AiProviderDescriptor,
     private readonly dialect: Dialect,
-    private readonly config: AiProviderConfig,
+    private readonly config: ProviderSettings,
     newId?: () => string,
   ) {
     this.newId = newId ?? defaultNewId;
@@ -101,7 +101,7 @@ export class DialectProvider implements AiProvider {
    */
   async complete(req: AiCompleteRequest): Promise<string> {
     const ctx = this.ctx();
-    const fim = this.descriptor.capabilities.fim;
+    const fim = this.descriptor.capabilities?.fim;
     const d = this.dialect;
     if (fim && d.buildFim && d.parseFim && new RegExp(fim.modelPattern, 'i').test(ctx.model)) {
       const buildFim = d.buildFim.bind(d);
