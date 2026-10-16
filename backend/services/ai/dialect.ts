@@ -12,7 +12,12 @@ export interface AiRequest {
   stopSequences?: string[];
   temperature?: number;
   effort?: 'low';
-  cache?: boolean;           // default true
+  /**
+   * true (default): cache the whole request, which suits a conversation that grows by appending.
+   * 'prefix': cache only the system prompt, for a request whose last message is different every time.
+   * false: no caching.
+   */
+  cache?: boolean | 'prefix';
   signal?: AbortSignal;
 }
 
@@ -33,7 +38,7 @@ export interface AiStreamOptions {
   stopSequences?: string[];
   temperature?: number;
   effort?: 'low';
-  cache?: boolean;
+  cache?: boolean | 'prefix';
   /**
    * Ids of models that already declined a request in this run. The router skips them and adds any model that refuses.
    * A refusal starts no cooldown, so without this a run whose context holds the refused content would ask the same model

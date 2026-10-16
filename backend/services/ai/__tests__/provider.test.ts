@@ -118,7 +118,7 @@ describe('DialectProvider', () => {
     stubFetch(() => new Response(null, { status: 200 }));
     await expect(collect(createProvider('openrouter', { apiKey: 'k' }).createStreamingRequest(msgs, '', []))).rejects.toThrow('OpenRouter response has no body');
   });
-  it('complete(): chat branch drains the stream, trims at the first triple newline, and sends cache:false/effort for anthropic 5.x', async () => {
+  it('complete(): chat branch drains the stream, trims at the first triple newline, and caches only the system prompt with low effort for anthropic 5.x', async () => {
     const stub = stubFetch(() => sseResponse([
       { event: 'message_start', data: JSON.stringify({ type: 'message_start', message: { usage: { input_tokens: 1 } } }) },
       { event: 'content_block_delta', data: JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'foo()\n\n\nbar()' } }) },
@@ -127,11 +127,12 @@ describe('DialectProvider', () => {
     ]));
     const out = await createProvider('anthropic', { apiKey: 'k', model: 'claude-haiku-5-5' }).complete({ prefix: 'a', suffix: 'b', systemPrompt: 'S', maxOutputTokens: 256 });
     expect(out).toBe('foo()');
+    // The code around the cursor differs on every call, so only the system prompt carries a cache marker.
     expect(stub.calls[0].body.cache_control).toBeUndefined();
+    expect(stub.calls[0].body.system).toEqual([{ type: 'text', text: 'S', cache_control: { type: 'ephemeral' } }]);
+    expect(stub.calls[0].body.messages).toEqual([{ role: 'user', content: 'a<CURSOR>b' }]);
     expect(stub.calls[0].body.output_config).toEqual({ effort: 'low' });
     expect(stub.calls[0].body.max_tokens).toBe(256);
-    expect(stub.calls[0].body.system).toBe('S');
-    expect(stub.calls[0].body.messages[0].content).toBe('a<CURSOR>b');
   });
   it('complete(): an output-limit stop returns the text so far', async () => {
     stubFetch(() => sseResponse([

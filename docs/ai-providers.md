@@ -11,7 +11,7 @@ an optional Base URL. A model row picks a provider, a model id, and a tier.
 
 | Type | Dialect | Default base URL | Default model | Notes |
 |---|---|---|---|---|
-| `anthropic` | Anthropic Messages | `https://api.anthropic.com` | `claude-sonnet-5-5` | Chat and agent requests use prompt caching. Inline completion and connection tests do not. See [Claude plans and API credits](#claude-plans-and-api-credits). |
+| `anthropic` | Anthropic Messages | `https://api.anthropic.com` | `claude-sonnet-5-5` | Chat and agent requests use prompt caching. Inline completion caches only its system prompt (the code around the cursor changes on every call), and connection tests do not use caching. See [Claude plans and API credits](#claude-plans-and-api-credits). |
 | `gemini` | Gemini `generateContent` | `https://generativelanguage.googleapis.com` | `gemini-2.5-flash` | Thought signatures are kept with the conversation and sent back, which function calling on Gemini 3 and later (Gemini 4 included) requires; see [Provider data on stored messages](#provider-data-on-stored-messages). |
 | `ollama` | Ollama `/api/chat` | `http://localhost:11434` | `llama3.1` | No key. Waits up to 180 s for response headers (60 s for the other types). |
 | `openrouter` | OpenAI chat completions | `https://openrouter.ai/api/v1` | `openrouter/auto` | `openrouter/auto` lets OpenRouter choose the model for each request. Choose a model to pin one. |

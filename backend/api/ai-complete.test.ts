@@ -521,7 +521,7 @@ describe('AI Complete API Endpoint', () => {
       }
     });
 
-    it('anthropic: no temperature, stop sequence and 256-token cap, no cache_control, cursor split in the user message', async () => {
+    it('anthropic: no temperature, stop sequence and 256-token cap, only the system prompt marked for caching, cursor split in the user message', async () => {
       setSetting(db, 'ai_provider', 'anthropic'); setSetting(db, 'anthropic_api_key', 'sk-test-placeholder');
       const stub = stubFetch(() => okStream('anthropic'));
       await request(createApp(db, emptyRouter())).post('/v1/ai/complete').send({ prefix: 'await ', suffix: ';' });
@@ -529,7 +529,7 @@ describe('AI Complete API Endpoint', () => {
       expect(stub.calls[0].body.temperature).toBeUndefined();
       expect(stub.calls[0].body.cache_control).toBeUndefined();
       expect(JSON.stringify(stub.calls[0].body.messages)).toContain('await <CURSOR>;');
-      expect(stub.calls[0].body.system).toBe(EXPECTED_SYSTEM_PROMPT);
+      expect(stub.calls[0].body.system).toEqual([{ type: 'text', text: EXPECTED_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }]);
       expect(callHeader(stub.calls[0], 'x-api-key')).toBe('sk-test-placeholder');
     });
 
