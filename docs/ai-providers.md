@@ -183,7 +183,9 @@ another tier. The fallback and cooldown rules above apply. `claude-cli` models a
 because the CLI has no HTTP completion. On a `mistral` or `codestral` provider a model whose
 id starts with `codestral` uses FIM. Every other model gets a chat request with the cursor
 marked `<CURSOR>` and no tools. Output is capped at 256 tokens and cut at the first run of
-three newlines. If the Low tier has no usable model, the deprecated settings below apply.
+three newlines. `prefix` and `suffix` must be strings, and together at most 100,000 characters;
+otherwise the request is refused with 400 or 413 before any provider is called. If the Low tier
+has no usable model, the deprecated settings below apply.
 
 ## Usage and cost
 
