@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'path';
 import { AI_PROVIDER_IDS } from '../../../../shared/lib/ai-provider-catalog';
-import { scanTree } from '../../../test-utils/provider-branch-scan';
+import { formatHits, scanTree } from '../../../test-utils/provider-branch-scan';
 
 // Provider-specific behaviour belongs in the catalog (data) and the wire dialects (code).
 // Everything else asks the catalog (isCliProvider, providerFormShape, getProviderDescriptor)
@@ -17,8 +17,9 @@ const ALLOW = (rel: string) =>
 describe('provider id branches live only in the catalog, dialects, and the two data migrations', () => {
   for (const dir of ['backend', 'frontend', 'shared']) {
     it(`no provider-id comparisons under ${dir}/`, () => {
-      const hits = scanTree(path.join(ROOT, dir), AI_PROVIDER_IDS, (rel) => ALLOW(`${dir}/${rel}`));
-      expect(hits.map((h) => `${dir}/${h.file}:${h.line} ${h.text}`)).toEqual([]);
+      const hits = scanTree(path.join(ROOT, dir), AI_PROVIDER_IDS, (rel) => ALLOW(`${dir}/${rel}`))
+        .map((h) => ({ ...h, file: `${dir}/${h.file}` }));
+      if (hits.length > 0) expect.fail(formatHits(hits));
     });
   }
 });

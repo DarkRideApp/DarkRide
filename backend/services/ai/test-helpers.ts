@@ -55,8 +55,6 @@ export function textResponse(text: string, status = 200, headers: Record<string,
 }
 
 type StreamKind = 'anthropic' | 'gemini' | 'ollama' | 'openai-chat';
-// A table, not a switch: the kinds 'anthropic', 'gemini' and 'ollama' equal provider ids, and the provider-id guard
-// (backend/services/ai/__tests__/provider-branch-guard.test.ts) flags `case '<provider id>'` outside the catalog and the dialects.
 const OK_STREAMS: Record<StreamKind, () => Response> = {
   anthropic: () => sseResponse([
     { event: 'message_start', data: JSON.stringify({ type: 'message_start', message: { usage: { input_tokens: 3 } } }) },
