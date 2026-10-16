@@ -228,6 +228,27 @@ Not recorded: inline completion (the provider returns text only), requests cance
 their first output, and the per-request detail of runs from before this feature (their token
 totals still count, their cost shows `n/a`).
 
+### Would a 1-hour prompt cache be cheaper?
+
+Requests use Anthropic's 5-minute prompt cache. A 1-hour cache writes at twice the input price
+instead of 1.25 times, so it only pays when the gaps between requests in one conversation run
+past five minutes, which happens in a chat you come back to. `scripts/ai-cache-ttl-whatif.ts`
+replays the recorded requests under both lifetimes and prints, per purpose, how many follow-up
+requests came more than five minutes and more than an hour after the one before, the two
+prompt costs, and which lifetime wins:
+
+```bash
+npx tsx scripts/ai-cache-ttl-whatif.ts --days 30
+npx tsx scripts/ai-cache-ttl-whatif.ts --db /path/to/copy-of-darkride.db
+```
+
+It reads the database (`DATABASE_PATH`, or `--db`) and nothing else: it changes nothing and
+makes no AI request, so it is safe to run while the server is up. The figures cover prompt
+tokens only, use the price table above, and leave out requests on a model with no price. Runs do
+not record which chat they belong to, so chat runs of one user on one page are joined when a
+later run starts with a longer prompt than the earlier one ended with. There is no setting for a
+1-hour cache yet; this report is what decides whether one is worth adding.
+
 ## Deprecated settings
 
 `ai_provider`, `anthropic_api_key`, `gemini_api_key`, `openrouter_api_key`,
