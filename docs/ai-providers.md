@@ -37,8 +37,8 @@ as exhausted credits and moves on to the next model.
   is set and omits `system` when the system prompt is empty. `max_tokens` is 16000 unless the
   caller sets one. Never sends `temperature`, `top_p`, `top_k`, `thinking`, or `tool_choice`.
   Reported input tokens include cache reads and writes. A model refusal before any output is an
-  error the router falls back on (see Errors and fallback); a refusal after the model has started
-  answering is appended to the partial answer as a message.
+  error the router falls back on; a refusal after the model has started answering ends the stream
+  with a `refusal` event and the output of that turn is discarded (see Errors and fallback).
 - **Gemini**: the key goes in the `x-goog-api-key` header, never the URL. Omits
   `systemInstruction` when the system prompt is empty. Tool results carry the real function
   name. `thought` parts are not shown, and thinking tokens count as output tokens. An invalid
@@ -117,8 +117,15 @@ A refusal is about the request, not the model, so it falls back to the next mode
 cooldown. If every model that was tried refused, the request fails with the first model's own
 message (for Anthropic it names the category and, for `cyber`, the Cyber Verification Program)
 instead of the generic "rate-limited or unavailable" text. A refusal that arrives after the model
-has already started answering keeps the partial answer and adds the message, as before. In a
-background run that message is just text, so such a run is not recorded as failed.
+has already started answering cannot fall back, because the caller may already hold output. For
+Anthropic, which says to treat output from a refused stream as incomplete, the text and tool calls
+of that turn are dropped: the stored and shown turn is the refusal message alone, no tool call of
+that turn runs, and later turns never replay it. A tiered run counts a refused research turn as
+final (no escalation to the write tier) and a refused write turn as declining to write. A refused
+context-compaction summary is dropped and the conversation keeps its full history. Inline
+completion treats a refusal after partial output like one before any output and tries the next
+model. Gemini and OpenAI-style providers still keep the partial answer and add the message. In a
+background run the message is just text, so such a run is not recorded as failed.
 
 Within one run, a model that refused is not asked again by that run's later requests, and the
 research and write providers of a tiered run share that memory. Refusals start no cooldown, so

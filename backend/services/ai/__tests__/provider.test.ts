@@ -9,7 +9,7 @@ import { DialectProvider } from '../provider';
 import { parseSSEStream } from '../http';
 import { __resetOpenAiChatMemo } from '../dialects/openai-chat';
 import type { Dialect } from '../dialect';
-import { UnknownProviderError, AiProviderError, ConnectionError, isFallbackEligible } from '../errors';
+import { UnknownProviderError, AiProviderError, ConnectionError, ModelRefusedError, isFallbackEligible } from '../errors';
 import { stubFetch, sseResponse, jsonResponse, textResponse, collect, callHeader } from '../test-helpers';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -141,6 +141,18 @@ describe('DialectProvider', () => {
       { event: 'message_stop', data: JSON.stringify({ type: 'message_stop' }) },
     ]));
     expect(await createProvider('anthropic', { apiKey: 'k', model: 'claude-haiku-5-5' }).complete({ prefix: 'a', suffix: '', maxOutputTokens: 256 })).toBe('partial');
+  });
+  it('complete(): a refusal after part of the completion throws ModelRefusedError, so the router can try another model', async () => {
+    stubFetch(() => sseResponse([
+      { event: 'message_start', data: JSON.stringify({ type: 'message_start', message: { usage: { input_tokens: 1 } } }) },
+      { event: 'content_block_delta', data: JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'foo(' } }) },
+      { event: 'message_delta', data: JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber' } }, usage: { output_tokens: 2 } }) },
+      { event: 'message_stop', data: JSON.stringify({ type: 'message_stop' }) },
+    ]));
+    const err: any = await createProvider('anthropic', { apiKey: 'k', model: 'claude-haiku-5-5' }).complete({ prefix: 'a', suffix: '' }).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelRefusedError);
+    expect(err.message).toContain('Claude declined this request (category: cyber).');
+    expect(err.provider).toBe('anthropic');
   });
   it('complete(): other stream errors still throw', async () => {
     stubFetch(() => sseResponse([{ event: 'error', data: JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'boom' } }) }]));
