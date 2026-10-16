@@ -14,6 +14,7 @@ const thrown = async (events: any[]): Promise<any> => {
   throw new Error('expected parseStream to throw');
 };
 const req = { messages: [{ role: 'user' as const, content: 'hi' }], systemPrompt: 'sys', tools: [] };
+const hook = (status: number, body: string, ctx = makeCtx('gemini')) => geminiDialect.classifyError!(status, new Headers(), body, ctx);
 
 describe('buildChat', () => {
   it('uses the header for the key, never the URL, and the streaming endpoint', () => {
@@ -460,7 +461,7 @@ describe.each(QUOTA_CASES)('quota or rate limit: %s', (_label, fields, isQuota) 
     else expect(e.headers.get('retry-after')).toBe('7');   // the generic path keeps the headers for the cooldown
   });
   it('classifyError returns a QuotaExhaustedError for a quota 429 and defers otherwise', () => {
-    const r = geminiDialect.classifyError!(429, new Headers(), JSON.stringify({ error }));
+    const r = hook(429, JSON.stringify({ error }));
     if (isQuota) expect(r).toBeInstanceOf(QuotaExhaustedError); else expect(r).toBeUndefined();
   });
 });
@@ -471,39 +472,79 @@ describe('classifyError', () => {
     details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID', domain: 'googleapis.com' }],
   } });
   it('a 400 for a bad key is AuthError (Gemini does not answer 401)', () => {
-    const e = geminiDialect.classifyError!(400, new Headers(), badKeyBody) as any;
+    const e = hook(400, badKeyBody) as any;
     expect(e).toBeInstanceOf(AuthError);
     expect(e.status).toBe(400);
     expect(e.message).toBe('Gemini API error (400): API key not valid. Please pass a valid API key.');
   });
   it('matches on the reason code alone, and on a non-JSON body', () => {
-    expect(geminiDialect.classifyError!(400, new Headers(), '{"error":{"message":"x","details":[{"reason":"API_KEY_INVALID"}]}}')).toBeInstanceOf(AuthError);
-    const e = geminiDialect.classifyError!(400, new Headers(), '<html>API key not valid</html>') as any;
+    expect(hook(400, '{"error":{"message":"x","details":[{"reason":"API_KEY_INVALID"}]}}')).toBeInstanceOf(AuthError);
+    const e = hook(400, '<html>API key not valid</html>') as any;
     expect(e).toBeInstanceOf(AuthError);
     expect(e.message).toContain('API key not valid');
   });
   it('a JSON 400 that merely echoes the phrase mid-sentence is not treated as a bad key', () => {
     const proxy = JSON.stringify({ error: { code: 400, message: 'upstream said: API key not valid', status: 'INVALID_ARGUMENT' } });
-    expect(geminiDialect.classifyError!(400, new Headers(), proxy)).toBeUndefined();
+    expect(hook(400, proxy)).toBeUndefined();
     const reasonText = JSON.stringify({ error: { code: 400, message: 'bad field, see API_KEY_INVALID in the docs' } });
-    expect(geminiDialect.classifyError!(400, new Headers(), reasonText)).toBeUndefined();
+    expect(hook(400, reasonText)).toBeUndefined();
     expect(classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), proxy).constructor).toBe(AiProviderError);
   });
   it('a JSON 400 whose message starts with the phrase matches, with no details', () => {
     const body = JSON.stringify({ error: { code: 400, message: 'API key not valid. Please pass a valid API key.' } });
-    expect(geminiDialect.classifyError!(400, new Headers(), body)).toBeInstanceOf(AuthError);
+    expect(hook(400, body)).toBeInstanceOf(AuthError);
   });
-  it('the hook leaves capping to classifyHttpError, which caps the final message at 1000 characters', () => {
-    const body = `API key not valid ${'x'.repeat(5000)}`;
-    expect((geminiDialect.classifyError!(400, new Headers(), body) as any).message.length).toBeGreaterThan(1000);
-    const e = classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), body);
-    expect(e).toBeInstanceOf(AuthError);
-    expect(e.message.length).toBeLessThanOrEqual(1000);
+  describe('the error message is safe to show: the hook redacts the key and caps the upstream text itself', () => {
+    const PREFIX = 'Gemini API error (400): ';
+    const KEY = 'sk-test-placeholder';
+
+    it('caps a long upstream message at 500 characters', () => {
+      const e = hook(400, `API key not valid ${'x'.repeat(5000)}`) as any;
+      expect(e).toBeInstanceOf(AuthError);
+      expect(e.message).toHaveLength(PREFIX.length + 500);
+    });
+    it('masks the key, in a JSON message and in a plain body', () => {
+      const json = hook(400, JSON.stringify({ error: { code: 400, message: `API key not valid: ${KEY}` } })) as any;
+      expect(json.message).toBe(`${PREFIX}API key not valid: ***`);
+      const plain = hook(400, `API key not valid ${KEY}`) as any;
+      expect(plain.message).toBe(`${PREFIX}API key not valid ***`);
+    });
+    it('masks the key in a quota 429 and in a PERMISSION_DENIED 403', () => {
+      const quota = hook(429, JSON.stringify({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: `billing limit hit for ${KEY}` } })) as any;
+      expect(quota).toBeInstanceOf(QuotaExhaustedError);
+      expect(quota.message).not.toContain(KEY);
+      const denied = hook(403, JSON.stringify({ error: { code: 403, status: 'PERMISSION_DENIED', message: `key ${KEY} is restricted` } })) as any;
+      expect(denied).toBeInstanceOf(AuthError);
+      expect(denied.message).not.toContain(KEY);
+    });
+    it('redacts before capping: a key straddling the cap leaves no fragment', () => {
+      for (const pad of [480, 490, 495, 498, 499, 500]) {
+        const e = hook(400, `API key not valid ${'x'.repeat(pad - 'API key not valid '.length)}${KEY} tail`) as any;
+        expect(e.message, `pad ${pad}`).not.toContain('sk-');
+      }
+    });
+    it('masks URL userinfo', () => {
+      const e = hook(400, 'API key not valid, see https://user:pw@proxy.test/x') as any;
+      expect(e.message).not.toContain('user:pw');
+    });
+    it('tags the provider, and the status of the HTTP response', () => {
+      const e = hook(400, 'API key not valid') as any;
+      expect(e.provider).toBe('gemini');
+      expect(e.status).toBe(400);
+    });
+    it('the same text comes out through classifyHttpError', () => {
+      const body = `API key not valid ${KEY} ${'x'.repeat(5000)}`;
+      const e = classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), body);
+      expect(e).toBeInstanceOf(AuthError);
+      expect(e.message).not.toContain(KEY);
+      expect(e.message).toHaveLength(PREFIX.length + 500);
+      expect(e.provider).toBe('gemini');
+    });
   });
   it('an unrelated 400 and other statuses return undefined', () => {
-    expect(geminiDialect.classifyError!(400, new Headers(), '{"error":{"code":400,"message":"Invalid JSON payload","status":"INVALID_ARGUMENT"}}')).toBeUndefined();
-    expect(geminiDialect.classifyError!(500, new Headers(), badKeyBody)).toBeUndefined();
-    expect(geminiDialect.classifyError!(429, new Headers(), '{}')).toBeUndefined();
+    expect(hook(400, '{"error":{"code":400,"message":"Invalid JSON payload","status":"INVALID_ARGUMENT"}}')).toBeUndefined();
+    expect(hook(500, badKeyBody)).toBeUndefined();
+    expect(hook(429, '{}')).toBeUndefined();
   });
   it('classifyHttpError uses the hook for a bad-key 400 and falls through for others', () => {
     const ctx = makeCtx('gemini');
@@ -515,7 +556,7 @@ describe('classifyError', () => {
 describe('403 split: a key-level PERMISSION_DENIED is a credential failure, any other 403 is not', () => {
   const denied = JSON.stringify({ error: { code: 403, message: 'Method doesn\'t allow unregistered callers.', status: 'PERMISSION_DENIED' } });
   it('PERMISSION_DENIED stays an AuthError in the usual message shape', () => {
-    const e = geminiDialect.classifyError!(403, new Headers(), denied) as any;
+    const e = hook(403, denied) as any;
     expect(e).toBeInstanceOf(AuthError);
     expect(e.status).toBe(403);
     expect(e.message).toBe('Gemini API error (403): Method doesn\'t allow unregistered callers.');
@@ -531,10 +572,10 @@ describe('403 split: a key-level PERMISSION_DENIED is a credential failure, any 
     ['a non-JSON body', '<html>403 PERMISSION_DENIED</html>'],
     ['an empty body', ''],
   ])('a 403 with %s falls through to the generic path', (_label, body) => {
-    expect(geminiDialect.classifyError!(403, new Headers(), body)).toBeUndefined();
+    expect(hook(403, body)).toBeUndefined();
   });
   it('PERMISSION_DENIED on another status is left alone', () => {
-    expect(geminiDialect.classifyError!(400, new Headers(), denied)).toBeUndefined();
+    expect(hook(400, denied)).toBeUndefined();
   });
 });
 
@@ -571,8 +612,9 @@ describe('key echoed by the upstream never survives, even straddling a cap (real
     const { status, body, cls } = bodies[path](`${'x'.repeat(offset)}${KEY} tail`);
     const e = classifyHttpError(geminiDialect, makeCtx('gemini', { apiKey: KEY }), status, new Headers(), body);
     expect(e).toBeInstanceOf(cls);
-    expect(e.message).toContain('***');
-    expect(e.message.length).toBeLessThanOrEqual(1000);
+    // The mask itself can be cut by the 500-character cap when the key starts within 3 characters of it.
+    if (offset + 3 <= 500) expect(e.message).toContain('***');
+    expect(e.message.length).toBeLessThanOrEqual('Gemini API error (400): '.length + 500);
     for (const text of [e.message, String(e.stack)]) {
       expect(text).not.toContain(KEY);
       // any 4+ character prefix of the key contains the first four characters
@@ -634,14 +676,14 @@ describe('malformed error shapes never throw and land on the safe side', () => {
     ['an HTML page', '<html><body><h1>502 Bad Gateway</h1></body></html>'],
   ];
   it.each(BODY_ROWS)('HTTP 429 with %s: hook defers, generic path gives RateLimitError', (_label, body) => {
-    expect(geminiDialect.classifyError!(429, new Headers(), body)).toBeUndefined();
+    expect(hook(429, body)).toBeUndefined();
     const headers = new Headers({ 'retry-after': '3' });
     const e: any = classifyHttpError(geminiDialect, makeCtx('gemini'), 429, headers, body);
     expect(e).toBeInstanceOf(RateLimitError);
     expect(e.headers.get('retry-after')).toBe('3');
   });
   it.each(BODY_ROWS)('HTTP 400 with %s: hook defers, generic path gives a plain AiProviderError', (_label, body) => {
-    expect(geminiDialect.classifyError!(400, new Headers(), body)).toBeUndefined();
+    expect(hook(400, body)).toBeUndefined();
     expect(classifyHttpError(geminiDialect, makeCtx('gemini'), 400, new Headers(), body).constructor).toBe(AiProviderError);
   });
 
@@ -655,6 +697,6 @@ describe('malformed error shapes never throw and land on the safe side', () => {
     ['message is missing', {}],
     ['message is numeric', { message: 429 }],
   ])('HTTP 429 body whose error has %s: hook defers', (_label, error) => {
-    expect(geminiDialect.classifyError!(429, new Headers(), JSON.stringify({ error }))).toBeUndefined();
+    expect(hook(429, JSON.stringify({ error }))).toBeUndefined();
   });
 });

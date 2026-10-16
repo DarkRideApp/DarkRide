@@ -146,7 +146,7 @@ function isBadKeyBody(bodyText: string): boolean {
  * RateLimitError).
  * Everything else returns undefined and takes the generic path, which keeps Retry-After for a plain 429.
  */
-function classifyError(status: number, _headers: Headers, bodyText: string): AiProviderError | undefined {
+function classifyError(status: number, _headers: Headers, bodyText: string, ctx: DialectContext): AiProviderError | undefined {
   const { error } = parseErrorBody(bodyText);
   const quota = status === 429 && isQuotaExhausted(error);
   // A 403 PERMISSION_DENIED is about the key itself (leaked, disabled, restricted, or the API is off for its project),
@@ -154,11 +154,9 @@ function classifyError(status: number, _headers: Headers, bodyText: string): AiP
   const deniedKey = status === 403 && error?.status === 'PERMISSION_DENIED';
   if (!quota && !deniedKey && !(status === 400 && isBadKeyBody(bodyText))) return undefined;
   const msg = typeof error?.message === 'string' && error.message ? error.message : bodyText.trim();
-  // Deliberately the raw upstream text: the hook has no DialectContext (no key to redact with). classifyHttpError
-  // redacts the key first and only then caps the length, so a key straddling a cap can never leave a prefix behind.
-  // Capping here would run before that redaction and cut a key in half.
-  const text = `Gemini API error (${status}): ${msg}`;
-  return quota ? new QuotaExhaustedError(text, { status }) : new AuthError(text, { status });
+  const text = `${ctx.descriptor.shortName} API error (${status}): ${safeText(msg, ctx)}`;
+  const opts = { status, provider: ctx.descriptor.id };
+  return quota ? new QuotaExhaustedError(text, opts) : new AuthError(text, opts);
 }
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
