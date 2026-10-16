@@ -1,6 +1,6 @@
 // backend/services/ai/dialects/ollama-chat.ts
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
-import { parseNDJSONStream, safeText } from '../http';
+import { authHeaders, parseNDJSONStream, safeText } from '../http';
 import { AiProviderError } from '../errors';
 import { toolInput } from '../tool-input';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
@@ -33,6 +33,10 @@ function formatMessages(messages: AiMessage[], systemPrompt: string): any[] {
 
 function formatTools(tools: AiToolDefinition[]): any[] {
   return tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.inputSchema } }));
+}
+
+function headers(ctx: DialectContext): Record<string, string> {
+  return { 'Content-Type': 'application/json', ...authHeaders(ctx) };
 }
 
 function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError {
@@ -86,12 +90,12 @@ export const ollamaDialect: Dialect = {
     if (req.stopSequences?.length) options.stop = req.stopSequences;
     if (req.temperature !== undefined) options.temperature = req.temperature;
     if (Object.keys(options).length > 0) body.options = options;
-    return { url: `${ctx.baseUrl}/api/chat`, headers: { 'Content-Type': 'application/json' }, body };
+    return { url: `${ctx.baseUrl}/api/chat`, headers: headers(ctx), body };
   },
   parseStream,
   classifyStreamError,
   buildListModels(ctx: DialectContext) {
-    return { url: `${ctx.baseUrl}/api/tags`, headers: { 'Content-Type': 'application/json' } };
+    return { url: `${ctx.baseUrl}/api/tags`, headers: headers(ctx) };
   },
   parseModels(json: any) {
     return {

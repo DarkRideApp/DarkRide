@@ -1,7 +1,7 @@
 // backend/services/ai/dialects/openai-chat.ts
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
-import { OPENAI_QUOTA_CODES, OVERLOADED_CODES, OVERLOADED_STATUSES, RATE_LIMIT_CODES, parseSSEStream, safeText } from '../http';
+import { OPENAI_QUOTA_CODES, OVERLOADED_CODES, OVERLOADED_STATUSES, RATE_LIMIT_CODES, authHeaders, parseSSEStream, safeText } from '../http';
 import { AiProviderError, ModelRefusedError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiCompleteRequest, AiRequest, Dialect, DialectContext } from '../dialect';
 import { isPlainObject, toolInput } from '../tool-input';
@@ -13,9 +13,7 @@ const rejectedStreamOptions = new Set<string>();
 export function __resetOpenAiChatMemo(): void { rejectedStreamOptions.clear(); }
 
 function headers(ctx: DialectContext): Record<string, string> {
-  const h: Record<string, string> = { 'Content-Type': 'application/json', ...(ctx.descriptor.extraHeaders ?? {}) };
-  if (ctx.descriptor.auth.scheme === 'bearer' && ctx.apiKey) h.Authorization = `Bearer ${ctx.apiKey}`;
-  return h;
+  return { 'Content-Type': 'application/json', ...(ctx.descriptor.extraHeaders ?? {}), ...authHeaders(ctx) };
 }
 
 function formatMessages(messages: AiMessage[], systemPrompt: string): any[] {

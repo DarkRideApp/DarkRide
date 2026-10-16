@@ -1,6 +1,6 @@
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
-import { parseSSEStream, safeText } from '../http';
+import { authHeaders, parseSSEStream, safeText } from '../http';
 import { AiProviderError, AuthError, ModelRefusedError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 import { toolInput } from '../tool-input';
@@ -40,7 +40,7 @@ function serverId(id: string): string | undefined {
 }
 
 function headers(ctx: DialectContext): Record<string, string> {
-  return { 'Content-Type': 'application/json', ...(ctx.apiKey ? { 'x-goog-api-key': ctx.apiKey } : {}) };
+  return { 'Content-Type': 'application/json', ...authHeaders(ctx) };
 }
 
 /**

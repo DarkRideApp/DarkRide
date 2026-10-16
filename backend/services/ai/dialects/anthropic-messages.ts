@@ -1,6 +1,6 @@
 // backend/services/ai/dialects/anthropic-messages.ts
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
-import { parseSSEStream, safeText } from '../http';
+import { authHeaders, parseSSEStream, safeText } from '../http';
 import { AiProviderError, ModelRefusedError, OutputLimitError, OverloadedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 import { toolInput } from '../tool-input';
@@ -35,7 +35,7 @@ function formatMessages(messages: AiMessage[]): any[] {
 }
 
 function headers(ctx: DialectContext): Record<string, string> {
-  return { 'Content-Type': 'application/json', ...(ctx.apiKey ? { 'x-api-key': ctx.apiKey } : {}), ...(ctx.descriptor.extraHeaders ?? {}) };
+  return { 'Content-Type': 'application/json', ...authHeaders(ctx), ...(ctx.descriptor.extraHeaders ?? {}) };
 }
 
 function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError {

@@ -358,6 +358,18 @@ export function classifyHttpError(
 
 // ── Sending ──────────────────────────────────────────────────────────
 
+/** The credential header the catalog's auth scheme calls for. Empty when there is no key or the scheme sends none. */
+export function authHeaders(ctx: DialectContext): Record<string, string> {
+  const key = ctx.apiKey;
+  if (!key) return {};
+  switch (ctx.descriptor.auth.scheme) {
+    case 'bearer': return { Authorization: `Bearer ${key}` };
+    case 'x-api-key': return { 'x-api-key': key };
+    case 'x-goog-api-key': return { 'x-goog-api-key': key };
+    case 'none': return {};
+  }
+}
+
 const DEFAULT_HEADERS_TIMEOUT_MS = 60_000;
 
 /** 50 -> "50ms", 2000 -> "2s", 1500 -> "1.5s". Never rounds a sub-second timeout down to "0s". */
