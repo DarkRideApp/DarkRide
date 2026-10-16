@@ -325,16 +325,18 @@ Create takes `name` and `providerId` (required), and optionally `model`, `enable
 |--------|------|-------------|
 | POST | /v1/ai/complete | Code completion for automation scripts |
 
-Request body: `{ "prefix": "...", "suffix": "..." }`. At least one must be non-empty; a missing one counts as an empty string. The request uses the enabled models of the `Low` tier only, never another tier, with the fallback described in [ai-providers.md](ai-providers.md#errors-and-fallback). If the `Low` tier has no usable model, it falls back to the deprecated AI settings keys. Output is capped at 256 tokens.
+Request body: `{ "prefix": "...", "suffix": "..." }`. Each must be a string when present, and `null` is not a string. At least one must be non-empty; a missing one counts as an empty string. Together they may not exceed 100,000 characters (UTF-16 code units, as `String.length` counts them); the check runs before any provider is called. The request uses the enabled models of the `Low` tier only, never another tier, with the fallback described in [ai-providers.md](ai-providers.md#errors-and-fallback). If the `Low` tier has no usable model, it falls back to the deprecated AI settings keys. Output is capped at 256 tokens.
 
 Success: `200` with `{ "success": true, "data": { "completion": "..." } }`. `completion` can be an empty string.
 
 | Status | `error` | When |
 |--------|---------|------|
+| 400 | `prefix must be a string` or `suffix must be a string` | that field is present and is not a string (a number, boolean, object, array or `null`). Checked before the next row |
 | 400 | `prefix or suffix is required` | both are empty or missing |
 | 400 | `No AI provider configured` | no usable `Low` tier model and no `ai_provider` setting |
 | 400 | `Unknown AI provider: <type>` | the `ai_provider` setting is not `anthropic`, `gemini`, `ollama`, `openrouter`, or `codestral` |
 | 400 | `<Name> API key not configured` | the `ai_provider` setting names Anthropic, Gemini, OpenRouter, or Codestral and its key setting is empty |
+| 413 | `prefix and suffix together may not exceed 100000 characters` | the two lengths add up to more than 100,000 |
 | 502 | the provider's message, key masked | the provider failed, for example `OpenAI API error (400): <provider message>`. When every `Low` tier model failed or is cooling down: `All AI models are rate-limited or unavailable:` and one `<model>: <reason>` line per model |
 | 500 | `Inline completion failed` | any other error. The detail goes to the server log only |
 
