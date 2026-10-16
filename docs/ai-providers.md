@@ -256,9 +256,12 @@ golden-table row.
 
 Keep provider ids out of comparisons everywhere except the catalog and the dialects. A test
 (`backend/services/ai/__tests__/provider-branch-guard.test.ts`) catches direct comparisons such
-as `type === 'openai'` or a `case 'gemini':`. It does not catch lookups through a table, a
-`Set`, or a named constant, so treat it as a safety net and put provider-specific behaviour in
-the catalog or a dialect.
+as `type === 'openai'` or a `case 'gemini':`, `includes`, `indexOf` and `Set.has` with a
+provider id, and lookups such as `({ openai: 1 })[type]` or `table['openai']`. It skips test
+files, `__tests__` and `test-utils` directories, and `test-helpers.ts`. It does not catch an id
+held in a named constant or table, `startsWith` or a regular expression on an id, or an id
+passed to a catalog function such as `getProviderDescriptor('claude-cli')`, so treat it as a
+safety net and put provider-specific behaviour in the catalog or a dialect.
 
 If you only need to use a service yourself, the `openai-compatible` type works with no code
 change. Add a catalog entry when the service should be its own type with its own defaults.
