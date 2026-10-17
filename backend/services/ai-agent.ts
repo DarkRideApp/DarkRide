@@ -4,6 +4,7 @@ import type { AiToolRegistry } from './ai-tools';
 import type { AiStreamingProvider } from './ai/dialect';
 import { ModelRefusedError } from './ai/errors';
 import { createLoggers } from '../logs';
+import { contextWindowFor } from '../../shared/lib/ai-model-context';
 
 const { log, error: logError } = createLoggers('ai-agent');
 import type {
@@ -166,10 +167,17 @@ const TOOL_TIMEOUT_MS = 30_000;
 const STREAM_TURN_TIMEOUT_MS = 120_000;
 const MAX_TOOL_RESULT_LENGTH = 3_000;
 const TITLE_MAX_LENGTH = 50;
-/** Assumed context window size (tokens) for compaction threshold calculation */
-const CONTEXT_WINDOW_TOKENS = 200_000;
-/** Compact the conversation when context usage reaches this fraction */
+/** Compact the conversation when context usage reaches this fraction of the context window */
 const COMPACTION_THRESHOLD = 0.55;
+
+/**
+ * The context window to measure the prompt against: the smallest among the models that served this run, because
+ * the router can send the next request to any of them. A request that did not report its model counts as 200K.
+ */
+function runContextWindow(requests: AgentRequestUsage[]): number {
+  if (requests.length === 0) return contextWindowFor(undefined);
+  return Math.min(...requests.map((r) => contextWindowFor(r.model)));
+}
 
 // ── Interface ────────────────────────────────────────────────────────
 
@@ -601,8 +609,9 @@ export class AiAgent implements AiAgentInterface {
       }
 
       // Report context usage percentage after each turn
+      const contextWindow = runContextWindow(runUsage.requests);
       if (turnInputTokens > 0 && onContextUsage) {
-        onContextUsage(Math.round((turnInputTokens / CONTEXT_WINDOW_TOKENS) * 100));
+        onContextUsage(Math.round((turnInputTokens / contextWindow) * 100));
       }
 
       // 5c. Append assistant message
@@ -711,8 +720,8 @@ export class AiAgent implements AiAgentInterface {
       }
 
       // Compact the conversation if context is near capacity
-      if (turnInputTokens > 0 && turnInputTokens / CONTEXT_WINDOW_TOKENS >= COMPACTION_THRESHOLD) {
-        const percentUsed = Math.round((turnInputTokens / CONTEXT_WINDOW_TOKENS) * 100);
+      if (turnInputTokens > 0 && turnInputTokens / contextWindow >= COMPACTION_THRESHOLD) {
+        const percentUsed = Math.round((turnInputTokens / contextWindow) * 100);
         log(`Context at ${percentUsed}% — compacting conversation for turn ${turn + 1}`);
         messages = await this.compactMessages(messages, systemPrompt, tools, totalUsage, runUsage.requests, tierConfig?.researchProvider);
       }
@@ -936,21 +945,25 @@ export class AiAgent implements AiAgentInterface {
       {
         role: 'user',
         content:
-          'CONTEXT COMPACTION REQUIRED: Please provide a comprehensive summary of everything you have analyzed and discovered so far. Include all key findings, code patterns, API endpoints, URLs, security issues, and any notes you have written. Be thorough — this summary will replace the full conversation history so the analysis can continue.',
+          'CONTEXT COMPACTION REQUIRED: Please provide a comprehensive summary of everything you have analyzed and discovered so far. Include all key findings, code patterns, API endpoints, URLs, security issues, and any notes you have written. Be thorough — this summary will replace the full conversation history so the analysis can continue. Do not call any tools: answer with the summary as text.',
       },
     ];
 
     const summaryChunks: string[] = [];
     let refused = false;
+    let calledTool = false;
     try {
+      // The run's tools go with the request: Anthropic rejects a history that holds tool calls when no tools are
+      // defined, and the same system prompt and tools keep the request on the prefix the run has cached.
       const stream = (provider ?? this.provider).createStreamingRequest(
         compactionPrompt,
         systemPrompt,
-        [], // no tools during compaction
+        tools,
       );
       const recordUsage = requestUsageRecorder(requests);
       for await (const event of stream) {
         if (event.type === 'text') summaryChunks.push(event.text);
+        if (event.type === 'tool_use') calledTool = true;
         if (event.type === 'refusal') refused = true;
         if (event.type === 'usage') {
           recordUsage(event);
@@ -966,6 +979,11 @@ export class AiAgent implements AiAgentInterface {
     const summary = summaryChunks.join('');
     if (refused) {
       log('Compaction summary was refused, continuing with existing context');
+      return messages;
+    }
+    if (calledTool) {
+      // Whatever text came with the call is the start of more work, not a summary to replace the history with.
+      log('Compaction response called a tool instead of summarising, continuing with existing context');
       return messages;
     }
     if (!summary) return messages;

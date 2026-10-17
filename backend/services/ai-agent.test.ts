@@ -2639,11 +2639,11 @@ describe('AiAgent', () => {
       const { provider, fn } = scripted(
         async function* () {
           yield { type: 'tool_use', id: 't1', name: 'ok_tool', input: {} };
-          // Over the compaction threshold of the agent's context window.
-          yield { type: 'usage', inputTokens: 150_000, outputTokens: 10, model: 'claude-sonnet-5-5' };
+          // Over the compaction threshold of the model's 1M-token context window.
+          yield { type: 'usage', inputTokens: 600_000, outputTokens: 10, model: 'claude-sonnet-5-5' };
         },
         async function* () {
-          yield { type: 'usage', inputTokens: 150_500, outputTokens: 0, cachedInputTokens: 150_000, model: 'claude-sonnet-5-5' };
+          yield { type: 'usage', inputTokens: 600_500, outputTokens: 0, cachedInputTokens: 600_000, model: 'claude-sonnet-5-5' };
           yield { type: 'text', text: 'summary of the work so far' };
           yield { type: 'usage', inputTokens: 0, outputTokens: 400 };
         },
@@ -2656,10 +2656,10 @@ describe('AiAgent', () => {
       const result = await run(new AiAgent(db, registry, provider));
 
       expect(fn).toHaveBeenCalledTimes(3);
-      expect(fn.mock.calls[1][2]).toEqual([]);   // the compaction request sends no tools
+      expect(fn.mock.calls[1][2]).toEqual(fn.mock.calls[0][2]);   // the compaction request sends the run's tools
       expect(result.run?.requests?.map((r) => [r.inputTokens, r.cacheReadTokens, r.outputTokens])).toEqual([
-        [150_000, 0, 10],
-        [150_500, 150_000, 400],
+        [600_000, 0, 10],
+        [600_500, 600_000, 400],
         [2000, 0, 5],
       ]);
       expect(result.run?.turns).toBe(2);
@@ -2923,6 +2923,149 @@ describe('AiAgent', () => {
       await send(agent, null);
 
       expect(toolNames(fn, 2)).toEqual(['list_devices', 'request_tools']);
+    });
+  });
+
+  describe('context window and compaction', () => {
+    const identity: AgentIdentity = {
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: [],
+      onBehalfOfService: 'test',
+    };
+    const OPUS = 'claude-opus-5-5';
+    const HAIKU_45 = 'claude-haiku-4-5';
+    const send = (agent: AiAgent, extra: Record<string, unknown> = {}) => agent.handleMessageWithIdentity(identity, {
+      conversationId: null,
+      message: 'go',
+      pageContext: 'devices',
+      contextId: '',
+      onToken: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolResult: vi.fn(),
+      mode: 'streaming',
+      ...extra,
+    });
+    const usesTool = (inputTokens: number, model?: string) => async function* (): AsyncIterable<AiStreamEvent> {
+      yield { type: 'tool_use', id: `t${inputTokens}`, name: 'ok_tool', input: {} };
+      yield { type: 'usage', inputTokens, outputTokens: 10, ...(model ? { model } : {}) };
+    };
+    const summary = (text: string) => async function* (): AsyncIterable<AiStreamEvent> {
+      yield { type: 'text', text };
+      yield { type: 'usage', inputTokens: 0, outputTokens: 50 };
+    };
+    /** A provider whose Nth request runs the Nth script, and keeps every request's arguments. */
+    const scripted = (...scripts: Array<() => AsyncIterable<AiStreamEvent>>) => {
+      let n = 0;
+      const fn = vi.fn(() => scripts[Math.min(n++, scripts.length - 1)]());
+      return { agent: new AiAgent(db, makeRegistry([{ name: 'ok_tool' }]), makeMockProvider(fn)), fn };
+    };
+    type Args = [AiMessage[], string, unknown[]];
+    const args = (fn: ReturnType<typeof scripted>['fn'], request: number) => fn.mock.calls[request] as unknown as Args;
+    const wasCompacted = (fn: ReturnType<typeof scripted>['fn'], request: number) =>
+      JSON.stringify(args(fn, request)[0][0]).includes('Conversation compacted');
+
+    it('sends the tools of the run with the compaction request, so a provider that needs them accepts the history', async () => {
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      const [, compactionSystem, compactionTools] = args(fn, 1);
+      expect(compactionTools.length).toBeGreaterThan(0);
+      expect(JSON.stringify(compactionTools)).toBe(JSON.stringify(args(fn, 0)[2]));
+      expect(compactionSystem).toBe(args(fn, 0)[1]);
+    });
+
+    it('sends the whole history first and the compaction instruction last, so the request extends the cached prefix', async () => {
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      const [compactionMessages] = args(fn, 1);
+      expect(compactionMessages.map((m) => m.role)).toEqual(['user', 'assistant', 'tool_result', 'user']);
+      expect(compactionMessages[0]).toMatchObject({ role: 'user', content: 'go' });
+    });
+
+    it('tells the model to answer in text without calling a tool', async () => {
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      const last = args(fn, 1)[0].at(-1);
+      expect(last?.role).toBe('user');
+      expect(String(last?.content)).toMatch(/do not call any tools/i);
+    });
+
+    it('replaces the history with the summary when the model answers in text', async () => {
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(wasCompacted(fn, 2)).toBe(true);
+      expect(JSON.stringify(args(fn, 2)[0][0])).toContain('the summary');
+    });
+
+    it('keeps the history when the model calls a tool instead of summarising', async () => {
+      const calledATool = async function* (): AsyncIterable<AiStreamEvent> {
+        yield { type: 'text', text: 'Let me look one more thing up first.' };
+        yield { type: 'tool_use', id: 'again', name: 'ok_tool', input: {} };
+        yield { type: 'usage', inputTokens: 0, outputTokens: 20 };
+      };
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), calledATool, () => textOnlyStream('finished'));
+      const result = await send(agent);
+
+      expect(result.error).toBeUndefined();
+      expect(wasCompacted(fn, 2)).toBe(false);
+      expect(args(fn, 2)[0][0]).toMatchObject({ role: 'user', content: 'go' });
+    });
+
+    it('does not compact a model with a 1M window at 150K tokens, and reports the share of its real window', async () => {
+      const percents: number[] = [];
+      const { agent, fn } = scripted(usesTool(150_000, OPUS), () => textOnlyStream('finished'));
+      await send(agent, { onContextUsage: (p: number) => percents.push(p) });
+
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(wasCompacted(fn, 1)).toBe(false);
+      expect(percents[0]).toBe(15);
+    });
+
+    it('compacts a model with a 1M window once the prompt is 55% of it', async () => {
+      const below = scripted(usesTool(549_000, OPUS), () => textOnlyStream('finished'));
+      await send(below.agent);
+      expect(below.fn).toHaveBeenCalledTimes(2);
+
+      const at = scripted(usesTool(550_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(at.agent);
+      expect(at.fn).toHaveBeenCalledTimes(3);
+    });
+
+    it('compacts a 200K model at 110K tokens', async () => {
+      const { agent, fn } = scripted(usesTool(110_000, HAIKU_45), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(wasCompacted(fn, 2)).toBe(true);
+    });
+
+    it('assumes a 200K window when the provider does not report the model', async () => {
+      const percents: number[] = [];
+      const { agent, fn } = scripted(usesTool(110_000), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent, { onContextUsage: (p: number) => percents.push(p) });
+
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(percents[0]).toBe(55);
+    });
+
+    it('uses the smallest window among the models that served the run, since any of them can serve the next request', async () => {
+      const percents: number[] = [];
+      const { agent, fn } = scripted(
+        usesTool(50_000, HAIKU_45),   // a fallback model with a 200K window served the first request
+        usesTool(150_000, OPUS),      // 150K is 15% of 1M but 75% of the 200K window the fallback could serve again
+        summary('the summary'),
+        () => textOnlyStream('finished'),
+      );
+      await send(agent, { onContextUsage: (p: number) => percents.push(p) });
+
+      expect(percents[1]).toBe(75);
+      expect(fn).toHaveBeenCalledTimes(4);
+      expect(wasCompacted(fn, 3)).toBe(true);
     });
   });
 });
