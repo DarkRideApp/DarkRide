@@ -268,7 +268,7 @@ describe('an Anthropic stream that ends in a refusal after output', () => {
           return stream(messageStart(), textBlock(0, 'Summary so far: the notes say'), refusal());
         }
         return n === 0
-          ? stream(messageStart(150_000), toolBlock(0, 'toolu_01A', 'read_notes', ['{}']), end('tool_use', 9))
+          ? stream(messageStart(600_000), toolBlock(0, 'toolu_01A', 'read_notes', ['{}']), end('tool_use', 9))   // over 55% of the model's 1M window
           : stream(messageStart(), textBlock(0, 'Done.'), end('end_turn', 2));
       });
       const agent = new AiAgent(db, makeRegistry(), anthropic());
@@ -281,6 +281,29 @@ describe('an Anthropic stream that ends in a refusal after output', () => {
       expect(JSON.stringify(nextTurn)).toContain('look at my notes');
       expect(JSON.stringify(nextTurn)).not.toContain('Conversation compacted');
       expect(JSON.stringify(nextTurn)).not.toContain('Summary so far');
+    });
+
+    it('sends the run\'s tools and system prompt with the summary request, which Anthropic needs for a history that holds tool calls', async () => {
+      const fetchStub = stubFetch((call, n) => {
+        const last: any = call.body.messages[call.body.messages.length - 1];
+        if (typeof last.content === 'string' && last.content.startsWith('CONTEXT COMPACTION REQUIRED')) {
+          return stream(messageStart(), textBlock(0, 'Summary so far: the notes say'), end('end_turn', 7));
+        }
+        return n === 0
+          ? stream(messageStart(600_000), toolBlock(0, 'toolu_01A', 'read_notes', ['{}']), end('tool_use', 9))
+          : stream(messageStart(), textBlock(0, 'Done.'), end('end_turn', 2));
+      });
+      const agent = new AiAgent(db, makeRegistry(), anthropic());
+      const { result } = run(agent);
+      await result;
+
+      expect(fetchStub.calls).toHaveLength(3);
+      const [turn, summary, afterSummary] = fetchStub.calls.map((c) => c.body);
+      expect(summary.tools?.length).toBeGreaterThan(0);
+      expect(summary.tools).toEqual(turn.tools);
+      expect(summary.system).toEqual(turn.system);
+      expect(JSON.stringify(afterSummary.messages)).toContain('Conversation compacted');
+      expect(JSON.stringify(afterSummary.messages)).toContain('Summary so far');
     });
   });
 });

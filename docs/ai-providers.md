@@ -337,6 +337,20 @@ the part it came from. A first function call with no stored signature still gets
 placeholder, as does one whose signature was written for a different model, for example after a
 fallback or when the compaction request runs on another model of the tier.
 
+## Context compaction
+
+When a turn's prompt reaches 55% of the context window, the agent asks the model for a summary of the run so
+far and carries on from that summary in place of the history. The window is the model's: 1M tokens for the
+current Claude models (`shared/lib/ai-model-context.ts`), 200K for any other model and for a request whose
+provider does not report the model, so an unlisted model compacts early, never late. A run that several
+models served is measured against the smallest, because the router can send the next request to any of them.
+The percentage shown in the chat and on the APK analysis page uses the same window.
+
+The summary request carries the run's system prompt and tools, because Anthropic does not accept tool calls
+in the history of a request that defines no tools, and so that the request extends the prefix the run has
+already cached. The instruction tells the model not to call a tool. A reply that calls one anyway is
+discarded and the history is kept, as it is for a refusal or an error.
+
 ## Known limits
 
 - Anthropic `thinking` blocks are not carried between tool turns, so models that think lose
@@ -346,4 +360,7 @@ fallback or when the compaction request runs on another model of the tier.
   more tools and rewrites the history when it compacts. Sending them needs a way to know the
   history is unchanged, so they are dropped, which the API allows.
 - The tiered research/write path does not fall back across models.
-- The built-in agent assumes a 200k-token context window when deciding to compact.
+- The built-in agent knows the context window of the current Claude models only. A model of another
+  provider with a longer window is taken to have 200K tokens and compacts earlier than it needs to.
+- Haiku 5.5 charges higher rates for a prompt over 100K tokens, and the agent does not compact it until 55%
+  of its 1M window.
