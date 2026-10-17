@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useLayoutEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
 
 interface ModalProps {
@@ -12,7 +12,10 @@ interface ModalProps {
 export function Modal({ title, onClose, children, footer, className }: ModalProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
 
-  useEffect(() => {
+  // A layout effect, so the dialog is open in the commit that puts it in the document. A passive effect leaves it
+  // closed (and out of the accessibility tree) until a later task, and anything that waits for the title to
+  // appear and then reaches for a button can get there first.
+  useLayoutEffect(() => {
     const dialog = dialogRef.current;
     if (dialog && !dialog.open) {
       dialog.showModal();
