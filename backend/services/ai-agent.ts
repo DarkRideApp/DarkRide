@@ -295,6 +295,21 @@ export function generateTitle(firstMessage: string): string {
   return trimmed.slice(0, TITLE_MAX_LENGTH) + '...';
 }
 
+/** Contexts the model loaded with request_tools earlier in this conversation, in the order it first asked for them. */
+export function contextsLoadedEarlier(messages: AiMessage[]): string[] {
+  const loaded = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type !== 'tool_use' || block.name !== 'request_tools') continue;
+      const asked: unknown = block.input?.contexts;
+      if (!Array.isArray(asked)) continue;
+      for (const context of asked) if (typeof context === 'string' && context) loaded.add(context);
+    }
+  }
+  return [...loaded];
+}
+
 /** Valid page context name: lowercase alphanumeric with hyphens only. */
 const VALID_CONTEXT_RE = /^[a-z0-9-]+$/;
 
@@ -453,10 +468,19 @@ export class AiAgent implements AiAgentInterface {
 
     // 3. Get tool definitions for the page context (filtered by user scopes + unattended mode)
     const activeContexts = new Set<string>([pageContext]);
-    let tools = this.toolRegistry.getToolDefinitionsForUser(pageContext, userScopes, unattended);
+    const pageTools = this.toolRegistry.getToolDefinitionsForUser(pageContext, userScopes, unattended);
 
-    // 4. Build system prompt
-    const systemPrompt = buildSystemPrompt(pageContext, contextId, tools, maxTurns);
+    // 4. Build system prompt from the page's own tools, so it does not change when more contexts are loaded
+    const systemPrompt = buildSystemPrompt(pageContext, contextId, pageTools, maxTurns);
+
+    // A later message starts with the tools the model already loaded. Its first request is then the previous
+    // request plus the new message, which keeps the cached prefix, and the model does not have to ask again.
+    for (const context of contextsLoadedEarlier(messages)) activeContexts.add(context);
+    let tools = pageTools;
+    if (activeContexts.size > 1) {
+      tools = this.toolRegistry.getToolDefinitionsForContextsForUser([...activeContexts], userScopes, unattended);
+      log(`Starting with the tool contexts loaded earlier in this conversation: ${[...activeContexts].join(', ')}`);
+    }
 
     // 5. Tool loop
     let totalUsage = { inputTokens: 0, outputTokens: 0 };

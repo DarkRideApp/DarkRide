@@ -4,6 +4,7 @@ import * as schema from '../db/schema';
 import {
   AiAgent,
   buildSystemPrompt,
+  contextsLoadedEarlier,
   parseTextBasedToolUses,
   containsUnparsedToolCallAttempt,
   getRunUsageFromError,
@@ -175,6 +176,48 @@ describe('containsUnparsedToolCallAttempt', () => {
 
   it('does NOT trigger on empty text', () => {
     expect(containsUnparsedToolCallAttempt('', names)).toBe(false);
+  });
+});
+
+describe('contextsLoadedEarlier', () => {
+  const asks = (...contexts: unknown[]): AiMessage => ({
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'r', name: 'request_tools', input: { contexts } }],
+  });
+
+  it('is empty for a conversation that never called request_tools', () => {
+    const messages: AiMessage[] = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: [{ type: 'text', text: 'hello' }, { type: 'tool_use', id: 't', name: 'list_devices', input: { contexts: ['traffic'] } }] },
+      { role: 'tool_result', toolUseId: 't', content: 'traffic' },
+    ];
+    expect(contextsLoadedEarlier(messages)).toEqual([]);
+  });
+
+  it('lists the contexts in the order they were first asked for, across calls, without repeats', () => {
+    const messages: AiMessage[] = [
+      { role: 'user', content: 'a' },
+      asks('traffic', 'devices'),
+      { role: 'tool_result', toolUseId: 'r', content: 'ok' },
+      { role: 'user', content: 'b' },
+      asks('proxies', 'traffic'),
+    ];
+    expect(contextsLoadedEarlier(messages)).toEqual(['traffic', 'devices', 'proxies']);
+  });
+
+  it('skips anything in a stored message that is not a list of context names', () => {
+    const messages: AiMessage[] = [
+      asks('traffic', 7, null, { a: 1 }, ['x'], ''),
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'r', name: 'request_tools', input: {} }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'r', name: 'request_tools', input: { contexts: 'devices' } }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'r', name: 'request_tools', input: { contexts: null } }] },
+    ];
+    expect(contextsLoadedEarlier(messages)).toEqual(['traffic']);
+  });
+
+  it('copes with a stored conversation whose assistant content is not an array', () => {
+    const messages = [{ role: 'assistant', content: 'plain text' }, asks('traffic')] as unknown as AiMessage[];
+    expect(contextsLoadedEarlier(messages)).toEqual(['traffic']);
   });
 });
 
@@ -2790,6 +2833,96 @@ describe('AiAgent', () => {
       const result = await run(agent, person(5), { conversationId: 4242 });
       expect(result.conversationId).not.toBe(4242);
       expect(all()).toHaveLength(1);
+    });
+  });
+
+  describe('tools loaded earlier in a conversation', () => {
+    const identity: AgentIdentity = {
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: ['core.traffic:read'],
+      onBehalfOfService: 'test',
+    };
+    const registry = () => makeRegistry([
+      { name: 'list_devices', context: ['devices'] },
+      { name: 'dump_traffic', context: ['traffic'], requiredScope: 'core.traffic:read' },
+      { name: 'list_proxies', context: ['proxies'] },
+    ]);
+    const send = (agent: AiAgent, conversationId: number | null, extra: Record<string, unknown> = {}) =>
+      agent.handleMessageWithIdentity(identity, {
+        conversationId,
+        message: 'go',
+        pageContext: 'devices',
+        contextId: '',
+        onToken: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolResult: vi.fn(),
+        mode: 'streaming',
+        ...extra,
+      });
+    const asks = (...contexts: string[]) => async function* (): AsyncIterable<AiStreamEvent> {
+      yield { type: 'tool_use', id: 'r1', name: 'request_tools', input: { contexts } };
+      yield { type: 'usage', inputTokens: 10, outputTokens: 1 };
+    };
+    /** A provider whose Nth request runs the Nth script, and keeps every request's arguments. */
+    const scripted = (...scripts: Array<() => AsyncIterable<AiStreamEvent>>) => {
+      let n = 0;
+      const fn = vi.fn(() => scripts[Math.min(n++, scripts.length - 1)]());
+      return { agent: new AiAgent(db, registry(), makeMockProvider(fn)), fn };
+    };
+    const toolNames = (fn: ReturnType<typeof scripted>['fn'], request: number): string[] =>
+      (fn.mock.calls[request] as unknown as [unknown, unknown, Array<{ name: string }>])[2].map((t) => t.name);
+    const toolsJson = (fn: ReturnType<typeof scripted>['fn'], request: number): string =>
+      JSON.stringify((fn.mock.calls[request] as unknown as [unknown, unknown, unknown])[2]);
+    const systemPrompt = (fn: ReturnType<typeof scripted>['fn'], request: number): string =>
+      (fn.mock.calls[request] as unknown as [unknown, string])[1];
+
+    it('starts the next message with the tools the model already loaded, in the same order as its last request', async () => {
+      const { agent, fn } = scripted(asks('traffic'), () => textOnlyStream('done'), () => textOnlyStream('again'));
+      const first = await send(agent, null);
+      await send(agent, first.conversationId);
+
+      expect(toolNames(fn, 0)).not.toContain('dump_traffic');   // before the model asked
+      expect(toolNames(fn, 1)).toContain('dump_traffic');       // after request_tools
+      // The next message sends exactly what the last request of the previous one sent, so the cached prefix is reused.
+      expect(toolsJson(fn, 2)).toBe(toolsJson(fn, 1));
+      expect(systemPrompt(fn, 2)).toBe(systemPrompt(fn, 0));
+    });
+
+    it('keeps the order in which contexts were first requested across messages', async () => {
+      const { agent, fn } = scripted(asks('traffic'), () => textOnlyStream('a'), asks('proxies', 'traffic'), () => textOnlyStream('b'), () => textOnlyStream('c'));
+      const first = await send(agent, null);
+      const second = await send(agent, first.conversationId);
+      await send(agent, second.conversationId);
+
+      expect(toolNames(fn, 4)).toEqual(['list_devices', 'dump_traffic', 'list_proxies', 'request_tools']);
+      expect(toolsJson(fn, 4)).toBe(toolsJson(fn, 3));
+    });
+
+    it('does not restore a context whose tools the caller can no longer use', async () => {
+      const { agent, fn } = scripted(asks('traffic'), () => textOnlyStream('done'), () => textOnlyStream('again'));
+      const first = await send(agent, null);
+      await send(agent, first.conversationId, { userScopes: new Set<string>() });
+
+      expect(toolNames(fn, 1)).toContain('dump_traffic');
+      expect(toolNames(fn, 2)).not.toContain('dump_traffic');
+    });
+
+    it('sends only the page tools when no earlier message loaded anything', async () => {
+      const { agent, fn } = scripted(() => textOnlyStream('one'), () => textOnlyStream('two'));
+      const first = await send(agent, null);
+      await send(agent, first.conversationId);
+
+      expect(toolNames(fn, 1)).toEqual(['list_devices', 'request_tools']);
+      expect(toolsJson(fn, 1)).toBe(toolsJson(fn, 0));
+    });
+
+    it('starts a different conversation with the page tools only', async () => {
+      const { agent, fn } = scripted(asks('traffic'), () => textOnlyStream('done'), () => textOnlyStream('fresh'));
+      await send(agent, null);
+      await send(agent, null);
+
+      expect(toolNames(fn, 2)).toEqual(['list_devices', 'request_tools']);
     });
   });
 });

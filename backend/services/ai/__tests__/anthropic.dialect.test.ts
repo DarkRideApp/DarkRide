@@ -47,6 +47,31 @@ describe('buildChat', () => {
     expect(body.stop_sequences).toEqual(['\n\n\n']);
     expect(body.max_tokens).toBe(256);
   });
+  describe('prefix caching', () => {
+    const build = (r: object) => anthropicDialect.buildChat(makeCtx('anthropic'), { ...req, ...r }, { stream: true }).body as any;
+
+    it('marks only the system prompt when cache is "prefix", and leaves the rest of the request unmarked', () => {
+      const body = build({ cache: 'prefix' });
+      expect(body.system).toEqual([{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral' } }]);
+      expect(body.cache_control).toBeUndefined();
+      expect(body.messages).toEqual([{ role: 'user', content: 'hi' }]);
+    });
+
+    it('marks nothing when cache is "prefix" and there is no system prompt', () => {
+      const body = build({ cache: 'prefix', systemPrompt: '' });
+      expect(body.system).toBeUndefined();
+      expect(body.cache_control).toBeUndefined();
+    });
+
+    it('keeps the system prompt a plain string when the whole request is cached or nothing is', () => {
+      expect(build({}).system).toBe('sys');
+      expect(build({ cache: true }).system).toBe('sys');
+      expect(build({ cache: false }).system).toBe('sys');
+      expect(build({}).cache_control).toEqual({ type: 'ephemeral' });
+      expect(build({ cache: true }).cache_control).toEqual({ type: 'ephemeral' });
+      expect(build({ cache: false }).cache_control).toBeUndefined();
+    });
+  });
   it('sends output_config.effort only for 5.x models', () => {
     const r = { ...req, effort: 'low' as const };
     expect((anthropicDialect.buildChat(makeCtx('anthropic', { model: 'claude-haiku-5-5' }), r, { stream: true }).body as any).output_config).toEqual({ effort: 'low' });

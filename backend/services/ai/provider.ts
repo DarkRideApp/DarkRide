@@ -96,8 +96,9 @@ export class DialectProvider implements AiProvider {
   /**
    * Inline code completion. Fill-in-the-middle when the descriptor declares it and the model matches its
    * pattern; otherwise a chat request with `prefix<CURSOR>suffix` and no tools, drained to text. An output
-   * limit returns the text collected so far. Prompt caching is off (it would pay a write never read), and
-   * Anthropic 5.x models get low effort so thinking cannot eat the small output budget.
+   * limit returns the text collected so far. Prompt caching covers the system prompt only: the code around
+   * the cursor is different on every call, so caching it would pay a write that is never read. Anthropic 5.x
+   * models get low effort so thinking cannot eat the small output budget.
    */
   async complete(req: AiCompleteRequest): Promise<string> {
     const ctx = this.ctx();
@@ -114,7 +115,7 @@ export class DialectProvider implements AiProvider {
       for await (const e of this.stream(ctx, {
         messages: [{ role: 'user', content: `${req.prefix}<CURSOR>${req.suffix}` }], systemPrompt: req.systemPrompt ?? '', tools: [],
         signal: req.signal, maxOutputTokens: req.maxOutputTokens, stopSequences: req.stopSequences,
-        temperature: req.temperature, effort: 'low', cache: false,
+        temperature: req.temperature, effort: 'low', cache: 'prefix',
       })) {
         if (e.type === 'text') text += e.text;
         else if (e.type === 'refusal') throw new ModelRefusedError(e.message, { provider: this.descriptor.id });

@@ -141,16 +141,21 @@ export const anthropicDialect: Dialect = {
 
   buildChat(ctx: DialectContext, req: AiRequest, opts: { stream: boolean }) {
     const d = ctx.descriptor;
+    const cache = req.cache ?? true;
     const body: any = {
       model: ctx.model,
       max_tokens: req.maxOutputTokens ?? d.defaultMaxOutputTokens ?? 16000,
       messages: formatMessages(req.messages),
       stream: opts.stream,
     };
-    if (req.systemPrompt) body.system = req.systemPrompt;
+    if (req.systemPrompt) {
+      body.system = cache === 'prefix'
+        ? [{ type: 'text', text: req.systemPrompt, cache_control: { type: 'ephemeral' } }]
+        : req.systemPrompt;
+    }
     if (req.tools.length > 0) body.tools = formatTools(req.tools);
     if (req.stopSequences?.length) body.stop_sequences = req.stopSequences;
-    if (req.cache !== false) body.cache_control = { type: 'ephemeral' };
+    if (cache === true) body.cache_control = { type: 'ephemeral' };
     if (req.effort === 'low' && SUPPORTS_EFFORT.test(ctx.model)) body.output_config = { effort: 'low' };
     // Deliberately absent: temperature, top_p, top_k, thinking, tool_choice. Current models
     // reject non-default sampling and forced tool choice; omitting thinking keeps each model's default.
