@@ -421,6 +421,16 @@ A request with no identity gets `401`, and one without the scope gets `403` befo
 
 Plugins can register their own REST endpoints using `ctx.api()` in their `start()` hook. Endpoints added this way are available over both HTTP and the WebSocket-REST transport (the `restapi` action), exactly like core endpoints. For full details see [docs/plugins/backend.md — API Endpoints](plugins/backend.md#api-endpoints).
 
+### Reading routes over MCP (`darkride_api_get`)
+
+MCP clients get one read-only tool, `darkride_api_get`, for GET requests against a short list of REST routes. It takes a `path` and an optional `query` object and returns `{ status, body }`. There is no way to set a method, body or header.
+
+- **Allow-list.** Reachable: everything under `/disney-menus`, and exactly `/v1/system/status`, `/v1/plugins/list` and `/v1/plugins/registry` (`API_GET_ALLOWED_ROUTES` in `backend/services/api-get-tool.ts`). The request path and the registered route that would answer it must both be on the list, so a `:param` route that happens to match an allowed path is refused. A route is added only after every GET handler it can reach has been read for sensitive output. A path off the list answers `{ status: 403 }`; an allowed path with no GET route answers `{ status: 404 }`.
+- **Secret-looking words.** A path containing a word such as `credential`, `secret`, `token`, `password`, `key`, `auth`, `cert`, `jwt`, `cookie` or `session` (matched inside a segment, any case; `key`, `keys`, `pem` and `id_rsa` only as whole words, so `monkey` is not refused) is refused even under an allowed entry. This is a backstop and errs towards refusing; the allow-list is the control.
+- **Your scopes apply.** Every scope in the route's `requires` must be held by the MCP user. The tool needs an authenticated MCP caller. It does not run for automations, for `POST /v1/tools/{name}` or for the in-app agent's own tool loop; the Claude CLI provider reaches it through MCP with the user's own token and scopes.
+- **Path rules.** At most 512 characters; must start with `/`; no scheme, host, `?`, `#`, backslash, empty segment, or dot segment (raw, percent-encoded or double-encoded). A bad path is a tool error (`Invalid path: ...`), not a 403. Pass query parameters in `query`; values must be strings, numbers or booleans.
+- **Limits.** A body over 60,000 characters (UTF-16 code units of the JSON text) is cut and the result carries `truncated: true` and `totalChars`. Binary bodies are replaced by a size note. A handler that does not answer within 15 s returns 504; the handler is not cancelled and keeps running. Routes that stream or send files are unsupported and return 500.
+
 ## WebSocket
 
 Connect to `ws://localhost:3000/ws`. Messages use JSON with an `action` field.
