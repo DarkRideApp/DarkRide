@@ -164,7 +164,14 @@ export function mountMcpSseServer(app: Express, registry: AiToolRegistry, db: Ap
     transport.onerror = (err) => error(`MCP transport error: ${err.message}`);
 
     try {
-      const server = createMcpServer(userScopes, authUser);
+      // Tools get identity and scopes only. authUser also carries the session
+      // id, CSRF token and credential ids, which no tool needs.
+      const server = createMcpServer(userScopes, {
+        userId: authUser.userId,
+        username: authUser.username,
+        via: authUser.via,
+        effectiveScopes: new Set(authUser.effectiveScopes),
+      });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
       log(`MCP request handled (user: ${authUser?.username ?? 'no-auth'}) ${describeMcpRequest(req.body)}`);

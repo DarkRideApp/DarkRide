@@ -101,3 +101,39 @@ describe('darkride_api_get over MCP', () => {
     expect(res.status).toBe(401);
   });
 });
+
+describe('the caller handed to tools over MCP', () => {
+  it('carries identity and scopes only, never session or token material', async () => {
+    let seen: any;
+    const registry = new AiToolRegistry();
+    registry.register({
+      name: 'probe_caller',
+      description: 'test probe',
+      inputSchema: { type: 'object', properties: {} },
+      context: ['api'],
+      async execute(_params: unknown, ctx?: { caller?: unknown }) {
+        seen = ctx?.caller;
+        return { ok: true };
+      },
+    });
+    const scopes = new Set(['core.admin:*']);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).authUser = {
+        userId: 4, username: 'cube', via: 'session', effectiveScopes: scopes,
+        sessionId: 'sess-secret', csrfToken: 'csrf-secret', apiKeyId: 9, oauthTokenId: 3,
+      };
+      next();
+    });
+    mountMcpSseServer(app, registry, fakeDb);
+    await request(app)
+      .post('/mcp')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'probe_caller', arguments: {} } });
+    expect(Object.keys(seen).sort()).toEqual(['effectiveScopes', 'userId', 'username', 'via']);
+    expect(seen).toMatchObject({ userId: 4, username: 'cube', via: 'session' });
+    expect([...seen.effectiveScopes]).toEqual(['core.admin:*']);
+    expect(seen.effectiveScopes).not.toBe(scopes);
+  });
+});

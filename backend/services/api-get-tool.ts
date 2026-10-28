@@ -11,8 +11,9 @@ import type { AiToolRegistry, ToolCaller } from './ai-tools';
  * Why an allow-list and not a deny-list: with 300+ routes and plugin routes
  * we do not control, a deny-list cannot be shown complete, and a route that
  * returns more than its MCP counterpart would slip through it. A
- * route is reachable here only if its path is on API_GET_ALLOWED_PREFIXES,
- * and a prefix goes on that list only after its GET handlers have been read.
+ * route is reachable here only if both the request path and the registered
+ * route that would answer it are on API_GET_ALLOWED_ROUTES, and an entry goes
+ * on that list only after its GET handlers have been read.
  *
  * The call runs in process against the registered endpoint table (the same
  * one the WebSocket REST bridge uses), so it cannot reach anything that was
@@ -30,25 +31,27 @@ export const API_GET_TIMEOUT_MS = 15_000;
 const MAX_PATH_CHARS = 512;
 
 /**
- * Path prefixes reachable through the tool. Each entry matches itself and
- * anything below it on a segment boundary. Add to this list only after
- * reading every GET handler under the prefix for sensitive output, and add a
- * case to api-get-tool.test.ts.
+ * Routes reachable through the tool. An entry matches that exact path, or, with
+ * `below`, that path and anything under it on a segment boundary. Add to this
+ * list only after reading every GET handler it can reach for sensitive output,
+ * and add a case to api-get-tool.test.ts.
  */
-export const API_GET_ALLOWED_PREFIXES: readonly string[] = [
-  '/disney-menus', // plugin: queue status, target list, change log (no credentials)
-  '/v1/system/status',
-  '/v1/plugins/list', // name + version only
-  '/v1/plugins/registry',
+export const API_GET_ALLOWED_ROUTES: readonly { path: string; below?: true }[] = [
+  { path: '/disney-menus', below: true }, // plugin: queue status, target list, change log
+  { path: '/v1/system/status' },
+  { path: '/v1/plugins/list' }, // name + version only
+  { path: '/v1/plugins/registry' },
 ];
 
 /**
- * Second layer under the allow-list: any path segment that looks like it
- * names a secret is refused even under an allowed prefix, so a later route
- * such as `/disney-menus/token` is not exposed by accident.
+ * Second layer under the allow-list: a path containing any word that looks
+ * like it names a secret is refused even under an allowed entry, so a later
+ * route such as `/disney-menus/token` is not exposed by accident. It matches
+ * inside a segment (so `accessToken` and `oauth2` are caught) and errs on the
+ * side of refusing. It is a backstop; the allow-list is the control.
  */
-const SECRET_SEGMENT =
-  /(^|[/_.-])(credentials?|secrets?|tokens?|passwords?|passwd|api-?keys?|oauth|auth|private-?keys?|keystores?|certs?)($|[/_.-])/;
+const SECRET_WORDS =
+  /cred|secret|token|passw|passphrase|pwd|auth|cert|jw[kt]|bearer|cookie|session|swid|keystore|api[-_]?key|private[-_]?key|signing[-_]?key|(^|[/_.-])(keys?|pem|id_rsa)($|[/_.-])/;
 
 export interface ApiGetInput {
   path: unknown;
@@ -119,8 +122,19 @@ export function isApiGetAllowed(path: string): boolean {
   const decoded = '/' + path.slice(1).split('/').map(decodeURIComponent).join('/');
   const lower = decoded.toLowerCase();
 
-  if (SECRET_SEGMENT.test(lower)) return false;
-  return API_GET_ALLOWED_PREFIXES.some((p) => lower === p || lower.startsWith(p + '/'));
+  if (SECRET_WORDS.test(lower)) return false;
+  return API_GET_ALLOWED_ROUTES.some((r) => lower === r.path || (r.below && lower.startsWith(r.path + '/')));
+}
+
+/**
+ * Is this registered route pattern (`/v1/plugins/:name/x`) on the allow-list?
+ * The request path alone is not enough: the dispatcher answers with the first
+ * route whose pattern matches, and a `:param` segment can swallow an allowed
+ * literal such as `list`. Only a pattern whose own literal segments equal the
+ * entry (and, for `below` entries, extend it) is allowed.
+ */
+function isRoutePatternAllowed(pattern: string): boolean {
+  return API_GET_ALLOWED_ROUTES.some((r) => pattern === r.path || (r.below && pattern.startsWith(r.path + '/')));
 }
 
 function normaliseQuery(query: unknown): Record<string, string> {
@@ -236,6 +250,10 @@ function buildRequest(path: string, query: Record<string, string>, params: Recor
   } as unknown as Request;
 }
 
+function allowedSummary(): string {
+  return API_GET_ALLOWED_ROUTES.map((r) => (r.below ? `${r.path}/*` : r.path)).join(', ');
+}
+
 function failure(status: number, error: string): ApiGetResult {
   return { status, body: { success: false, error } };
 }
@@ -263,12 +281,12 @@ export async function runApiGet(
   if (!isApiGetAllowed(path)) {
     return failure(
       403,
-      `${path} is not available through darkride_api_get. Allowed prefixes: ${API_GET_ALLOWED_PREFIXES.join(', ')}`,
+      `${path} is not available through darkride_api_get. Allowed: ${allowedSummary()}`,
     );
   }
 
   const pathname = path;
-  let matched: { handler: (req: Request, res: Response) => void | Promise<void>; requires?: string[]; params: Record<string, string> } | undefined;
+  let matched: { pattern: string; handler: (req: Request, res: Response) => void | Promise<void>; requires?: string[]; params: Record<string, string> } | undefined;
   for (const endpoint of getRegisteredEndpoints()) {
     if (endpoint.method !== 'GET') continue;
     const { regex, paramNames } = pathToRegex(endpoint.path);
@@ -276,10 +294,15 @@ export async function runApiGet(
     if (!m) continue;
     const params: Record<string, string> = {};
     paramNames.forEach((name, i) => { params[name] = decodeURIComponent(m[i + 1]); });
-    matched = { handler: endpoint.handler, requires: endpoint.opts?.requires, params };
+    matched = { pattern: endpoint.path, handler: endpoint.handler, requires: endpoint.opts?.requires, params };
     break;
   }
   if (!matched) return failure(404, `Not found: GET ${path}`);
+  // First match wins, as in Express. If that route is not one we allow, refuse
+  // rather than look further, so the answer never differs from the real one.
+  if (!isRoutePatternAllowed(matched.pattern)) {
+    return failure(403, `${path} is not available through darkride_api_get. Allowed: ${allowedSummary()}`);
+  }
 
   const missing = (matched.requires ?? []).filter((s) => !scopeMatches(caller.effectiveScopes, s));
   if (missing.length > 0) {
@@ -308,8 +331,8 @@ export function registerApiGetTool(registry: AiToolRegistry): void {
     description:
       'Read-only. Issue a GET against an allow-listed DarkRide REST route and return { status, body }. ' +
       'GET only: there is no way to send a method, body or headers. ' +
-      `Allowed path prefixes: ${API_GET_ALLOWED_PREFIXES.join(', ')}. ` +
-      'Paths containing credential, token, secret, password, api-key, oauth, auth or cert segments are always refused. ' +
+      `Allowed paths: ${allowedSummary()}. ` +
+      'A path containing a word like credential, token, secret, password, key, auth, cert, cookie or session is refused. ' +
       `Bodies over ${API_GET_MAX_CHARS} characters are cut and flagged truncated. ` +
       'Your own scopes are enforced against each route.',
     inputSchema: {
@@ -328,6 +351,8 @@ export function registerApiGetTool(registry: AiToolRegistry): void {
       required: ['path'],
     },
     context: ['api'],
+    // MCP only: automations and scheduled runs have no caller to scope by.
+    allowUnattended: false,
     async execute(params: ApiGetInput, ctx) {
       return runApiGet(params, ctx?.caller);
     },

@@ -3,6 +3,7 @@ import { clearEndpoints, registerEndpoint } from '../api/api-service';
 import { AiToolRegistry, type ToolCaller } from './ai-tools';
 import {
   API_GET_MAX_CHARS,
+  API_GET_TIMEOUT_MS,
   isApiGetAllowed,
   registerApiGetTool,
   runApiGet,
@@ -330,5 +331,206 @@ describe('registerApiGetTool', () => {
     await expect(
       setup().executeTool('darkride_api_get', { path: '/disney-menus/status' }),
     ).rejects.toThrow(/authenticated caller/i);
+  });
+});
+
+describe('allow-list follows the route that will actually run', () => {
+  beforeEach(() => {
+    clearEndpoints();
+  });
+
+  it('treats the three core entries as exact paths, and /disney-menus as a prefix', () => {
+    expect(isApiGetAllowed('/v1/plugins/list/scope-status')).toBe(false);
+    expect(isApiGetAllowed('/v1/plugins/registry/uninstall-footprint')).toBe(false);
+    expect(isApiGetAllowed('/v1/system/status/anything')).toBe(false);
+    expect(isApiGetAllowed('/disney-menus/restaurants/32482')).toBe(true);
+  });
+
+  it('refuses a parameterised route that an allowed literal happens to match', async () => {
+    const handler = vi.fn((_req, res) => res.json({ reached: true }));
+    registerEndpoint('GET', '/v1/plugins/:name/scope-status', handler);
+    const result = await runApiGet({ path: '/v1/plugins/list/scope-status' }, caller(['core.admin:*']));
+    expect(result.status).toBe(403);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('refuses when a wildcard route is registered ahead of the allowed literal one', async () => {
+    const wildcard = vi.fn((_req, res) => res.json({ reached: 'wildcard' }));
+    const literal = vi.fn((_req, res) => res.json({ reached: 'literal' }));
+    registerEndpoint('GET', '/v1/:a/:b', wildcard);
+    registerEndpoint('GET', '/v1/system/status', literal);
+    const result = await runApiGet({ path: '/v1/system/status' }, caller());
+    expect(result.status).toBe(403);
+    expect(wildcard).not.toHaveBeenCalled();
+    expect(literal).not.toHaveBeenCalled();
+  });
+
+  it('refuses an encoded path that only a parameterised route would accept', async () => {
+    const handler = vi.fn((_req, res) => res.json({ reached: true }));
+    registerEndpoint('GET', '/v1/:a/:b', handler);
+    const result = await runApiGet({ path: '/v1/system/%73tatus' }, caller());
+    expect(result.status).toBe(403);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('still runs a parameterised route that sits under /disney-menus', async () => {
+    registerEndpoint('GET', '/disney-menus/targets/:id', (req, res) => res.json({ id: req.params.id }));
+    const result = await runApiGet({ path: '/disney-menus/targets/12' }, caller());
+    expect(result).toEqual({ status: 200, body: { id: '12' } });
+  });
+});
+
+describe('secret-looking words', () => {
+  it.each([
+    'credentials', 'credential', 'creds', 'cred',
+    'secret', 'secrets', 'clientSecret', 'secretkey',
+    'token', 'tokens', 'accessToken', 'authToken', 'tokenId',
+    'password', 'passwords', 'passwd', 'pwd', 'passphrase',
+    'api-key', 'api_key', 'apikey', 'apiKeys',
+    'private-key', 'private_key', 'privatekey', 'signing-keys', 'keystore',
+    'key', 'keys', 'id_rsa', 'pem', 'jwks',
+    'oauth', 'oauth2', 'auth', 'authn', 'authorization', 'authenticate',
+    'cert', 'certs', 'certificate', 'jwt', 'bearer',
+    'cookie', 'cookies', 'session', 'sessions', 'swid',
+  ])('refuses %s under an allowed prefix', (word) => {
+    expect(isApiGetAllowed(`/disney-menus/${word}`)).toBe(false);
+    expect(isApiGetAllowed(`/disney-menus/targets/12/${word}`)).toBe(false);
+  });
+
+  it('does not refuse the routes the tool exists for', () => {
+    for (const p of [
+      '/disney-menus/status',
+      '/disney-menus/targets',
+      '/disney-menus/targets/12',
+      '/disney-menus/changes',
+      '/disney-menus/restaurants/32482',
+      '/v1/system/status',
+      '/v1/plugins/list',
+      '/v1/plugins/registry',
+    ]) {
+      expect(isApiGetAllowed(p), p).toBe(true);
+    }
+  });
+});
+
+describe('what the handler is given', () => {
+  beforeEach(() => {
+    clearEndpoints();
+  });
+
+  it('hands over the caller identity and a private copy of the scopes', async () => {
+    let seen: any;
+    registerEndpoint('GET', '/disney-menus/status', (req, res) => {
+      seen = req.authUser;
+      (req.authUser as any).effectiveScopes.add('handler:added');
+      res.json({});
+    });
+    const who = caller(['a:b']);
+    await runApiGet({ path: '/disney-menus/status' }, who);
+    expect(seen).toMatchObject({ userId: 7, username: 'cube', via: 'oauth' });
+    expect([...seen.effectiveScopes].sort()).toEqual(['a:b', 'handler:added']);
+    expect(who.effectiveScopes.has('handler:added')).toBe(false);
+  });
+
+  it('puts the query in req.query, req.url and req.originalUrl', async () => {
+    let seen: any;
+    registerEndpoint('GET', '/disney-menus/targets', (req, res) => {
+      seen = { query: req.query, url: req.url, originalUrl: req.originalUrl, path: req.path };
+      res.json({});
+    });
+    await runApiGet(
+      { path: '/disney-menus/targets', query: { status: 'failing', limit: 200, all: true } },
+      caller(),
+    );
+    expect(seen.query).toEqual({ status: 'failing', limit: '200', all: 'true' });
+    expect(seen.url).toBe('/disney-menus/targets?status=failing&limit=200&all=true');
+    expect(seen.originalUrl).toBe(seen.url);
+    expect(seen.path).toBe('/disney-menus/targets');
+  });
+
+  it.each([
+    ['__proto__', JSON.parse('{"__proto__":"x"}')],
+    ['constructor', { constructor: 'x' }],
+    ['prototype', { prototype: 'x' }],
+    ['an array', ['a']],
+    ['a string', 'a=1'],
+    ['a null value', { a: null }],
+  ])('rejects a query that is %s', async (_label, query) => {
+    registerEndpoint('GET', '/disney-menus/status', (_req, res) => res.json({}));
+    await expect(
+      runApiGet({ path: '/disney-menus/status', query: query as any }, caller()),
+    ).rejects.toThrow(/query/i);
+  });
+
+  it('treats a missing or null query as empty', async () => {
+    let seen: any;
+    registerEndpoint('GET', '/disney-menus/status', (req, res) => { seen = req.query; res.json({}); });
+    await runApiGet({ path: '/disney-menus/status', query: null }, caller());
+    expect(seen).toEqual({});
+  });
+});
+
+describe('scopes with more than one requirement', () => {
+  beforeEach(() => {
+    clearEndpoints();
+  });
+
+  it('needs every scope, not any of them', async () => {
+    const handler = vi.fn((_req, res) => res.json({ ok: true }));
+    registerEndpoint('GET', '/disney-menus/status', handler, { requires: ['a:read', 'b:read'] });
+    const partial = await runApiGet({ path: '/disney-menus/status' }, caller(['a:read']));
+    expect(partial.status).toBe(403);
+    expect((partial.body as any).missing).toEqual(['b:read']);
+    expect(handler).not.toHaveBeenCalled();
+    const full = await runApiGet({ path: '/disney-menus/status' }, caller(['a:read', 'b:read']));
+    expect(full.status).toBe(200);
+  });
+});
+
+describe('limits', () => {
+  beforeEach(() => {
+    clearEndpoints();
+  });
+
+  it('pins the documented numbers', () => {
+    expect(API_GET_MAX_CHARS).toBe(60_000);
+    expect(API_GET_TIMEOUT_MS).toBe(15_000);
+  });
+
+  it('cuts a body one character over the cap, with the marker and full size', async () => {
+    registerEndpoint('GET', '/disney-menus/status', (_req, res) => res.send('z'.repeat(60_001)));
+    const result = await runApiGet({ path: '/disney-menus/status' }, caller());
+    expect(result.truncated).toBe(true);
+    expect(result.totalChars).toBe(60_001);
+    expect(result.body).toBe(
+      `${'z'.repeat(60_000)}\n[truncated: showing 60000 of 60001 characters]`,
+    );
+  });
+
+  it('accepts a path of exactly 512 characters and rejects 513', () => {
+    expect(validateApiGetPath('/' + 'a'.repeat(511)).ok).toBe(true);
+    expect(validateApiGetPath('/' + 'a'.repeat(512)).ok).toBe(false);
+  });
+
+  it('keeps the first answer when a handler responds twice', async () => {
+    registerEndpoint('GET', '/disney-menus/status', (_req, res) => {
+      res.status(200).json({ first: true });
+      res.status(500).json({ second: true });
+    });
+    expect(await runApiGet({ path: '/disney-menus/status' }, caller())).toEqual({
+      status: 200,
+      body: { first: true },
+    });
+  });
+});
+
+describe('unattended callers', () => {
+  it('is blocked for unattended runs even when a caller is present', async () => {
+    const registry = new AiToolRegistry();
+    registerApiGetTool(registry);
+    registerEndpoint('GET', '/disney-menus/status', (_req, res) => res.json({}));
+    await expect(
+      registry.executeTool('darkride_api_get', { path: '/disney-menus/status' }, new Set(['core.admin:*']), true, caller(['core.admin:*'])),
+    ).rejects.toThrow();
   });
 });
