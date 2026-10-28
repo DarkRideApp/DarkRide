@@ -364,6 +364,16 @@ Notes:
 
 Plugins can register their own REST endpoints using `ctx.api()` in their `start()` hook. Endpoints added this way are available over both HTTP and the WebSocket-REST transport (the `restapi` action), exactly like core endpoints. For full details see [docs/plugins/backend.md — API Endpoints](plugins/backend.md#api-endpoints).
 
+### Reading routes over MCP (`darkride_api_get`)
+
+MCP clients get one read-only tool, `darkride_api_get`, for GET requests against a short list of REST routes. It takes a `path` and an optional `query` object and returns `{ status, body }`. There is no way to set a method, body or header.
+
+- **Allow-list.** Only paths under `/disney-menus`, `/v1/system/status`, `/v1/plugins/list` and `/v1/plugins/registry` are reachable (`API_GET_ALLOWED_PREFIXES` in `backend/services/api-get-tool.ts`). Anything else answers 403. A prefix is added only after every GET handler under it has been read for sensitive output.
+- **Secret segments.** A path with a `credential`, `secret`, `token`, `password`, `api-key`, `oauth`, `auth`, `private-key`, `keystore` or `cert` segment is refused even under an allowed prefix.
+- **Your scopes apply.** The route's `requires` scopes are checked against the MCP user's scopes. The tool does not run without an authenticated MCP caller (it is unavailable to the in-app agent, automations and `POST /v1/tools/{name}`).
+- **Path rules.** The path must start with `/` and contain no scheme, host, `?`, `#`, backslash, empty segment, or dot segment (raw, percent-encoded or double-encoded). Pass query parameters in `query`.
+- **Limits.** A body over 60,000 characters is cut and the result carries `truncated: true` and `totalChars`. Binary bodies are replaced by a size note. A handler that does not answer within 15 s returns 504. Routes that stream or send files are unsupported and return 500.
+
 ## WebSocket
 
 Connect to `ws://localhost:3000/ws`. Messages use JSON with an `action` field.

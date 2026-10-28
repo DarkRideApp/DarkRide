@@ -95,6 +95,11 @@ describe('registerAllTools', () => {
     expect(names).toContain('list_proxies');
   });
 
+  it('registers the read-only REST tool in the api context', () => {
+    const names = registry.getToolsForContext('api').map((t) => t.name);
+    expect(names).toEqual(['darkride_api_get']);
+  });
+
   it('registers tools for dashboard context', () => {
     const tools = registry.getToolsForContext('dashboard');
     const names = tools.map((t) => t.name);

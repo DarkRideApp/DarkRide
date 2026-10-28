@@ -15,6 +15,7 @@ import type { AutomationRunner } from './automation-runner';
 import type { TriggerType } from '../../shared/types/api';
 import type { AutomationScheduler } from './automation-scheduler';
 import { validateScheduleConfig } from './schedule-validator';
+import { registerApiGetTool } from './api-get-tool';
 import type { AutomationCompiler } from './automation-compiler';
 import type { CaptureSessionManager } from './capture-session-manager';
 import type { PluginStateManager } from './plugin-state-manager';
@@ -164,6 +165,10 @@ export function registerAllTools(
     apkTracker,
     sourceRegistry,
   } = services;
+
+  // ── Generic read-only REST access (allow-listed, MCP only) ──────
+  registerApiGetTool(registry);
+
   // ── Session Timeline tools ──────────────────────────────────────
 
   registry.register({

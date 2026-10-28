@@ -2,9 +2,26 @@ import type { AiToolDefinition } from '../../shared/types/ai-chat';
 import type { AiToolRegistry as IAiToolRegistry } from '@darkrideapp/plugin-sdk';
 import { scopeMatches } from '../auth/scope-matcher';
 
+/**
+ * Who is calling a tool. Only the MCP layer supplies this today; callers that
+ * do not (the in-app agent, automations, POST /v1/tools/:name) leave it unset,
+ * so a tool that needs an identity must refuse to run without one.
+ */
+export interface ToolCaller {
+  userId: number;
+  username: string;
+  via: string;
+  effectiveScopes: Set<string>;
+}
+
+/** Second argument to `execute`; present only when the caller is known. */
+export interface ToolExecContext {
+  caller: ToolCaller;
+}
+
 /** Tool registration: schema + execute function */
 export interface AiToolRegistration extends AiToolDefinition {
-  execute: (params: any) => Promise<any>;
+  execute: (params: any, ctx?: ToolExecContext) => Promise<any>;
   /** Scope required to use this tool. If unset, the tool is unrestricted. */
   requiredScope?: string;
   /** When true, the agent must get user confirmation before executing this tool. */
@@ -83,9 +100,17 @@ export class AiToolRegistry implements IAiToolRegistry {
    * Execute a registered tool by name.
    * When `userScopes` is provided, the tool's `requiredScope` is checked first.
    * When `unattended` is true, tools with `allowUnattended: false` are blocked.
+   * When `caller` is provided it is passed to the tool as `execute(params, { caller })`;
+   * without it the tool is called with `params` alone, as before.
    * Throws if the tool is unknown, blocked, or the user lacks the required scope.
    */
-  async executeTool(name: string, params: any, userScopes?: Set<string>, unattended?: boolean): Promise<any> {
+  async executeTool(
+    name: string,
+    params: any,
+    userScopes?: Set<string>,
+    unattended?: boolean,
+    caller?: ToolCaller,
+  ): Promise<any> {
     const tool = this.tools.get(name);
     if (!tool) {
       throw new Error(`Unknown tool: ${name}`);
@@ -96,7 +121,7 @@ export class AiToolRegistry implements IAiToolRegistry {
     if (unattended && tool.allowUnattended === false) {
       throw new Error(`Tool ${name} is not available in unattended mode`);
     }
-    return tool.execute(params);
+    return caller ? tool.execute(params, { caller }) : tool.execute(params);
   }
 
   /** Return every unique context string across all registered tools. */

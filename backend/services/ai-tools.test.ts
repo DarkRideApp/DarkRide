@@ -322,6 +322,28 @@ describe('AiToolRegistry', () => {
     expect(result).toBe('admin-ok');
   });
 
+  // ── Caller identity ───────────────────────────────────────────────
+
+  it('executeTool hands the caller to the tool as its second argument', async () => {
+    const registry = new AiToolRegistry();
+    const fn = vi.fn().mockResolvedValue('ok');
+    registry.register(makeTool({ name: 'who', execute: fn }));
+    const caller = { userId: 3, username: 'cube', via: 'apikey', effectiveScopes: new Set(['core.admin:*']) };
+
+    await registry.executeTool('who', { x: 1 }, caller.effectiveScopes, undefined, caller);
+    expect(fn).toHaveBeenCalledWith({ x: 1 }, { caller });
+  });
+
+  it('executeTool still checks requiredScope when a caller is supplied', async () => {
+    const registry = new AiToolRegistry();
+    registry.register(makeTool({ name: 'scoped', requiredScope: 'devices:write' }));
+    const caller = { userId: 3, username: 'cube', via: 'apikey', effectiveScopes: new Set(['devices:read']) };
+
+    await expect(
+      registry.executeTool('scoped', {}, caller.effectiveScopes, undefined, caller),
+    ).rejects.toThrow('Insufficient scope');
+  });
+
   // ── Unattended mode ───────────────────────────────────────────────
 
   it('executeTool throws when unattended=true on tool with allowUnattended: false', async () => {

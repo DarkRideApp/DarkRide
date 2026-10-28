@@ -22,9 +22,9 @@ const registeredEndpoints: EndpointRegistration[] = [];
 
 /**
  * Convert an Express-style path pattern (/v1/proxy/view/:id) to a regex
- * for matching incoming WebSocket restapi requests.
+ * for matching incoming WebSocket restapi requests and in-process GETs.
  */
-function pathToRegex(path: string): { regex: RegExp; paramNames: string[] } {
+export function pathToRegex(path: string): { regex: RegExp; paramNames: string[] } {
   const paramNames: string[] = [];
   const regexStr = path.replace(/:([a-zA-Z_][a-zA-Z0-9_]*)/g, (_match, paramName) => {
     paramNames.push(paramName);

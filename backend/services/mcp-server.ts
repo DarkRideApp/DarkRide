@@ -6,7 +6,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { eq } from 'drizzle-orm';
 import type { Express, Request, Response } from 'express';
-import type { AiToolRegistry } from './ai-tools';
+import type { AiToolRegistry, ToolCaller } from './ai-tools';
 import type { AppDatabase } from '../db/index';
 import { settings } from '../db/schema';
 import { createLoggers } from '../logs';
@@ -100,8 +100,9 @@ export function mountMcpSseServer(app: Express, registry: AiToolRegistry, db: Ap
   log(`MCP: ${registry.listContexts().length} contexts registered`);
 
   // Factory: each request gets its own Server instance (stateless mode)
-  // Uses the authenticated user's scopes to filter tools
-  function createMcpServer(userScopes?: Set<string>): Server {
+  // Uses the authenticated user's scopes to filter tools; `caller` is handed to
+  // tools that need to know who is asking (e.g. darkride_api_get).
+  function createMcpServer(userScopes?: Set<string>, caller?: ToolCaller): Server {
     const server = new Server(
       { name: 'darkride', version: '1.0.0' },
       { capabilities: { tools: {} } },
@@ -125,7 +126,7 @@ export function mountMcpSseServer(app: Express, registry: AiToolRegistry, db: Ap
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       try {
-        const result = await registry.executeTool(name, args ?? {}, userScopes);
+        const result = await registry.executeTool(name, args ?? {}, userScopes, undefined, caller);
         return { content: toMcpToolContent(result) };
       } catch (err: any) {
         return {
@@ -163,7 +164,7 @@ export function mountMcpSseServer(app: Express, registry: AiToolRegistry, db: Ap
     transport.onerror = (err) => error(`MCP transport error: ${err.message}`);
 
     try {
-      const server = createMcpServer(userScopes);
+      const server = createMcpServer(userScopes, authUser);
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
       log(`MCP request handled (user: ${authUser?.username ?? 'no-auth'}) ${describeMcpRequest(req.body)}`);
