@@ -7,11 +7,21 @@ import { clearEndpoints, getApiRouter } from './api-service';
 import { registerAiChatApiEndpoints } from './ai-chat';
 import { createTestDb } from '../test-utils/create-test-db';
 
-function createApp(db: BetterSQLite3Database<typeof schema>) {
+interface TestUser { userId: number; scopes: string[] }
+const CHATTER: TestUser = { userId: 1, scopes: ['core.ai:chat'] };
+
+/** `user` is the caller's identity; null sends the request with none, as if auth had not run. */
+function createApp(db: BetterSQLite3Database<typeof schema>, user: TestUser | null = CHATTER) {
   clearEndpoints();
   registerAiChatApiEndpoints(db as any);
   const app = express();
   app.use(express.json());
+  app.use((req, _res, next) => {
+    if (user) {
+      req.authUser = { userId: user.userId, username: `u${user.userId}`, via: 'session', effectiveScopes: new Set(user.scopes) };
+    }
+    next();
+  });
   app.use(getApiRouter());
   return app;
 }
@@ -22,20 +32,24 @@ function insertConversation(
   contextId: string,
   messages: any[],
   updatedAt: number,
-  opts?: { inputTokens?: number; outputTokens?: number },
-) {
-  db.insert(schema.aiConversations)
+  opts?: { inputTokens?: number; outputTokens?: number; userId?: number | null; title?: string; originPath?: string | null; unfinished?: boolean; automated?: boolean },
+): number {
+  return db.insert(schema.aiConversations)
     .values({
       pageContext,
       contextId,
-      title: 'Test',
+      title: opts?.title ?? 'Test',
+      userId: opts?.userId ?? null,
+      originPath: opts?.originPath ?? null,
+      unfinished: opts?.unfinished ?? false,
+      automated: opts?.automated ?? false,
       messages: JSON.stringify(messages),
       inputTokens: opts?.inputTokens ?? null,
       outputTokens: opts?.outputTokens ?? null,
       createdAt: new Date(updatedAt),
       updatedAt: new Date(updatedAt),
     })
-    .run();
+    .run().lastInsertRowid as number;
 }
 
 describe('GET /v1/ai/conversations/latest', () => {
@@ -212,5 +226,312 @@ describe('GET /v1/ai/usage', () => {
     expect(res.body.data.totalInputTokens).toBe(5000);
     expect(res.body.data.totalOutputTokens).toBe(1000);
     expect(res.body.data.conversationCount).toBe(2);
+  });
+});
+
+describe('GET /v1/ai/conversations/latest, owner and history fields', () => {
+  let db: BetterSQLite3Database<typeof schema>;
+
+  beforeEach(() => { db = createTestDb(); });
+
+  it('returns originPath and unfinished', async () => {
+    insertConversation(db, 'apk-analysis', '12', [], 1000, { originPath: '/ui/analysis/12', unfinished: true });
+    const res = await request(createApp(db)).get('/v1/ai/conversations/latest?pageContext=apk-analysis&contextId=12');
+    expect(res.body.data.originPath).toBe('/ui/analysis/12');
+    expect(res.body.data.unfinished).toBe(true);
+  });
+
+  it('does not return another user\'s conversation, even when it is the most recent', async () => {
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'mine' }], 1000, { userId: 1 });
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'theirs' }], 2000, { userId: 2 });
+    const res = await request(createApp(db)).get('/v1/ai/conversations/latest?pageContext=devices&contextId=');
+    expect(res.body.data.messages).toEqual([{ role: 'user', content: 'mine' }]);
+  });
+
+  it('returns a conversation saved before ownership existed', async () => {
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'old' }], 1000, { userId: null });
+    const res = await request(createApp(db, { userId: 7, scopes: ['core.ai:chat'] })).get('/v1/ai/conversations/latest?pageContext=devices&contextId=');
+    expect(res.body.data.messages).toEqual([{ role: 'user', content: 'old' }]);
+  });
+
+  it('answers 401 when the request has no identity', async () => {
+    const res = await request(createApp(db, null)).get('/v1/ai/conversations/latest?pageContext=devices&contextId=');
+    expect(res.status).toBe(401);
+  });
+
+  it('answers 403 without the chat scope and returns no messages, including for unowned conversations', async () => {
+    insertConversation(db, 'apk-analysis', '12', [{ role: 'user', content: 'unowned run' }], 1000, { userId: null, automated: true });
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'mine' }], 1000, { userId: 1 });
+    for (const [pageContext, contextId] of [['apk-analysis', '12'], ['devices', '']]) {
+      const res = await request(createApp(db, { userId: 1, scopes: ['core.apk:read'] }))
+        .get(`/v1/ai/conversations/latest?pageContext=${pageContext}&contextId=${contextId}`);
+      expect(res.status).toBe(403);
+      expect(JSON.stringify(res.body)).not.toContain('unowned run');
+      expect(JSON.stringify(res.body)).not.toContain('mine');
+    }
+  });
+});
+
+describe('GET /v1/ai/usage, who can read what', () => {
+  let db: BetterSQLite3Database<typeof schema>;
+  const NO_CHAT: TestUser = { userId: 1, scopes: ['core.apk:read'] };
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertConversation(db, 'devices', '', [], 1000, { userId: 1, title: 'Mine', inputTokens: 100, outputTokens: 10 });
+    insertConversation(db, 'devices', '', [], 2000, { userId: 2, title: 'Private plan for user two', inputTokens: 400, outputTokens: 40 });
+    insertConversation(db, 'apk-analysis', '5', [], 3000, { userId: null, title: 'Unowned run', inputTokens: 5, outputTokens: 1, automated: true });
+  });
+
+  it('answers 403 without the chat scope and 401 without an identity, returning no titles or totals', async () => {
+    const forbidden = await request(createApp(db, NO_CHAT)).get('/v1/ai/usage');
+    expect(forbidden.status).toBe(403);
+    expect(JSON.stringify(forbidden.body)).not.toContain('Private plan');
+    const anonymous = await request(createApp(db, null)).get('/v1/ai/usage');
+    expect(anonymous.status).toBe(401);
+    expect(JSON.stringify(anonymous.body)).not.toContain('Private plan');
+  });
+
+  it('counts only the caller\'s conversations and unowned ones, never another user\'s', async () => {
+    const res = await request(createApp(db, { userId: 1, scopes: ['core.ai:chat'] })).get('/v1/ai/usage');
+    expect(res.status).toBe(200);
+    expect(res.body.data.totalInputTokens).toBe(105);
+    expect(res.body.data.totalOutputTokens).toBe(11);
+    expect(res.body.data.conversationCount).toBe(2);
+    const titles = res.body.data.conversations.map((c: { title: string }) => c.title).sort();
+    expect(titles).toEqual(['Mine', 'Unowned run']);
+    expect(res.body.data.byContext.find((c: { pageContext: string }) => c.pageContext === 'devices').count).toBe(1);
+  });
+
+  it('shows the other user their own totals and not the first user\'s', async () => {
+    const res = await request(createApp(db, { userId: 2, scopes: ['core.ai:chat'] })).get('/v1/ai/usage');
+    expect(res.body.data.totalInputTokens).toBe(405);
+    const titles = res.body.data.conversations.map((c: { title: string }) => c.title);
+    expect(titles).not.toContain('Mine');
+  });
+
+  it('keeps the other user out of a filtered query too', async () => {
+    const res = await request(createApp(db, { userId: 1, scopes: ['core.ai:chat'] })).get('/v1/ai/usage?pageContext=devices');
+    expect(res.body.data.conversationCount).toBe(1);
+    expect(res.body.data.conversations.map((c: { title: string }) => c.title)).toEqual(['Mine']);
+  });
+});
+
+describe('GET /v1/ai/conversations (history list)', () => {
+  let db: BetterSQLite3Database<typeof schema>;
+
+  beforeEach(() => { db = createTestDb(); });
+  const list = (qs = '', user: TestUser | null = CHATTER) => request(createApp(db, user)).get(`/v1/ai/conversations${qs}`);
+  const titles = (res: request.Response) => res.body.data.conversations.map((c: any) => c.title);
+
+  it('lists summaries newest activity first, without messages', async () => {
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'a' }], 1000, { userId: 1, title: 'older', originPath: '/ui/devices' });
+    insertConversation(db, 'automations', '5', [{ role: 'user', content: 'b' }], 3000, { userId: 1, title: 'newest', unfinished: true });
+    insertConversation(db, 'proxies', '', [{ role: 'user', content: 'c' }], 2000, { userId: 1, title: 'middle' });
+
+    const res = await list();
+    expect(res.status).toBe(200);
+    expect(res.body.data.hasMore).toBe(false);
+    expect(titles(res)).toEqual(['newest', 'middle', 'older']);
+    expect(res.body.data.conversations[0]).toEqual({
+      id: expect.any(Number), title: 'newest', pageContext: 'automations', contextId: '5',
+      originPath: null, unfinished: true, createdAt: 3000, updatedAt: 3000,
+    });
+    expect(res.body.data.conversations[2].originPath).toBe('/ui/devices');
+  });
+
+  it('lists only the caller\'s conversations plus ones saved before ownership existed', async () => {
+    insertConversation(db, 'devices', '', [], 1000, { userId: 1, title: 'mine' });
+    insertConversation(db, 'devices', '', [], 2000, { userId: 2, title: 'theirs' });
+    insertConversation(db, 'devices', '', [], 3000, { userId: null, title: 'legacy' });
+    expect(titles(await list())).toEqual(['legacy', 'mine']);
+  });
+
+  it('leaves out conversations started by automated runs', async () => {
+    insertConversation(db, 'apk-diff', '3', [], 2000, { title: 'diff run', automated: true });
+    insertConversation(db, 'devices', '', [], 1000, { userId: 1, title: 'chat' });
+    expect(titles(await list())).toEqual(['chat']);
+  });
+
+  it('pages with limit and offset and reports hasMore', async () => {
+    for (let i = 1; i <= 5; i++) insertConversation(db, 'devices', '', [], i * 1000, { userId: 1, title: `c${i}` });
+    const p1 = await list('?limit=2&offset=0');
+    expect(titles(p1)).toEqual(['c5', 'c4']);
+    expect(p1.body.data.hasMore).toBe(true);
+    const p3 = await list('?limit=2&offset=4');
+    expect(titles(p3)).toEqual(['c1']);
+    expect(p3.body.data.hasMore).toBe(false);
+  });
+
+  it('defaults to 30, caps at 100, and ignores junk limit and offset', async () => {
+    for (let i = 0; i < 105; i++) insertConversation(db, 'devices', '', [], i + 1, { userId: 1 });
+    expect((await list()).body.data.conversations).toHaveLength(30);
+    expect((await list('?limit=1000')).body.data.conversations).toHaveLength(100);
+    expect((await list('?limit=abc&offset=-5')).body.data.conversations).toHaveLength(30);
+    expect((await list('?limit=0')).body.data.conversations).toHaveLength(30);
+  });
+
+  it('searches the title and the message text, ignoring case', async () => {
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'nothing here' }], 1000, { userId: 1, title: 'Pixel Frida hook' });
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'why does the Cronet bypass fail' }], 2000, { userId: 1, title: 'other' });
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'unrelated' }], 3000, { userId: 1, title: 'third' });
+    expect(titles(await list('?q=frida'))).toEqual(['Pixel Frida hook']);
+    expect(titles(await list('?q=CRONET'))).toEqual(['other']);
+    expect(titles(await list('?q=zzz'))).toEqual([]);
+  });
+
+  it('treats % and _ in the search text as plain characters', async () => {
+    insertConversation(db, 'devices', '', [], 1000, { userId: 1, title: '100% done' });
+    insertConversation(db, 'devices', '', [], 2000, { userId: 1, title: 'plain' });
+    expect(titles(await list('?q=%25'))).toEqual(['100% done']);
+    expect(titles(await list('?q=_'))).toEqual([]);
+  });
+
+  it('never searches another user\'s messages', async () => {
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'secret-token' }], 1000, { userId: 2, title: 'theirs' });
+    expect(titles(await list('?q=secret-token'))).toEqual([]);
+  });
+
+  it('narrows to one page context and context id', async () => {
+    insertConversation(db, 'apk-analysis', '1', [], 1000, { userId: 1, title: 'a1' });
+    insertConversation(db, 'apk-analysis', '2', [], 2000, { userId: 1, title: 'a2' });
+    insertConversation(db, 'devices', '', [], 3000, { userId: 1, title: 'd' });
+    expect(titles(await list('?pageContext=apk-analysis'))).toEqual(['a2', 'a1']);
+    expect(titles(await list('?pageContext=apk-analysis&contextId=1'))).toEqual(['a1']);
+    expect(titles(await list('?pageContext=devices&contextId='))).toEqual(['d']);
+  });
+
+  it('answers 403 without the chat scope and 401 without an identity', async () => {
+    insertConversation(db, 'devices', '', [], 1000, { userId: 1 });
+    expect((await list('', { userId: 1, scopes: ['core.apk:read'] })).status).toBe(403);
+    expect((await list('', null)).status).toBe(401);
+  });
+});
+
+describe('GET /v1/ai/conversations/:id', () => {
+  let db: BetterSQLite3Database<typeof schema>;
+
+  beforeEach(() => { db = createTestDb(); });
+  const get = (id: string | number, user: TestUser | null = CHATTER) => request(createApp(db, user)).get(`/v1/ai/conversations/${id}`);
+
+  it('returns the conversation with its messages', async () => {
+    const msgs = [{ role: 'user', content: 'hello' }];
+    const id = insertConversation(db, 'devices', '', msgs, 1000, { userId: 1, title: 'T', originPath: '/ui/devices', unfinished: true });
+    const res = await get(id);
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ id, title: 'T', pageContext: 'devices', contextId: '', messages: msgs, originPath: '/ui/devices', unfinished: true });
+  });
+
+  it('returns a conversation saved before ownership existed', async () => {
+    const id = insertConversation(db, 'devices', '', [], 1000, { userId: null });
+    expect((await get(id, { userId: 9, scopes: ['core.ai:chat'] })).status).toBe(200);
+  });
+
+  describe('provider data stays on the server', () => {
+    const data = { dialect: 'gemini-generate', model: 'gemini-3-pro-preview', data: { thoughtSignature: 'SIG-SECRET' } };
+    const stored = [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: [
+        { type: 'text', text: 'Reading.', providerData: data },
+        { type: 'tool_use', id: 'fc1', name: 'read_notes', input: { id: 3 }, providerData: data },
+      ] },
+      { role: 'tool_result', toolUseId: 'fc1', content: 'done' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Here.', providerData: data }] },
+    ];
+    const shown = [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: [
+        { type: 'text', text: 'Reading.' },
+        { type: 'tool_use', id: 'fc1', name: 'read_notes', input: { id: 3 } },
+      ] },
+      { role: 'tool_result', toolUseId: 'fc1', content: 'done' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Here.' }] },
+    ];
+
+    it('is left out of a conversation fetched by id, and everything else is returned as stored', async () => {
+      const id = insertConversation(db, 'devices', '', stored, 1000, { userId: 1 });
+      const res = await get(id);
+      expect(res.body.data.messages).toEqual(shown);
+      expect(JSON.stringify(res.body)).not.toContain('SIG-SECRET');
+    });
+
+    it('is left out of the latest conversation for a page too', async () => {
+      insertConversation(db, 'devices', '7', stored, 1000, { userId: 1 });
+      const res = await request(createApp(db)).get('/v1/ai/conversations/latest?pageContext=devices&contextId=7');
+      expect(res.body.data.messages).toEqual(shown);
+      expect(JSON.stringify(res.body)).not.toContain('SIG-SECRET');
+    });
+
+    it('leaves the stored copy alone', async () => {
+      const id = insertConversation(db, 'devices', '', stored, 1000, { userId: 1 });
+      await get(id);
+      expect(JSON.parse(db.select().from(schema.aiConversations).get()!.messages)).toEqual(stored);
+    });
+
+    it('returns messages without any blocks, or with a string body, untouched', async () => {
+      const plain = [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'legacy string body' }, { role: 'assistant', content: [] }];
+      const id = insertConversation(db, 'devices', '', plain, 1000, { userId: 1 });
+      expect((await get(id)).body.data.messages).toEqual(plain);
+    });
+  });
+
+  it('answers 404 for another user\'s conversation and for a missing one', async () => {
+    const id = insertConversation(db, 'devices', '', [], 1000, { userId: 2 });
+    expect((await get(id)).status).toBe(404);
+    expect((await get(9999)).status).toBe(404);
+  });
+
+  it('answers 400 for a non-numeric id and does not shadow /latest', async () => {
+    expect((await get('abc')).status).toBe(400);
+    insertConversation(db, 'devices', '', [{ role: 'user', content: 'x' }], 1000, { userId: 1 });
+    const latest = await request(createApp(db)).get('/v1/ai/conversations/latest?pageContext=devices&contextId=');
+    expect(latest.status).toBe(200);
+    expect(latest.body.data.pageContext).toBe('devices');
+  });
+
+  it('answers 403 without the chat scope and 401 without an identity', async () => {
+    const id = insertConversation(db, 'devices', '', [], 1000, { userId: 1 });
+    expect((await get(id, { userId: 1, scopes: [] })).status).toBe(403);
+    expect((await get(id, null)).status).toBe(401);
+  });
+});
+
+describe('DELETE /v1/ai/conversations/:id', () => {
+  let db: BetterSQLite3Database<typeof schema>;
+
+  beforeEach(() => { db = createTestDb(); });
+  const del = (id: string | number, user: TestUser | null = CHATTER) => request(createApp(db, user)).delete(`/v1/ai/conversations/${id}`);
+  const count = () => db.select().from(schema.aiConversations).all().length;
+
+  it('deletes the caller\'s own conversation', async () => {
+    const id = insertConversation(db, 'devices', '', [], 1000, { userId: 1 });
+    const res = await del(id);
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(count()).toBe(0);
+  });
+
+  it('deletes a conversation saved before ownership existed', async () => {
+    const id = insertConversation(db, 'devices', '', [], 1000, { userId: null });
+    expect((await del(id)).status).toBe(200);
+    expect(count()).toBe(0);
+  });
+
+  it('answers 404 and keeps another user\'s conversation', async () => {
+    const id = insertConversation(db, 'devices', '', [], 1000, { userId: 2 });
+    expect((await del(id)).status).toBe(404);
+    expect(count()).toBe(1);
+  });
+
+  it('answers 404 for a missing id and 400 for a bad one', async () => {
+    expect((await del(9999)).status).toBe(404);
+    expect((await del('abc')).status).toBe(400);
+  });
+
+  it('answers 403 without the chat scope and 401 without an identity, deleting nothing', async () => {
+    const id = insertConversation(db, 'devices', '', [], 1000, { userId: 1 });
+    expect((await del(id, { userId: 1, scopes: [] })).status).toBe(403);
+    expect((await del(id, null)).status).toBe(401);
+    expect(count()).toBe(1);
   });
 });

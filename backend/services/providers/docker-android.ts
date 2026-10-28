@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'fs';
-import { dirname, resolve } from 'path';
+import { existsSync } from 'fs';
+import { resolve } from 'path';
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import type {
@@ -10,7 +10,7 @@ import { type DockerLike, detectDockerDaemon, listDarkrideContainers } from './d
 import { createLoggers } from '../../logs';
 import { getServerIp } from '../wireguard-config';
 import {
-  loadOrCreateCoturnCreds, buildTurncfgScript, ensureCoturn, type CoturnCreds,
+  loadOrCreateCoturnCreds, buildTurnConfig, writeTurncfgScript, ensureCoturn, TURN_CONFIG_ENV, type CoturnCreds,
 } from '../coturn-manager';
 
 const execFile = promisify(execFileCb);
@@ -54,6 +54,12 @@ const LABEL_KEY = 'darkride.emulator';
 // core.devices:read scope); the raw port is reachable only by host-local
 // processes.
 const GRPC_PORT = 8554;
+
+// An instance row has an empty runtime id until its container exists. An empty
+// id makes a `/containers//…` path, which Docker redirects and docker-modem
+// follows to a host named "containers"; that failed lookup is uncaught and
+// ends the process. Methods that take an id check for it before calling Docker.
+const NO_CONTAINER = 'This instance has no container yet (it is still being created, or creating it failed)';
 
 // WebRTC media can't traverse Docker NAT on its own — the emulator's media
 // track reaches `connected` then drops. DarkRide launches a coturn relay
@@ -287,17 +293,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
   // stubs to assert the emulator args deterministically without Docker.
   const coturn = opts.coturn ?? {
     ensure: ensureCoturn,
-    writeTurncfg: (lanIp: string, creds: CoturnCreds, hostPath: string): string | null => {
-      mkdirSync(dirname(hostPath), { recursive: true });
-      writeFileSync(hostPath, buildTurncfgScript(lanIp, creds));
-      // 0700, NOT 0755: this script embeds the long-term TURN credential, so a
-      // world-readable mode would leak the LAN-reachable relay's secret to
-      // every local user. The budtmo emulator container runs as root and reads
-      // it through the bind mount regardless of host ownership, so owner-only
-      // (rwx for the DarkRide user) keeps it functional while host-private.
-      chmodSync(hostPath, 0o700);
-      return hostPath;
-    },
+    writeTurncfg: (_lanIp: string, _creds: CoturnCreds, hostPath: string): string | null => writeTurncfgScript(hostPath),
   };
 
   return {
@@ -382,6 +378,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
       // turncfg value is a mounted script path, not an inline command.
       const emulatorArgs = ['-no-skin', `-grpc ${GRPC_PORT}`];
       const binds: string[] = [];
+      let turnConfigEnv: string | null = null;
       // Set up the TURN relay: launch (or reuse) coturn, and ONLY when it's
       // actually up, generate + mount the turncfg script pointing at it.
       // Mounting -turncfg toward a relay that failed to start is pointless, so
@@ -397,6 +394,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
         if (mountPath) {
           emulatorArgs.push(`-turncfg ${TURN_CFG_CONTAINER_PATH}`);
           binds.push(`${mountPath}:${TURN_CFG_CONTAINER_PATH}:ro`);
+          turnConfigEnv = `${TURN_CONFIG_ENV}=${buildTurnConfig(lanIp, creds)}`;
           log(`docker-android: WebRTC TURN enabled (coturn external-ip ${lanIp}, mounting ${mountPath})`);
         } else {
           log('docker-android: coturn relay unavailable — skipping -turncfg; WebRTC media may not traverse Docker NAT (png fallback still works)');
@@ -442,6 +440,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
             // loopback below. `-turncfg` (when the script is mounted) supplies
             // the WebRTC TURN relay. Built above.
             `EMULATOR_ADDITIONAL_ARGS=${emulatorArgs.join(' ')}`,
+            ...(turnConfigEnv ? [turnConfigEnv] : []),
             // Disable nvidia-container-cli's legacy mode entirely. When the
             // nvidia-container-toolkit is installed in the host environment
             // (e.g. Docker Desktop with GPU support enabled on Windows/WSL),
@@ -512,6 +511,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     },
 
     async startInstance(id: string): Promise<RunningInstance> {
+      if (!id) throw new Error(NO_CONTAINER);
       const container = d.getContainer(id);
       await container.start();
       const info = await container.inspect();
@@ -571,6 +571,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     },
 
     async stopInstance(id: string): Promise<void> {
+      if (!id) return;
       const container = d.getContainer(id);
       try {
         await container.stop({ t: 10 });
@@ -581,6 +582,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     },
 
     async deleteInstance(id: string): Promise<void> {
+      if (!id) return;
       const container = d.getContainer(id);
       const info = await container.inspect();
       if (info?.State?.Running) {
@@ -590,6 +592,7 @@ export function createDockerAndroidProvider(d: DockerLike, opts: DockerAndroidOp
     },
 
     async getGrpcEndpoint(id: string): Promise<{ host: string; port: number; token?: string }> {
+      if (!id) throw new Error(NO_CONTAINER);
       const container = d.getContainer(id);
       const info = await container.inspect();
       if (!info?.State?.Running) {

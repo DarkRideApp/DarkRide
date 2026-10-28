@@ -134,6 +134,7 @@ export function isApiGetAllowed(path: string): boolean {
  * entry (and, for `below` entries, extend it) is allowed.
  */
 function isRoutePatternAllowed(pattern: string): boolean {
+  if (SECRET_WORDS.test(pattern.toLowerCase())) return false;
   return API_GET_ALLOWED_ROUTES.some((r) => pattern === r.path || (r.below && pattern.startsWith(r.path + '/')));
 }
 
@@ -329,7 +330,7 @@ export function registerApiGetTool(registry: AiToolRegistry): void {
   registry.register({
     name: 'darkride_api_get',
     description:
-      'Read-only. Issue a GET against an allow-listed DarkRide REST route and return { status, body }. ' +
+      'MCP only. Read-only. Issue a GET against an allow-listed DarkRide REST route and return { status, body }. ' +
       'GET only: there is no way to send a method, body or headers. ' +
       `Allowed paths: ${allowedSummary()}. ` +
       'A path containing a word like credential, token, secret, password, key, auth, cert, cookie or session is refused. ' +

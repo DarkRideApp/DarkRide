@@ -1,6 +1,6 @@
 // backend/services/ai/dialects/anthropic-messages.ts
 import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
-import { parseSSEStream, safeText } from '../http';
+import { authHeaders, parseSSEStream, safeText } from '../http';
 import { AiProviderError, ModelRefusedError, OutputLimitError, OverloadedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 import { toolInput } from '../tool-input';
@@ -35,7 +35,7 @@ function formatMessages(messages: AiMessage[]): any[] {
 }
 
 function headers(ctx: DialectContext): Record<string, string> {
-  return { 'Content-Type': 'application/json', ...(ctx.apiKey ? { 'x-api-key': ctx.apiKey } : {}), ...(ctx.descriptor.extraHeaders ?? {}) };
+  return { 'Content-Type': 'application/json', ...authHeaders(ctx), ...(ctx.descriptor.extraHeaders ?? {}) };
 }
 
 function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError {
@@ -50,7 +50,6 @@ function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   const shortName = ctx.descriptor.shortName;
-  if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
 
   let toolId = '', toolName = '', toolJson = '';
   let messageStopped = false;
@@ -58,10 +57,10 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
   let refusalCategory: string | undefined;
   let emittedOut = 0;
   // Whether any text or tool call has gone out. A refusal before that is an error the router can fall back on; after it,
-  // the partial answer stays and the message is appended, because a fallback would duplicate what the caller already has.
+  // a refusal event tells the consumer to drop what it received, because a fallback would duplicate output it already has.
   let produced = false;
 
-  for await (const sse of parseSSEStream(res.body, signal)) {
+  for await (const sse of parseSSEStream(res.body!, signal)) {
     if (!sse.data || sse.data === '[DONE]') continue;
     let p: any;
     try { p = JSON.parse(sse.data); } catch { continue; }
@@ -133,7 +132,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     const cat = refusalCategory ? ` (category: ${safeText(refusalCategory, ctx)})` : '';
     const message = `Claude declined this request${cat}.${refusalCategory === 'cyber' ? CYBER_NOTE : ''}`;
     if (!produced) throw new ModelRefusedError(message, { provider: ctx.descriptor.id });
-    yield { type: 'text', text: message };
+    yield { type: 'refusal', message };
   }
 }
 
@@ -142,16 +141,21 @@ export const anthropicDialect: Dialect = {
 
   buildChat(ctx: DialectContext, req: AiRequest, opts: { stream: boolean }) {
     const d = ctx.descriptor;
+    const cache = req.cache ?? true;
     const body: any = {
       model: ctx.model,
       max_tokens: req.maxOutputTokens ?? d.defaultMaxOutputTokens ?? 16000,
       messages: formatMessages(req.messages),
       stream: opts.stream,
     };
-    if (req.systemPrompt) body.system = req.systemPrompt;
+    if (req.systemPrompt) {
+      body.system = cache === 'prefix'
+        ? [{ type: 'text', text: req.systemPrompt, cache_control: { type: 'ephemeral' } }]
+        : req.systemPrompt;
+    }
     if (req.tools.length > 0) body.tools = formatTools(req.tools);
     if (req.stopSequences?.length) body.stop_sequences = req.stopSequences;
-    if (req.cache !== false) body.cache_control = { type: 'ephemeral' };
+    if (cache === true) body.cache_control = { type: 'ephemeral' };
     if (req.effort === 'low' && SUPPORTS_EFFORT.test(ctx.model)) body.output_config = { effort: 'low' };
     // Deliberately absent: temperature, top_p, top_k, thinking, tool_choice. Current models
     // reject non-default sampling and forced tool choice; omitting thinking keeps each model's default.

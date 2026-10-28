@@ -1,7 +1,8 @@
 // backend/services/ai/dialects/openai-chat.ts
-import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
+import type { AiMessage, AiStreamEvent } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
-import { OPENAI_QUOTA_CODES, OVERLOADED_CODES, OVERLOADED_STATUSES, RATE_LIMIT_CODES, parseSSEStream, safeText } from '../http';
+import { functionTools } from '../format';
+import { OPENAI_QUOTA_CODES, OVERLOADED_CODES, OVERLOADED_STATUSES, RATE_LIMIT_CODES, authHeaders, parseSSEStream, safeText } from '../http';
 import { AiProviderError, ModelRefusedError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiCompleteRequest, AiRequest, Dialect, DialectContext } from '../dialect';
 import { isPlainObject, toolInput } from '../tool-input';
@@ -13,9 +14,7 @@ const rejectedStreamOptions = new Set<string>();
 export function __resetOpenAiChatMemo(): void { rejectedStreamOptions.clear(); }
 
 function headers(ctx: DialectContext): Record<string, string> {
-  const h: Record<string, string> = { 'Content-Type': 'application/json', ...(ctx.descriptor.extraHeaders ?? {}) };
-  if (ctx.descriptor.auth.scheme === 'bearer' && ctx.apiKey) h.Authorization = `Bearer ${ctx.apiKey}`;
-  return h;
+  return { 'Content-Type': 'application/json', ...(ctx.descriptor.extraHeaders ?? {}), ...authHeaders(ctx) };
 }
 
 function formatMessages(messages: AiMessage[], systemPrompt: string): any[] {
@@ -38,10 +37,6 @@ function formatMessages(messages: AiMessage[], systemPrompt: string): any[] {
     }
   }
   return out;
-}
-
-function formatTools(tools: AiToolDefinition[]): any[] {
-  return tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.inputSchema } }));
 }
 
 function wantsUsage(ctx: DialectContext): boolean {
@@ -85,7 +80,6 @@ function argsComplete(args: string): boolean {
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   const shortName = ctx.descriptor.shortName;
-  if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
 
   /** Insertion order is the order the calls started, which is the order they are emitted in. */
   const bufs = new Map<number, Buf>();
@@ -126,7 +120,7 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     if (final) { bufs.clear(); keyByIndex.clear(); newest = undefined; }
   }
 
-  for await (const sse of parseSSEStream(res.body, signal)) {
+  for await (const sse of parseSSEStream(res.body!, signal)) {
     // The caller cancelled: events still buffered from the last read are not acted on.
     if (signal?.aborted) return;
     if (sse.data === '[DONE]') { done = true; break; }
@@ -206,7 +200,7 @@ export const openAiChatDialect: Dialect = {
   buildChat(ctx: DialectContext, req: AiRequest, opts: { stream: boolean }) {
     const d = ctx.descriptor;
     const body: any = { model: ctx.model, messages: formatMessages(req.messages, req.systemPrompt), stream: opts.stream };
-    if (req.tools.length > 0) body.tools = formatTools(req.tools);
+    if (req.tools.length > 0) body.tools = functionTools(req.tools);
     if (req.maxOutputTokens) body[d.maxTokensParam ?? 'max_tokens'] = req.maxOutputTokens;
     if (req.stopSequences?.length && d.sendStop !== false) body.stop = req.stopSequences;
     if (req.temperature !== undefined) body.temperature = req.temperature;
@@ -217,7 +211,7 @@ export const openAiChatDialect: Dialect = {
   parseStream,
 
   buildFim(ctx: DialectContext, req: AiCompleteRequest) {
-    const fim = ctx.descriptor.capabilities.fim!;
+    const fim = ctx.descriptor.capabilities!.fim!;
     const body: any = { model: ctx.model, prompt: req.prefix, suffix: req.suffix };
     if (req.maxOutputTokens) body.max_tokens = req.maxOutputTokens;
     if (req.stopSequences?.length && ctx.descriptor.sendStop !== false) body.stop = req.stopSequences;

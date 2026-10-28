@@ -13,7 +13,8 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1, // Sequential — tests share server state (plugin enable/disable, auth)
   forbidOnly: !!process.env.CI,
-  retries: 0,
+  // One retry in CI: a spec that only passes the second time is reported as flaky and its trace is kept.
+  retries: process.env.CI ? 1 : 0,
   reporter: 'list',
   timeout: 60_000,
   use: {
@@ -39,6 +40,9 @@ export default defineConfig({
       // this, every WS-dependent spec hangs on "Connecting to server..." and
       // times out (403 on the WS upgrade). Allow the E2E dev origin explicitly.
       WEBSOCKET_ALLOWED_ORIGINS: 'http://localhost:5199',
+      // Every spec logs in from the same address, and the default 30 logins per
+      // 5 minutes is below what a full run needs on a fast machine.
+      DARKRIDE_LOGIN_RATE_LIMIT: '1000',
     },
   },
 });

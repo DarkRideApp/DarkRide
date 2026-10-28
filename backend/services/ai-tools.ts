@@ -91,9 +91,30 @@ export class AiToolRegistry implements IAiToolRegistry {
     return defs;
   }
 
+  /** Every distinct tool the given scopes may run (all tools when `userScopes` is unset), without `execute`. */
+  listTools(userScopes?: Set<string>): Array<{ name: string; description: string; contexts: string[] }> {
+    const tools: Array<{ name: string; description: string; contexts: string[] }> = [];
+    for (const tool of this.tools.values()) {
+      if (!this.toolPassesFilter(tool, userScopes)) continue;
+      tools.push({ name: tool.name, description: tool.description, contexts: tool.context });
+    }
+    return tools;
+  }
+
   /** Check if a tool requires user confirmation. */
   requiresConfirmation(name: string): boolean {
     return this.tools.get(name)?.requiresConfirmation === true;
+  }
+
+  /** Throw unless `userScopes` covers the tool's required scope (a tool with none always passes). */
+  assertScope(name: string, userScopes: Set<string>): void {
+    const tool = this.tools.get(name);
+    if (!tool) {
+      throw new Error(`Unknown tool: ${name}`);
+    }
+    if (tool.requiredScope && !scopeMatches(userScopes, tool.requiredScope)) {
+      throw new Error(`Insufficient scope: ${tool.requiredScope} required for tool ${name}`);
+    }
   }
 
   /**
@@ -115,9 +136,7 @@ export class AiToolRegistry implements IAiToolRegistry {
     if (!tool) {
       throw new Error(`Unknown tool: ${name}`);
     }
-    if (userScopes && tool.requiredScope && !scopeMatches(userScopes, tool.requiredScope)) {
-      throw new Error(`Insufficient scope: ${tool.requiredScope} required for tool ${name}`);
-    }
+    if (userScopes) this.assertScope(name, userScopes);
     if (unattended && tool.allowUnattended === false) {
       throw new Error(`Tool ${name} is not available in unattended mode`);
     }

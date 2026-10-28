@@ -169,6 +169,12 @@ describe('docker-android provider', () => {
     const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
     expect(addArgs).toContain('-turncfg /opt/turncfg.sh');
     expect(call.HostConfig.Binds).toEqual(['/tmp/turncfg.sh:/opt/turncfg.sh:ro']);
+    // The mounted script holds no secret; the iceServers JSON rides in the env.
+    const turnEnv = (call.Env as string[]).find((e) => e.startsWith('DARKRIDE_TURN_CONFIG='));
+    const config = JSON.parse(turnEnv!.slice('DARKRIDE_TURN_CONFIG='.length));
+    expect(config.iceServers[0].urls[1]).toBe('turn:host.docker.internal:3478?transport=udp');
+    expect(config.iceServers[0].username).toEqual(expect.any(String));
+    expect(config.iceServers[0].credential).toEqual(expect.any(String));
   });
 
   it('skips -turncfg (and Binds) when turncfg generation returns null', async () => {
@@ -184,6 +190,7 @@ describe('docker-android provider', () => {
     const call = (d.createContainer as any).mock.calls[0][0];
     const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
     expect(addArgs).not.toContain('-turncfg');
+    expect((call.Env as string[]).some((e) => e.startsWith('DARKRIDE_TURN_CONFIG='))).toBe(false);
     expect(call.HostConfig.Binds).toBeUndefined();
   });
 
@@ -202,6 +209,7 @@ describe('docker-android provider', () => {
     const call = (d.createContainer as any).mock.calls[0][0];
     const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
     expect(addArgs).not.toContain('-turncfg');
+    expect((call.Env as string[]).some((e) => e.startsWith('DARKRIDE_TURN_CONFIG='))).toBe(false);
     expect(call.HostConfig.Binds).toBeUndefined();
   });
 
@@ -221,6 +229,7 @@ describe('docker-android provider', () => {
     const call = (d.createContainer as any).mock.calls[0][0];
     const addArgs = (call.Env as string[]).find((e) => e.startsWith('EMULATOR_ADDITIONAL_ARGS='));
     expect(addArgs).not.toContain('-turncfg');
+    expect((call.Env as string[]).some((e) => e.startsWith('DARKRIDE_TURN_CONFIG='))).toBe(false);
     expect(call.HostConfig.Binds).toBeUndefined();
   });
 
@@ -336,6 +345,38 @@ describe('docker-android provider', () => {
     });
     const p = makeProvider(d);
     await expect(p.deleteInstance!('container-test-emu')).rejects.toThrow(/running/i);
+  });
+
+  describe('an instance with no container yet (empty runtime id)', () => {
+    // Docker answers a path with an empty id segment by redirecting, and
+    // docker-modem follows the redirect to a bogus host. Never send it.
+    it('stopInstance is a no-op and never asks Docker for a container', async () => {
+      const d = makeDockerMock();
+      const p = makeProvider(d);
+      await expect(p.stopInstance('')).resolves.toBeUndefined();
+      expect(d.getContainer).not.toHaveBeenCalled();
+    });
+
+    it('deleteInstance is a no-op and never asks Docker for a container', async () => {
+      const d = makeDockerMock();
+      const p = makeProvider(d);
+      await expect(p.deleteInstance!('')).resolves.toBeUndefined();
+      expect(d.getContainer).not.toHaveBeenCalled();
+    });
+
+    it('startInstance rejects with a plain message and never asks Docker for a container', async () => {
+      const d = makeDockerMock();
+      const p = makeProvider(d);
+      await expect(p.startInstance('')).rejects.toThrow(/no container/i);
+      expect(d.getContainer).not.toHaveBeenCalled();
+    });
+
+    it('getGrpcEndpoint rejects and never asks Docker for a container', async () => {
+      const d = makeDockerMock();
+      const p = makeProvider(d);
+      await expect(p.getGrpcEndpoint!('')).rejects.toThrow(/no container/i);
+      expect(d.getContainer).not.toHaveBeenCalled();
+    });
   });
 
   it('getNetworkConfig returns emu-http-proxy mode (HTTP forward proxy via adb reverse)', () => {

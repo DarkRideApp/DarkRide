@@ -4,6 +4,7 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { WebSocketContext, ToastProvider } from '@darkrideapp/plugin-sdk/react';
 import type { WebSocketContextValue } from '@darkrideapp/plugin-sdk/react';
 import { AppDetail } from './AppDetail';
+import { DOWNLOAD_PENDING_NOTE } from '../../shared/lib/download-pending';
 
 vi.mock('../utils/upload', () => ({ uploadApk: vi.fn() }));
 import { uploadApk } from '../utils/upload';
@@ -164,6 +165,56 @@ describe('AppDetail', () => {
     // playstore has a stored version + lastCheckedAt → Available; qq never checked.
     expect(screen.getByTestId('source-availability-playstore').textContent).toMatch(/available v11\.4\.0/i);
     expect(screen.getByTestId('source-availability-qq').textContent).toMatch(/not checked/i);
+  });
+
+  // After "Check stores" an auto-analyse source holds a new version whose APK the
+  // next scheduled check will fetch. The backend marks that in `lastError`, which
+  // the page used to draw as a red failure and which hid "Available vX" until the
+  // next check, so a healthy app looked broken.
+  describe('a download that is only pending is not drawn as a failure', () => {
+    const sourcesReply = (playstore: Record<string, unknown>) => ({
+      type: 'restapi', id: '8', status: 200, body: { success: true, data: [
+        { source: 'playstore', label: 'Play Store', enabled: true, lastVersion: '11.5.0', lastError: null, lastCheckedAt: 't', storeUrl: 'https://play.google.com/store/apps/details?id=x', ...playstore },
+        { source: 'qq', label: 'QQ App Store (应用宝)', enabled: false, lastVersion: null, lastError: null, lastCheckedAt: null, storeUrl: 'https://sj.qq.com/appdetail/x' },
+      ] },
+    });
+    const renderWithPlaystore = async (playstore: Record<string, unknown>) => {
+      renderDetail(wsWith({ '/v1/apps/track/1/sources': sourcesReply(playstore) }));
+      await waitFor(() => screen.getByTestId('source-availability-playstore'));
+      return screen.getByTestId('source-availability-playstore');
+    };
+
+    it('keeps "Available vX" visible and shows a neutral pending note, not an error', async () => {
+      const cell = await renderWithPlaystore({ lastError: DOWNLOAD_PENDING_NOTE });
+
+      expect(cell.textContent, 'the pending marker hid the available version').toMatch(/available v11\.5\.0/i);
+      expect(within(cell).getByTestId('source-pending-playstore').textContent).toContain(DOWNLOAD_PENDING_NOTE);
+      expect(within(cell).queryByTestId('source-error-playstore'), 'drawn as a failure').toBeNull();
+    });
+
+    it('does not use the error colour for the pending note', async () => {
+      const cell = await renderWithPlaystore({ lastError: DOWNLOAD_PENDING_NOTE });
+
+      const pending = within(cell).getByTestId('source-pending-playstore');
+      expect(pending.getAttribute('style') ?? '').not.toMatch(/danger/);
+      expect(pending.getAttribute('style') ?? '').toMatch(/text-muted/);
+    });
+
+    it('still draws a real download failure as an error, and hides "Available"', async () => {
+      const cell = await renderWithPlaystore({ lastError: 'apkeep produced no downloadable files (APKPure)' });
+
+      expect(within(cell).getByTestId('source-error-playstore').textContent).toContain('apkeep produced no downloadable files');
+      expect(within(cell).queryByTestId('source-pending-playstore')).toBeNull();
+      expect(cell.textContent).not.toMatch(/available/i);
+    });
+
+    it('a clean source is unchanged: available, no error, no pending note', async () => {
+      const cell = await renderWithPlaystore({});
+
+      expect(cell.textContent).toMatch(/available v11\.5\.0/i);
+      expect(within(cell).queryByTestId('source-error-playstore')).toBeNull();
+      expect(within(cell).queryByTestId('source-pending-playstore')).toBeNull();
+    });
   });
 
   it('Check stores probes availability and flips the badge from "not checked" to "not on this store"', async () => {

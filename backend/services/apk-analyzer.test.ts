@@ -81,6 +81,17 @@ describe('ApkAnalyzerService', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // The worker exits when told to shut down. Without this, stop() waits out its
+    // 3 s kill timeout in every test that calls it.
+    const exitHandlers: Array<(code: number) => void> = [];
+    mockChildProcess.on.mockImplementation((event: string, cb: (code: number) => void) => {
+      if (event === 'exit') exitHandlers.push(cb);
+      return mockChildProcess;
+    });
+    mockStdin.write.mockImplementation((line: string) => {
+      if (String(line).includes('"shutdown"')) queueMicrotask(() => exitHandlers.splice(0).forEach((cb) => cb(0)));
+      return true;
+    });
     db = createTestDb();
     service = new ApkAnalyzerService(db as any);
   });

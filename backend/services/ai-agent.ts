@@ -1,10 +1,10 @@
-import { eq } from 'drizzle-orm';
 import type { AppDatabase } from '../db/index';
-import { aiConversations } from '../db/schema';
+import { appendUserMessage, loadForRun, ownerOf, saveRunEnd, saveRunStart } from './ai-conversation-store';
 import type { AiToolRegistry } from './ai-tools';
 import type { AiStreamingProvider } from './ai/dialect';
 import { ModelRefusedError } from './ai/errors';
 import { createLoggers } from '../logs';
+import { contextWindowFor } from '../../shared/lib/ai-model-context';
 
 const { log, error: logError } = createLoggers('ai-agent');
 import type {
@@ -13,7 +13,9 @@ import type {
   AiToolUseBlock,
   AiTextBlock,
   AiToolDefinition,
+  AiProviderData,
   AiStreamEvent,
+  AiStreamToolUseEvent,
   AiStreamUsageEvent,
 } from '../../shared/types/ai-chat';
 
@@ -39,6 +41,8 @@ export interface HandleMessageParams {
   message: string;
   pageContext: string;
   contextId: string;
+  /** App path a new chat is started from, kept so chat history can link back. Ignored for an existing conversation. */
+  originPath?: string;
   onToken: (text: string) => void;
   onToolStart: (toolUseId: string, toolName: string, input: unknown, toolUseCount: number, turnsRemaining: number) => void;
   onToolResult: (toolUseId: string, toolName: string, output: unknown, durationMs: number) => void;
@@ -138,6 +142,20 @@ function requestUsageRecorder(requests: AgentRequestUsage[]): (event: AiStreamUs
   };
 }
 
+/** A tool_use event as a block of the assistant message, with the provider data it arrived with. */
+const toolUseBlock = (e: AiStreamToolUseEvent): AiToolUseBlock =>
+  ({ type: 'tool_use', id: e.id, name: e.name, input: e.input, ...(e.providerData ? { providerData: e.providerData } : {}) });
+
+/** A refusal event drops the text and tool calls before it and makes its message the turn's text; usage stays, that output was billed. */
+function applyRefusal(events: AiStreamEvent[]): AiStreamEvent[] {
+  let settled: AiStreamEvent[] = [];
+  for (const event of events) {
+    if (event.type === 'refusal') settled = [...settled.filter((e) => e.type === 'usage'), { type: 'text', text: event.message }];
+    else settled.push(event);
+  }
+  return settled;
+}
+
 // ── Constants ────────────────────────────────────────────────────────
 
 export const DEFAULT_MAX_TURNS = 25;
@@ -149,10 +167,17 @@ const TOOL_TIMEOUT_MS = 30_000;
 const STREAM_TURN_TIMEOUT_MS = 120_000;
 const MAX_TOOL_RESULT_LENGTH = 3_000;
 const TITLE_MAX_LENGTH = 50;
-/** Assumed context window size (tokens) for compaction threshold calculation */
-const CONTEXT_WINDOW_TOKENS = 200_000;
-/** Compact the conversation when context usage reaches this fraction */
+/** Compact the conversation when context usage reaches this fraction of the context window */
 const COMPACTION_THRESHOLD = 0.55;
+
+/**
+ * The context window to measure the prompt against: the smallest among the models that served this run, because
+ * the router can send the next request to any of them. A request that did not report its model counts as 200K.
+ */
+function runContextWindow(requests: AgentRequestUsage[]): number {
+  if (requests.length === 0) return contextWindowFor(undefined);
+  return Math.min(...requests.map((r) => contextWindowFor(r.model)));
+}
 
 // ── Interface ────────────────────────────────────────────────────────
 
@@ -276,6 +301,21 @@ export function generateTitle(firstMessage: string): string {
     return trimmed;
   }
   return trimmed.slice(0, TITLE_MAX_LENGTH) + '...';
+}
+
+/** Contexts the model loaded with request_tools earlier in this conversation, in the order it first asked for them. */
+export function contextsLoadedEarlier(messages: AiMessage[]): string[] {
+  const loaded = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type !== 'tool_use' || block.name !== 'request_tools') continue;
+      const asked: unknown = block.input?.contexts;
+      if (!Array.isArray(asked)) continue;
+      for (const context of asked) if (typeof context === 'string' && context) loaded.add(context);
+    }
+  }
+  return [...loaded];
 }
 
 /** Valid page context name: lowercase alphanumeric with hyphens only. */
@@ -416,30 +456,39 @@ export class AiAgent implements AiAgentInterface {
 
     const unattended = mode === 'silent';
 
-    let { conversationId } = params;
+    // 1. Load the conversation this run continues; an unknown or foreign id starts a new one
+    const ownerId = ownerOf(identity, unattended);
+    const existing = loadForRun(this.db, params.conversationId, ownerId);
+    let messages: AiMessage[] = existing ? JSON.parse(existing.messages) : [];
 
-    // 1. Load or create conversation
-    let messages: AiMessage[] = [];
-    if (conversationId !== null) {
-      const row = this.db
-        .select()
-        .from(aiConversations)
-        .where(eq(aiConversations.id, conversationId))
-        .get();
-      if (row) {
-        messages = JSON.parse(row.messages);
-      }
-    }
-
-    // 2. Append user message
-    messages.push({ role: 'user', content: message });
+    // 2. Append the user message and save it before the model is called
+    messages = appendUserMessage(messages, message);
+    const conversationId = saveRunStart(this.db, {
+      conversationId: existing ? existing.id : null,
+      ownerId,
+      automated: unattended,
+      pageContext,
+      contextId,
+      originPath: params.originPath,
+      title: generateTitle(message),
+      messages,
+    });
 
     // 3. Get tool definitions for the page context (filtered by user scopes + unattended mode)
     const activeContexts = new Set<string>([pageContext]);
-    let tools = this.toolRegistry.getToolDefinitionsForUser(pageContext, userScopes, unattended);
+    const pageTools = this.toolRegistry.getToolDefinitionsForUser(pageContext, userScopes, unattended);
 
-    // 4. Build system prompt
-    const systemPrompt = buildSystemPrompt(pageContext, contextId, tools, maxTurns);
+    // 4. Build system prompt from the page's own tools, so it does not change when more contexts are loaded
+    const systemPrompt = buildSystemPrompt(pageContext, contextId, pageTools, maxTurns);
+
+    // A later message starts with the tools the model already loaded. Its first request is then the previous
+    // request plus the new message, which keeps the cached prefix, and the model does not have to ask again.
+    for (const context of contextsLoadedEarlier(messages)) activeContexts.add(context);
+    let tools = pageTools;
+    if (activeContexts.size > 1) {
+      tools = this.toolRegistry.getToolDefinitionsForContextsForUser([...activeContexts], userScopes, unattended);
+      log(`Starting with the tool contexts loaded earlier in this conversation: ${[...activeContexts].join(', ')}`);
+    }
 
     // 5. Tool loop
     let totalUsage = { inputTokens: 0, outputTokens: 0 };
@@ -460,6 +509,7 @@ export class AiAgent implements AiAgentInterface {
         : turnTimeoutSignal;
 
       let textChunks: string[];
+      let textProviderData: AiProviderData | undefined;
       let toolUses: AiToolUseBlock[];
       let turnInputTokens: number;
       runUsage.turns++;
@@ -470,6 +520,7 @@ export class AiAgent implements AiAgentInterface {
           tierConfig, messages, systemPrompt, tools, totalUsage, runUsage.requests, { signal: turnSignal },
         );
         textChunks = tiered.textChunks;
+        textProviderData = tiered.textProviderData;
         toolUses = tiered.toolUses;
         turnInputTokens = tiered.turnInputTokens;
         if (turnSignal.aborted) {
@@ -499,19 +550,23 @@ export class AiAgent implements AiAgentInterface {
 
           switch (event.type) {
             case 'text':
-              textChunks.push(event.text);
-              pendingText.push(event.text);
+              // A provider can send data on a part that has no text; it belongs to the turn's text block all the same.
+              if (event.text) {
+                textChunks.push(event.text);
+                pendingText.push(event.text);
+              }
+              if (event.providerData) textProviderData = event.providerData;
               break;
             case 'tool_use':
-              // Flush buffered text before an API tool call
-              for (const chunk of pendingText) onToken(chunk);
+              toolUses.push(toolUseBlock(event));
+              break;
+            case 'refusal':
+              // Nothing of this turn is shown before the stream ends, so the discarded output never reaches the client.
+              textChunks = [event.message];
+              textProviderData = undefined;
               pendingText.length = 0;
-              toolUses.push({
-                type: 'tool_use',
-                id: event.id,
-                name: event.name,
-                input: event.input,
-              });
+              pendingText.push(event.message);
+              toolUses.length = 0;
               break;
             case 'usage':
               recordUsage(event);
@@ -538,6 +593,7 @@ export class AiAgent implements AiAgentInterface {
             log(`Detected ${textToolUses.length} text-based tool call(s) — parsing instead of emitting as text`);
             toolUses.push(...textToolUses);
             textChunks = []; // Don't store raw tool-call XML in conversation history
+            textProviderData = undefined;
           } else {
             if (containsUnparsedToolCallAttempt(fullPending, validNames)) {
               // No write provider available in the non-tiered path — log so new
@@ -553,15 +609,16 @@ export class AiAgent implements AiAgentInterface {
       }
 
       // Report context usage percentage after each turn
+      const contextWindow = runContextWindow(runUsage.requests);
       if (turnInputTokens > 0 && onContextUsage) {
-        onContextUsage(Math.round((turnInputTokens / CONTEXT_WINDOW_TOKENS) * 100));
+        onContextUsage(Math.round((turnInputTokens / contextWindow) * 100));
       }
 
       // 5c. Append assistant message
       const assistantContent: Array<AiTextBlock | AiToolUseBlock> = [];
       const fullText = textChunks.join('');
       if (fullText) {
-        assistantContent.push({ type: 'text', text: fullText });
+        assistantContent.push({ type: 'text', text: fullText, ...(textProviderData ? { providerData: textProviderData } : {}) });
       }
       for (const tu of toolUses) {
         assistantContent.push(tu);
@@ -663,8 +720,8 @@ export class AiAgent implements AiAgentInterface {
       }
 
       // Compact the conversation if context is near capacity
-      if (turnInputTokens > 0 && turnInputTokens / CONTEXT_WINDOW_TOKENS >= COMPACTION_THRESHOLD) {
-        const percentUsed = Math.round((turnInputTokens / CONTEXT_WINDOW_TOKENS) * 100);
+      if (turnInputTokens > 0 && turnInputTokens / contextWindow >= COMPACTION_THRESHOLD) {
+        const percentUsed = Math.round((turnInputTokens / contextWindow) * 100);
         log(`Context at ${percentUsed}% — compacting conversation for turn ${turn + 1}`);
         messages = await this.compactMessages(messages, systemPrompt, tools, totalUsage, runUsage.requests, tierConfig?.researchProvider);
       }
@@ -675,37 +732,13 @@ export class AiAgent implements AiAgentInterface {
       }
     }
 
-    // 6. Save conversation to DB
-    const title = generateTitle(message);
-    const now = new Date();
-
-    if (conversationId !== null) {
-      this.db
-        .update(aiConversations)
-        .set({
-          messages: JSON.stringify(messages),
-          inputTokens: totalUsage.inputTokens,
-          outputTokens: totalUsage.outputTokens,
-          updatedAt: now,
-        })
-        .where(eq(aiConversations.id, conversationId))
-        .run();
-    } else {
-      const result = this.db
-        .insert(aiConversations)
-        .values({
-          pageContext,
-          contextId,
-          title,
-          messages: JSON.stringify(messages),
-          inputTokens: totalUsage.inputTokens,
-          outputTokens: totalUsage.outputTokens,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .run();
-      conversationId = Number(result.lastInsertRowid);
-    }
+    // 6. Save the conversation
+    saveRunEnd(this.db, conversationId, {
+      messages,
+      inputTokens: totalUsage.inputTokens,
+      outputTokens: totalUsage.outputTokens,
+      unfinished: Boolean(error) || turnLimitReached,
+    });
 
     // 7. Return result
     return {
@@ -727,10 +760,10 @@ export class AiAgent implements AiAgentInterface {
     totalUsage: { inputTokens: number; outputTokens: number },
     requests: AgentRequestUsage[],
     options?: { signal?: AbortSignal },
-  ): Promise<{ textChunks: string[]; toolUses: AiToolUseBlock[]; turnInputTokens: number; parseMissAttempt: boolean }> {
+  ): Promise<{ textChunks: string[]; textProviderData?: AiProviderData; toolUses: AiToolUseBlock[]; turnInputTokens: number; parseMissAttempt: boolean }> {
     // Phase 1: Run cheap research model, buffering all events. Usage is recorded for the call log as it
     // arrives, whichever response is used later: a discarded response was still billed.
-    const buffered: AiStreamEvent[] = [];
+    let buffered: AiStreamEvent[] = [];
     const researchStream = tierConfig.researchProvider.createStreamingRequest(
       messages, systemPrompt, tools, options,
     );
@@ -739,6 +772,7 @@ export class AiAgent implements AiAgentInterface {
       if (event.type === 'usage') recordResearch(event);
       buffered.push(event);
     }
+    buffered = applyRefusal(buffered);
 
     // Check if any tool_use targets a write tool. Mutable so the text-based
     // parser path below can flip it true when it extracts a write-class call
@@ -757,16 +791,18 @@ export class AiAgent implements AiAgentInterface {
     if (!hasWriteTool) {
       // No write tool — replay buffered events
       const textChunks: string[] = [];
+      let textProviderData: AiProviderData | undefined;
       const toolUses: AiToolUseBlock[] = [];
       let turnInputTokens = 0;
 
       for (const event of buffered) {
         switch (event.type) {
           case 'text':
-            textChunks.push(event.text);
+            if (event.text) textChunks.push(event.text);
+            if (event.providerData) textProviderData = event.providerData;
             break;
           case 'tool_use':
-            toolUses.push({ type: 'tool_use', id: event.id, name: event.name, input: event.input });
+            toolUses.push(toolUseBlock(event));
             break;
           case 'usage':
             if (event.inputTokens > 0) turnInputTokens = event.inputTokens;
@@ -802,7 +838,7 @@ export class AiAgent implements AiAgentInterface {
       }
 
       if (!parseMissAttempt && !hasWriteTool) {
-        return { textChunks, toolUses, turnInputTokens, parseMissAttempt: false };
+        return { textChunks, textProviderData, toolUses, turnInputTokens, parseMissAttempt: false };
       }
     }
 
@@ -843,6 +879,7 @@ export class AiAgent implements AiAgentInterface {
         throw writeErr;
       }
     }
+    writeBuffered = applyRefusal(writeBuffered);
 
     // If write model didn't actually use a write tool, fall back to cheap model's response
     // (which did want to write). This avoids repeated false escalations where the expensive
@@ -871,16 +908,18 @@ export class AiAgent implements AiAgentInterface {
 
     // Replay the chosen response
     const textChunks: string[] = [];
+    let textProviderData: AiProviderData | undefined;
     const toolUses: AiToolUseBlock[] = [];
     let turnInputTokens = 0;
 
     for (const event of eventsToUse) {
       switch (event.type) {
         case 'text':
-          textChunks.push(event.text);
+          if (event.text) textChunks.push(event.text);
+          if (event.providerData) textProviderData = event.providerData;
           break;
         case 'tool_use':
-          toolUses.push({ type: 'tool_use', id: event.id, name: event.name, input: event.input });
+          toolUses.push(toolUseBlock(event));
           break;
         case 'usage':
           if (event.inputTokens > 0) turnInputTokens = event.inputTokens;
@@ -890,7 +929,7 @@ export class AiAgent implements AiAgentInterface {
       }
     }
 
-    return { textChunks, toolUses, turnInputTokens, parseMissAttempt };
+    return { textChunks, textProviderData, toolUses, turnInputTokens, parseMissAttempt };
   }
 
   private async compactMessages(
@@ -906,20 +945,26 @@ export class AiAgent implements AiAgentInterface {
       {
         role: 'user',
         content:
-          'CONTEXT COMPACTION REQUIRED: Please provide a comprehensive summary of everything you have analyzed and discovered so far. Include all key findings, code patterns, API endpoints, URLs, security issues, and any notes you have written. Be thorough — this summary will replace the full conversation history so the analysis can continue.',
+          'CONTEXT COMPACTION REQUIRED: Please provide a comprehensive summary of everything you have analyzed and discovered so far. Include all key findings, code patterns, API endpoints, URLs, security issues, and any notes you have written. Be thorough — this summary will replace the full conversation history so the analysis can continue. Do not call any tools: answer with the summary as text.',
       },
     ];
 
     const summaryChunks: string[] = [];
+    let refused = false;
+    let calledTool = false;
     try {
+      // The run's tools go with the request: Anthropic rejects a history that holds tool calls when no tools are
+      // defined, and the same system prompt and tools keep the request on the prefix the run has cached.
       const stream = (provider ?? this.provider).createStreamingRequest(
         compactionPrompt,
         systemPrompt,
-        [], // no tools during compaction
+        tools,
       );
       const recordUsage = requestUsageRecorder(requests);
       for await (const event of stream) {
         if (event.type === 'text') summaryChunks.push(event.text);
+        if (event.type === 'tool_use') calledTool = true;
+        if (event.type === 'refusal') refused = true;
         if (event.type === 'usage') {
           recordUsage(event);
           totalUsage.inputTokens += event.inputTokens;
@@ -932,6 +977,15 @@ export class AiAgent implements AiAgentInterface {
     }
 
     const summary = summaryChunks.join('');
+    if (refused) {
+      log('Compaction summary was refused, continuing with existing context');
+      return messages;
+    }
+    if (calledTool) {
+      // Whatever text came with the call is the start of more work, not a summary to replace the history with.
+      log('Compaction response called a tool instead of summarising, continuing with existing context');
+      return messages;
+    }
     if (!summary) return messages;
 
     log(`Compaction complete (${summary.length} chars summary)`);

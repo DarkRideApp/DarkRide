@@ -9,7 +9,7 @@ import { DialectProvider } from '../provider';
 import { parseSSEStream } from '../http';
 import { __resetOpenAiChatMemo } from '../dialects/openai-chat';
 import type { Dialect } from '../dialect';
-import { UnknownProviderError, AiProviderError, ConnectionError, isFallbackEligible } from '../errors';
+import { UnknownProviderError, AiProviderError, ConnectionError, ModelRefusedError, isFallbackEligible } from '../errors';
 import { stubFetch, sseResponse, jsonResponse, textResponse, collect, callHeader } from '../test-helpers';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -118,7 +118,7 @@ describe('DialectProvider', () => {
     stubFetch(() => new Response(null, { status: 200 }));
     await expect(collect(createProvider('openrouter', { apiKey: 'k' }).createStreamingRequest(msgs, '', []))).rejects.toThrow('OpenRouter response has no body');
   });
-  it('complete(): chat branch drains the stream, trims at the first triple newline, and sends cache:false/effort for anthropic 5.x', async () => {
+  it('complete(): chat branch drains the stream, trims at the first triple newline, and caches only the system prompt with low effort for anthropic 5.x', async () => {
     const stub = stubFetch(() => sseResponse([
       { event: 'message_start', data: JSON.stringify({ type: 'message_start', message: { usage: { input_tokens: 1 } } }) },
       { event: 'content_block_delta', data: JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'foo()\n\n\nbar()' } }) },
@@ -127,11 +127,12 @@ describe('DialectProvider', () => {
     ]));
     const out = await createProvider('anthropic', { apiKey: 'k', model: 'claude-haiku-5-5' }).complete({ prefix: 'a', suffix: 'b', systemPrompt: 'S', maxOutputTokens: 256 });
     expect(out).toBe('foo()');
+    // The code around the cursor differs on every call, so only the system prompt carries a cache marker.
     expect(stub.calls[0].body.cache_control).toBeUndefined();
+    expect(stub.calls[0].body.system).toEqual([{ type: 'text', text: 'S', cache_control: { type: 'ephemeral' } }]);
+    expect(stub.calls[0].body.messages).toEqual([{ role: 'user', content: 'a<CURSOR>b' }]);
     expect(stub.calls[0].body.output_config).toEqual({ effort: 'low' });
     expect(stub.calls[0].body.max_tokens).toBe(256);
-    expect(stub.calls[0].body.system).toBe('S');
-    expect(stub.calls[0].body.messages[0].content).toBe('a<CURSOR>b');
   });
   it('complete(): an output-limit stop returns the text so far', async () => {
     stubFetch(() => sseResponse([
@@ -141,6 +142,18 @@ describe('DialectProvider', () => {
       { event: 'message_stop', data: JSON.stringify({ type: 'message_stop' }) },
     ]));
     expect(await createProvider('anthropic', { apiKey: 'k', model: 'claude-haiku-5-5' }).complete({ prefix: 'a', suffix: '', maxOutputTokens: 256 })).toBe('partial');
+  });
+  it('complete(): a refusal after part of the completion throws ModelRefusedError, so the router can try another model', async () => {
+    stubFetch(() => sseResponse([
+      { event: 'message_start', data: JSON.stringify({ type: 'message_start', message: { usage: { input_tokens: 1 } } }) },
+      { event: 'content_block_delta', data: JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'foo(' } }) },
+      { event: 'message_delta', data: JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber' } }, usage: { output_tokens: 2 } }) },
+      { event: 'message_stop', data: JSON.stringify({ type: 'message_stop' }) },
+    ]));
+    const err: any = await createProvider('anthropic', { apiKey: 'k', model: 'claude-haiku-5-5' }).complete({ prefix: 'a', suffix: '' }).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelRefusedError);
+    expect(err.message).toContain('Claude declined this request (category: cyber).');
+    expect(err.provider).toBe('anthropic');
   });
   it('complete(): other stream errors still throw', async () => {
     stubFetch(() => sseResponse([{ event: 'error', data: JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'boom' } }) }]));

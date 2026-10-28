@@ -132,6 +132,19 @@ export const automations = sqliteTable('automations', {
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
 
+/**
+ * Who last saved a script's code, and the scopes of the credential they used.
+ * A script's `tools` calls are checked against this, never against whoever runs
+ * it. Kept out of `automations` so no automation response can carry it. No row
+ * means nobody has claimed the script.
+ */
+export const automationAuthors = sqliteTable('automation_authors', {
+  automationId: integer('automation_id').primaryKey().references(() => automations.id, { onDelete: 'cascade' }),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'set null' }),
+  scopes: text('scopes', { mode: 'json' }).$type<string[]>().notNull().default(sql`'[]'`),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+});
+
 export const automationSessions = sqliteTable('automation_sessions', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   automationId: integer('automation_id').references(() => automations.id),
@@ -417,6 +430,14 @@ export const aiConversations = sqliteTable('ai_conversations', {
   outputTokens: integer('output_tokens'),
   /** Claude CLI session ID for --resume support (null for non-CLI conversations) */
   claudeSessionId: text('claude_session_id'),
+  /** Owner. Null for chats saved before ownership existed, which every user can see. */
+  userId: integer('user_id'),
+  /** App path the chat was started from, so history can link back to it. */
+  originPath: text('origin_path'),
+  /** Set when a run starts and cleared when it ends cleanly, so a cancel, an error or a crash leaves it set. */
+  unfinished: integer('unfinished', { mode: 'boolean' }).notNull().default(false),
+  /** Started by an automated run (APK analysis, diff summary), not by a person chatting. */
+  automated: integer('automated', { mode: 'boolean' }).notNull().default(false),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
@@ -737,6 +758,28 @@ export const passwordResetTokens = sqliteTable('password_reset_tokens', {
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   expiresAt: integer('expires_at', { mode: 'timestamp' }).notNull(),
   usedAt: integer('used_at', { mode: 'timestamp' }),
+});
+
+export const adbProxyKeys = sqliteTable('adb_proxy_keys', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  keyId: text('key_id').notNull().unique(),
+  publicKey: text('public_key').notNull(),
+  comment: text('comment'),
+  status: text('status', { enum: ['approved', 'denied', 'revoked'] as const }).notNull(),
+  deviceIds: text('device_ids', { mode: 'json' }).$type<string[] | null>(),
+  firstSeenAt: integer('first_seen_at', { mode: 'timestamp' }).notNull(),
+  lastSeenAt: integer('last_seen_at', { mode: 'timestamp' }).notNull(),
+  lastSeenIp: text('last_seen_ip'),
+  lastDeviceId: text('last_device_id'),
+  decidedBy: integer('decided_by').references(() => users.id, { onDelete: 'set null' }),
+  decidedAt: integer('decided_at', { mode: 'timestamp' }),
+});
+
+export const adbProxyDevices = sqliteTable('adb_proxy_devices', {
+  deviceId: text('device_id').primaryKey().references(() => devices.id),
+  port: integer('port').notNull().unique(),
+  enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
 export const aiCallLog = sqliteTable('ai_call_log', {

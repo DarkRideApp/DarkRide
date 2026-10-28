@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, resolve } from 'path';
 import { randomBytes, createHash } from 'crypto';
 import { getDataRoot } from '../config/paths';
@@ -61,11 +61,11 @@ export function loadOrCreateCoturnCreds(): CoturnCreds {
   return creds;
 }
 
+/** Container env var the `-turncfg` script reads the iceServers JSON from. */
+export const TURN_CONFIG_ENV = 'DARKRIDE_TURN_CONFIG';
+
 /**
- * Build the `-turncfg` script the emulator runs in-container. It must print
- * the iceServers JSON to stdout and return in under a second, so it's a plain
- * printf — no network, no env lookups (the file is mounted read-only, the
- * container has no coturn env). Values are baked in directly.
+ * The iceServers JSON the emulator's `-turncfg` script prints.
  *
  * DUAL-URL: both peers receive the same urls array (android-emulator-webrtc
  * has no browser-side iceServers hook). The browser reaches coturn via the
@@ -73,12 +73,34 @@ export function loadOrCreateCoturnCreds(): CoturnCreds {
  * (which resolves only inside containers). Listing both lets each peer use the
  * one that works and fail the other candidate fast.
  */
-export function buildTurncfgScript(lanIp: string, creds: CoturnCreds): string {
-  return [
-    '#!/bin/sh',
-    `printf '{"iceServers":[{"urls":["turn:%s:3478?transport=udp","turn:host.docker.internal:3478?transport=udp"],"username":"%s","credential":"%s"}]}' "${lanIp}" "${creds.username}" "${creds.password}"`,
-    '',
-  ].join('\n');
+export function buildTurnConfig(lanIp: string, creds: CoturnCreds): string {
+  return JSON.stringify({
+    iceServers: [{
+      urls: [`turn:${lanIp}:3478?transport=udp`, 'turn:host.docker.internal:3478?transport=udp'],
+      username: creds.username,
+      credential: creds.password,
+    }],
+  });
+}
+
+/**
+ * The `-turncfg` script the emulator runs in-container. It must print the
+ * iceServers JSON and return in under a second, so it only echoes
+ * TURN_CONFIG_ENV, which the container is created with. The script holds no
+ * secret, so it can be readable by the emulator's user (uid 1300, not the
+ * DarkRide user) without exposing the TURN credential to other host users.
+ */
+export function buildTurncfgScript(): string {
+  return ['#!/bin/sh', `printf '%s' "$${TURN_CONFIG_ENV}"`, ''].join('\n');
+}
+
+/** Write the script to `hostPath` for the emulator container to mount. */
+export function writeTurncfgScript(hostPath: string): string {
+  mkdirSync(dirname(hostPath), { recursive: true });
+  writeFileSync(hostPath, buildTurncfgScript());
+  // 0755: the emulator user is not the owner; see buildTurncfgScript.
+  chmodSync(hostPath, 0o755);
+  return hostPath;
 }
 
 export interface CoturnContainerSpec {

@@ -65,7 +65,7 @@ Commands:
 
 ### Pruning
 
-`backend/db/prune.ts` runs daily at 3 AM. Deletes automation sessions, screenshots (files + DB rows), captured traffic, WebSocket messages, and injected APKs older than `PRUNE_DAYS` (default: 7, except injected APKs which use a 3-day TTL). Pinned sessions and their related data are excluded. Delete order respects FK constraints.
+`backend/db/prune.ts` runs daily at 3 AM. Deletes automation sessions, screenshots (files + DB rows), captured traffic, WebSocket messages, and injected APKs older than `PRUNE_DAYS` (default: 7, except injected APKs which use a 3-day TTL). Pinned sessions and their related data are excluded. Delete order respects FK constraints. AI chats are kept for `AI_CONVERSATION_PRUNE_DAYS` (default 90) after their last use; conversations from automated runs follow `PRUNE_DAYS`.
 
 ## Device Management
 
@@ -85,6 +85,18 @@ On first connect (or version change), the device goes through setup:
 3. Install WireGuard app (if rooted)
 4. Install mitmproxy CA certificate (if rooted)
 5. Generate WireGuard keypair and tunnel config
+
+## ADB Proxy
+
+`AdbProxyService` (`backend/services/adb-proxy/`) lets other machines run `adb connect` against Android devices attached to this host. It is off by default.
+
+- **One port per device.** Each online Android device gets a persistent TCP port from a configurable range (default 6500 to 6599), stored in `adb_proxy_devices`. The port speaks the ADB wire protocol as a device would, one connection per client. The service follows `DeviceManager` through a small `DeviceDirectory` interface (`device-directory.ts`) and, while the proxy is on, also compares its own device list with it every 5 seconds (it does no background work while off). The same check retries a device whose port another process holds, and a device that found the range full once a port is free. A port is taken back only when a device without one needs it and the range is full: the offline device whose port row is oldest loses it, and a device with proxying disabled never does. The service ignores devices that are its own listeners (`adb connect` to a proxy port from the same host).
+- **Authentication.** A client must prove it holds its adb key by signing a token issued on that connection. A key it offers is honoured only when a signature it already sent on this connection verifies under that key, so a public key alone never authenticates and never creates a request. A proven key that is approved gets in. A denied or revoked key is closed. An unknown key becomes an in-memory pending request, shown live in Settings → ADB Proxy and held for up to 5 minutes, and the client stays `unauthorized` meanwhile. An admin with `core.adb-proxy:manage` denies it; approving also needs `core.devices:shell`, because an approved key gets a shell on every proxied device. Decisions are stored in `adb_proxy_keys`.
+- **Forwarding.** Each client stream becomes a fresh connection to the host's ADB server (`ANDROID_ADB_SERVER_ADDRESS` and `ANDROID_ADB_SERVER_PORT`, default `127.0.0.1:5037`): `host:transport:<serial>`, then the service string. Services starting with `host`, and `reverse:`, `tcpip:` and `usb:`, are refused with `CLSE`. The proxy advertises a maximum payload of 256 KiB. A session closes when the ADB server refuses the transport for its device, after a `reboot` service ends, and after a `root:` or `unroot:` service whose output says adbd is restarting (a production build refuses `root:` and the session stays open).
+- **Abuse limits.** Unauthenticated sockets are capped per source address and in total, and pending requests are capped and rate limited per source address. A connection keeps its unauthenticated slot and its 10 second deadline until the proxy sends `CNXN`, so the device banner fetch is covered; concurrent sessions for one device share a single banner fetch, and its result is kept for 5 seconds. The per-key session caps count sessions that are still finishing and are checked before the banner is fetched. Log lines that a peer without an approved key can provoke share one rate-limited budget. The numbers are in the user guide.
+- **Live updates.** The service pushes its full status snapshot as an `adb-proxy` message on a filtered WebSocket channel, after any change including a stream opening or closing, coalesced to one message per 50 ms. Only clients that held `core.adb-proxy:read` when they subscribed receive it. The page counts elapsed times itself from a shared one-second clock (`useNow`).
+
+REST endpoints live in `backend/api/adb-proxy.ts` and the page in `frontend/pages/settings/AdbProxyPage.tsx`. User guide: [`adb-proxy.md`](adb-proxy.md). Design: [`specs/2026-10-11-adb-proxy-design.md`](specs/2026-10-11-adb-proxy-design.md).
 
 ## Python Bridge
 

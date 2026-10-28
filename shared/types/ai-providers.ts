@@ -1,12 +1,9 @@
 // ── AI Provider Types ────────────────────────────────────────────────
 
-import { AI_PROVIDER_IDS, type AiProviderType as CatalogProviderType } from '../lib/ai-provider-catalog';
+import type { AiProviderType as CatalogProviderType } from '../lib/ai-provider-catalog';
 
 /** Derived from the provider catalog (`shared/lib/ai-provider-catalog.ts`). */
 export type AiProviderType = CatalogProviderType;
-
-/** Kept for existing importers; derived from the catalog. */
-export const AI_PROVIDER_TYPES: AiProviderType[] = [...AI_PROVIDER_IDS];
 
 // ── Response (credentials masked) ───────────────────────────────────
 

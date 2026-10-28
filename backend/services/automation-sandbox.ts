@@ -201,11 +201,17 @@ export async function executeInSandbox(
     if (httpAPI) hostObjects['http'] = httpAPI;
     if (context.documentStore) hostObjects['documentStore'] = context.documentStore;
 
+    // Throws to refuse a call; absent for callers that do not restrict what a script may reach.
+    const authorizeHostCall: ((target: string, method: string) => void) | undefined = context.authorizeHostCall;
+
     jail.setSync('__callHost', new ivm.Reference(async (target: string, method: string, argsJson: string) => {
+      // A promise that is already rejected when isolated-vm receives it is reported as an unhandled rejection, so nothing may throw before this.
+      await null;
       const obj = hostObjects[target];
       if (!obj) throw new Error(`Unknown host object: ${target}`);
       const fn = obj[method];
       if (typeof fn !== 'function') throw new Error(`${target}.${method} is not a function`);
+      authorizeHostCall?.(target, method);
       const args = JSON.parse(argsJson);
       const result = await fn.apply(obj, args);
       if (result === undefined) return undefined;
@@ -220,6 +226,7 @@ export async function executeInSandbox(
       if (!obj) throw new Error(`Unknown host object: ${target}`);
       const fn = obj[method];
       if (typeof fn !== 'function') throw new Error(`${target}.${method} is not a function`);
+      authorizeHostCall?.(target, method);
       const args = JSON.parse(argsJson);
       const result = fn.apply(obj, args);
       if (result === undefined) return undefined;
@@ -253,6 +260,8 @@ export async function executeInSandbox(
       onRequestRef: ivm.Reference<Function> | null,
       onResponseRef: ivm.Reference<Function> | null,
     ) => {
+      // Hooks register here, not through __callHost, so they are checked here.
+      authorizeHostCall?.('device.http', 'hook');
       if (!deviceAPI) throw new Error('No device API available');
       // applySync with {arguments: {reference: true}} wraps every arg including
       // the filter string; normalize back to a primitive before parsing.

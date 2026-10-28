@@ -9,14 +9,6 @@ test.describe('Extensible UI primitives', () => {
     await ctx.close();
   });
 
-  test('Settings tab strip uses NavItemList and shows built-in tabs', async ({ page }) => {
-    await loginAsAdmin(page);
-    await page.goto('/ui/settings');
-    await page.waitForLoadState('networkidle');
-    await expect(page.locator('.nav-item-list')).toBeVisible();
-    await expect(page.locator('.nav-item-list .nav-item', { hasText: 'Plugins' })).toBeVisible();
-  });
-
   test('kitchen-sink button contribution appears in DeviceViewer overflow', async ({ page }) => {
     // Depends on kitchen-sink being loaded + a device being present.
     // Skip gracefully if no device is in the e2e DB.

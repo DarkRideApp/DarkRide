@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { registerAiChatEndpoints, cleanupSocket, type AiChatDeps } from './ai-chat-handlers';
+import { registerAiChatEndpoints, cleanupSocket, MAX_REMEMBERED_CONVERSATIONS, type AiChatDeps } from './ai-chat-handlers';
 import { getWebsocketHandler, clearWebsocketHandlers } from './handlers';
 import type { AiToolRegistry } from '../services/ai-tools';
 
@@ -128,6 +128,43 @@ describe('AI Chat Handlers', () => {
         type: 'ai:done',
         conversationId: 42,
         usage: { inputTokens: 10, outputTokens: 20 },
+      });
+    });
+
+    describe('originPath', () => {
+      async function sentOriginPath(originPath: unknown): Promise<unknown> {
+        const mockAgent = { handleMessage: vi.fn().mockResolvedValue({ conversationId: 1 }) };
+        setupAgentAndProvider(deps, mockAgent);
+        const handler = getWebsocketHandler('ai:message')!.handler;
+        await handler({ conversationId: null, message: 'hi', pageContext: 'devices', contextId: '', originPath }, createAuthenticatedSocket());
+        return mockAgent.handleMessage.mock.calls[0][0].originPath;
+      }
+
+      it('passes an app path through to the agent', async () => {
+        expect(await sentOriginPath('/ui/analysis/12')).toBe('/ui/analysis/12');
+        expect(await sentOriginPath('/ui/network?pane=traffic&host=api.example.com')).toBe('/ui/network?pane=traffic&host=api.example.com');
+        expect(await sentOriginPath('/ui')).toBe('/ui');
+      });
+
+      it.each([
+        ['an absolute URL', 'https://evil.test/ui/x'],
+        ['a protocol-relative URL', '//evil.test/ui/x'],
+        ['a script URL', 'javascript:alert(1)'],
+        ['a path outside the app', '/v1/auth/me'],
+        ['a lookalike prefix', '/uix/devices'],
+        ['a parent segment', '/ui/../v1/auth/me'],
+        ['whitespace', '/ui/devices x'],
+        ['a newline', '/ui/devices\n/x'],
+        ['a backslash', '/ui\\evil'],
+        ['too long a path', `/ui/${'a'.repeat(600)}`],
+        ['a number', 42],
+        ['an empty string', ''],
+      ])('drops %s', async (_label, value) => {
+        expect(await sentOriginPath(value)).toBeUndefined();
+      });
+
+      it('sends nothing when the browser sends nothing', async () => {
+        expect(await sentOriginPath(undefined)).toBeUndefined();
       });
     });
 
@@ -693,6 +730,518 @@ describe('AI Chat Handlers', () => {
       // userId must NOT be present on the params (identity is in the factory-bound agent)
       expect(callParams.userId).toBeUndefined();
       expect(callParams.userScopes).toBeUndefined();
+    });
+  });
+
+  describe('tool confirmation', () => {
+    // Approvals live in module state, so every test takes a user id nobody else has used.
+    let nextUserId = 5000;
+    let toolUseSeq = 0;
+
+    const confirmEvents = (socket: any) =>
+      socket.send.mock.calls.map((c: any[]) => JSON.parse(c[0])).filter((e: any) => e.type === 'ai:tool-confirm');
+
+    const respond = (socket: any, toolUseId: string, allowed: boolean, scope?: unknown) =>
+      getWebsocketHandler('ai:tool-confirm-response')!.handler(
+        { toolUseId, allowed, ...(scope !== undefined ? { scope } : {}) },
+        socket,
+      );
+
+    interface Reply { allowed: boolean; scope?: unknown }
+    interface Turn {
+      conversationId: number | null;
+      /** Tools the agent asks to confirm, in order. */
+      tools: string[];
+      /** Answers for the prompts this turn raises, in order. A prompt with no reply is denied. */
+      replies?: Reply[];
+      /** Conversation id the agent reports when it finishes. Defaults to the one it was given. */
+      endsAs?: number;
+      /** Throw after the confirmations, as a provider failure would. */
+      fail?: boolean;
+      /** The `yolo` flag a new chat sends with its first message. */
+      yolo?: boolean;
+    }
+
+    /** Run one `ai:message` through the real handler with a scripted agent, answering each prompt as it arrives. */
+    async function converse(socket: any, turn: Turn) {
+      const answers: boolean[] = [];
+      const agent = {
+        handleMessage: vi.fn(async (params: any) => {
+          for (const tool of turn.tools) {
+            answers.push(await params.onToolConfirm(`tu-${++toolUseSeq}`, tool, { call: answers.length }));
+          }
+          if (turn.fail) throw new Error('provider failed');
+          return { conversationId: turn.endsAs ?? turn.conversationId, usage: { inputTokens: 1, outputTokens: 1 } };
+        }),
+      };
+      (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+      const before = confirmEvents(socket).length;
+      let finished = false;
+      const done = getWebsocketHandler('ai:message')!.handler(
+        { conversationId: turn.conversationId, message: 'go', pageContext: 'devices', contextId: '', ...(turn.yolo ? { yolo: true } : {}) },
+        socket,
+      ).finally(() => { finished = true; });
+
+      let answered = 0;
+      while (!finished) {
+        const events = confirmEvents(socket);
+        if (events.length - before > answered) {
+          const reply = turn.replies?.[answered] ?? { allowed: false };
+          await respond(socket, events[before + answered].toolUseId, reply.allowed, reply.scope);
+          answered++;
+        } else {
+          await new Promise((r) => setTimeout(r, 1));
+        }
+      }
+      await done;
+      return { answers, prompts: confirmEvents(socket).slice(before).map((e: any) => e.toolName) };
+    }
+
+    it('sends the tool name and input with the prompt, and a denial reaches the agent', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, { conversationId: 1, tools: ['run_adb_command'], replies: [{ allowed: false }] });
+
+      expect(r.answers).toEqual([false]);
+      expect(confirmEvents(socket)[0]).toMatchObject({
+        type: 'ai:tool-confirm',
+        toolName: 'run_adb_command',
+        input: { call: 0 },
+      });
+    });
+
+    it('asks again for the same tool when the user allows only once', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'run_adb_command'],
+        replies: [{ allowed: true, scope: 'once' }, { allowed: true }],
+      });
+
+      expect(r.prompts).toEqual(['run_adb_command', 'run_adb_command']);
+      expect(r.answers).toEqual([true, true]);
+    });
+
+    it('does not ask again for a tool the user allowed for the conversation, within the same run', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'run_adb_command', 'run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }],
+      });
+
+      expect(r.prompts).toEqual(['run_adb_command']);
+      expect(r.answers).toEqual([true, true, true]);
+    });
+
+    it('keeps the approval to the tool it was given for', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'update_setting', 'run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }, { allowed: true }],
+      });
+
+      expect(r.prompts).toEqual(['run_adb_command', 'update_setting']);
+      expect(r.answers).toEqual([true, true, true]);
+    });
+
+    it('never remembers a denial, even one sent with the conversation scope', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'run_adb_command'],
+        replies: [{ allowed: false, scope: 'conversation' }, { allowed: true }],
+      });
+
+      expect(r.prompts).toEqual(['run_adb_command', 'run_adb_command']);
+      expect(r.answers).toEqual([false, true]);
+    });
+
+    it('treats an unrecognised scope as a single approval', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(socket, {
+        conversationId: 1,
+        tools: ['run_adb_command', 'run_adb_command'],
+        replies: [{ allowed: true, scope: 'forever' }, { allowed: true }],
+      });
+
+      expect(r.prompts).toEqual(['run_adb_command', 'run_adb_command']);
+      expect(r.answers).toEqual([true, true]);
+    });
+
+    it('carries an approval into the next message of the same conversation', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const first = await converse(socket, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+
+      const next = await converse(socket, { conversationId: 7, tools: ['run_adb_command'] });
+
+      expect(first.answers).toEqual([true]);
+      expect(next.prompts).toEqual([]);
+      expect(next.answers).toEqual([true]);
+    });
+
+    it('carries an approval made in a new conversation once the conversation has an id', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const first = await converse(socket, {
+        conversationId: null,
+        endsAs: 42,
+        tools: ['run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }],
+      });
+
+      const next = await converse(socket, { conversationId: 42, tools: ['run_adb_command'] });
+
+      expect(first.answers).toEqual([true]);
+      expect(next.prompts).toEqual([]);
+      expect(next.answers).toEqual([true]);
+    });
+
+    it('does not carry an approval into a different conversation', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      await converse(socket, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+
+      const other = await converse(socket, { conversationId: 8, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+      expect(other.prompts).toEqual(['run_adb_command']);
+    });
+
+    it('does not carry an approval to another user in the same conversation', async () => {
+      const owner = createAuthenticatedSocket(++nextUserId);
+      await converse(owner, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+
+      const other = createAuthenticatedSocket(++nextUserId);
+      const r = await converse(other, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+      expect(r.prompts).toEqual(['run_adb_command']);
+    });
+
+    it('keeps an approval across a reconnect', async () => {
+      const userId = ++nextUserId;
+      const first = await converse(createAuthenticatedSocket(userId), {
+        conversationId: 7,
+        tools: ['run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }],
+      });
+
+      const reconnected = await converse(createAuthenticatedSocket(userId), { conversationId: 7, tools: ['run_adb_command'] });
+
+      expect(first.answers).toEqual([true]);
+      expect(reconnected.prompts).toEqual([]);
+      expect(reconnected.answers).toEqual([true]);
+    });
+
+    it('keeps an approval when the run fails after it was given', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const failed = await converse(socket, {
+        conversationId: 7,
+        fail: true,
+        tools: ['run_adb_command'],
+        replies: [{ allowed: true, scope: 'conversation' }],
+      });
+
+      const next = await converse(socket, { conversationId: 7, tools: ['run_adb_command'] });
+
+      expect(failed.answers).toEqual([true]);
+      expect(next.prompts).toEqual([]);
+      expect(next.answers).toEqual([true]);
+    });
+
+    describe('the cap on remembered conversations', () => {
+      const allowForConversation = (socket: any, id: number) =>
+        converse(socket, { conversationId: id, tools: ['run_adb_command'], replies: [{ allowed: true, scope: 'conversation' }] });
+      const askAgain = (socket: any, id: number) =>
+        converse(socket, { conversationId: id, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+      it('is 500', () => {
+        expect(MAX_REMEMBERED_CONVERSATIONS).toBe(500);
+      });
+
+      it('remembers every conversation up to the cap', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS; id++) await allowForConversation(socket, id);
+
+        expect((await askAgain(socket, 1)).prompts).toEqual([]);
+        expect((await askAgain(socket, MAX_REMEMBERED_CONVERSATIONS)).prompts).toEqual([]);
+      }, 30_000);
+
+      it('drops the oldest conversation once past it', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS + 1; id++) await allowForConversation(socket, id);
+
+        expect((await askAgain(socket, 1)).prompts).toEqual(['run_adb_command']);
+        expect((await askAgain(socket, MAX_REMEMBERED_CONVERSATIONS + 1)).prompts).toEqual([]);
+      }, 30_000);
+
+      it('keeps a conversation that was used recently over an older one', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS; id++) await allowForConversation(socket, id);
+        await askAgain(socket, 1);
+        await allowForConversation(socket, MAX_REMEMBERED_CONVERSATIONS + 1);
+
+        expect((await askAgain(socket, 2)).prompts).toEqual(['run_adb_command']);
+        expect((await askAgain(socket, 1)).prompts).toEqual([]);
+      }, 30_000);
+    });
+
+    it('denies a prompt nobody answers within 60 seconds, and a late click remembers nothing', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const agent = {
+        handleMessage: vi.fn(async (params: any) => {
+          const allowed = await params.onToolConfirm('tu-late', 'run_adb_command', {});
+          return { conversationId: 9, usage: { inputTokens: 1, outputTokens: 1 }, allowed };
+        }),
+      };
+      (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+      vi.useFakeTimers();
+      try {
+        const done = getWebsocketHandler('ai:message')!.handler(
+          { conversationId: 9, message: 'go', pageContext: 'devices', contextId: '' },
+          socket,
+        );
+        await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+        await vi.advanceTimersByTimeAsync(60_000);
+        await done;
+        expect(await agent.handleMessage.mock.results[0].value).toMatchObject({ allowed: false });
+        await respond(socket, 'tu-late', true, 'conversation');
+      } finally {
+        vi.useRealTimers();
+      }
+
+      const next = await converse(socket, { conversationId: 9, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+      expect(next.prompts).toEqual(['run_adb_command']);
+    });
+
+    it('denies a pending prompt when the socket disconnects', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const agent = {
+        handleMessage: vi.fn(async (params: any) => {
+          const allowed = await params.onToolConfirm('tu-disconnect', 'run_adb_command', {});
+          return { conversationId: 1, usage: { inputTokens: 1, outputTokens: 1 }, allowed };
+        }),
+      };
+      (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+      const done = getWebsocketHandler('ai:message')!.handler(
+        { conversationId: 1, message: 'go', pageContext: 'devices', contextId: '' },
+        socket,
+      );
+      await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+      cleanupSocket(socket);
+      await done;
+
+      expect(await agent.handleMessage.mock.results[0].value).toMatchObject({ allowed: false });
+    });
+
+    it('denies a pending prompt when the request is cancelled', async () => {
+      const socket = createAuthenticatedSocket(++nextUserId);
+      const agent = {
+        handleMessage: vi.fn(async (params: any) => {
+          const allowed = await params.onToolConfirm('tu-cancel', 'run_adb_command', {});
+          return { conversationId: 1, usage: { inputTokens: 1, outputTokens: 1 }, allowed };
+        }),
+      };
+      (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+      const done = getWebsocketHandler('ai:message')!.handler(
+        { conversationId: 1, message: 'go', pageContext: 'devices', contextId: '', requestId: 'req-cancel' },
+        socket,
+      );
+      await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+      await getWebsocketHandler('ai:cancel')!.handler({ conversationId: 1, requestId: 'req-cancel' }, socket);
+      await done;
+
+      expect(await agent.handleMessage.mock.results[0].value).toMatchObject({ allowed: false });
+    });
+
+    describe('YOLO mode', () => {
+      const yoloEvents = (socket: any) =>
+        socket.send.mock.calls.map((c: any[]) => JSON.parse(c[0])).filter((e: any) => e.type === 'ai:yolo-state');
+
+      /** Send `ai:yolo` and return the state the server answered with. Leave `enabled` out to ask. */
+      async function yolo(socket: any, target: { conversationId?: unknown; requestId?: string }, enabled?: boolean) {
+        await getWebsocketHandler('ai:yolo')!.handler({ ...target, ...(enabled === undefined ? {} : { enabled }) }, socket);
+        const events = yoloEvents(socket);
+        return events[events.length - 1];
+      }
+
+      /** An agent that confirms `tools` in order, pausing before each one until `gate()` resolves. */
+      function gatedAgent(tools: string[], gate: () => Promise<void>, answers: boolean[]) {
+        return {
+          handleMessage: vi.fn(async (params: any) => {
+            for (const tool of tools) {
+              await gate();
+              answers.push(await params.onToolConfirm(`tu-${++toolUseSeq}`, tool, {}));
+            }
+            return { conversationId: 5, usage: { inputTokens: 1, outputTokens: 1 } };
+          }),
+        };
+      }
+
+      it('is off for a conversation nobody switched it on for', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        expect(await yolo(socket, { conversationId: 7 })).toEqual({ type: 'ai:yolo-state', conversationId: 7, enabled: false });
+      });
+
+      it('reports each change back, and remembers it', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        expect((await yolo(socket, { conversationId: 7 }, true)).enabled).toBe(true);
+        expect((await yolo(socket, { conversationId: 7 })).enabled).toBe(true);
+        expect((await yolo(socket, { conversationId: 7 }, false)).enabled).toBe(false);
+        expect((await yolo(socket, { conversationId: 7 })).enabled).toBe(false);
+      });
+
+      it('is per user and per conversation', async () => {
+        const owner = createAuthenticatedSocket(++nextUserId);
+        await yolo(owner, { conversationId: 7 }, true);
+
+        expect((await yolo(owner, { conversationId: 8 })).enabled).toBe(false);
+        expect((await yolo(createAuthenticatedSocket(++nextUserId), { conversationId: 7 })).enabled).toBe(false);
+      });
+
+      it('keeps it across a reconnect', async () => {
+        const userId = ++nextUserId;
+        await yolo(createAuthenticatedSocket(userId), { conversationId: 7 }, true);
+
+        expect((await yolo(createAuthenticatedSocket(userId), { conversationId: 7 })).enabled).toBe(true);
+      });
+
+      it('runs every flagged tool without asking while it is on', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await yolo(socket, { conversationId: 7 }, true);
+
+        const r = await converse(socket, { conversationId: 7, tools: ['run_adb_command', 'update_setting', 'delete_intercept_rule'] });
+
+        expect(r.prompts).toEqual([]);
+        expect(r.answers).toEqual([true, true, true]);
+      });
+
+      it('asks again once it is switched off', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await yolo(socket, { conversationId: 7 }, true);
+        await yolo(socket, { conversationId: 7 }, false);
+
+        const r = await converse(socket, { conversationId: 7, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+        expect(r.prompts).toEqual(['run_adb_command']);
+      });
+
+      it('does not touch other conversations of the same user', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await yolo(socket, { conversationId: 7 }, true);
+
+        const r = await converse(socket, { conversationId: 8, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+        expect(r.prompts).toEqual(['run_adb_command']);
+      });
+
+      it('switching it off in the middle of a run takes effect on the next tool call', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await yolo(socket, { conversationId: 5 }, true);
+        let release!: () => void;
+        const answers: boolean[] = [];
+        let first = true;
+        const agent = gatedAgent(['run_adb_command', 'run_adb_command'], async () => {
+          if (first) { first = false; return; }
+          await new Promise<void>((resolve) => { release = resolve; });
+        }, answers);
+        (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+        const done = getWebsocketHandler('ai:message')!.handler(
+          { conversationId: 5, message: 'go', pageContext: 'devices', contextId: '' },
+          socket,
+        );
+        await vi.waitFor(() => expect(answers).toEqual([true]));
+        await yolo(socket, { conversationId: 5 }, false);
+        release();
+        await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+        await respond(socket, confirmEvents(socket)[0].toolUseId, false);
+        await done;
+
+        expect(answers).toEqual([true, false]);
+      });
+
+      it('lets a new chat start in YOLO with the flag on its first message', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        const r = await converse(socket, { conversationId: null, endsAs: 42, yolo: true, tools: ['run_adb_command', 'update_setting'] });
+
+        expect(r.prompts).toEqual([]);
+        expect(r.answers).toEqual([true, true]);
+      });
+
+      it('does not keep a new chat in YOLO on its own: the browser switches it on for the new id', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        await converse(socket, { conversationId: null, endsAs: 42, yolo: true, tools: ['run_adb_command'] });
+
+        expect((await yolo(socket, { conversationId: 42 })).enabled).toBe(false);
+        await yolo(socket, { conversationId: 42 }, true);
+        const next = await converse(socket, { conversationId: 42, tools: ['run_adb_command'] });
+
+        expect(next.prompts).toEqual([]);
+      });
+
+      it('ignores the flag on a message to an existing conversation', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        const r = await converse(socket, { conversationId: 7, yolo: true, tools: ['run_adb_command'], replies: [{ allowed: true }] });
+
+        expect(r.prompts).toEqual(['run_adb_command']);
+      });
+
+      it('switches a new chat off by request id before its conversation has an id', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        let release!: () => void;
+        const answers: boolean[] = [];
+        let first = true;
+        const agent = gatedAgent(['run_adb_command', 'run_adb_command'], async () => {
+          if (first) { first = false; return; }
+          await new Promise<void>((resolve) => { release = resolve; });
+        }, answers);
+        (deps.aiFactory.forUser as any).mockReturnValue(agent);
+
+        const done = getWebsocketHandler('ai:message')!.handler(
+          { conversationId: null, message: 'go', pageContext: 'devices', contextId: '', requestId: 'req-new-chat', yolo: true },
+          socket,
+        );
+        await vi.waitFor(() => expect(answers).toEqual([true]));
+        expect(await yolo(socket, { requestId: 'req-new-chat' }, false)).toMatchObject({ requestId: 'req-new-chat', enabled: false });
+        release();
+        await vi.waitFor(() => expect(confirmEvents(socket)).toHaveLength(1));
+        await respond(socket, confirmEvents(socket)[0].toolUseId, false);
+        await done;
+
+        expect(answers).toEqual([true, false]);
+      });
+
+      it('answers an unknown request id as off', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+
+        expect(await yolo(socket, { requestId: 'nobody' }, true)).toMatchObject({ requestId: 'nobody', enabled: false });
+      });
+
+      it('does not let a client set it without a user, or for an id that is not a whole number', async () => {
+        const anonymous = { readyState: 1, send: vi.fn() } as any;
+        expect((await yolo(anonymous, { conversationId: 7 }, true)).enabled).toBe(false);
+
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (const bad of ['7', 7.5, null, undefined, {}]) {
+          expect((await yolo(socket, { conversationId: bad }, true)).enabled).toBe(false);
+        }
+        expect((await yolo(socket, { conversationId: 7 })).enabled).toBe(false);
+      });
+
+      it('forgets the least recently switched on conversation past the cap', async () => {
+        const socket = createAuthenticatedSocket(++nextUserId);
+        for (let id = 1; id <= MAX_REMEMBERED_CONVERSATIONS + 1; id++) await yolo(socket, { conversationId: id }, true);
+
+        expect((await yolo(socket, { conversationId: 1 })).enabled).toBe(false);
+        expect((await yolo(socket, { conversationId: MAX_REMEMBERED_CONVERSATIONS + 1 })).enabled).toBe(true);
+        expect((await yolo(socket, { conversationId: 2 })).enabled).toBe(true);
+      });
     });
   });
 });

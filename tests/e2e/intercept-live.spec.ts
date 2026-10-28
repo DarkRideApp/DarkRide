@@ -14,7 +14,7 @@
 
 import { test, expect, type APIResponse } from '@playwright/test';
 import path from 'path';
-import { API_BASE, loginAsAdmin, waitForBackend } from './helpers/auth';
+import { API_BASE, getCsrfToken, loginAsAdmin, waitForBackend } from './helpers/auth';
 
 const SHOT_DIR = path.resolve(process.cwd(), 'screenshots');
 
@@ -26,9 +26,11 @@ async function ensureArmed(page: import('@playwright/test').Page): Promise<void>
   await expect(armToggle).toBeVisible();
   const current = await (await page.request.get(`${API_BASE}/v1/intercept/armed`)).json();
   if (!current?.data?.enabled) {
+    // The toggle opens the scope editor; applying it with no rule arms every request.
     await armToggle.click();
+    await page.getByTestId('intercept-arm-apply').click();
   }
-  await expect(armToggle).toContainText('On');
+  await expect(armToggle).not.toContainText(/off/i);
   await expect.poll(async () => {
     const res = await page.request.get(`${API_BASE}/v1/intercept/armed`);
     return (await res.json())?.data?.enabled;
@@ -47,7 +49,12 @@ test.describe('Interactive intercept (breakpoints)', () => {
     // Disarm through the authenticated browser context so the next test starts
     // clean. (The bare `request` fixture is unauthenticated and /armed is not
     // loopback-exempt, so it must go through page.request.)
-    await page.request.post(`${API_BASE}/v1/intercept/armed`, { data: { enabled: false } }).catch(() => {});
+    // Same payload as the UI's Disarm; with only `enabled: false` the armed scope stays set.
+    const res = await page.request.post(`${API_BASE}/v1/intercept/armed`, {
+      headers: { 'X-CSRF-Token': await getCsrfToken(page) },
+      data: { enabled: false, rules: [], phases: ['request', 'response'] },
+    });
+    expect(res.ok(), `disarm failed: ${res.status()} ${await res.text()}`).toBe(true);
   });
 
   test('arm → held request flow → edit → forward modified', async ({ page }) => {
@@ -57,7 +64,7 @@ test.describe('Interactive intercept (breakpoints)', () => {
 
     // The existing subheader affordances must still be present (additive change).
     // Use exact match: the filter bar also renders a "Clear all" button.
-    await expect(page.getByRole('button', { name: 'Clear', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Clear view', exact: true })).toBeVisible();
 
     // Arm interception from the subheader toggle.
     await ensureArmed(page);

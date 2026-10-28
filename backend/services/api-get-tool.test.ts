@@ -373,6 +373,16 @@ describe('allow-list follows the route that will actually run', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  it('also applies the secret-word filter to the matched route pattern', async () => {
+    // pathToRegex feeds the pattern straight into a RegExp, so one route can serve
+    // a request that looks harmless while the same pattern also serves a token.
+    const handler = vi.fn((_req, res) => res.json({ reached: true }));
+    registerEndpoint('GET', '/disney-menus/:x/(token|status)', handler);
+    const result = await runApiGet({ path: '/disney-menus/foo/status' }, caller());
+    expect(result.status).toBe(403);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it('still runs a parameterised route that sits under /disney-menus', async () => {
     registerEndpoint('GET', '/disney-menus/targets/:id', (req, res) => res.json({ id: req.params.id }));
     const result = await runApiGet({ path: '/disney-menus/targets/12' }, caller());

@@ -178,9 +178,6 @@ export async function* parseNDJSONStream(
 // ── Redaction and messages ───────────────────────────────────────────
 
 const MAX_UPSTREAM_CHARS = 500;
-// Backstop for a message a dialect hook built itself: its prefix ("Gemini API error (400): ") plus up to
-// MAX_UPSTREAM_CHARS of upstream text and possibly a hint. Only stops runaway text; not a tighter limit.
-const MAX_ERROR_MESSAGE_CHARS = 1000;
 
 /**
  * Mask the API key and any URL userinfo (`scheme://user:pass@` and the token-only `scheme://token@`).
@@ -205,7 +202,7 @@ export function safeText(msg: unknown, ctx: { apiKey?: string }): string {
 }
 
 /** Extract the provider's message from an error body, redact `apiKey` (if given), then cap at 500 chars. */
-export function upstreamMessage(bodyText: string, apiKey?: string): string {
+function upstreamMessage(bodyText: string, apiKey?: string): string {
   const trimmed = bodyText.trim();
   try {
     const parsed = JSON.parse(trimmed);
@@ -244,12 +241,12 @@ export const OVERLOADED_CODES = new Set(['overloaded', 'overloaded_error', 'engi
 export const OVERLOADED_STATUSES: readonly number[] = [502, 503, 529, 408];
 
 /**
- * Redact (and cap) an error's message and stack in place. Throws if a property it has to change is not writable.
+ * Redact an error's message and stack in place. Throws if a property it has to change is not writable.
  * V8 bakes the construction-time message into the stack header, so the stack is scrubbed too.
  */
-function scrubError(err: Error, apiKey: string | undefined, maxChars: number): void {
+function scrubError(err: Error, apiKey: string | undefined): void {
   const original = err.message;
-  const message = redact(original, apiKey).slice(0, maxChars);
+  const message = redact(original, apiKey);
   if (message !== original) err.message = message;
   if (typeof err.stack === 'string') {
     const stack = redact(message !== original ? err.stack.split(original).join(message) : err.stack, apiKey);
@@ -264,7 +261,7 @@ function scrubCause(holder: { cause?: unknown }, apiKey: string | undefined): vo
     const redacted = redact(cause, apiKey);
     if (redacted !== cause) holder.cause = redacted;
   } else if (cause instanceof Error) {
-    scrubError(cause, apiKey, Infinity);
+    scrubError(cause, apiKey);
   }
 }
 
@@ -292,27 +289,6 @@ export function redactedCause(err: unknown, apiKey: string | undefined): unknown
   } catch { return undefined; }
 }
 
-/**
- * A dialect's classifyError hook has no DialectContext, so it cannot redact or tag its own errors. Do it here, once,
- * for every dialect: mask the key and URL userinfo (BEFORE the cap) in the message, stack and cause, cap the message,
- * and fill in provider and status if the hook left them unset. The error is edited in place, so its class (and e.g. a
- * RateLimitError's headers) and identity are preserved. If it cannot be edited (frozen or read-only) the result is a
- * plain AiProviderError built from the redacted message, without the cause. Never throws.
- */
-function normaliseHookError(err: AiProviderError, ctx: DialectContext, status: number): AiProviderError {
-  try {
-    scrubError(err, ctx.apiKey, MAX_ERROR_MESSAGE_CHARS);
-    scrubCause(err, ctx.apiKey);
-    err.provider ??= ctx.descriptor.id;
-    err.status ??= status;
-    return err;
-  } catch {
-    let raw = '';
-    try { raw = String(err.message ?? ''); } catch { /* unreadable message */ }
-    return new AiProviderError(redact(raw, ctx.apiKey).slice(0, MAX_ERROR_MESSAGE_CHARS), { status, provider: ctx.descriptor.id });
-  }
-}
-
 export function classifyHttpError(
   dialect: Dialect,
   ctx: DialectContext,
@@ -320,8 +296,8 @@ export function classifyHttpError(
   headers: Headers,
   bodyText: string,
 ): AiProviderError {
-  const fromDialect = dialect.classifyError?.(status, headers, bodyText);
-  if (fromDialect) return normaliseHookError(fromDialect, ctx, status);
+  const fromDialect = dialect.classifyError?.(status, headers, bodyText, ctx);
+  if (fromDialect) return fromDialect;
 
   const d: AiProviderDescriptor = ctx.descriptor;
   const opts = { status, provider: d.id };
@@ -358,6 +334,18 @@ export function classifyHttpError(
 
 // ── Sending ──────────────────────────────────────────────────────────
 
+/** The credential header the catalog's auth scheme calls for. Empty when there is no key or the scheme sends none. */
+export function authHeaders(ctx: DialectContext): Record<string, string> {
+  const key = ctx.apiKey;
+  if (!key) return {};
+  switch (ctx.descriptor.auth.scheme) {
+    case 'bearer': return { Authorization: `Bearer ${key}` };
+    case 'x-api-key': return { 'x-api-key': key };
+    case 'x-goog-api-key': return { 'x-goog-api-key': key };
+    case 'none': return {};
+  }
+}
+
 const DEFAULT_HEADERS_TIMEOUT_MS = 60_000;
 
 /** 50 -> "50ms", 2000 -> "2s", 1500 -> "1.5s". Never rounds a sub-second timeout down to "0s". */
@@ -371,7 +359,7 @@ function abortError(signal?: AbortSignal): unknown {
   return signal?.reason ?? new DOMException('This operation was aborted', 'AbortError');
 }
 
-export async function sendBuilt(
+async function sendBuilt(
   built: BuiltRequest,
   ctx: DialectContext,
   signal?: AbortSignal,

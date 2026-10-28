@@ -87,7 +87,7 @@ test.describe('Plugin lifecycle (Add Source → Install → Enable → Use → D
 
     const stateRow = db.prepare("SELECT * FROM plugin_state WHERE name='test-plugin'").get() as any;
     expect(stateRow).toBeTruthy();
-    expect(stateRow.enabled).toBe(0);
+    expect(stateRow.enabled).toBe(1); // a new install starts enabled; it loads after the restart
     expect(stateRow.installed_via).toBe('managed');
     expect(stateRow.npm_package).toBe('@darkrideapp/plugin-test');
     db.close();
@@ -165,7 +165,8 @@ test.describe('Plugin lifecycle (Add Source → Install → Enable → Use → D
     csrf = await login(request, server.baseUrl);
     const res = await request.post(`${server.baseUrl}/v1/plugins/uninstall`, {
       headers: { 'X-CSRF-Token': csrf },
-      data: { name: 'test-plugin' },
+      // Uninstall keeps the plugin's tables and data folder unless told otherwise.
+      data: { name: 'test-plugin', preserveData: false },
     });
     expect(res.status()).toBe(200);
 

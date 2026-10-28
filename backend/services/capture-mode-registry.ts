@@ -23,6 +23,8 @@ export interface CaptureModeContext {
 export interface CaptureModeResult {
   tunnelActivated: boolean;
   emuHttpProxy?: { host: string; port: number };
+  /** Undo what the handler set up outside mitmproxy and the device; run once when the capture stops. */
+  teardown?: () => Promise<void>;
 }
 
 export type CaptureHandler = (ctx: CaptureModeContext) => Promise<CaptureModeResult>;

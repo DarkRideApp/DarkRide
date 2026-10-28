@@ -11,6 +11,8 @@ import { createLoggers } from '../logs';
 
 const { log: dpLog } = createLoggers('devices-providers-api');
 
+const stillBeingCreated = (id: number) => `Instance ${id} is still being created`;
+
 /** Injectable side-effects, overridden in tests to avoid touching real adb. */
 export interface DevicesProvidersDeps {
   /** Drop an `adb connect <host:port>` entry. Defaults to real `adb disconnect`. */
@@ -184,6 +186,10 @@ export function registerDevicesProvidersEndpoints(
       res.status(404).json({ success: false, error: `Instance ${req.params.instId} not found` });
       return;
     }
+    if (row.state === 'pulling') {
+      res.status(409).json({ success: false, error: stillBeingCreated(row.id) });
+      return;
+    }
     try {
       repo.updateState(row.id, 'starting');
       broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
@@ -242,6 +248,10 @@ export function registerDevicesProvidersEndpoints(
       res.status(404).json({ success: false, error: 'Unknown provider or instance' });
       return;
     }
+    if (row.state === 'pulling') {
+      res.status(409).json({ success: false, error: stillBeingCreated(row.id) });
+      return;
+    }
     try {
       repo.updateState(row.id, 'stopping');
       broadcastToAll({ type: 'provider-instance-updated', instance: repo.getById(row.id) });
@@ -277,6 +287,10 @@ export function registerDevicesProvidersEndpoints(
     }
     if (!p.deleteInstance) {
       res.status(400).json({ success: false, error: `Provider "${p.id}" does not support deleteInstance` });
+      return;
+    }
+    if (row.state === 'pulling') {
+      res.status(409).json({ success: false, error: stillBeingCreated(row.id) });
       return;
     }
     try {

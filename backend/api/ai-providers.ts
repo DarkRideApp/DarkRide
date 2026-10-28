@@ -4,8 +4,9 @@ import { aiProviders, aiModels } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import type { AiProviderConfig } from '../../shared/types/ai-providers';
 import {
-  AI_PROVIDER_IDS, getProviderDescriptor, isKnownProviderType, normalizeBaseUrl, sameEffectiveBaseUrl,
+  AI_PROVIDER_IDS, getProviderDescriptor, isKnownProviderType, normalizeBaseUrl, type AiProviderDescriptor,
 } from '../../shared/lib/ai-provider-catalog';
+import { baseUrlRedirects, savingClearsKey } from '../../shared/lib/ai-provider-form';
 import { listModels, testProvider } from '../services/ai/provider-ops';
 import type { RateLimitCache } from '../services/ai-model-router';
 
@@ -48,6 +49,14 @@ export function cleanName(raw: unknown): Clean<string> {
 /** A base URL in a request body is a string, null, or absent. Anything else would crash the normaliser. */
 function baseUrlShapeError(raw: unknown): string | null {
   return raw === undefined || raw === null || typeof raw === 'string' ? null : 'baseUrl must be a string or null';
+}
+
+/** A Base URL as it is stored for a type that uses one: normalised, and present when the type requires it. */
+function cleanBaseUrl(d: AiProviderDescriptor, raw: string | null | undefined): Clean<string | null> {
+  const norm = normalizeBaseUrl(d, raw);
+  if (!norm.ok) return { ok: false, error: norm.error };
+  if (d.baseUrl === 'required' && norm.url === null) return { ok: false, error: `Base URL is required for ${d.label}` };
+  return { ok: true, value: norm.url };
 }
 
 function providerToResponse(row: typeof aiProviders.$inferSelect): AiProviderConfig {
@@ -106,16 +115,12 @@ export function registerAiProviderEndpoints(db: AppDatabase, rateLimitCache: Rat
     }
     let storedUrl: string | null = null;
     if (d.baseUrl !== 'hidden') {
-      const norm = normalizeBaseUrl(d, baseUrl);
-      if (!norm.ok) {
-        res.status(400).json({ success: false, error: norm.error });
+      const url = cleanBaseUrl(d, baseUrl);
+      if (!url.ok) {
+        res.status(400).json({ success: false, error: url.error });
         return;
       }
-      if (d.baseUrl === 'required' && norm.url === null) {
-        res.status(400).json({ success: false, error: `Base URL is required for ${d.label}` });
-        return;
-      }
-      storedUrl = norm.url;
+      storedUrl = url.value;
     }
 
     const now = new Date();
@@ -173,42 +178,30 @@ export function registerAiProviderEndpoints(db: AppDatabase, rateLimitCache: Rat
     }
     if (newType !== undefined) updates.type = newType;
 
-    // urlChanged means "requests would now go to a different host or path", which is what clears the key.
-    let urlChanged = false;
     if (d) {
       if (d.baseUrl === 'hidden') {
         // This type never sends the URL anywhere, so dropping a stale value does not redirect the
         // credential and must not clear it.
         if (existing.baseUrl !== null) updates.baseUrl = null;
-      } else {
-        urlChanged = baseUrl !== undefined && !sameEffectiveBaseUrl(d, existing.baseUrl, baseUrl);
+      } else if (typeChanged || baseUrlRedirects(type, existing.baseUrl, baseUrl)) {
         // Validate only what the user changed: the form re-posts the stored URL on every edit, so an
         // unchanged legacy value must not block a rename. A type change re-checks the stored value
         // against the new descriptor.
-        if (urlChanged || typeChanged) {
-          const incoming = baseUrl !== undefined ? baseUrl : existing.baseUrl;
-          const norm = normalizeBaseUrl(d, incoming);
-          if (!norm.ok) {
-            res.status(400).json({ success: false, error: norm.error });
-            return;
-          }
-          if (d.baseUrl === 'required' && norm.url === null) {
-            res.status(400).json({ success: false, error: `Base URL is required for ${d.label}` });
-            return;
-          }
-          updates.baseUrl = norm.url;
+        const url = cleanBaseUrl(d, baseUrl !== undefined ? baseUrl : existing.baseUrl);
+        if (!url.ok) {
+          res.status(400).json({ success: false, error: url.error });
+          return;
         }
+        updates.baseUrl = url.value;
       }
     } else if (baseUrl !== undefined) {
       // Retired type: no catalog rules apply, store as given. Nothing can send requests for this type,
       // but a changed value still clears the key so the rule stays uniform.
-      const next = (typeof baseUrl === 'string' && baseUrl.trim()) || null;
-      urlChanged = next !== ((existing.baseUrl ?? '').trim() || null);
-      updates.baseUrl = next;
+      updates.baseUrl = (typeof baseUrl === 'string' && baseUrl.trim()) || null;
     }
 
     if (key.value !== undefined) updates.apiKey = key.value === '' ? null : key.value;
-    else if (typeChanged || urlChanged) updates.apiKey = null; // a credential must not follow a redirected destination
+    else if (savingClearsKey(existing, { type, baseUrl })) updates.apiKey = null; // a credential must not follow a redirected destination
 
     db.update(aiProviders).set(updates).where(eq(aiProviders.id, id)).run();
 

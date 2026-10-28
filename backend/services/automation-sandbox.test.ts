@@ -1522,4 +1522,162 @@ describe('AutomationSandbox', () => {
       expect(get).toHaveBeenCalled();
     });
   });
+
+  describe('authorizeHostCall', () => {
+    const refuse = (target: string, method: string) => { throw new Error(`refused ${target}.${method}`); };
+
+    it('stops an async host call before the host method runs, and the script can catch it', async () => {
+      const getCredentials = vi.fn().mockResolvedValue({ username: 'u' });
+      class FakeDevice { async getCredentials(appId: string) { return getCredentials(appId); } }
+
+      await expect(compileAndRun(compiler, `
+        export default async function(device: any) {
+          try { await device.getCredentials('com.example'); } catch (e: any) { if (!/refused/.test(e.message)) throw e; }
+        }
+      `, new FakeDevice() as any, { authorizeHostCall: refuse })).resolves.toBeUndefined();
+
+      expect(getCredentials).not.toHaveBeenCalled();
+    });
+
+    it('surfaces the refusal to the script as an error', async () => {
+      class FakeDevice { async getCredentials() { return { username: 'u' }; } }
+
+      await expect(compileAndRun(compiler, `
+        export default async function(device: any) { await device.getCredentials('com.example'); }
+      `, new FakeDevice() as any, { authorizeHostCall: refuse })).rejects.toThrow('refused device.getCredentials');
+    });
+
+    it('refuses without leaving an unhandled rejection in the host process', async () => {
+      class FakeDevice { async getCredentials() { return { username: 'u' }; } }
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+      process.on('unhandledRejection', onUnhandled);
+
+      try {
+        await compileAndRun(compiler, `
+          export default async function(device: any) {
+            try { await device.getCredentials('com.example'); } catch (e: any) { /* refused */ }
+          }
+        `, new FakeDevice() as any, { authorizeHostCall: refuse });
+        // Node reports an unhandled rejection after the microtask queue drains.
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+
+      expect(unhandled).toEqual([]);
+    });
+
+    it('stops a synchronous host call as well', async () => {
+      const unhookAll = vi.fn();
+      const seen: string[][] = [];
+
+      await expect(compileAndRun(compiler, `
+        export default async function(device: any) { device.http.unhookAll(); }
+      `, { http: { unhookAll } } as any, {
+        authorizeHostCall: (target: string, method: string) => { seen.push([target, method]); refuse(target, method); },
+      })).rejects.toThrow('refused device.http.unhookAll');
+
+      expect(unhookAll).not.toHaveBeenCalled();
+      expect(seen).toEqual([['device.http', 'unhookAll']]);
+    });
+
+    it('names the http namespace and the document store the way the table does', async () => {
+      const seen: string[] = [];
+      const authorizeHostCall = (target: string, method: string) => { seen.push(`${target}.${method}`); };
+      const httpAPI = { get: vi.fn().mockResolvedValue({ status: 200, headers: {}, body: '' }), post: vi.fn(), put: vi.fn(), delete: vi.fn(), patch: vi.fn() };
+      const documentStore = { getDoc: vi.fn().mockResolvedValue(null), putDoc: vi.fn() };
+
+      await compileAndRun(compiler, `
+        export default async function(device: any) {
+          await http.get('https://x');
+          await documentStore.getDoc('d');
+        }
+      `, null as any, { authorizeHostCall, httpAPI, documentStore });
+
+      expect(seen).toEqual(['http.get', 'documentStore.getDoc']);
+    });
+
+    describe('hook registration, which does not go through the host call dispatcher', () => {
+      const hookScript = (call: string) => `export default async function(device: any) { ${call} }`;
+
+      it('asks the check before registering a hook, and does not register it when the check throws', async () => {
+        const hook = vi.fn(() => 'hook-id');
+        const seen: string[] = [];
+
+        await expect(compileAndRun(compiler, hookScript(`device.http.hook({ hostname: 'x' }, (req: any) => req);`),
+          { http: { hook } } as any,
+          { authorizeHostCall: (target: string, method: string) => { seen.push(`${target}.${method}`); refuse(target, method); } },
+        )).rejects.toThrow('refused device.http.hook');
+
+        expect(hook).not.toHaveBeenCalled();
+        expect(seen).toEqual(['device.http.hook']);
+      });
+
+      it('applies the same check to hookRequest and hookResponse', async () => {
+        for (const call of [`device.http.hookRequest({ url: /x/ }, (r: any) => r);`, `device.http.hookResponse({ url: /x/ }, (r: any) => r);`]) {
+          const hook = vi.fn(() => 'hook-id');
+          await expect(compileAndRun(compiler, hookScript(call), { http: { hook } } as any, { authorizeHostCall: refuse }),
+            call).rejects.toThrow('refused device.http.hook');
+          expect(hook, call).not.toHaveBeenCalled();
+        }
+      });
+
+      it('applies the check when a script reaches the registration function directly', async () => {
+        const hook = vi.fn(() => 'hook-id');
+
+        await expect(compileAndRun(compiler, hookScript(`(globalThis as any).__registerHook.applySync(undefined, ['{}', null, null], { arguments: { reference: true } });`),
+          { http: { hook } } as any, { authorizeHostCall: refuse },
+        )).rejects.toThrow('refused device.http.hook');
+
+        expect(hook).not.toHaveBeenCalled();
+      });
+
+      it('lets the script catch the refusal', async () => {
+        await expect(compileAndRun(compiler, hookScript(`try { device.http.hook({}, (r: any) => r); } catch (e: any) { if (!/refused/.test(e.message)) throw e; }`),
+          { http: { hook: vi.fn() } } as any, { authorizeHostCall: refuse },
+        )).resolves.toBeUndefined();
+      });
+
+      it('registers the hook when the check does not throw', async () => {
+        const hook = vi.fn(() => 'hook-id');
+
+        await compileAndRun(compiler, hookScript(`device.http.hook({ hostname: 'x' }, (req: any) => req);`),
+          { http: { hook } } as any, { authorizeHostCall: () => undefined });
+
+        expect(hook).toHaveBeenCalledTimes(1);
+      });
+
+      it('registers the hook when the caller passes no check', async () => {
+        const hook = vi.fn(() => 'hook-id');
+
+        await compileAndRun(compiler, hookScript(`device.http.hook({ hostname: 'x' }, (req: any) => req);`), { http: { hook } } as any);
+
+        expect(hook).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it('lets the call through, with its arguments, when the check does not throw', async () => {
+      const sleep = vi.fn().mockResolvedValue(undefined);
+      class FakeDevice { async sleep(ms: number) { return sleep(ms); } }
+
+      await compileAndRun(compiler, `
+        export default async function(device: any) { await device.sleep(5); }
+      `, new FakeDevice() as any, { authorizeHostCall: () => undefined });
+
+      expect(sleep).toHaveBeenCalledWith(5);
+    });
+
+    it('does not restrict anything when the caller passes no check', async () => {
+      const sleep = vi.fn().mockResolvedValue(undefined);
+      class FakeDevice { async sleep(ms: number) { return sleep(ms); } }
+
+      await compileAndRun(compiler, `
+        export default async function(device: any) { await device.sleep(5); }
+      `, new FakeDevice() as any);
+
+      expect(sleep).toHaveBeenCalledWith(5);
+    });
+  });
 });

@@ -9,11 +9,18 @@ vi.mock('../../logs', () => ({
   createLoggers: () => ({ log: vi.fn(), error: vi.fn(), warn: vi.fn() }),
 }));
 
-function createApp(registry: AiToolRegistry): express.Express {
+/** `scopes` are the caller's effective scopes; null sends the request with no identity, as if auth had not run. */
+function createApp(registry: AiToolRegistry, scopes: string[] | null = []): express.Express {
   clearEndpoints();
   registerToolApiEndpoints(registry);
   const app = express();
   app.use(express.json());
+  app.use((req, _res, next) => {
+    if (scopes) {
+      req.authUser = { userId: 1, username: 'u', via: 'apikey', effectiveScopes: new Set(scopes) };
+    }
+    next();
+  });
   app.use(getApiRouter());
   return app;
 }
@@ -234,6 +241,125 @@ describe('Tool API Endpoints', () => {
       // The api-service catch wrapper handles empty message
       expect(res.status).toBe(500);
       expect(res.body.success).toBe(false);
+    });
+  });
+
+  describe('GET /v1/tools scope filtering', () => {
+    let scoped: AiToolRegistry;
+
+    beforeEach(() => {
+      scoped = new AiToolRegistry();
+      const tool = (name: string, context: string[], requiredScope?: string) => ({
+        name,
+        description: `description of ${name}`,
+        inputSchema: { type: 'object', properties: {} },
+        context,
+        requiredScope,
+        execute: vi.fn(),
+      });
+      scoped.register(tool('creds_tool', ['credentials'], 'core.credentials:read'));
+      scoped.register(tool('device_shell_tool', ['devices'], 'core.devices:manage'));
+      scoped.register(tool('open_tool', ['credentials', 'devices']));
+    });
+
+    const namesFor = async (scopes: string[] | null) =>
+      (await request(createApp(scoped, scopes)).get('/v1/tools')).body.data?.map((t: { name: string }) => t.name).sort();
+
+    it('lists only the tools the caller may run', async () => {
+      expect(await namesFor(['core.credentials:read'])).toEqual(['creds_tool', 'open_tool']);
+    });
+
+    it('lists only unrestricted tools for a caller with no scopes', async () => {
+      expect(await namesFor([])).toEqual(['open_tool']);
+    });
+
+    it('lists a tool when a wildcard grant covers its scope', async () => {
+      expect(await namesFor(['core.credentials:*', 'core.devices:*'])).toEqual(['creds_tool', 'device_shell_tool', 'open_tool']);
+    });
+
+    it('does not mention a hidden tool anywhere in the response', async () => {
+      const res = await request(createApp(scoped, ['core.credentials:read'])).get('/v1/tools');
+      expect(JSON.stringify(res.body)).not.toContain('device_shell_tool');
+    });
+
+    it('answers 401 with no tool names when the request carries no identity', async () => {
+      const res = await request(createApp(scoped, null)).get('/v1/tools');
+      expect(res.status).toBe(401);
+      expect(JSON.stringify(res.body)).not.toContain('open_tool');
+    });
+  });
+
+  describe('POST /v1/tools/:name scope enforcement', () => {
+    const guarded = vi.fn(async (params: any) => ({ echoed: params }));
+    const open = vi.fn(async () => 'ok');
+    let scoped: AiToolRegistry;
+
+    beforeEach(() => {
+      guarded.mockClear();
+      open.mockClear();
+      scoped = new AiToolRegistry();
+      scoped.register({
+        name: 'guarded_tool',
+        description: 'needs a scope',
+        inputSchema: { type: 'object', properties: {} },
+        context: ['credentials'],
+        requiredScope: 'core.credentials:read',
+        execute: guarded,
+      });
+      scoped.register({
+        name: 'open_tool',
+        description: 'no scope',
+        inputSchema: { type: 'object', properties: {} },
+        context: ['credentials'],
+        execute: open,
+      });
+    });
+
+    it('runs a tool when the caller holds its required scope', async () => {
+      const res = await request(createApp(scoped, ['core.credentials:read']))
+        .post('/v1/tools/guarded_tool').send({ a: 1 });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, data: { echoed: { a: 1 } } });
+    });
+
+    it('accepts a wildcard scope that covers the requirement', async () => {
+      const res = await request(createApp(scoped, ['core.credentials:*']))
+        .post('/v1/tools/guarded_tool').send({});
+      expect(res.status).toBe(200);
+    });
+
+    it('refuses with 403 and does not run the tool when the scope is missing', async () => {
+      const res = await request(createApp(scoped, ['core.apk:read']))
+        .post('/v1/tools/guarded_tool').send({});
+      expect(res.status).toBe(403);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/core\.credentials:read/);
+      expect(guarded).not.toHaveBeenCalled();
+    });
+
+    it('refuses a caller with no scopes at all', async () => {
+      const res = await request(createApp(scoped, []))
+        .post('/v1/tools/guarded_tool').send({});
+      expect(res.status).toBe(403);
+      expect(guarded).not.toHaveBeenCalled();
+    });
+
+    it('refuses with 401 and runs nothing when the request carries no identity', async () => {
+      const res = await request(createApp(scoped, null))
+        .post('/v1/tools/guarded_tool').send({});
+      expect(res.status).toBe(401);
+      expect(guarded).not.toHaveBeenCalled();
+      const unguarded = await request(createApp(scoped, null))
+        .post('/v1/tools/open_tool').send({});
+      expect(unguarded.status).toBe(401);
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    it('runs a tool that declares no required scope for any authenticated caller', async () => {
+      const res = await request(createApp(scoped, []))
+        .post('/v1/tools/open_tool').send({});
+      expect(res.status).toBe(200);
+      expect(open).toHaveBeenCalledTimes(1);
     });
   });
 });

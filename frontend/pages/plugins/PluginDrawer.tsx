@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { AlertTriangle, ExternalLink, Settings, Trash2, X } from 'lucide-react';
 import {
@@ -113,8 +113,9 @@ export function PluginDrawer({
     };
   }, []);
 
-  // Escape closes the drawer, unless a modal above it already took the key.
-  useEffect(() => {
+  // Escape closes the drawer, unless a modal above it already took the key. Listening from the commit that shows
+  // the drawer means a key pressed the moment it appears is not lost.
+  useLayoutEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !e.defaultPrevented) onClose();
     };

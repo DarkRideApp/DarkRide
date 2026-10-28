@@ -93,7 +93,9 @@ export function Devices() {
    * therefore not yet visible to the adb-device tracker. Providers without
    * `canCreate` (e.g. adb-device) have no managed instances and are skipped.
    */
+  const canManage = auth?.hasScope('core.devices:manage') ?? true;
   const fetchInstances = useCallback(async () => {
+    if (!canManage) return;
     try {
       const provs = await ws.sendRestApi('GET', '/v1/devices/providers');
       const list = (provs.body?.data?.providers ?? []) as Array<{ id: string; capabilities: { canCreate: boolean }; available: boolean }>;
@@ -108,7 +110,7 @@ export function Devices() {
     } catch {
       // ignore — partial failure shouldn't blank the page
     }
-  }, [ws]);
+  }, [ws, canManage]);
 
   useEffect(() => {
     if (!ws.connected) return;

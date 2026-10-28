@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { makeCaptureHandlers } from './capture-handlers';
 
+const DOCKER = { id: 'docker-client' };
+
 function deps() {
   return {
     mitmproxyManager: {
@@ -12,9 +14,11 @@ function deps() {
       injectMitmproxyCaCert: vi.fn().mockResolvedValue(undefined),
       activateWireGuardTunnel: vi.fn().mockResolvedValue(undefined),
       setupEmulatorHttpProxy: vi.fn().mockResolvedValue(undefined),
+      waitForEmulatorProxyReachable: vi.fn().mockResolvedValue(true),
     },
     spawnContainerHttpForwarder: vi.fn().mockResolvedValue(undefined),
-    getActiveDockerClient: vi.fn().mockReturnValue({}),
+    stopContainerHttpForwarders: vi.fn().mockResolvedValue(undefined),
+    getActiveDockerClient: vi.fn().mockReturnValue(DOCKER),
     lookupRuntimeId: vi.fn().mockReturnValue('container123'),
     waitForTunnelReady: vi.fn().mockResolvedValue(true),
     getActiveSessionId: vi.fn().mockReturnValue(1),
@@ -175,7 +179,43 @@ describe('capture handlers', () => {
     expect(d.mitmproxyManager.startHttpProxyCapture).toHaveBeenCalled();
     expect(d.spawnContainerHttpForwarder).toHaveBeenCalled();
     expect(d.deviceManager.setupEmulatorHttpProxy).toHaveBeenCalledWith('localhost:32770', '10.0.2.2', 8081);
-    expect(r).toEqual({ tunnelActivated: false, emuHttpProxy: { host: '10.0.2.2', port: 8081 } });
+    expect(r).toEqual({ tunnelActivated: false, emuHttpProxy: { host: '10.0.2.2', port: 8081 }, teardown: expect.any(Function) });
+  });
+
+  it('emu-http-proxy: returns only once the guest can reach the proxy, and reports connectivity ok', async () => {
+    // Regression: a freshly booted emulator is "running" a few seconds before
+    // its wifi is up. capture/start used to return at once with connectivity
+    // ok, and an app launched right after got "Network is unreachable".
+    const d = deps();
+    const order: string[] = [];
+    d.deviceManager.setupEmulatorHttpProxy = vi.fn().mockImplementation(async () => { order.push('setup'); });
+    let release!: (reachable: boolean) => void;
+    d.deviceManager.waitForEmulatorProxyReachable = vi.fn().mockImplementation(
+      () => { order.push('wait'); return new Promise<boolean>((resolve) => { release = resolve; }); },
+    );
+    const c = ctx({ mode: 'emu-http-proxy' });
+    let done = false;
+    const pending = makeCaptureHandlers(d as any)['emu-http-proxy'](c).then((r) => { done = true; return r; });
+
+    await vi.waitFor(() => expect(d.deviceManager.waitForEmulatorProxyReachable).toHaveBeenCalled());
+    expect(order).toEqual(['setup', 'wait']);
+    expect(d.deviceManager.waitForEmulatorProxyReachable).toHaveBeenCalledWith('localhost:32770', '10.0.2.2', 8081);
+    expect(done).toBe(false);
+
+    release(true);
+    const r = await pending;
+    expect(r.emuHttpProxy).toEqual({ host: '10.0.2.2', port: 8081 });
+    expect(c.setSubsystem).toHaveBeenCalledWith('connectivity', 'ok');
+  });
+
+  it('emu-http-proxy: still succeeds with a connectivity warning when the guest never reaches the proxy', async () => {
+    const d = deps();
+    d.deviceManager.waitForEmulatorProxyReachable = vi.fn().mockResolvedValue(false);
+    const c = ctx({ mode: 'emu-http-proxy' });
+    const r = await makeCaptureHandlers(d as any)['emu-http-proxy'](c);
+    expect(r).toEqual({ tunnelActivated: false, emuHttpProxy: { host: '10.0.2.2', port: 8081 }, teardown: expect.any(Function) });
+    expect(c.setSubsystem).toHaveBeenCalledWith('connectivity', 'warning');
+    expect(c.setSubsystem).not.toHaveBeenCalledWith('connectivity', 'ok');
   });
 
   it('emu-http-proxy: throws when no docker client/runtimeId', async () => {
@@ -189,6 +229,71 @@ describe('capture handlers', () => {
     d.mitmproxyManager.isCapturing = vi.fn().mockReturnValue(false);
     const h = makeCaptureHandlers(d as any);
     await expect(h['emu-http-proxy'](ctx({ mode: 'emu-http-proxy' }))).rejects.toThrow(/mitmproxy process exited/i);
+  });
+
+  it('emu-http-proxy: teardown stops the in-container forwarder of this device', async () => {
+    const d = deps();
+    const r = await makeCaptureHandlers(d as any)['emu-http-proxy'](ctx({ mode: 'emu-http-proxy' }));
+    expect(d.stopContainerHttpForwarders).not.toHaveBeenCalled();
+
+    await r.teardown!();
+
+    expect(d.stopContainerHttpForwarders).toHaveBeenCalledTimes(1);
+    expect(d.stopContainerHttpForwarders).toHaveBeenCalledWith(DOCKER, 'container123');
+  });
+
+  it('emu-http-proxy: stops the forwarder and rethrows when setup fails after it was spawned', async () => {
+    const d = deps();
+    d.deviceManager.setupEmulatorHttpProxy = vi.fn().mockRejectedValue(new Error('adb root failed'));
+    const h = makeCaptureHandlers(d as any);
+
+    await expect(h['emu-http-proxy'](ctx({ mode: 'emu-http-proxy' }))).rejects.toThrow('adb root failed');
+
+    expect(d.stopContainerHttpForwarders).toHaveBeenCalledWith(DOCKER, 'container123');
+  });
+
+  it('emu-http-proxy: stops the forwarder when mitmproxy exited during startup', async () => {
+    const d = deps();
+    d.mitmproxyManager.isCapturing = vi.fn().mockReturnValue(false);
+    const h = makeCaptureHandlers(d as any);
+
+    await expect(h['emu-http-proxy'](ctx({ mode: 'emu-http-proxy' }))).rejects.toThrow(/mitmproxy process exited/i);
+
+    expect(d.stopContainerHttpForwarders).toHaveBeenCalledWith(DOCKER, 'container123');
+  });
+
+  it('emu-http-proxy: cleans up after a forwarder that failed to start', async () => {
+    const d = deps();
+    d.spawnContainerHttpForwarder = vi.fn().mockRejectedValue(new Error('in-container forwarder failed to start'));
+    const h = makeCaptureHandlers(d as any);
+
+    await expect(h['emu-http-proxy'](ctx({ mode: 'emu-http-proxy' }))).rejects.toThrow(/failed to start/);
+
+    expect(d.stopContainerHttpForwarders).toHaveBeenCalledWith(DOCKER, 'container123');
+  });
+
+  it('emu-http-proxy: a failing cleanup does not hide the original error', async () => {
+    const d = deps();
+    d.deviceManager.setupEmulatorHttpProxy = vi.fn().mockRejectedValue(new Error('adb root failed'));
+    d.stopContainerHttpForwarders = vi.fn().mockRejectedValue(new Error('container is not running'));
+    const h = makeCaptureHandlers(d as any);
+
+    await expect(h['emu-http-proxy'](ctx({ mode: 'emu-http-proxy' }))).rejects.toThrow('adb root failed');
+  });
+
+  it('emu-http-proxy: does not touch the container when it has no container handle', async () => {
+    const d = deps(); d.lookupRuntimeId = vi.fn().mockReturnValue(undefined);
+    const h = makeCaptureHandlers(d as any);
+
+    await expect(h['emu-http-proxy'](ctx({ mode: 'emu-http-proxy' }))).rejects.toThrow(/no container handle/i);
+
+    expect(d.stopContainerHttpForwarders).not.toHaveBeenCalled();
+  });
+
+  it('wireguard and ios-bridge return no teardown', async () => {
+    const d = deps(); const h = makeCaptureHandlers(d as any);
+    expect((await h.wireguard(ctx())).teardown).toBeUndefined();
+    expect((await h['ios-bridge'](ctx({ platform: 'ios', mode: 'ios-bridge' }))).teardown).toBeUndefined();
   });
 
   it('ios-bridge: starts capture, skips on-device setup, tunnelActivated false', async () => {

@@ -1,14 +1,13 @@
 // backend/services/ai/dialects/ollama-chat.ts
-import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
-import { parseNDJSONStream, safeText } from '../http';
+import type { AiMessage, AiStreamEvent } from '../../../../shared/types/ai-chat';
+import { functionTools, toolNamesById } from '../format';
+import { authHeaders, parseNDJSONStream, safeText } from '../http';
 import { AiProviderError } from '../errors';
 import { toolInput } from '../tool-input';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 
 function formatMessages(messages: AiMessage[], systemPrompt: string): any[] {
-  const names = new Map<string, string>();
-  for (const m of messages) if (m.role === 'assistant') for (const b of m.content) if (b.type === 'tool_use') names.set(b.id, b.name);
-
+  const names = toolNamesById(messages);
   const out: any[] = [{ role: 'system', content: systemPrompt }];
   for (const msg of messages) {
     if (msg.role === 'user') out.push({ role: 'user', content: msg.content });
@@ -31,8 +30,8 @@ function formatMessages(messages: AiMessage[], systemPrompt: string): any[] {
   return out;
 }
 
-function formatTools(tools: AiToolDefinition[]): any[] {
-  return tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.inputSchema } }));
+function headers(ctx: DialectContext): Record<string, string> {
+  return { 'Content-Type': 'application/json', ...authHeaders(ctx) };
 }
 
 function classifyStreamError(payload: any, ctx: DialectContext): AiProviderError {
@@ -51,10 +50,9 @@ function argumentsInput(args: unknown): Record<string, any> {
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   const shortName = ctx.descriptor.shortName;
-  if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
   let sawLine = false;
   let finished = false;
-  for await (const chunk of parseNDJSONStream(res.body, signal)) {
+  for await (const chunk of parseNDJSONStream(res.body!, signal)) {
     // A line can be valid JSON without being an object (null, 7, "text"); there is nothing to read from it.
     if (!chunk || typeof chunk !== 'object') continue;
     sawLine = true;
@@ -80,18 +78,18 @@ export const ollamaDialect: Dialect = {
 
   buildChat(ctx: DialectContext, req: AiRequest, opts: { stream: boolean }) {
     const body: any = { model: ctx.model, messages: formatMessages(req.messages, req.systemPrompt), stream: opts.stream };
-    if (req.tools.length > 0) body.tools = formatTools(req.tools);
+    if (req.tools.length > 0) body.tools = functionTools(req.tools);
     const options: any = {};
     if (req.maxOutputTokens) options.num_predict = req.maxOutputTokens;
     if (req.stopSequences?.length) options.stop = req.stopSequences;
     if (req.temperature !== undefined) options.temperature = req.temperature;
     if (Object.keys(options).length > 0) body.options = options;
-    return { url: `${ctx.baseUrl}/api/chat`, headers: { 'Content-Type': 'application/json' }, body };
+    return { url: `${ctx.baseUrl}/api/chat`, headers: headers(ctx), body };
   },
   parseStream,
   classifyStreamError,
   buildListModels(ctx: DialectContext) {
-    return { url: `${ctx.baseUrl}/api/tags`, headers: { 'Content-Type': 'application/json' } };
+    return { url: `${ctx.baseUrl}/api/tags`, headers: headers(ctx) };
   },
   parseModels(json: any) {
     return {

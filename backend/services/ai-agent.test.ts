@@ -4,6 +4,7 @@ import * as schema from '../db/schema';
 import {
   AiAgent,
   buildSystemPrompt,
+  contextsLoadedEarlier,
   parseTextBasedToolUses,
   containsUnparsedToolCallAttempt,
   getRunUsageFromError,
@@ -175,6 +176,48 @@ describe('containsUnparsedToolCallAttempt', () => {
 
   it('does NOT trigger on empty text', () => {
     expect(containsUnparsedToolCallAttempt('', names)).toBe(false);
+  });
+});
+
+describe('contextsLoadedEarlier', () => {
+  const asks = (...contexts: unknown[]): AiMessage => ({
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'r', name: 'request_tools', input: { contexts } }],
+  });
+
+  it('is empty for a conversation that never called request_tools', () => {
+    const messages: AiMessage[] = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: [{ type: 'text', text: 'hello' }, { type: 'tool_use', id: 't', name: 'list_devices', input: { contexts: ['traffic'] } }] },
+      { role: 'tool_result', toolUseId: 't', content: 'traffic' },
+    ];
+    expect(contextsLoadedEarlier(messages)).toEqual([]);
+  });
+
+  it('lists the contexts in the order they were first asked for, across calls, without repeats', () => {
+    const messages: AiMessage[] = [
+      { role: 'user', content: 'a' },
+      asks('traffic', 'devices'),
+      { role: 'tool_result', toolUseId: 'r', content: 'ok' },
+      { role: 'user', content: 'b' },
+      asks('proxies', 'traffic'),
+    ];
+    expect(contextsLoadedEarlier(messages)).toEqual(['traffic', 'devices', 'proxies']);
+  });
+
+  it('skips anything in a stored message that is not a list of context names', () => {
+    const messages: AiMessage[] = [
+      asks('traffic', 7, null, { a: 1 }, ['x'], ''),
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'r', name: 'request_tools', input: {} }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'r', name: 'request_tools', input: { contexts: 'devices' } }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'r', name: 'request_tools', input: { contexts: null } }] },
+    ];
+    expect(contextsLoadedEarlier(messages)).toEqual(['traffic']);
+  });
+
+  it('copes with a stored conversation whose assistant content is not an array', () => {
+    const messages = [{ role: 'assistant', content: 'plain text' }, asks('traffic')] as unknown as AiMessage[];
+    expect(contextsLoadedEarlier(messages)).toEqual(['traffic']);
   });
 });
 
@@ -2596,11 +2639,11 @@ describe('AiAgent', () => {
       const { provider, fn } = scripted(
         async function* () {
           yield { type: 'tool_use', id: 't1', name: 'ok_tool', input: {} };
-          // Over the compaction threshold of the agent's context window.
-          yield { type: 'usage', inputTokens: 150_000, outputTokens: 10, model: 'claude-sonnet-5-5' };
+          // Over the compaction threshold of the model's 1M-token context window.
+          yield { type: 'usage', inputTokens: 600_000, outputTokens: 10, model: 'claude-sonnet-5-5' };
         },
         async function* () {
-          yield { type: 'usage', inputTokens: 150_500, outputTokens: 0, cachedInputTokens: 150_000, model: 'claude-sonnet-5-5' };
+          yield { type: 'usage', inputTokens: 600_500, outputTokens: 0, cachedInputTokens: 600_000, model: 'claude-sonnet-5-5' };
           yield { type: 'text', text: 'summary of the work so far' };
           yield { type: 'usage', inputTokens: 0, outputTokens: 400 };
         },
@@ -2613,10 +2656,10 @@ describe('AiAgent', () => {
       const result = await run(new AiAgent(db, registry, provider));
 
       expect(fn).toHaveBeenCalledTimes(3);
-      expect(fn.mock.calls[1][2]).toEqual([]);   // the compaction request sends no tools
+      expect(fn.mock.calls[1][2]).toEqual(fn.mock.calls[0][2]);   // the compaction request sends the run's tools
       expect(result.run?.requests?.map((r) => [r.inputTokens, r.cacheReadTokens, r.outputTokens])).toEqual([
-        [150_000, 0, 10],
-        [150_500, 150_000, 400],
+        [600_000, 0, 10],
+        [600_500, 600_000, 400],
         [2000, 0, 5],
       ]);
       expect(result.run?.turns).toBe(2);
@@ -2670,6 +2713,359 @@ describe('AiAgent', () => {
       expect(usage?.requests.map((r) => r.inputTokens)).toEqual([40, 60]);
       expect(usage?.turns).toBe(2);
       expect(usage?.toolCalls).toBe(1);
+    });
+  });
+
+  describe('conversation history persistence', () => {
+    const person = (id: number): AgentIdentity => ({ identityType: 'user', actorUserId: id, effectiveScopes: [] });
+    const run = (agent: AiAgent, identity: AgentIdentity, extra: Record<string, unknown> = {}) => agent.handleMessageWithIdentity(identity, {
+      conversationId: null,
+      message: 'hello there',
+      pageContext: 'apk-analysis',
+      contextId: '12',
+      originPath: '/ui/analysis/12',
+      onToken: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolResult: vi.fn(),
+      mode: 'streaming',
+      ...extra,
+    } as any);
+    const all = () => db.select().from(schema.aiConversations).all();
+    const seedRow = (over: Partial<typeof schema.aiConversations.$inferInsert> = {}) => Number(db.insert(schema.aiConversations).values({
+      pageContext: 'apk-analysis', contextId: '12', title: 'old chat', createdAt: new Date(1000), updatedAt: new Date(1000),
+      messages: JSON.stringify([{ role: 'user', content: 'q' }, { role: 'assistant', content: [{ type: 'text', text: 'a' }] }]),
+      ...over,
+    }).run().lastInsertRowid);
+
+    it('saves a new chat with its owner and where it started, and clears the unfinished flag when it ends cleanly', async () => {
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('hi')));
+      const result = await run(agent, person(5));
+      const row = all()[0];
+      expect(row.id).toBe(result.conversationId);
+      expect(row).toMatchObject({ userId: 5, originPath: '/ui/analysis/12', unfinished: false, automated: false, title: 'hello there' });
+    });
+
+    it('saves an automated run with no owner, flagged automated', async () => {
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('hi')));
+      await run(agent, person(5), { mode: 'silent', originPath: undefined });
+      expect(all()[0]).toMatchObject({ userId: null, automated: true, originPath: null, unfinished: false });
+    });
+
+    it('has the user message stored before the model is called', async () => {
+      let seen: typeof schema.aiConversations.$inferSelect | undefined;
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => {
+        seen = all()[0];
+        return textOnlyStream('hi');
+      }));
+      await run(agent, person(5));
+      expect(seen).toBeDefined();
+      expect(seen!.unfinished).toBe(true);
+      expect(JSON.parse(seen!.messages)).toEqual([{ role: 'user', content: 'hello there' }]);
+    });
+
+    it('keeps the message and leaves the chat unfinished when the model request throws', async () => {
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => {
+        throw new Error('provider down');
+      }));
+      await expect(run(agent, person(5))).rejects.toThrow('provider down');
+      const row = all()[0];
+      expect(row.unfinished).toBe(true);
+      expect(JSON.parse(row.messages)).toEqual([{ role: 'user', content: 'hello there' }]);
+    });
+
+    it('leaves the chat unfinished when the run is cancelled, and keeps the completed turns', async () => {
+      const controller = new AbortController();
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => (async function* () {
+        controller.abort();
+        yield { type: 'text', text: 'partial' } as AiStreamEvent;
+      })()));
+      const result = await run(agent, person(5), { signal: controller.signal });
+      expect(result.aborted).toBe(true);
+      expect(all()[0].unfinished).toBe(true);
+    });
+
+    it('leaves the chat unfinished when it stops at the turn limit', async () => {
+      const registry = makeRegistry([{ name: 'ping', context: ['apk-analysis'] }]);
+      const agent = new AiAgent(db, registry, makeMockProvider(() => (async function* () {
+        yield { type: 'tool_use', id: 't', name: 'ping', input: {} } as AiStreamEvent;
+        yield { type: 'usage', inputTokens: 1, outputTokens: 1 } as AiStreamEvent;
+      })()));
+      const result = await run(agent, person(5), { maxTurns: 1 });
+      expect(result.turnLimitReached).toBe(true);
+      expect(all()[0].unfinished).toBe(true);
+    });
+
+    it('continues an existing chat, keeping its owner, title and origin, and clears the flag', async () => {
+      const id = seedRow({ userId: 5, originPath: '/ui/analysis/12', unfinished: true });
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('again')));
+      const result = await run(agent, person(5), { conversationId: id, originPath: '/ui/devices', message: 'next' });
+      expect(result.conversationId).toBe(id);
+      expect(all()).toHaveLength(1);
+      expect(all()[0]).toMatchObject({ userId: 5, title: 'old chat', originPath: '/ui/analysis/12', unfinished: false });
+      expect(JSON.parse(all()[0].messages)).toHaveLength(4);
+    });
+
+    it('puts a note between the old message and the new one when the earlier run never replied', async () => {
+      const id = seedRow({ userId: 5, unfinished: true, messages: JSON.stringify([{ role: 'user', content: 'unanswered' }]) });
+      let sent: AiMessage[] = [];
+      const agent = new AiAgent(db, makeRegistry(), {
+        name: 'mock',
+        createStreamingRequest: (messages: AiMessage[]) => { sent = structuredClone(messages); return textOnlyStream('ok'); },
+      } as AiStreamingProvider);
+      await run(agent, person(5), { conversationId: id, message: 'continue' });
+      expect(sent.map(m => m.role)).toEqual(['user', 'assistant', 'user']);
+      expect(sent[2]).toEqual({ role: 'user', content: 'continue' });
+    });
+
+    it('starts a new chat instead of continuing another user\'s conversation', async () => {
+      const theirs = seedRow({ userId: 9 });
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('hi')));
+      const result = await run(agent, person(5), { conversationId: theirs });
+      expect(result.conversationId).not.toBe(theirs);
+      const rows = all();
+      expect(rows).toHaveLength(2);
+      expect(rows.find(r => r.id === theirs)!.messages).toContain('"q"');
+      expect(rows.find(r => r.id === result.conversationId)!.userId).toBe(5);
+    });
+
+    it('starts a new chat when the conversation id no longer exists', async () => {
+      const agent = new AiAgent(db, makeRegistry(), makeMockProvider(() => textOnlyStream('hi')));
+      const result = await run(agent, person(5), { conversationId: 4242 });
+      expect(result.conversationId).not.toBe(4242);
+      expect(all()).toHaveLength(1);
+    });
+  });
+
+  describe('tools loaded earlier in a conversation', () => {
+    const identity: AgentIdentity = {
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: ['core.traffic:read'],
+      onBehalfOfService: 'test',
+    };
+    const registry = () => makeRegistry([
+      { name: 'list_devices', context: ['devices'] },
+      { name: 'dump_traffic', context: ['traffic'], requiredScope: 'core.traffic:read' },
+      { name: 'list_proxies', context: ['proxies'] },
+    ]);
+    const send = (agent: AiAgent, conversationId: number | null, extra: Record<string, unknown> = {}) =>
+      agent.handleMessageWithIdentity(identity, {
+        conversationId,
+        message: 'go',
+        pageContext: 'devices',
+        contextId: '',
+        onToken: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolResult: vi.fn(),
+        mode: 'streaming',
+        ...extra,
+      });
+    const asks = (...contexts: string[]) => async function* (): AsyncIterable<AiStreamEvent> {
+      yield { type: 'tool_use', id: 'r1', name: 'request_tools', input: { contexts } };
+      yield { type: 'usage', inputTokens: 10, outputTokens: 1 };
+    };
+    /** A provider whose Nth request runs the Nth script, and keeps every request's arguments. */
+    const scripted = (...scripts: Array<() => AsyncIterable<AiStreamEvent>>) => {
+      let n = 0;
+      const fn = vi.fn(() => scripts[Math.min(n++, scripts.length - 1)]());
+      return { agent: new AiAgent(db, registry(), makeMockProvider(fn)), fn };
+    };
+    const toolNames = (fn: ReturnType<typeof scripted>['fn'], request: number): string[] =>
+      (fn.mock.calls[request] as unknown as [unknown, unknown, Array<{ name: string }>])[2].map((t) => t.name);
+    const toolsJson = (fn: ReturnType<typeof scripted>['fn'], request: number): string =>
+      JSON.stringify((fn.mock.calls[request] as unknown as [unknown, unknown, unknown])[2]);
+    const systemPrompt = (fn: ReturnType<typeof scripted>['fn'], request: number): string =>
+      (fn.mock.calls[request] as unknown as [unknown, string])[1];
+
+    it('starts the next message with the tools the model already loaded, in the same order as its last request', async () => {
+      const { agent, fn } = scripted(asks('traffic'), () => textOnlyStream('done'), () => textOnlyStream('again'));
+      const first = await send(agent, null);
+      await send(agent, first.conversationId);
+
+      expect(toolNames(fn, 0)).not.toContain('dump_traffic');   // before the model asked
+      expect(toolNames(fn, 1)).toContain('dump_traffic');       // after request_tools
+      // The next message sends exactly what the last request of the previous one sent, so the cached prefix is reused.
+      expect(toolsJson(fn, 2)).toBe(toolsJson(fn, 1));
+      expect(systemPrompt(fn, 2)).toBe(systemPrompt(fn, 0));
+    });
+
+    it('keeps the order in which contexts were first requested across messages', async () => {
+      const { agent, fn } = scripted(asks('traffic'), () => textOnlyStream('a'), asks('proxies', 'traffic'), () => textOnlyStream('b'), () => textOnlyStream('c'));
+      const first = await send(agent, null);
+      const second = await send(agent, first.conversationId);
+      await send(agent, second.conversationId);
+
+      expect(toolNames(fn, 4)).toEqual(['list_devices', 'dump_traffic', 'list_proxies', 'request_tools']);
+      expect(toolsJson(fn, 4)).toBe(toolsJson(fn, 3));
+    });
+
+    it('does not restore a context whose tools the caller can no longer use', async () => {
+      const { agent, fn } = scripted(asks('traffic'), () => textOnlyStream('done'), () => textOnlyStream('again'));
+      const first = await send(agent, null);
+      await send(agent, first.conversationId, { userScopes: new Set<string>() });
+
+      expect(toolNames(fn, 1)).toContain('dump_traffic');
+      expect(toolNames(fn, 2)).not.toContain('dump_traffic');
+    });
+
+    it('sends only the page tools when no earlier message loaded anything', async () => {
+      const { agent, fn } = scripted(() => textOnlyStream('one'), () => textOnlyStream('two'));
+      const first = await send(agent, null);
+      await send(agent, first.conversationId);
+
+      expect(toolNames(fn, 1)).toEqual(['list_devices', 'request_tools']);
+      expect(toolsJson(fn, 1)).toBe(toolsJson(fn, 0));
+    });
+
+    it('starts a different conversation with the page tools only', async () => {
+      const { agent, fn } = scripted(asks('traffic'), () => textOnlyStream('done'), () => textOnlyStream('fresh'));
+      await send(agent, null);
+      await send(agent, null);
+
+      expect(toolNames(fn, 2)).toEqual(['list_devices', 'request_tools']);
+    });
+  });
+
+  describe('context window and compaction', () => {
+    const identity: AgentIdentity = {
+      identityType: 'core-service',
+      actorUserId: 0,
+      effectiveScopes: [],
+      onBehalfOfService: 'test',
+    };
+    const OPUS = 'claude-opus-5-5';
+    const HAIKU_45 = 'claude-haiku-4-5';
+    const send = (agent: AiAgent, extra: Record<string, unknown> = {}) => agent.handleMessageWithIdentity(identity, {
+      conversationId: null,
+      message: 'go',
+      pageContext: 'devices',
+      contextId: '',
+      onToken: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolResult: vi.fn(),
+      mode: 'streaming',
+      ...extra,
+    });
+    const usesTool = (inputTokens: number, model?: string) => async function* (): AsyncIterable<AiStreamEvent> {
+      yield { type: 'tool_use', id: `t${inputTokens}`, name: 'ok_tool', input: {} };
+      yield { type: 'usage', inputTokens, outputTokens: 10, ...(model ? { model } : {}) };
+    };
+    const summary = (text: string) => async function* (): AsyncIterable<AiStreamEvent> {
+      yield { type: 'text', text };
+      yield { type: 'usage', inputTokens: 0, outputTokens: 50 };
+    };
+    /** A provider whose Nth request runs the Nth script, and keeps every request's arguments. */
+    const scripted = (...scripts: Array<() => AsyncIterable<AiStreamEvent>>) => {
+      let n = 0;
+      const fn = vi.fn(() => scripts[Math.min(n++, scripts.length - 1)]());
+      return { agent: new AiAgent(db, makeRegistry([{ name: 'ok_tool' }]), makeMockProvider(fn)), fn };
+    };
+    type Args = [AiMessage[], string, unknown[]];
+    const args = (fn: ReturnType<typeof scripted>['fn'], request: number) => fn.mock.calls[request] as unknown as Args;
+    const wasCompacted = (fn: ReturnType<typeof scripted>['fn'], request: number) =>
+      JSON.stringify(args(fn, request)[0][0]).includes('Conversation compacted');
+
+    it('sends the tools of the run with the compaction request, so a provider that needs them accepts the history', async () => {
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      const [, compactionSystem, compactionTools] = args(fn, 1);
+      expect(compactionTools.length).toBeGreaterThan(0);
+      expect(JSON.stringify(compactionTools)).toBe(JSON.stringify(args(fn, 0)[2]));
+      expect(compactionSystem).toBe(args(fn, 0)[1]);
+    });
+
+    it('sends the whole history first and the compaction instruction last, so the request extends the cached prefix', async () => {
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      const [compactionMessages] = args(fn, 1);
+      expect(compactionMessages.map((m) => m.role)).toEqual(['user', 'assistant', 'tool_result', 'user']);
+      expect(compactionMessages[0]).toMatchObject({ role: 'user', content: 'go' });
+    });
+
+    it('tells the model to answer in text without calling a tool', async () => {
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      const last = args(fn, 1)[0].at(-1);
+      expect(last?.role).toBe('user');
+      expect(String(last?.content)).toMatch(/do not call any tools/i);
+    });
+
+    it('replaces the history with the summary when the model answers in text', async () => {
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(wasCompacted(fn, 2)).toBe(true);
+      expect(JSON.stringify(args(fn, 2)[0][0])).toContain('the summary');
+    });
+
+    it('keeps the history when the model calls a tool instead of summarising', async () => {
+      const calledATool = async function* (): AsyncIterable<AiStreamEvent> {
+        yield { type: 'text', text: 'Let me look one more thing up first.' };
+        yield { type: 'tool_use', id: 'again', name: 'ok_tool', input: {} };
+        yield { type: 'usage', inputTokens: 0, outputTokens: 20 };
+      };
+      const { agent, fn } = scripted(usesTool(600_000, OPUS), calledATool, () => textOnlyStream('finished'));
+      const result = await send(agent);
+
+      expect(result.error).toBeUndefined();
+      expect(wasCompacted(fn, 2)).toBe(false);
+      expect(args(fn, 2)[0][0]).toMatchObject({ role: 'user', content: 'go' });
+    });
+
+    it('does not compact a model with a 1M window at 150K tokens, and reports the share of its real window', async () => {
+      const percents: number[] = [];
+      const { agent, fn } = scripted(usesTool(150_000, OPUS), () => textOnlyStream('finished'));
+      await send(agent, { onContextUsage: (p: number) => percents.push(p) });
+
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(wasCompacted(fn, 1)).toBe(false);
+      expect(percents[0]).toBe(15);
+    });
+
+    it('compacts a model with a 1M window once the prompt is 55% of it', async () => {
+      const below = scripted(usesTool(549_000, OPUS), () => textOnlyStream('finished'));
+      await send(below.agent);
+      expect(below.fn).toHaveBeenCalledTimes(2);
+
+      const at = scripted(usesTool(550_000, OPUS), summary('the summary'), () => textOnlyStream('finished'));
+      await send(at.agent);
+      expect(at.fn).toHaveBeenCalledTimes(3);
+    });
+
+    it('compacts a 200K model at 110K tokens', async () => {
+      const { agent, fn } = scripted(usesTool(110_000, HAIKU_45), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent);
+
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(wasCompacted(fn, 2)).toBe(true);
+    });
+
+    it('assumes a 200K window when the provider does not report the model', async () => {
+      const percents: number[] = [];
+      const { agent, fn } = scripted(usesTool(110_000), summary('the summary'), () => textOnlyStream('finished'));
+      await send(agent, { onContextUsage: (p: number) => percents.push(p) });
+
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(percents[0]).toBe(55);
+    });
+
+    it('uses the smallest window among the models that served the run, since any of them can serve the next request', async () => {
+      const percents: number[] = [];
+      const { agent, fn } = scripted(
+        usesTool(50_000, HAIKU_45),   // a fallback model with a 200K window served the first request
+        usesTool(150_000, OPUS),      // 150K is 15% of 1M but 75% of the 200K window the fallback could serve again
+        summary('the summary'),
+        () => textOnlyStream('finished'),
+      );
+      await send(agent, { onContextUsage: (p: number) => percents.push(p) });
+
+      expect(percents[1]).toBe(75);
+      expect(fn).toHaveBeenCalledTimes(4);
+      expect(wasCompacted(fn, 3)).toBe(true);
     });
   });
 });

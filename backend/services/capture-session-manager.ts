@@ -21,6 +21,7 @@ interface ActiveCapture {
   sessionId: number;
   deviceId: string;
   tunnelActivated: boolean;
+  teardown?: () => Promise<void>;
   subsystems?: CaptureSubsystemStatus;
   // Egress fingerprint — how this session's traffic leaves the machine. Read by
   // the replay path (ProxiedRequestService) to reproduce the same proxy + TLS
@@ -226,6 +227,7 @@ export class CaptureSessionManager {
         sessionId,
         deviceId,
         tunnelActivated,
+        teardown: result.teardown,
         subsystems,
         // Egress fingerprint for the replay path. proxyOptions/tlsProfile are
         // the exact same inputs mitmproxy was configured with above, so a
@@ -317,6 +319,11 @@ export class CaptureSessionManager {
     // Stop mitmproxy
     try { await this.mitmproxyManager.stopCapture(deviceId); }
     catch (err: any) { error(`Failed to stop mitmproxy: ${err.message}`); }
+
+    if (capture.teardown) {
+      try { await capture.teardown(); }
+      catch (err: any) { error(`Failed to tear down capture for ${deviceId}: ${err.message}`); }
+    }
 
     // Update session status
     this.db

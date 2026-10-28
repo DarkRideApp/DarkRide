@@ -19,6 +19,9 @@ import type { AutomationRunner as IAutomationRunner } from '@darkrideapp/plugin-
 import type { SessionStatusUpdate } from '../../shared/types/websocket';
 import type { TriggerType } from '../../shared/types/api';
 import { DocumentStore } from './document-store';
+import { currentAuthorId, resolveToolAccess, type ToolAccess } from './automation-authors';
+import { isScriptCallable, requiredHostScope } from './automation-host-scopes';
+import { scopeMatches } from '../auth/scope-matcher';
 import type { HookBus } from '@darkrideapp/plugin-sdk';
 
 const { log, error } = createLoggers('automation-runner');
@@ -87,14 +90,50 @@ export class AutomationRunner implements IAutomationRunner {
     this.toolRegistry = registry;
   }
 
-  private buildToolsProxy(): Record<string, (params: any) => Promise<any>> {
+  /**
+   * What the author's scopes allow right now, or a throw when nothing does. Read fresh on every call so a revoked scope applies at once.
+   * `authorAtStart` is the author when the run began: if a different person saves the script mid-run, the old code must not inherit their authority.
+   */
+  private authorAccess(automationId: number, authorAtStart: number | null): Exclude<ToolAccess, { kind: 'denied' }> {
+    if (currentAuthorId(this.db, automationId) !== authorAtStart) {
+      throw new Error('Access denied: the script was saved by someone else while it was running.');
+    }
+    const access = resolveToolAccess(this.db, automationId);
+    if (access.kind === 'denied') throw new Error(access.reason);
+    return access;
+  }
+
+  /** A script's tools run with its author's scopes. */
+  private buildToolsProxy(automationId: number): Record<string, (params: any) => Promise<any>> {
     if (!this.toolRegistry) return {};
     const registry = this.toolRegistry;
+    const authorAtStart = currentAuthorId(this.db, automationId);
     return new Proxy({} as Record<string, (params: any) => Promise<any>>, {
-      get(_target, prop: string) {
-        return (params: any) => registry.executeTool(prop, params);
+      get: (_target, prop: string) => {
+        return async (params: any) => {
+          const access = this.authorAccess(automationId, authorAtStart);
+          if (access.kind === 'scoped') {
+            registry.assertScope(prop, access.snapshot);
+            registry.assertScope(prop, access.current);
+          }
+          return registry.executeTool(prop, params);
+        };
       },
     });
+  }
+
+  /** Refuses a host call that automation-host-scopes does not list, and one whose scope the script's author lacks. */
+  private buildHostGate(automationId: number): (target: string, method: string) => void {
+    const authorAtStart = currentAuthorId(this.db, automationId);
+    return (target, method) => {
+      if (!isScriptCallable(target, method)) throw new Error(`${target}.${method} is not available to scripts`);
+      const scope = requiredHostScope(target, method);
+      if (!scope) return;
+      const access = this.authorAccess(automationId, authorAtStart);
+      if (access.kind === 'scoped' && !(scopeMatches(access.snapshot, scope) && scopeMatches(access.current, scope))) {
+        throw new Error(`Insufficient scope: ${scope} required for ${target}.${method}`);
+      }
+    };
   }
 
   async runAutomation(
@@ -442,7 +481,8 @@ export class AutomationRunner implements IAutomationRunner {
       try {
         await Promise.race([
           this.compiler.execute(compiled.code, apiForExecution, {
-            documentStore, console: automationConsole, tools: this.buildToolsProxy(), httpAPI,
+            documentStore, console: automationConsole, tools: this.buildToolsProxy(automationId), httpAPI,
+            authorizeHostCall: this.buildHostGate(automationId),
           }, { signal: abortController.signal }),
           timeoutPromise,
         ]);
@@ -656,7 +696,7 @@ export class AutomationRunner implements IAutomationRunner {
           const handle = await this.compiler.execute(
             compiled.code,
             deviceAPI,
-            { documentStore, tools: this.buildToolsProxy() },
+            { documentStore, tools: this.buildToolsProxy(rule.id), authorizeHostCall: this.buildHostGate(rule.id) },
             { keepAlive: true },
           );
           const handles = this.captureRuleIsolates.get(deviceId) ?? [];
@@ -720,7 +760,9 @@ export class AutomationRunner implements IAutomationRunner {
             continue;
           }
 
-          await this.compiler.execute(compiled.code, deviceAPI, { documentStore, tools: this.buildToolsProxy() });
+          await this.compiler.execute(compiled.code, deviceAPI, {
+            documentStore, tools: this.buildToolsProxy(rule.id), authorizeHostCall: this.buildHostGate(rule.id),
+          });
         } catch (err: any) {
           error(`Rule "${rule.name}" failed: ${err.message}`);
         }

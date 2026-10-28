@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import express from 'express';
+import { eq } from 'drizzle-orm';
 import * as schema from '../db/schema';
 import { registerAutomationEndpoints } from './automations';
 import { AutomationRunner } from '../services/automation-runner';
 import { AutomationCompiler } from '../services/automation-compiler';
 import { AutomationScheduler } from '../services/automation-scheduler';
 import { PythonBridgeManager } from '../services/python-bridge';
+import { resolveToolAccess } from '../services/automation-authors';
 import { clearEndpoints, getApiRouter } from './api-service';
 import type { AppDatabase } from '../db/index';
 import { createTestDb } from '../test-utils/create-test-db';
@@ -191,6 +193,218 @@ describe('Automation API', () => {
         .send({ name: 'Updated' });
 
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe('recording who wrote a script', () => {
+    let userCount = 0;
+
+    function addUser(scopes: string[]) {
+      const now = new Date();
+      db.insert(schema.users).values({
+        username: `writer${++userCount}`, providerId: 'core.local', scopes, createdAt: now, updatedAt: now,
+      }).run();
+      return db.select().from(schema.users).all().pop()!;
+    }
+
+    // Mounts the same router behind an identity, as the auth middleware does in production.
+    function appAs(userId: number, scopes: string[]) {
+      const a = express();
+      a.use(express.json());
+      a.use((req, _res, next) => {
+        req.authUser = { userId, username: 'writer', via: 'apikey', effectiveScopes: new Set(scopes) };
+        next();
+      });
+      a.use(getApiRouter());
+      return a;
+    }
+
+    const EDIT = 'core.automations:edit';
+    const authorOf = (id: number) =>
+      db.select().from(schema.automationAuthors).where(eq(schema.automationAuthors.automationId, id)).all()[0];
+
+    it('records the creator and the scopes of the credential used', async () => {
+      const user = addUser(['core.admin:*']);
+      const res = await request(appAs(user.id, [EDIT, 'core.devices:shell']))
+        .post('/v1/automation/create').send({ name: 'a', code: 'code' });
+
+      expect(res.status).toBe(201);
+      const row = authorOf(res.body.data.id);
+      expect(row.userId).toBe(user.id);
+      expect([...row.scopes].sort()).toEqual(['core.automations:edit', 'core.devices:shell']);
+    });
+
+    it('moves the author to whoever saves the code next', async () => {
+      const first = addUser(['core.admin:*']);
+      const second = addUser([EDIT]);
+      const created = await request(appAs(first.id, [EDIT, 'core.devices:shell']))
+        .post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+
+      await request(appAs(second.id, [EDIT])).put(`/v1/automation/update/${id}`).send({ code: 'two' });
+
+      const row = authorOf(id);
+      expect(row.userId).toBe(second.id);
+      expect(row.scopes).toEqual([EDIT]);
+    });
+
+    it('also claims the script when the code sent is unchanged', async () => {
+      const first = addUser(['core.admin:*']);
+      const second = addUser([EDIT]);
+      const created = await request(appAs(first.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'same' });
+      const id = created.body.data.id;
+
+      await request(appAs(second.id, [EDIT])).put(`/v1/automation/update/${id}`).send({ code: 'same' });
+
+      expect(authorOf(id).userId).toBe(second.id);
+    });
+
+    it('leaves the author alone when the update does not send code', async () => {
+      const first = addUser(['core.admin:*']);
+      const second = addUser([EDIT]);
+      const created = await request(appAs(first.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+
+      await request(appAs(second.id, [EDIT])).put(`/v1/automation/update/${id}`).send({ name: 'renamed', enabled: false, timeoutMs: 5000 });
+
+      expect(authorOf(id).userId).toBe(first.id);
+    });
+
+    it('records no author when the request carries no identity, and drops an existing one on a code save', async () => {
+      const user = addUser([EDIT]);
+      const created = await request(appAs(user.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+      expect(authorOf(id)).toBeDefined();
+
+      await request(app).put(`/v1/automation/update/${id}`).send({ code: 'two' });
+      expect(authorOf(id)).toBeUndefined();
+
+      const anonymous = await request(app).post('/v1/automation/create').send({ name: 'b', code: 'code' });
+      expect(authorOf(anonymous.body.data.id)).toBeUndefined();
+    });
+
+    it('keeps the author out of every response', async () => {
+      const user = addUser([EDIT]);
+      const created = await request(appAs(user.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+      const responses = [
+        created,
+        await request(appAs(user.id, [EDIT, 'core.automations:read'])).put(`/v1/automation/update/${id}`).send({ code: 'two' }),
+        await request(appAs(user.id, [EDIT, 'core.automations:read'])).get(`/v1/automation/view/${id}`),
+        await request(appAs(user.id, [EDIT, 'core.automations:read'])).get('/v1/automation/list'),
+      ];
+
+      for (const res of responses) {
+        expect(res.status).toBeLessThan(300);
+        expect(JSON.stringify(res.body)).not.toMatch(/author/i);
+      }
+    });
+
+    it('removes the author row when the automation is deleted', async () => {
+      const user = addUser([EDIT]);
+      const created = await request(appAs(user.id, [EDIT])).post('/v1/automation/create').send({ name: 'a', code: 'one' });
+      const id = created.body.data.id;
+
+      const res = await request(appAs(user.id, [EDIT])).delete(`/v1/automation/delete/${id}`);
+
+      expect(res.status).toBe(200);
+      expect(authorOf(id)).toBeUndefined();
+    });
+
+    describe('claiming scripts nobody has claimed', () => {
+      const READ = 'core.automations:read';
+
+      // Scripts saved before authors were recorded have no row; the anonymous route leaves none.
+      async function createUnclaimed(name: string) {
+        const res = await request(app).post('/v1/automation/create').send({ name, code: 'code' });
+        expect(authorOf(res.body.data.id)).toBeUndefined();
+        return res.body.data.id as number;
+      }
+
+      it('counts the scripts that have no author', async () => {
+        const user = addUser([EDIT, READ]);
+        await createUnclaimed('one');
+        await createUnclaimed('two');
+        await request(appAs(user.id, [EDIT])).post('/v1/automation/create').send({ name: 'claimed', code: 'code' });
+
+        const res = await request(appAs(user.id, [READ])).get('/v1/automation/unclaimed');
+
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ success: true, data: { count: 2 } });
+      });
+
+      it('needs the read scope to count', async () => {
+        const user = addUser([]);
+        const res = await request(appAs(user.id, [])).get('/v1/automation/unclaimed');
+        expect(res.status).toBe(403);
+      });
+
+      it('makes the caller the author of every unclaimed script, with the scopes of the credential used', async () => {
+        const user = addUser(['core.admin:*']);
+        const a = await createUnclaimed('one');
+        const b = await createUnclaimed('two');
+
+        const res = await request(appAs(user.id, [EDIT, 'core.credentials:read'])).post('/v1/automation/claim-all').send({});
+
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ success: true, data: { claimed: 2 } });
+        for (const id of [a, b]) {
+          expect(authorOf(id).userId).toBe(user.id);
+          expect([...authorOf(id).scopes].sort()).toEqual([EDIT, 'core.credentials:read']);
+        }
+      });
+
+      it('leaves a script that already has an author with that author', async () => {
+        const owner = addUser(['core.admin:*']);
+        const caller = addUser([EDIT]);
+        const owned = await request(appAs(owner.id, [EDIT])).post('/v1/automation/create').send({ name: 'owned', code: 'code' });
+        const loose = await createUnclaimed('loose');
+
+        const res = await request(appAs(caller.id, [EDIT])).post('/v1/automation/claim-all').send({});
+
+        expect(res.body.data.claimed).toBe(1);
+        expect(authorOf(owned.body.data.id).userId).toBe(owner.id);
+        expect(authorOf(loose).userId).toBe(caller.id);
+      });
+
+      it('has nothing left to claim the second time', async () => {
+        const user = addUser([EDIT]);
+        await createUnclaimed('one');
+        await request(appAs(user.id, [EDIT])).post('/v1/automation/claim-all').send({});
+
+        const again = await request(appAs(user.id, [EDIT])).post('/v1/automation/claim-all').send({});
+
+        expect(again.body.data.claimed).toBe(0);
+      });
+
+      it('needs the edit scope', async () => {
+        const user = addUser([READ]);
+        const id = await createUnclaimed('one');
+
+        const res = await request(appAs(user.id, [READ])).post('/v1/automation/claim-all').send({});
+
+        expect(res.status).toBe(403);
+        expect(authorOf(id)).toBeUndefined();
+      });
+
+      it('refuses a request with no identity, since there would be nobody to claim for', async () => {
+        const id = await createUnclaimed('one');
+
+        const res = await request(app).post('/v1/automation/claim-all').send({});
+
+        expect(res.status).toBe(401);
+        expect(authorOf(id)).toBeUndefined();
+      });
+
+      it('lets the claimed script use a gated call afterwards', async () => {
+        const user = addUser(['core.admin:*']);
+        const id = await createUnclaimed('one');
+        expect(resolveToolAccess(db, id).kind).toBe('denied');
+
+        await request(appAs(user.id, ['core.admin:*'])).post('/v1/automation/claim-all').send({});
+
+        expect(resolveToolAccess(db, id).kind).toBe('scoped');
+      });
     });
   });
 

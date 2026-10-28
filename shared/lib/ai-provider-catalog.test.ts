@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   AI_PROVIDER_CATALOG, AI_PROVIDER_IDS, getProviderDescriptor, isKnownProviderType,
-  isCliProvider, normalizeBaseUrl, sameEffectiveBaseUrl,
+  isCliProvider, normalizeBaseUrl, sameEffectiveBaseUrl, type AiProviderDescriptor,
 } from './ai-provider-catalog';
 
 const d = (id: string) => getProviderDescriptor(id)!;
@@ -20,6 +20,14 @@ describe('catalog invariants', () => {
     for (const p of AI_PROVIDER_CATALOG) {
       if (p.baseUrl === 'hidden') expect(p.kind).toBe('cli');
       if (p.baseUrl === 'required') expect((p as any).defaultBaseUrl).toBeUndefined();
+    }
+  });
+  it('defaultPath is exactly the path of defaultBaseUrl, so a custom origin gets the same prefix', () => {
+    for (const p of AI_PROVIDER_CATALOG) {
+      const url = (p as AiProviderDescriptor).defaultBaseUrl;
+      if (!url) continue;
+      const path = new URL(url).pathname.replace(/\/+$/, '');
+      expect((p as AiProviderDescriptor).defaultPath, p.id).toBe(path === '' ? undefined : path);
     }
   });
   it('contains the legacy ids unchanged', () => {

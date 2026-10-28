@@ -1,6 +1,5 @@
-import { eq } from 'drizzle-orm';
 import type { AppDatabase } from '../db/index';
-import { aiConversations } from '../db/schema';
+import { appendUserMessage, loadForRun, ownerOf, saveRunEnd, saveRunStart } from './ai-conversation-store';
 import type { ClaudeCliProvider } from './claude-cli-provider';
 import { buildSystemPrompt, generateTitle, DEFAULT_MAX_TURNS, type AiAgentInterface, type AgentIdentity, type HandleMessageParams, type HandleMessageResult } from './ai-agent';
 import { createLoggers } from '../logs';
@@ -45,26 +44,25 @@ export class ClaudeCliAgent implements AiAgentInterface {
       maxTurns,
     } = params;
 
-    let { conversationId } = params;
+    // 1. Load the conversation this run continues (and its claudeSessionId for resume); an unknown or foreign id starts a new one
+    const automated = params.mode === 'silent';
+    const ownerId = ownerOf(identity, automated);
+    const existing = loadForRun(this.db, params.conversationId, ownerId);
+    let messages: AiMessage[] = existing ? JSON.parse(existing.messages) : [];
+    const existingSessionId: string | null = existing?.claudeSessionId ?? null;
 
-    // 1. Load existing conversation to get claudeSessionId for resume
-    let messages: AiMessage[] = [];
-    let existingSessionId: string | null = null;
-
-    if (conversationId !== null) {
-      const row = this.db
-        .select()
-        .from(aiConversations)
-        .where(eq(aiConversations.id, conversationId))
-        .get();
-      if (row) {
-        messages = JSON.parse(row.messages);
-        existingSessionId = row.claudeSessionId ?? null;
-      }
-    }
-
-    // 2. Append user message
-    messages.push({ role: 'user', content: message });
+    // 2. Append the user message and save it before the CLI is called
+    messages = appendUserMessage(messages, message);
+    const conversationId = saveRunStart(this.db, {
+      conversationId: existing ? existing.id : null,
+      ownerId,
+      automated,
+      pageContext,
+      contextId,
+      originPath: params.originPath,
+      title: generateTitle(message),
+      messages,
+    });
 
     // 3. Build system prompt — pass empty tools list since MCP exposes them
     const systemPrompt = buildSystemPrompt(pageContext, contextId, [], maxTurns);
@@ -183,38 +181,13 @@ export class ClaudeCliAgent implements AiAgentInterface {
     // Note: the messages array here is for display/audit purposes only.
     // Session continuity is handled by the CLI via --resume using claudeSessionId,
     // not by replaying these messages.
-    const title = generateTitle(message);
-    const now = new Date();
-
-    if (conversationId !== null) {
-      this.db
-        .update(aiConversations)
-        .set({
-          messages: JSON.stringify(messages),
-          inputTokens: totalUsage.inputTokens,
-          outputTokens: totalUsage.outputTokens,
-          claudeSessionId: cliSessionId,
-          updatedAt: now,
-        })
-        .where(eq(aiConversations.id, conversationId))
-        .run();
-    } else {
-      const result = this.db
-        .insert(aiConversations)
-        .values({
-          pageContext,
-          contextId,
-          title,
-          messages: JSON.stringify(messages),
-          inputTokens: totalUsage.inputTokens,
-          outputTokens: totalUsage.outputTokens,
-          claudeSessionId: cliSessionId,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .run();
-      conversationId = Number(result.lastInsertRowid);
-    }
+    saveRunEnd(this.db, conversationId, {
+      messages,
+      inputTokens: totalUsage.inputTokens,
+      outputTokens: totalUsage.outputTokens,
+      unfinished: Boolean(cliError) || turnLimitReached,
+      claudeSessionId: cliSessionId,
+    });
 
     // 8. Return result
     return {

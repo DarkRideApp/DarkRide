@@ -29,8 +29,7 @@ export interface AiProviderDescriptor {
   readonly listModels?:
     | { readonly path: string }
     | { readonly static: readonly { readonly id: string; readonly name: string }[] };
-  readonly capabilities: {
-    readonly tools: boolean;
+  readonly capabilities?: {
     readonly fim?: { readonly path: string; readonly modelPattern: string };
   };
 }
@@ -46,28 +45,28 @@ export const AI_PROVIDER_CATALOG = [
     auth: { scheme: 'x-api-key', required: true, label: 'API Key', placeholder: 'sk-ant-...' },
     extraHeaders: { 'anthropic-version': '2023-06-01' },
     rateLimitScheme: 'anthropic', defaultModel: 'claude-sonnet-5-5', defaultMaxOutputTokens: 16000,
-    listModels: { path: '/v1/models' }, capabilities: { tools: true },
+    listModels: { path: '/v1/models' },
   },
   {
     id: 'gemini', label: 'Google Gemini', shortName: 'Gemini', kind: 'http', dialect: 'gemini-generate',
     defaultBaseUrl: 'https://generativelanguage.googleapis.com', baseUrl: 'optional',
     auth: { scheme: 'x-goog-api-key', required: true, label: 'API Key' },
     rateLimitScheme: 'none', defaultModel: 'gemini-2.5-flash',
-    listModels: { path: '/v1beta/models' }, capabilities: { tools: true },
+    listModels: { path: '/v1beta/models' },
   },
   {
     id: 'ollama', label: 'Ollama', shortName: 'Ollama', kind: 'http', dialect: 'ollama-chat',
     defaultBaseUrl: 'http://localhost:11434', baseUrl: 'optional',
     auth: { scheme: 'none', required: false, label: 'API Key' },
     rateLimitScheme: 'none', defaultModel: 'llama3.1', headersTimeoutMs: 180000,
-    listModels: { path: '/api/tags' }, capabilities: { tools: true },
+    listModels: { path: '/api/tags' },
   },
   {
     id: 'openrouter', label: 'OpenRouter', shortName: 'OpenRouter', kind: 'http', dialect: 'openai-chat',
     defaultBaseUrl: 'https://openrouter.ai/api/v1', defaultPath: '/api/v1', baseUrl: 'optional',
     auth: { scheme: 'bearer', required: true, label: 'API Key' },
     rateLimitScheme: 'x-ratelimit', defaultModel: 'openrouter/auto', streamUsage: 'always',
-    listModels: { path: '/models' }, capabilities: { tools: true },
+    listModels: { path: '/models' },
   },
   {
     id: 'codestral', label: 'Codestral', shortName: 'Codestral', kind: 'http', dialect: 'openai-chat',
@@ -75,7 +74,7 @@ export const AI_PROVIDER_CATALOG = [
     auth: { scheme: 'bearer', required: true, label: 'API Key' }, authHint: MISTRAL_HINT,
     rateLimitScheme: 'x-ratelimit', defaultModel: 'codestral-latest', streamUsage: 'try',
     listModels: { path: '/models' },
-    capabilities: { tools: true, fim: { path: '/fim/completions', modelPattern: '^codestral' } },
+    capabilities: { fim: { path: '/fim/completions', modelPattern: '^codestral' } },
   },
   {
     id: 'mistral', label: 'Mistral', shortName: 'Mistral', kind: 'http', dialect: 'openai-chat',
@@ -83,21 +82,21 @@ export const AI_PROVIDER_CATALOG = [
     auth: { scheme: 'bearer', required: true, label: 'API Key' }, authHint: MISTRAL_HINT,
     rateLimitScheme: 'x-ratelimit', streamUsage: 'try',
     listModels: { path: '/models' },
-    capabilities: { tools: true, fim: { path: '/fim/completions', modelPattern: '^codestral' } },
+    capabilities: { fim: { path: '/fim/completions', modelPattern: '^codestral' } },
   },
   {
     id: 'openai', label: 'OpenAI', shortName: 'OpenAI', kind: 'http', dialect: 'openai-chat',
     defaultBaseUrl: 'https://api.openai.com/v1', defaultPath: '/v1', baseUrl: 'optional',
     auth: { scheme: 'bearer', required: true, label: 'API Key', placeholder: 'sk-...' },
     rateLimitScheme: 'x-ratelimit', maxTokensParam: 'max_completion_tokens', sendStop: false, streamUsage: 'always',
-    listModels: { path: '/models' }, capabilities: { tools: true },
+    listModels: { path: '/models' },
   },
   {
     id: 'openai-compatible', label: 'OpenAI-compatible', shortName: 'OpenAI-compatible', kind: 'http', dialect: 'openai-chat',
     defaultPath: '/v1', baseUrl: 'required',
     auth: { scheme: 'bearer', required: false, label: 'API Key' },
     rateLimitScheme: 'none', streamUsage: 'try',
-    listModels: { path: '/models' }, capabilities: { tools: true },
+    listModels: { path: '/models' },
   },
   {
     id: 'claude-cli', label: 'Claude CLI', shortName: 'Claude CLI', kind: 'cli',
@@ -119,7 +118,6 @@ export const AI_PROVIDER_CATALOG = [
         { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5' },
       ],
     },
-    capabilities: { tools: true },
   },
 ] as const satisfies readonly AiProviderDescriptor[];
 

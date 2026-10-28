@@ -76,6 +76,8 @@ docker logs darkride 2>&1 | grep -E "bootstrap|claim"   # find the admin passwor
 
 Open `http://localhost:3000/ui`. The container ships with Node 24 + Python 3.13 + `adb` + the mitmproxy/frida/pymobiledevice3 Python bridges, ready to talk to a USB-attached Android device once you mount it with `--device` (Linux hosts) or set up `adb connect` over the network.
 
+To let other machines use those devices through the [ADB proxy](docs/adb-proxy.md), also publish its port range (6500 to 6599 unless you change it in Settings) with `-p 6500-6599:6500-6599`, and set `-e WG_SERVER_IP=<the host's address>`. The proxy is off until you turn it on. [Running in Docker](docs/adb-proxy.md#running-in-docker) explains the firewall behaviour and what happens if you change the range.
+
 Tags available: `:latest` follows main; `:sha-<7chars>` pins to a specific build for rollback.
 
 ### Install and Run (development)
@@ -144,6 +146,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full breakdown, and [do
 
 - [REST API](docs/api.md) — endpoint listing for scripting against DarkRide
 - [AI providers](docs/ai-providers.md): supported providers, Base URL rules, model fallback, adding a provider
+- [ADB proxy](docs/adb-proxy.md): letting other machines run `adb` against the devices on this host, approving machines, limits, troubleshooting
 - [Architecture](docs/ARCHITECTURE.md) — high-level design, data flow, plugin model
 - [Video streaming reliability](docs/video-streaming-reliability.md) — design notes for the H.264 pipeline
 

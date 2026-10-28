@@ -5,7 +5,8 @@ import { stat } from 'fs/promises';
 import { join, resolve } from 'path';
 import { getDataRoot } from '../config/paths';
 import { registerEndpoint } from './api-service';
-import { automations, automationSessions, screenshots, capturedTraffic, websocketMessages, apiEndpointSessions } from '../db/schema';
+import { automations, automationAuthors, automationSessions, screenshots, capturedTraffic, websocketMessages, apiEndpointSessions } from '../db/schema';
+import { claimAutomation, claimUnclaimed, listUnclaimed } from '../services/automation-authors';
 import type { AppDatabase } from '../db/index';
 import { AutomationRunner } from '../services/automation-runner';
 import { AutomationCompiler } from '../services/automation-compiler';
@@ -97,6 +98,22 @@ export function registerAutomationEndpoints(
     res.json({ success: true, data: results });
   }, { requires: ['core.automations:read'] });
 
+  // GET /v1/automation/unclaimed — how many scripts cannot use gated calls until someone claims them
+  registerEndpoint('GET', '/v1/automation/unclaimed', (_req, res) => {
+    res.json({ success: true, data: { count: listUnclaimed(db).length } });
+  }, { requires: ['core.automations:read'] });
+
+  // POST /v1/automation/claim-all — the caller becomes the author of every unclaimed script
+  registerEndpoint('POST', '/v1/automation/claim-all', (req, res) => {
+    const caller = req.authUser;
+    if (!caller) {
+      res.status(401).json({ success: false, error: 'Sign in to claim automations' });
+      return;
+    }
+    const claimed = db.transaction((tx) => claimUnclaimed(tx, caller));
+    res.json({ success: true, data: { claimed } });
+  }, { requires: ['core.automations:edit'] });
+
   // POST /v1/automation/create
   registerEndpoint('POST', '/v1/automation/create', (req, res) => {
     const { name, code, timeoutMs, requiresDevice, requiresHttpsCapture, isRule, isCaptureRule, priority, enabled } = req.body;
@@ -134,6 +151,7 @@ export function registerAutomationEndpoints(
 
     const all = db.select().from(automations).all();
     const created = all[all.length - 1];
+    claimAutomation(db, created.id, req.authUser);
 
     // Set schedule if provided
     if (req.body.schedule) {
@@ -207,7 +225,10 @@ export function registerAutomationEndpoints(
       return;
     }
 
-    db.update(automations).set(updates).where(eq(automations.id, id)).run();
+    db.transaction((tx) => {
+      tx.update(automations).set(updates).where(eq(automations.id, id)).run();
+      if (req.body.code !== undefined) claimAutomation(tx, id, req.authUser);
+    });
 
     // Handle schedule update
     if (req.body.schedule !== undefined) {
@@ -251,6 +272,7 @@ export function registerAutomationEndpoints(
     // the null-out and the delete can't half-apply.
     db.transaction((tx) => {
       tx.update(automationSessions).set({ automationId: null }).where(eq(automationSessions.automationId, id)).run();
+      tx.delete(automationAuthors).where(eq(automationAuthors.automationId, id)).run();
       tx.delete(automations).where(eq(automations.id, id)).run();
     });
 

@@ -1,6 +1,7 @@
-import type { AiMessage, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
+import type { AiMessage, AiProviderData, AiStreamEvent, AiToolDefinition } from '../../../../shared/types/ai-chat';
 import { createLoggers } from '../../../logs';
-import { parseSSEStream, safeText } from '../http';
+import { toolNamesById } from '../format';
+import { authHeaders, parseSSEStream, safeText } from '../http';
 import { AiProviderError, AuthError, ModelRefusedError, OutputLimitError, OverloadedError, QuotaExhaustedError, RateLimitError } from '../errors';
 import type { AiRequest, Dialect, DialectContext } from '../dialect';
 import { toolInput } from '../tool-input';
@@ -16,7 +17,8 @@ const BLOCK_FINISH = new Set([
 ]);
 /** Documented stand-in for a thought signature we do not have (a replayed or injected call). */
 const SKIP_SIGNATURE = 'skip_thought_signature_validator';
-const isGemini3 = (model: string): boolean => /^gemini-3/i.test(model);
+/** Gemini 3 and every later generation: `gemini-3.8-flash` and `gemini-4-argon` count, `gemini-2.5-pro` and `gemma-3-27b-it` do not. */
+const isGemini3OrLater = (model: string): boolean => Number(/^gemini-(\d+)/i.exec(model)?.[1] ?? 0) >= 3;
 
 /**
  * Tool-call ids this dialect generated itself (Gemini sent none). Gemini must only ever see ids it issued, so
@@ -39,18 +41,36 @@ function serverId(id: string): string | undefined {
   return id && !generatedIds.has(id) && !GENERATED_ID_SHAPE.test(id) ? id : undefined;
 }
 
+/** The thought signature on a response part. Gemini sends camelCase; the docs also spell it snake_case. */
+function signatureOf(part: any): string | undefined {
+  const sig = part.thoughtSignature ?? part.thought_signature;
+  return typeof sig === 'string' && sig ? sig : undefined;
+}
+
+/** The signature as provider data for the block it arrived on, tagged with the model that sent it. */
+function signatureData(ctx: DialectContext, sig: string | undefined): { providerData?: AiProviderData } {
+  return sig ? { providerData: { dialect: 'gemini-generate', model: ctx.model, data: { thoughtSignature: sig } } } : {};
+}
+
+/** A stored signature, only when this dialect wrote it for this very model. */
+function storedSignature(data: AiProviderData | undefined, model: string): string | undefined {
+  if (data?.dialect !== 'gemini-generate' || data.model !== model) return undefined;
+  const sig = data.data.thoughtSignature;
+  return typeof sig === 'string' && sig ? sig : undefined;
+}
+
 function headers(ctx: DialectContext): Record<string, string> {
-  return { 'Content-Type': 'application/json', ...(ctx.apiKey ? { 'x-goog-api-key': ctx.apiKey } : {}) };
+  return { 'Content-Type': 'application/json', ...authHeaders(ctx) };
 }
 
 /**
- * Gemini 3 rejects a replayed function call without a thought signature. We do not keep the real one, so the first
- * functionCall part of each model turn carries the documented stand-in; parallel calls after it carry none.
+ * Gemini 3 and later reject a replayed function call without a thought signature. A call that kept the real one sends it back in
+ * the part it came from. For the first functionCall part of a model turn that has none (history from before signatures
+ * were kept, or from another model) the documented stand-in is sent instead; parallel calls after it carry none.
  */
 function formatContents(messages: AiMessage[], model: string): any[] {
-  const names = new Map<string, string>();
-  for (const m of messages) if (m.role === 'assistant') for (const b of m.content) if (b.type === 'tool_use') names.set(b.id, b.name);
-  const signCalls = isGemini3(model);
+  const names = toolNamesById(messages);
+  const signCalls = isGemini3OrLater(model);
 
   const contents: any[] = [];
   for (const msg of messages) {
@@ -60,10 +80,12 @@ function formatContents(messages: AiMessage[], model: string): any[] {
       const parts: any[] = [];
       let signed = false;
       for (const b of msg.content) {
-        if (b.type === 'text') { if (b.text) parts.push({ text: b.text }); continue; }
+        const sig = storedSignature(b.providerData, model);
+        if (b.type === 'text') { if (b.text) parts.push(sig ? { text: b.text, thoughtSignature: sig } : { text: b.text }); continue; }
         const id = serverId(b.id);
         const part: any = { functionCall: { ...(id ? { id } : {}), name: b.name, args: b.input } };
-        if (signCalls && !signed) { part.thoughtSignature = SKIP_SIGNATURE; signed = true; }
+        if (sig) { part.thoughtSignature = sig; signed = true; }
+        else if (signCalls && !signed) { part.thoughtSignature = SKIP_SIGNATURE; signed = true; }
         parts.push(part);
       }
       if (parts.length > 0) contents.push({ role: 'model', parts });
@@ -80,13 +102,14 @@ function formatContents(messages: AiMessage[], model: string): any[] {
 
 /**
  * The least thinking each model family accepts (https://ai.google.dev/gemini-api/docs/generate-content/thinking):
- * 2.5 Flash and Flash-Lite turn it off with a budget of 0, 2.5 Pro cannot turn it off (minimum 128), Gemini 3 takes
- * a level. Other models get nothing, since an unknown field could be rejected.
+ * 2.5 Flash and Flash-Lite turn it off with a budget of 0, 2.5 Pro cannot turn it off (minimum 128), Gemini 3 and later
+ * take a level (`low` is accepted by all of them, `minimal` is an error on Gemini 4 and 3.8 Flash). Other models get
+ * nothing, since an unknown field could be rejected.
  */
 function lowThinking(model: string): Record<string, unknown> | undefined {
   if (/^gemini-2\.5-flash/i.test(model)) return { thinkingBudget: 0 };
   if (/^gemini-2\.5-pro/i.test(model)) return { thinkingBudget: 128 };
-  if (isGemini3(model)) return { thinkingLevel: 'low' };
+  if (isGemini3OrLater(model)) return { thinkingLevel: 'low' };
   return undefined;
 }
 
@@ -146,7 +169,7 @@ function isBadKeyBody(bodyText: string): boolean {
  * RateLimitError).
  * Everything else returns undefined and takes the generic path, which keeps Retry-After for a plain 429.
  */
-function classifyError(status: number, _headers: Headers, bodyText: string): AiProviderError | undefined {
+function classifyError(status: number, _headers: Headers, bodyText: string, ctx: DialectContext): AiProviderError | undefined {
   const { error } = parseErrorBody(bodyText);
   const quota = status === 429 && isQuotaExhausted(error);
   // A 403 PERMISSION_DENIED is about the key itself (leaked, disabled, restricted, or the API is off for its project),
@@ -154,23 +177,20 @@ function classifyError(status: number, _headers: Headers, bodyText: string): AiP
   const deniedKey = status === 403 && error?.status === 'PERMISSION_DENIED';
   if (!quota && !deniedKey && !(status === 400 && isBadKeyBody(bodyText))) return undefined;
   const msg = typeof error?.message === 'string' && error.message ? error.message : bodyText.trim();
-  // Deliberately the raw upstream text: the hook has no DialectContext (no key to redact with). classifyHttpError
-  // redacts the key first and only then caps the length, so a key straddling a cap can never leave a prefix behind.
-  // Capping here would run before that redaction and cut a key in half.
-  const text = `Gemini API error (${status}): ${msg}`;
-  return quota ? new QuotaExhaustedError(text, { status }) : new AuthError(text, { status });
+  const text = `${ctx.descriptor.shortName} API error (${status}): ${safeText(msg, ctx)}`;
+  const opts = { status, provider: ctx.descriptor.id };
+  return quota ? new QuotaExhaustedError(text, opts) : new AuthError(text, opts);
 }
 
 async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSignal): AsyncGenerator<AiStreamEvent> {
   const shortName = ctx.descriptor.shortName;
-  if (!res.body) throw new AiProviderError(`${shortName} response has no body`);
   const provider = ctx.descriptor.id;
   let usage: { input: number; output: number; cached: number } | undefined;
   let sawChunk = false;
   let finished = false;
   let produced = false;   // any visible text or tool call so far
 
-  for await (const sse of parseSSEStream(res.body, signal)) {
+  for await (const sse of parseSSEStream(res.body!, signal)) {
     if (sse.data === '[DONE]') break;
     let p: any;
     try { p = JSON.parse(sse.data); } catch { continue; }
@@ -187,14 +207,17 @@ async function* parseStream(res: Response, ctx: DialectContext, signal?: AbortSi
     const cand = p.candidates?.[0];
     for (const part of cand?.content?.parts ?? []) {
       if (!part || part.thought) continue;
-      if (part.text) { produced = true; yield { type: 'text', text: part.text }; }
+      const sig = signatureOf(part);
+      if (part.text) { produced = true; yield { type: 'text', text: part.text, ...signatureData(ctx, sig) }; }
       else if (part.functionCall) {
         // Gemini 3 sends an id with every call and expects it back on the result; older models send none.
         const fc = part.functionCall;
         const id = typeof fc.id === 'string' && fc.id ? fc.id : generateId(ctx);
         produced = true;
-        yield { type: 'tool_use', id, name: fc.name, input: toolInput(fc.args) };
+        yield { type: 'tool_use', id, name: fc.name, input: toolInput(fc.args), ...signatureData(ctx, sig) };
       }
+      // While streaming, the signature of a text answer can arrive on a part with no text.
+      else if (sig) yield { type: 'text', text: '', ...signatureData(ctx, sig) };
     }
     const fr: unknown = cand?.finishReason;
     if (fr) {

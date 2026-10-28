@@ -15,6 +15,31 @@ function makeTool(overrides: Partial<AiToolRegistration> = {}): AiToolRegistrati
 }
 
 describe('AiToolRegistry', () => {
+  // ── listTools ──────────────────────────────────────────────────
+
+  it('lists every tool once, without execute, when no scopes are given', () => {
+    const registry = new AiToolRegistry();
+    registry.register(makeTool({ name: 'a', context: ['devices', 'frida'] }));
+    registry.register(makeTool({ name: 'b', context: ['frida'], requiredScope: 'core.frida:manage' }));
+
+    const result = registry.listTools();
+    expect(result).toEqual([
+      { name: 'a', description: 'A test tool', contexts: ['devices', 'frida'] },
+      { name: 'b', description: 'A test tool', contexts: ['frida'] },
+    ]);
+  });
+
+  it('leaves out tools whose required scope the caller lacks, and keeps ones a wildcard covers', () => {
+    const registry = new AiToolRegistry();
+    registry.register(makeTool({ name: 'open' }));
+    registry.register(makeTool({ name: 'read', requiredScope: 'core.frida:read' }));
+    registry.register(makeTool({ name: 'manage', requiredScope: 'core.frida:manage' }));
+
+    expect(registry.listTools(new Set()).map(t => t.name)).toEqual(['open']);
+    expect(registry.listTools(new Set(['core.frida:read'])).map(t => t.name)).toEqual(['open', 'read']);
+    expect(registry.listTools(new Set(['core.frida:*'])).map(t => t.name)).toEqual(['open', 'read', 'manage']);
+  });
+
   // ── getToolsForContext ─────────────────────────────────────────
 
   it('returns tools registered for a given context', () => {
@@ -280,6 +305,30 @@ describe('AiToolRegistry', () => {
   });
 
   // ── Large scale ─────────────────────────────────────────────────
+
+  // ── assertScope ─────────────────────────────────────────────────
+
+  it('assertScope throws the executeTool message when the scopes do not cover the tool', () => {
+    const registry = new AiToolRegistry();
+    registry.register(makeTool({ name: 'shell', requiredScope: 'core.devices:shell' }));
+
+    expect(() => registry.assertScope('shell', new Set(['core.devices:read'])))
+      .toThrow('Insufficient scope: core.devices:shell required for tool shell');
+  });
+
+  it('assertScope passes for a covering grant or wildcard, and for a tool with no required scope', () => {
+    const registry = new AiToolRegistry();
+    registry.register(makeTool({ name: 'shell', requiredScope: 'core.devices:shell' }));
+    registry.register(makeTool({ name: 'open' }));
+
+    expect(() => registry.assertScope('shell', new Set(['core.devices:shell']))).not.toThrow();
+    expect(() => registry.assertScope('shell', new Set(['core.devices:*']))).not.toThrow();
+    expect(() => registry.assertScope('open', new Set())).not.toThrow();
+  });
+
+  it('assertScope throws for an unknown tool', () => {
+    expect(() => new AiToolRegistry().assertScope('nope', new Set())).toThrow('Unknown tool: nope');
+  });
 
   // ── Scope-gating (executeTool) ──────────────────────────────────
 

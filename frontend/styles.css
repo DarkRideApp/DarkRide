@@ -3283,6 +3283,249 @@ body.live-log-open .main-content {
   color: var(--warning-color, #f59e0b);
   font-weight: 600;
 }
+.ai-chat-yolo-toggle {
+  margin-left: auto;
+  margin-right: 8px;
+}
+.ai-chat-yolo-toggle-on {
+  background: var(--warning);
+  border-color: var(--warning);
+  color: #1f1300;
+  font-weight: 600;
+}
+.ai-chat-yolo-dialog p {
+  margin: 10px 0 0;
+  line-height: 1.5;
+}
+.ai-chat-yolo-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--warning-fg);
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  border-bottom: 1px solid var(--warning);
+  flex-shrink: 0;
+}
+
+/* Chat history */
+.ai-chat-history-toggle {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 8px;
+}
+.ai-chat-history-toggle[aria-pressed='true'] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.ai-chat-history {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.ai-chat-history-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+.ai-chat-history-search {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-color);
+  background: var(--bg-input);
+  color: var(--text-primary);
+}
+.ai-chat-history-scope {
+  display: flex;
+  gap: 6px;
+}
+.ai-chat-history-chip {
+  font-family: inherit;
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.ai-chat-history-chip:hover {
+  color: var(--text-primary);
+}
+.ai-chat-history-chip-on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.ai-chat-history-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 8px;
+}
+.ai-chat-history-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 24px 16px;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: center;
+}
+.ai-chat-history-state p {
+  margin: 0;
+}
+.ai-chat-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.ai-chat-history-row {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--border-color);
+}
+.ai-chat-history-row-active {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.ai-chat-history-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  font-family: inherit;
+  text-align: left;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.ai-chat-history-open:hover:not(:disabled) {
+  background: var(--bg-secondary);
+}
+.ai-chat-history-open:disabled,
+.ai-chat-history-delete:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.ai-chat-history-title {
+  max-width: 100%;
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-chat-history-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ai-chat-history-badge {
+  padding: 0 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--warning-fg);
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  border: 1px solid var(--warning);
+  border-radius: 999px;
+}
+.ai-chat-history-delete {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.ai-chat-history-delete:hover:not(:disabled) {
+  color: var(--danger);
+}
+.ai-chat-history-confirm {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.ai-chat-history-confirm span {
+  flex: 1;
+  min-width: 120px;
+}
+.ai-chat-history-confirm-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-chat-history-action-error {
+  margin: 8px 12px 0;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+}
+.ai-chat-history-more {
+  display: block;
+  margin: 8px auto 0;
+}
+
+/* Started-on bar and unfinished notice */
+.ai-chat-origin-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+.ai-chat-origin-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-chat-origin-text strong {
+  color: var(--text-primary);
+}
+.ai-chat-unfinished-notice {
+  margin: 4px 0 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px dashed var(--warning);
+  border-radius: 8px;
+}
 
 /* Message Area */
 .ai-chat-messages {
@@ -3576,8 +3819,14 @@ body.live-log-open .main-content {
   white-space: pre-wrap;
   word-break: break-all;
 }
+.ai-chat-confirm-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
 .ai-chat-confirm-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
   padding: 8px 12px;
@@ -4437,6 +4686,21 @@ body.live-log-open .ai-chat-fab {
 .empty-state-sm {
   text-align: center;
   padding: 24px;
+}
+
+/* Automations: scripts nobody has claimed */
+.claim-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius);
+  padding: 10px 16px;
+  margin-bottom: 12px;
+  font-size: 13px;
 }
 
 /* Tab bar */
@@ -8481,6 +8745,8 @@ body.live-log-open .ai-chat-fab {
 
 /* Network workspace — scope bar + pane tabs. */
 .network-workspace { display: flex; flex-direction: column; min-height: 0; }
+/* The traffic pane scrolls its own list inside a clipped .page-content, so the workspace must take that height instead of growing with the rows. */
+.network-workspace:has(.traffic-page) { height: 100%; }
 .network-topbar {
   display: flex;
   flex-direction: column;

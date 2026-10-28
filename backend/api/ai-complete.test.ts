@@ -11,7 +11,7 @@ import { eq } from 'drizzle-orm';
 import { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import * as schema from '../db/schema';
 import { clearEndpoints, getApiRouter } from './api-service';
-import { completeHandler, registerAiCompleteEndpoints } from './ai-complete';
+import { completeHandler, registerAiCompleteEndpoints, MAX_COMPLETE_CONTEXT_CHARS } from './ai-complete';
 import { createTestDb } from '../test-utils/create-test-db';
 import { stubFetch, jsonResponse, textResponse, okStream, callHeader } from '../services/ai/test-helpers';
 import { AiModelRouter, RateLimitCache } from '../services/ai-model-router';
@@ -314,6 +314,169 @@ describe('AI Complete API Endpoint', () => {
     });
   });
 
+  describe('input validation', () => {
+    const CAP = MAX_COMPLETE_CONTEXT_CHARS;
+
+    /** A router whose provider records every call, so a rejected request is shown never to reach it. */
+    function spyRouter() {
+      const calls: any[] = [];
+      return { calls, router: routerWith({ low: ['L'] }, { complete: async (req) => { calls.push(req); return 'ok'; } }) };
+    }
+
+    const post = (router: AiModelRouter, body: unknown) => request(createApp(db, router)).post('/v1/ai/complete').send(body as object);
+
+    it('caps the combined length at 100,000 characters', () => {
+      expect(CAP).toBe(100_000);
+    });
+
+    describe('type', () => {
+      const NOT_STRINGS: Array<[string, unknown]> = [
+        ['a number', 5],
+        ['zero', 0],
+        ['a boolean', false],
+        ['an object', { a: 1 }],
+        ['an array', ['a']],
+        ['null', null],
+      ];
+
+      for (const field of ['prefix', 'suffix'] as const) {
+        const other = field === 'prefix' ? 'suffix' : 'prefix';
+        for (const [label, value] of NOT_STRINGS) {
+          it(`rejects ${label} as ${field} with 400 and sends nothing upstream`, async () => {
+            const { calls, router } = spyRouter();
+            const res = await post(router, { [other]: 'valid', [field]: value });
+            expect(res.status).toBe(400);
+            expect(res.body).toEqual({ success: false, error: `${field} must be a string` });
+            expect(calls).toHaveLength(0);
+          });
+
+          it(`rejects ${label} as ${field} when the other field is absent`, async () => {
+            const { calls, router } = spyRouter();
+            const res = await post(router, { [field]: value });
+            expect(res.status).toBe(400);
+            expect(res.body).toEqual({ success: false, error: `${field} must be a string` });
+            expect(calls).toHaveLength(0);
+          });
+        }
+      }
+
+      it('rejects the reproduction from the bug report: an object prefix and a number suffix', async () => {
+        const { calls, router } = spyRouter();
+        const res = await post(router, { prefix: { a: 1 }, suffix: 5 });
+        expect(res.status).toBe(400);
+        expect(res.body).toEqual({ success: false, error: 'prefix must be a string' });
+        expect(calls).toHaveLength(0);
+      });
+
+      it('names the suffix when only the suffix has the wrong type', async () => {
+        const { router } = spyRouter();
+        const res = await post(router, { prefix: 'a', suffix: 5 });
+        expect(res.body).toEqual({ success: false, error: 'suffix must be a string' });
+      });
+
+      it('still asks for one of them when both are missing', async () => {
+        const { calls, router } = spyRouter();
+        const res = await post(router, {});
+        expect(res.status).toBe(400);
+        expect(res.body).toEqual({ success: false, error: 'prefix or suffix is required' });
+        expect(calls).toHaveLength(0);
+      });
+
+      it('accepts strings in either field and forwards them unchanged', async () => {
+        const { calls, router } = spyRouter();
+        expect((await post(router, { prefix: 'foo(', suffix: ')' })).status).toBe(200);
+        expect((await post(router, { prefix: 'foo(' })).status).toBe(200);
+        expect((await post(router, { suffix: ')' })).status).toBe(200);
+        expect(calls.map((c) => [c.prefix, c.suffix])).toEqual([['foo(', ')'], ['foo(', ''], ['', ')']]);
+      });
+    });
+
+    describe('size', () => {
+      it('accepts a prefix of exactly the cap', async () => {
+        const { calls, router } = spyRouter();
+        const res = await post(router, { prefix: 'a'.repeat(CAP) });
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ success: true, data: { completion: 'ok' } });
+        expect(calls[0].prefix).toHaveLength(CAP);
+      });
+
+      it('accepts a suffix of exactly the cap', async () => {
+        const { calls, router } = spyRouter();
+        const res = await post(router, { suffix: 'a'.repeat(CAP) });
+        expect(res.status).toBe(200);
+        expect(calls[0].suffix).toHaveLength(CAP);
+      });
+
+      it('accepts a prefix and suffix that together total exactly the cap', async () => {
+        const { calls, router } = spyRouter();
+        const res = await post(router, { prefix: 'a'.repeat(60_000), suffix: 'b'.repeat(CAP - 60_000) });
+        expect(res.status).toBe(200);
+        expect(calls).toHaveLength(1);
+      });
+
+      it('rejects a prefix one character over the cap with 413 and sends nothing upstream', async () => {
+        const { calls, router } = spyRouter();
+        const res = await post(router, { prefix: 'a'.repeat(CAP + 1) });
+        expect(res.status).toBe(413);
+        expect(res.body).toEqual({ success: false, error: 'prefix and suffix together may not exceed 100000 characters' });
+        expect(calls).toHaveLength(0);
+      });
+
+      it('rejects a suffix one character over the cap with 413', async () => {
+        const { calls, router } = spyRouter();
+        const res = await post(router, { suffix: 'a'.repeat(CAP + 1) });
+        expect(res.status).toBe(413);
+        expect(calls).toHaveLength(0);
+      });
+
+      it('counts the two fields together: each under the cap, the sum one over', async () => {
+        const { calls, router } = spyRouter();
+        const res = await post(router, { prefix: 'a'.repeat(60_000), suffix: 'b'.repeat(CAP - 60_000 + 1) });
+        expect(res.status).toBe(413);
+        expect(calls).toHaveLength(0);
+      });
+
+      it('rejects a body far over the cap without calling the provider', async () => {
+        const { calls, router } = spyRouter();
+        const { res, writes } = fakeRes();
+        await completeHandler(db as any, router)({ body: { prefix: 'a'.repeat(5_000_000), suffix: 'b'.repeat(5_000_000) } }, res);
+        expect(writes).toEqual([
+          ['status', 413],
+          ['json', { success: false, error: 'prefix and suffix together may not exceed 100000 characters' }],
+        ]);
+        expect(calls).toHaveLength(0);
+      });
+
+      it('measures length in UTF-16 code units, the unit String.length reports', async () => {
+        const { calls, router } = spyRouter();
+        const emoji = '\u{1F600}';
+        expect(emoji).toHaveLength(2);
+        const at = fakeRes();
+        await completeHandler(db as any, router)({ body: { prefix: emoji.repeat(CAP / 2) } }, at.res);
+        expect(at.writes).toEqual([['json', { success: true, data: { completion: 'ok' } }]]);
+        const over = fakeRes();
+        await completeHandler(db as any, router)({ body: { prefix: emoji.repeat(CAP / 2), suffix: 'a' } }, over.res);
+        expect(over.writes[0]).toEqual(['status', 413]);
+        expect(calls).toHaveLength(1);
+      });
+
+      it('answers 413 before a missing provider is looked up', async () => {
+        const res = await post(emptyRouter(), { prefix: 'a'.repeat(CAP + 1) });
+        expect(res.status).toBe(413);
+        expect(res.body.error).toBe('prefix and suffix together may not exceed 100000 characters');
+      });
+    });
+
+    it('rejects over the transports whose res has no .on (the WebSocket REST adapter builds a minimal res)', async () => {
+      const { calls, router } = spyRouter();
+      const out: any[] = [];
+      const res = { status(c: number) { out.push(['status', c]); return this; }, json(b: any) { out.push(['json', b]); return this; } };
+      await completeHandler(db as any, router)({ body: { prefix: { a: 1 } } }, res);
+      expect(out).toEqual([['status', 400], ['json', { success: false, error: 'prefix must be a string' }]]);
+      expect(calls).toHaveLength(0);
+    });
+  });
+
   describe('legacy settings path (deprecated)', () => {
     const CASES = [
       { type: 'anthropic', keys: { anthropic_api_key: 'sk-test-placeholder' }, resp: () => okStream('anthropic'),
@@ -358,7 +521,7 @@ describe('AI Complete API Endpoint', () => {
       }
     });
 
-    it('anthropic: no temperature, stop sequence and 256-token cap, no cache_control, cursor split in the user message', async () => {
+    it('anthropic: no temperature, stop sequence and 256-token cap, only the system prompt marked for caching, cursor split in the user message', async () => {
       setSetting(db, 'ai_provider', 'anthropic'); setSetting(db, 'anthropic_api_key', 'sk-test-placeholder');
       const stub = stubFetch(() => okStream('anthropic'));
       await request(createApp(db, emptyRouter())).post('/v1/ai/complete').send({ prefix: 'await ', suffix: ';' });
@@ -366,7 +529,7 @@ describe('AI Complete API Endpoint', () => {
       expect(stub.calls[0].body.temperature).toBeUndefined();
       expect(stub.calls[0].body.cache_control).toBeUndefined();
       expect(JSON.stringify(stub.calls[0].body.messages)).toContain('await <CURSOR>;');
-      expect(stub.calls[0].body.system).toBe(EXPECTED_SYSTEM_PROMPT);
+      expect(stub.calls[0].body.system).toEqual([{ type: 'text', text: EXPECTED_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }]);
       expect(callHeader(stub.calls[0], 'x-api-key')).toBe('sk-test-placeholder');
     });
 

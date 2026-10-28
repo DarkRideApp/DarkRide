@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -7,8 +8,10 @@ import 'highlight.js/styles/github-dark.css';
 import { Copy, Check } from 'lucide-react';
 import { useWebSocket } from '@darkrideapp/plugin-sdk/react';
 import { ToolCallCard } from './ToolCallCard';
-import { ShieldAlert } from 'lucide-react';
+import { AiChatHistory, describeContext } from './AiChatHistory';
+import { ShieldAlert, History } from 'lucide-react';
 import type {
+  AiConversation,
   AiTokenEvent,
   AiToolStartEvent,
   AiToolResultEvent,
@@ -16,6 +19,8 @@ import type {
   AiErrorEvent,
   AiContextUsageEvent,
   AiToolConfirmEvent,
+  AiToolConfirmScope,
+  AiYoloStateEvent,
   AiMessage,
   AiTextBlock,
   AiToolUseBlock,
@@ -45,8 +50,38 @@ export interface ChatMessage {
 interface AiChatPanelProps {
   pageContext: string;
   contextId: string;
+  /** Where in the app the panel is open (path and query); saved with a new chat so history can link back. */
+  originPath?: string;
+  /** Takes the user to an app path, for the "Go there" button. */
+  onNavigate?: (path: string) => void;
   onStreamingChange?: (streaming: boolean) => void;
 }
+
+const openKey = (pageContext: string, contextId: string) => `darkride:ai-chat:open:${pageContext}:${contextId}`;
+
+/** The conversation last open for a page context, or null. Storage can be blocked, so every access is guarded. */
+function readOpenConversation(pageContext: string, contextId: string): number | null {
+  try {
+    const id = Number(localStorage.getItem(openKey(pageContext, contextId)));
+    return Number.isInteger(id) && id > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberOpenConversation(pageContext: string, contextId: string, id: number): void {
+  try {
+    localStorage.setItem(openKey(pageContext, contextId), String(id));
+  } catch { /* storage blocked: the panel falls back to the latest conversation */ }
+}
+
+function forgetOpenConversation(pageContext: string, contextId: string): void {
+  try {
+    localStorage.removeItem(openKey(pageContext, contextId));
+  } catch { /* storage blocked */ }
+}
+
+const pathOf = (path: string) => path.split(/[?#]/)[0];
 
 const SUGGESTED_PROMPTS: Record<string, string[]> = {
   'session-timeline': [
@@ -271,7 +306,7 @@ interface PendingConfirm {
   input: Record<string, any>;
 }
 
-export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiChatPanelProps) {
+export function AiChatPanel({ pageContext, contextId, originPath, onNavigate, onStreamingChange }: AiChatPanelProps) {
   const ws = useWebSocket();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -281,6 +316,16 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
   const [turnLimitReached, setTurnLimitReached] = useState(false);
   const [contextPercent, setContextPercent] = useState<number | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+  const [yolo, setYolo] = useState(false);
+  const [yoloDialogOpen, setYoloDialogOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [unfinished, setUnfinished] = useState(false);
+  const [conversationOrigin, setConversationOrigin] = useState<{ path: string; label: string } | null>(null);
+  const contextRef = useRef({ pageContext, contextId });
+  contextRef.current = { pageContext, contextId };
+  const yoloRef = useRef(false);
+  const conversationIdRef = useRef<number | null>(null);
+  const newChatRunRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const streamingSegmentsRef = useRef<MessageSegment[]>([]);
@@ -311,25 +356,53 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     };
   }, [ws, conversationId, onStreamingChange]);
 
-  // Load latest conversation for this context on mount
+  // Puts a saved conversation on screen; a restore skips an empty one, an explicit open does not.
+  const showConversation = (conv: AiConversation, allowEmpty: boolean): boolean => {
+    const restored = Array.isArray(conv.messages) ? convertDbMessages(conv.messages) : [];
+    if (restored.length === 0 && !allowEmpty) return false;
+    setMessages(restored);
+    setConversationId(conv.id);
+    setUnfinished(!!conv.unfinished);
+    setConversationOrigin(conv.originPath
+      ? { path: conv.originPath, label: describeContext(conv.pageContext, conv.contextId) }
+      : null);
+    return true;
+  };
+
+  // Restore the conversation last open for this context, else the latest one
   useEffect(() => {
     let cancelled = false;
-    const params = new URLSearchParams({ pageContext, contextId });
-    ws.sendRestApi('GET', `/v1/ai/conversations/latest?${params}`)
-      .then(res => {
-        if (cancelled || hasLocalMutationRef.current) return;
-        if (res.status === 200 && res.body?.data) {
-          const conv = res.body.data;
-          const restored = convertDbMessages(conv.messages);
-          if (restored.length > 0) {
-            setMessages(restored);
-            setConversationId(conv.id);
-          }
-        }
-      })
-      .catch(() => { /* ignore load errors */ });
+    const stillWanted = () => !cancelled && !hasLocalMutationRef.current;
+    const restoreLatest = () => {
+      const params = new URLSearchParams({ pageContext, contextId });
+      return ws.sendRestApi('GET', `/v1/ai/conversations/latest?${params}`)
+        .then(res => {
+          if (stillWanted() && res.status === 200 && res.body?.data) showConversation(res.body.data, false);
+        })
+        .catch(() => { /* ignore load errors */ });
+    };
+
+    const remembered = readOpenConversation(pageContext, contextId);
+    if (remembered === null) {
+      void restoreLatest();
+    } else {
+      ws.sendRestApi('GET', `/v1/ai/conversations/${remembered}`)
+        .then(res => {
+          if (!stillWanted()) return;
+          if (res.status === 200 && res.body?.data && showConversation(res.body.data, false)) return;
+          if (res.status === 404) forgetOpenConversation(pageContext, contextId);
+          return restoreLatest();
+        })
+        .catch(() => (stillWanted() ? restoreLatest() : undefined));
+    }
     return () => { cancelled = true; };
+    // showConversation only calls state setters
   }, [ws, pageContext, contextId]);
+
+  // A confirmation card lives in the conversation view, so bring the user back to it.
+  useEffect(() => {
+    if (pendingConfirm) setHistoryOpen(false);
+  }, [pendingConfirm]);
 
   const resetStaleTimer = useCallback(() => {
     if (staleTimerRef.current) clearTimeout(staleTimerRef.current);
@@ -369,6 +442,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
       clearStaleTimer();
       setMessages(prev => [...prev, { role: 'assistant', content: 'Error: Connection lost while the response was streaming.' }]);
       activeRequestIdRef.current = null;
+      newChatRunRef.current = false;
       setPendingConfirm(null);
       setStreamingSegments([]);
       streamingSegmentsRef.current = [];
@@ -376,14 +450,41 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     }
   }, [ws.connected, clearStaleTimer]);
 
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
+
+  // The server holds YOLO mode, so ask it whenever a conversation opens or the connection returns, and show its answer.
+  useEffect(() => {
+    if (ws.connected && conversationId !== null) ws.sendMessage('ai:yolo', { conversationId });
+  }, [ws.connected, conversationId]);
+
+  const applyYolo = (enabled: boolean) => {
+    hasLocalMutationRef.current = true;
+    yoloRef.current = enabled;
+    setYolo(enabled);
+    if (conversationId !== null) {
+      ws.sendMessage('ai:yolo', { conversationId, enabled });
+    } else if (newChatRunRef.current && activeRequestIdRef.current) {
+      ws.sendMessage('ai:yolo', { requestId: activeRequestIdRef.current, enabled });
+    }
+  };
+
   // WebSocket subscriptions
   useEffect(() => {
     const unsubs: (() => void)[] = [];
 
+    // Compute from the ref, not inside an updater: updaters can run at render, after ai:done has read the ref.
+    const updateStreamingSegments = (update: (prev: MessageSegment[]) => MessageSegment[]) => {
+      const next = update(streamingSegmentsRef.current);
+      streamingSegmentsRef.current = next;
+      setStreamingSegments(next);
+    };
+
     unsubs.push(ws.subscribe('ai:token', (msg: AiTokenEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
-      setStreamingSegments(prev => {
+      updateStreamingSegments(prev => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (last?.type === 'text') {
@@ -391,7 +492,6 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
         } else {
           next.push({ type: 'text', text: msg.text });
         }
-        streamingSegmentsRef.current = next;
         return next;
       });
     }));
@@ -399,7 +499,7 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:tool-start', (msg: AiToolStartEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
-      setStreamingSegments(prev => {
+      updateStreamingSegments(prev => {
         const next = [...prev];
         const last = next[next.length - 1];
         const newTool: ToolCall = {
@@ -413,7 +513,6 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
         } else {
           next.push({ type: 'tools', tools: [newTool] });
         }
-        streamingSegmentsRef.current = next;
         return next;
       });
     }));
@@ -421,19 +520,16 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:tool-result', (msg: AiToolResultEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       resetStaleTimer();
-      setStreamingSegments(prev => {
-        const next = prev.map(seg => {
-          if (seg.type !== 'tools') return seg;
-          const updatedTools = seg.tools?.map(t =>
-            t.toolUseId === msg.toolUseId
-              ? { ...t, output: msg.result, durationMs: msg.durationMs, isRunning: false }
-              : t,
-          );
-          return { ...seg, tools: updatedTools };
-        });
-        streamingSegmentsRef.current = next;
-        return next;
-      });
+      setPendingConfirm(prev => (prev?.toolUseId === msg.toolUseId ? null : prev));
+      updateStreamingSegments(prev => prev.map(seg => {
+        if (seg.type !== 'tools') return seg;
+        const updatedTools = seg.tools?.map(t =>
+          t.toolUseId === msg.toolUseId
+            ? { ...t, output: msg.result, durationMs: msg.durationMs, isRunning: false }
+            : t,
+        );
+        return { ...seg, tools: updatedTools };
+      }));
     }));
 
     unsubs.push(ws.subscribe('ai:context-usage', (msg: AiContextUsageEvent) => {
@@ -444,6 +540,12 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:done', (msg: AiDoneEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
+      setPendingConfirm(null);
+      // A new chat's server-side YOLO needs the id this run just got.
+      if (newChatRunRef.current && yoloRef.current && msg.conversationId != null) {
+        ws.sendMessage('ai:yolo', { conversationId: msg.conversationId, enabled: true });
+      }
+      newChatRunRef.current = false;
       const segments = streamingSegmentsRef.current;
       const content = segments
         .filter(s => s.type === 'text')
@@ -464,6 +566,9 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
       setStreamingSegments([]);
       setIsStreaming(false);
       setConversationId(msg.conversationId);
+      if (msg.conversationId != null) {
+        rememberOpenConversation(contextRef.current.pageContext, contextRef.current.contextId, msg.conversationId);
+      }
       setTurnLimitReached(!!msg.turnLimitReached);
       streamingSegmentsRef.current = [];
     }));
@@ -481,6 +586,8 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     unsubs.push(ws.subscribe('ai:error', (msg: AiErrorEvent) => {
       if (msg.requestId && msg.requestId !== activeRequestIdRef.current) return;
       clearStaleTimer();
+      setPendingConfirm(null);
+      newChatRunRef.current = false;
       const segments = streamingSegmentsRef.current;
       const content = segments
         .filter(s => s.type === 'text')
@@ -500,6 +607,13 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
       streamingSegmentsRef.current = [];
     }));
 
+    unsubs.push(ws.subscribe('ai:yolo-state', (msg: AiYoloStateEvent) => {
+      // Answers by request id are for a run still in flight, which this panel already shows.
+      if (msg.requestId || msg.conversationId === null || msg.conversationId !== conversationIdRef.current) return;
+      yoloRef.current = msg.enabled;
+      setYolo(msg.enabled);
+    }));
+
     return () => unsubs.forEach(fn => fn());
   }, [ws, resetStaleTimer, clearStaleTimer]);
 
@@ -513,25 +627,35 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     setMessages(prev => [...prev, { role: 'user', content: trimmed }]);
     setInput('');
     setIsStreaming(true);
+    setPendingConfirm(null);
     setStreamingSegments([]);
     setTurnLimitReached(false);
+    setUnfinished(false);
     streamingSegmentsRef.current = [];
     resetStaleTimer();
 
+    const startsNewChat = conversationId === null;
+    newChatRunRef.current = startsNewChat;
+    if (startsNewChat) {
+      setConversationOrigin(originPath ? { path: originPath, label: describeContext(pageContext, contextId) } : null);
+    }
     ws.sendMessage('ai:message', {
       conversationId: conversationId ?? undefined,
       message: trimmed,
       pageContext,
       contextId,
       requestId,
+      ...(startsNewChat && originPath ? { originPath } : {}),
+      ...(startsNewChat && yoloRef.current ? { yolo: true } : {}),
     });
-  }, [ws, conversationId, pageContext, contextId, isStreaming, resetStaleTimer]);
+  }, [ws, conversationId, pageContext, contextId, originPath, isStreaming, resetStaleTimer]);
 
-  const respondToConfirm = useCallback((allowed: boolean) => {
+  const respondToConfirm = useCallback((allowed: boolean, scope: AiToolConfirmScope = 'once') => {
     if (!pendingConfirm) return;
     ws.sendMessage('ai:tool-confirm-response', {
       toolUseId: pendingConfirm.toolUseId,
       allowed,
+      scope,
     });
     setPendingConfirm(null);
     resetStaleTimer();
@@ -541,10 +665,15 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     ws.sendMessage('ai:cancel', { conversationId, requestId: activeRequestIdRef.current });
   }, [ws, conversationId]);
 
-  const newConversation = useCallback(() => {
+  const resetConversation = useCallback(() => {
     hasLocalMutationRef.current = true;
     if (activeRequestIdRef.current) ws.sendMessage('ai:cancel', { conversationId, requestId: activeRequestIdRef.current });
     activeRequestIdRef.current = null;
+    if (yoloRef.current && conversationId !== null) ws.sendMessage('ai:yolo', { conversationId, enabled: false });
+    yoloRef.current = false;
+    newChatRunRef.current = false;
+    setYolo(false);
+    setYoloDialogOpen(false);
     setPendingConfirm(null);
     clearStaleTimer();
     setMessages([]);
@@ -553,9 +682,37 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
     setConversationId(null);
     setStreamingSegments([]);
     setTurnLimitReached(false);
+    setUnfinished(false);
+    setConversationOrigin(null);
     setContextPercent(null);
     streamingSegmentsRef.current = [];
-  }, [ws, conversationId, clearStaleTimer]);
+    forgetOpenConversation(pageContext, contextId);
+  }, [ws, conversationId, clearStaleTimer, pageContext, contextId]);
+
+  const newConversation = useCallback(() => {
+    resetConversation();
+    setHistoryOpen(false);
+  }, [resetConversation]);
+
+  const openFromHistory = (conversation: AiConversation) => {
+    hasLocalMutationRef.current = true;
+    // Another conversation's YOLO state arrives from the server once it is open; the same one keeps its own.
+    if (conversation.id !== conversationIdRef.current) {
+      yoloRef.current = false;
+      setYolo(false);
+    }
+    newChatRunRef.current = false;
+    showConversation(conversation, true);
+    setTurnLimitReached(false);
+    setContextPercent(null);
+    rememberOpenConversation(pageContext, contextId, conversation.id);
+    setHistoryOpen(false);
+  };
+
+  const handleDeleted = (id: number) => {
+    if (id === conversationIdRef.current) resetConversation();
+    else if (readOpenConversation(pageContext, contextId) === id) forgetOpenConversation(pageContext, contextId);
+  };
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -581,6 +738,25 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
           </span>
         )}
         <button
+          className={`btn btn-sm ai-chat-yolo-toggle${yolo ? ' ai-chat-yolo-toggle-on' : ''}`}
+          onClick={yolo ? () => applyYolo(false) : () => setYoloDialogOpen(true)}
+          aria-pressed={yolo}
+          title={yolo ? 'Turn YOLO mode off' : 'Run every tool without asking'}
+          data-testid="ai-chat-yolo-toggle"
+        >
+          YOLO
+        </button>
+        <button
+          className="btn btn-sm ai-chat-history-toggle"
+          onClick={() => setHistoryOpen(open => !open)}
+          aria-label="Chat history"
+          aria-pressed={historyOpen}
+          title="Chat history"
+          data-testid="ai-chat-history-toggle"
+        >
+          <History size={14} />
+        </button>
+        <button
           className="btn btn-sm"
           onClick={newConversation}
           data-testid="ai-chat-new-btn"
@@ -589,141 +765,240 @@ export function AiChatPanel({ pageContext, contextId, onStreamingChange }: AiCha
         </button>
       </div>
 
-      <div className="ai-chat-messages" data-testid="ai-chat-messages">
-        {isEmpty && (
-          <div className="ai-chat-empty" data-testid="ai-chat-empty">
-            <p className="ai-chat-empty-text">Ask a question about this page's data</p>
-            {suggestedPrompts.length > 0 && (
-              <div className="ai-chat-suggestions" data-testid="ai-chat-suggestions">
-                {suggestedPrompts.map((prompt, i) => (
-                  <button
-                    key={i}
-                    className="ai-chat-suggestion-btn"
-                    onClick={() => sendMessage(prompt)}
-                    data-testid={`ai-chat-suggestion-${i}`}
-                  >
-                    {prompt}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+      {yolo && (
+        <div className="ai-chat-yolo-banner" role="status" data-testid="ai-chat-yolo-badge">
+          <ShieldAlert size={14} />
+          <span>YOLO mode: every tool runs without asking</span>
+        </div>
+      )}
 
-        {messages.map((msg, i) => (
+      {yoloDialogOpen && createPortal(
+        <div className="modal-overlay" onClick={() => setYoloDialogOpen(false)}>
           <div
-            key={i}
-            className={`ai-chat-message ai-chat-message-${msg.role}`}
-            data-testid={`ai-chat-message-${i}`}
+            className="modal ai-chat-yolo-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="ai-chat-yolo-title"
+            onClick={e => e.stopPropagation()}
+            onKeyDown={e => {
+              if (e.key !== 'Escape') return;
+              e.stopPropagation(); // the drawer closes itself on a window-level Escape
+              setYoloDialogOpen(false);
+            }}
+            data-testid="ai-chat-yolo-dialog"
           >
-            {msg.role === 'user' ? (
-              <div className="ai-chat-user-text">{msg.content}</div>
-            ) : (
-              <div className="ai-chat-assistant-text">
-                {msg.segments ? (
-                  renderSegments(msg.segments)
-                ) : msg.content ? (
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={markdownComponents}>
-                    {msg.content}
-                  </ReactMarkdown>
-                ) : null}
-              </div>
-            )}
-          </div>
-        ))}
-
-        {isStreaming && (
-          <div className="ai-chat-message ai-chat-message-assistant ai-chat-streaming" data-testid="ai-chat-streaming">
-            <div className="ai-chat-assistant-text">
-              {renderSegments(streamingSegments, true)}
-              {pendingConfirm ? (
-                <div className="ai-chat-confirm" data-testid="ai-chat-confirm">
-                  <div className="ai-chat-confirm-header">
-                    <ShieldAlert size={16} />
-                    <span>Confirmation Required</span>
-                  </div>
-                  <div className="ai-chat-confirm-body">
-                    <code>{pendingConfirm.toolName}</code>
-                    {pendingConfirm.input && Object.keys(pendingConfirm.input).length > 0 && (
-                      <pre className="ai-chat-confirm-params">
-                        {JSON.stringify(pendingConfirm.input, null, 2)}
-                      </pre>
-                    )}
-                  </div>
-                  <div className="ai-chat-confirm-actions">
-                    <button
-                      className="btn btn-danger btn-sm"
-                      onClick={() => respondToConfirm(false)}
-                      data-testid="ai-chat-confirm-deny"
-                    >
-                      Deny
-                    </button>
-                    <button
-                      className="btn btn-primary btn-sm"
-                      onClick={() => respondToConfirm(true)}
-                      data-testid="ai-chat-confirm-allow"
-                    >
-                      Allow
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <StatusIndicator
-                  isStreaming={isStreaming}
-                  segments={streamingSegments}
-                />
-              )}
+            <h3 id="ai-chat-yolo-title">Turn on YOLO mode?</h3>
+            <p>
+              Every tool runs without asking in this conversation: ADB shell commands, Frida scripts, changes to settings
+              and plugin switches. Your permissions still apply, and a model that reads hostile input can use these tools too.
+            </p>
+            <p>You can switch it off at any time, and New Chat turns it off.</p>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="btn btn-secondary"
+                autoFocus
+                onClick={() => setYoloDialogOpen(false)}
+                data-testid="ai-chat-yolo-cancel"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger"
+                onClick={() => { setYoloDialogOpen(false); applyYolo(true); }}
+                data-testid="ai-chat-yolo-confirm"
+              >
+                Turn on YOLO
+              </button>
             </div>
           </div>
-        )}
+        </div>,
+        document.body,
+      )}
 
-        {turnLimitReached && !isStreaming && (
-          <div className="ai-chat-turn-limit" data-testid="ai-chat-turn-limit">
-            <p>The AI ran out of turns and stopped.</p>
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={() => sendMessage('Continue where you left off.')}
-              data-testid="ai-chat-continue-btn"
-            >
-              Continue
-            </button>
+      {historyOpen ? (
+        <AiChatHistory
+          pageContext={pageContext}
+          contextId={contextId}
+          openConversationId={conversationId}
+          busy={isStreaming}
+          onOpen={openFromHistory}
+          onDeleted={handleDeleted}
+          onClose={() => setHistoryOpen(false)}
+        />
+      ) : (
+      <>
+        {conversationOrigin && originPath && pathOf(conversationOrigin.path) !== pathOf(originPath) && (
+          <div className="ai-chat-origin-bar" data-testid="ai-chat-origin-bar">
+            <span className="ai-chat-origin-text">Started on <strong>{conversationOrigin.label}</strong></span>
+            {onNavigate && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={() => onNavigate(conversationOrigin.path)}
+                data-testid="ai-chat-origin-go"
+              >
+                Go there
+              </button>
+            )}
           </div>
         )}
 
-        <div ref={messagesEndRef} />
-      </div>
+        <div className="ai-chat-messages" data-testid="ai-chat-messages">
+          {isEmpty && (
+            <div className="ai-chat-empty" data-testid="ai-chat-empty">
+              <p className="ai-chat-empty-text">Ask a question about this page's data</p>
+              {suggestedPrompts.length > 0 && (
+                <div className="ai-chat-suggestions" data-testid="ai-chat-suggestions">
+                  {suggestedPrompts.map((prompt, i) => (
+                    <button
+                      key={i}
+                      className="ai-chat-suggestion-btn"
+                      onClick={() => sendMessage(prompt)}
+                      data-testid={`ai-chat-suggestion-${i}`}
+                    >
+                      {prompt}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
-      <div className="ai-chat-input-area" data-testid="ai-chat-input-area">
-        <textarea
-          ref={textareaRef}
-          className="ai-chat-input"
-          data-testid="ai-chat-input"
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Ask a question..."
-          rows={1}
-          disabled={isStreaming}
-        />
-        {isStreaming ? (
-          <button
-            className="btn btn-danger btn-sm"
-            onClick={cancelRequest}
-            data-testid="ai-chat-cancel-btn"
-          >
-            Cancel
-          </button>
-        ) : (
-          <button
-            className="btn btn-primary btn-sm"
-            onClick={() => sendMessage(input)}
-            disabled={!input.trim()}
-            data-testid="ai-chat-send-btn"
-          >
-            Send
-          </button>
-        )}
-      </div>
+          {messages.map((msg, i) => (
+            <div
+              key={i}
+              className={`ai-chat-message ai-chat-message-${msg.role}`}
+              data-testid={`ai-chat-message-${i}`}
+            >
+              {msg.role === 'user' ? (
+                <div className="ai-chat-user-text">{msg.content}</div>
+              ) : (
+                <div className="ai-chat-assistant-text">
+                  {msg.segments ? (
+                    renderSegments(msg.segments)
+                  ) : msg.content ? (
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={markdownComponents}>
+                      {msg.content}
+                    </ReactMarkdown>
+                  ) : null}
+                </div>
+              )}
+            </div>
+          ))}
+
+          {isStreaming && (
+            <div className="ai-chat-message ai-chat-message-assistant ai-chat-streaming" data-testid="ai-chat-streaming">
+              <div className="ai-chat-assistant-text">
+                {renderSegments(streamingSegments, true)}
+                {pendingConfirm ? (
+                  <div className="ai-chat-confirm" data-testid="ai-chat-confirm">
+                    <div className="ai-chat-confirm-header">
+                      <ShieldAlert size={16} />
+                      <span>Confirmation Required</span>
+                    </div>
+                    <div className="ai-chat-confirm-body">
+                      <code>{pendingConfirm.toolName}</code>
+                      {pendingConfirm.input && Object.keys(pendingConfirm.input).length > 0 && (
+                        <pre className="ai-chat-confirm-params">
+                          {JSON.stringify(pendingConfirm.input, null, 2)}
+                        </pre>
+                      )}
+                      <p className="ai-chat-confirm-hint" data-testid="ai-chat-confirm-hint">
+                        Allow for this conversation covers every call to <code>{pendingConfirm.toolName}</code>, whatever the arguments.
+                      </p>
+                    </div>
+                    <div className="ai-chat-confirm-actions">
+                      <button
+                        className="btn btn-danger btn-sm"
+                        onClick={() => respondToConfirm(false)}
+                        data-testid="ai-chat-confirm-deny"
+                      >
+                        Deny
+                      </button>
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => respondToConfirm(true, 'conversation')}
+                        title={`Stop asking about ${pendingConfirm.toolName} in this conversation`}
+                        data-testid="ai-chat-confirm-allow-conversation"
+                      >
+                        Allow for this conversation
+                      </button>
+                      <button
+                        className="btn btn-primary btn-sm"
+                        onClick={() => respondToConfirm(true)}
+                        data-testid="ai-chat-confirm-allow"
+                      >
+                        Allow
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <StatusIndicator
+                    isStreaming={isStreaming}
+                    segments={streamingSegments}
+                  />
+                )}
+              </div>
+            </div>
+          )}
+
+          {turnLimitReached && !isStreaming && (
+            <div className="ai-chat-turn-limit" data-testid="ai-chat-turn-limit">
+              <p>The AI ran out of turns and stopped.</p>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => sendMessage('Continue where you left off.')}
+                data-testid="ai-chat-continue-btn"
+              >
+                Continue
+              </button>
+            </div>
+          )}
+
+          {unfinished && !isStreaming && (
+            <div className="ai-chat-unfinished-notice" role="status" data-testid="ai-chat-unfinished-notice">
+              The last reply was cut off. Send continue to pick it up.
+            </div>
+          )}
+
+          <div ref={messagesEndRef} />
+        </div>
+
+        <div className="ai-chat-input-area" data-testid="ai-chat-input-area">
+          <textarea
+            ref={textareaRef}
+            className="ai-chat-input"
+            data-testid="ai-chat-input"
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Ask a question..."
+            rows={1}
+            disabled={isStreaming}
+          />
+          {isStreaming ? (
+            <button
+              className="btn btn-danger btn-sm"
+              onClick={cancelRequest}
+              data-testid="ai-chat-cancel-btn"
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => sendMessage(input)}
+              disabled={!input.trim()}
+              data-testid="ai-chat-send-btn"
+            >
+              Send
+            </button>
+          )}
+        </div>
+      </>
+      )}
     </div>
   );
 }

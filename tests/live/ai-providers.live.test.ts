@@ -137,6 +137,18 @@ for (const p of LIVE) {
       expect(cached, `no cached input tokens on the second call (${shape(second)})`).toBeGreaterThan(0);
     });
 
+    // This is how inline completion sends its requests: the system prompt is the same each time, the code around
+    // the cursor is not. The second call can only read from cache if the marker sits on the system prompt.
+    it.skipIf(d.dialect !== 'anthropic-messages')('anthropic prefix caching reads the system prompt from cache when only the user message changes', async () => {
+      const ask = (content: string) => drain(make().createStreamingRequest(
+        [{ role: 'user', content }], FILLER, [], { maxOutputTokens: 512, cache: 'prefix' },
+      ));
+      await ask('Say ok.');
+      const second = await ask('Say fine.');
+      const cached = usageOf(second).reduce((n, e) => n + (e.cachedInputTokens ?? 0), 0);
+      expect(cached, `no cached input tokens on the second call (${shape(second)})`).toBeGreaterThan(0);
+    });
+
     it('inline completion: at least 7 of 8 cases pass deterministic checks', async () => {
       let pass = 0;
       for (const c of COMPLETION_CASES) {

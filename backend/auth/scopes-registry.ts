@@ -11,6 +11,8 @@ const REGISTRY: ScopeMetadata[] = [
   { key: 'core.devices:read', label: 'Read devices', description: 'List connected devices and view their state.', category: 'Devices' },
   { key: 'core.devices:manage', label: 'Manage devices', description: 'Connect, disconnect, configure, and push binaries to devices.', category: 'Devices' },
   { key: 'core.devices:shell', label: 'Device shell access', description: 'Execute arbitrary shell commands on connected devices.', category: 'Devices' },
+  { key: 'core.adb-proxy:read', label: 'Read ADB proxy', description: 'See ADB proxy ports, pending approval requests, approved machines and live connections.', category: 'Devices' },
+  { key: 'core.adb-proxy:manage', label: 'Manage ADB proxy', description: 'Turn the ADB proxy on or off, approve, deny and revoke remote machines, and change device ports. Approving a machine also needs Device shell access.', category: 'Devices' },
 
   // APKs
   { key: 'core.apk:read', label: 'Read APKs', description: 'Browse APK inventory, view analysis results and diffs.', category: 'APKs' },

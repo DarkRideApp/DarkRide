@@ -58,7 +58,8 @@ test.describe('APK section redesign', () => {
 
     await row.click();
     await expect(page.locator('[data-testid="app-detail"]')).toBeVisible();
-    await expect(page.locator('[data-testid="ps-toggle"]')).toBeVisible();
+    await expect(page.locator('[data-testid="app-detail-name"]')).toHaveText('com.e2e.fixture');
+    await expect(page.locator('[data-testid="analysis-panel"]')).toBeVisible();
 
     // Untrack via the settings kebab — requires a confirmation dialog.
     await page.getByRole('button', { name: 'App settings' }).click();

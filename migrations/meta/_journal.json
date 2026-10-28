@@ -596,6 +596,27 @@
       "when": 1791494784563,
       "tag": "0101_ai_call_request",
       "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1791494784564,
+      "tag": "0102_adb_proxy",
+      "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1791872734092,
+      "tag": "0103_ai_conversation_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1791968514150,
+      "tag": "0104_automation_authors",
+      "breakpoints": true
     }
   ]
 }

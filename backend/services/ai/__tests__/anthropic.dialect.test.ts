@@ -47,6 +47,31 @@ describe('buildChat', () => {
     expect(body.stop_sequences).toEqual(['\n\n\n']);
     expect(body.max_tokens).toBe(256);
   });
+  describe('prefix caching', () => {
+    const build = (r: object) => anthropicDialect.buildChat(makeCtx('anthropic'), { ...req, ...r }, { stream: true }).body as any;
+
+    it('marks only the system prompt when cache is "prefix", and leaves the rest of the request unmarked', () => {
+      const body = build({ cache: 'prefix' });
+      expect(body.system).toEqual([{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral' } }]);
+      expect(body.cache_control).toBeUndefined();
+      expect(body.messages).toEqual([{ role: 'user', content: 'hi' }]);
+    });
+
+    it('marks nothing when cache is "prefix" and there is no system prompt', () => {
+      const body = build({ cache: 'prefix', systemPrompt: '' });
+      expect(body.system).toBeUndefined();
+      expect(body.cache_control).toBeUndefined();
+    });
+
+    it('keeps the system prompt a plain string when the whole request is cached or nothing is', () => {
+      expect(build({}).system).toBe('sys');
+      expect(build({ cache: true }).system).toBe('sys');
+      expect(build({ cache: false }).system).toBe('sys');
+      expect(build({}).cache_control).toEqual({ type: 'ephemeral' });
+      expect(build({ cache: true }).cache_control).toEqual({ type: 'ephemeral' });
+      expect(build({ cache: false }).cache_control).toBeUndefined();
+    });
+  });
   it('sends output_config.effort only for 5.x models', () => {
     const r = { ...req, effort: 'low' as const };
     expect((anthropicDialect.buildChat(makeCtx('anthropic', { model: 'claude-haiku-5-5' }), r, { stream: true }).body as any).output_config).toEqual({ effort: 'low' });
@@ -231,17 +256,36 @@ describe('parseStream content', () => {
   it('a tool_use block that never finished before a refusal produces nothing, so the refusal still throws', async () => {
     await refusedWith([start(), toolStart('tu_1', 'get_apps'), toolDelta('{"q":'), msgDelta('refusal', 0), stop()]);
   });
-  it('a refusal after text was already produced keeps that text and appends the message instead of throwing', async () => {
+  const lastEvent = (events: any[]) => events[events.length - 1];
+  it('a refusal after text ends the stream with a refusal event, and does not append the message as text', async () => {
     const events = await run([start(), text('Sure, '), msgDelta('refusal', 3, { stop_details: { type: 'refusal', category: 'cyber' } }), stop()]);
-    const t = events.filter((e) => e.type === 'text') as any[];
-    expect(t.map((e) => e.text)[0]).toBe('Sure, ');
-    expect(t).toHaveLength(2);
-    expect(t[1].text).toContain('Claude declined this request');
+    expect(events.filter((e) => e.type === 'text')).toEqual([{ type: 'text', text: 'Sure, ' }]);
+    expect(lastEvent(events).type).toBe('refusal');
+    expect(lastEvent(events).message).toContain('Claude declined this request (category: cyber).');
+    expect(lastEvent(events).message).toContain('Cyber Verification Program');
   });
-  it('a refusal after a tool call was already produced keeps the call and appends the message instead of throwing', async () => {
+  it('a refusal after a completed tool_use block ends the stream with a refusal event', async () => {
     const events = await run([start(), toolStart('tu_1', 'get_apps'), toolDelta('{}'), blockStop(), msgDelta('refusal', 3), stop()]);
     expect(events.filter((e) => e.type === 'tool_use')).toHaveLength(1);
-    expect((events.filter((e) => e.type === 'text') as any[]).map((e) => e.text)).toEqual(['Claude declined this request.']);
+    expect(events.filter((e) => e.type === 'text')).toEqual([]);
+    expect(lastEvent(events)).toEqual({ type: 'refusal', message: 'Claude declined this request.' });
+  });
+  it('a refusal after text and a tool_use block that never finished yields no tool call and ends with a refusal event', async () => {
+    const events = await run([start(), text('Let me look. '), toolStart('tu_1', 'get_apps'), toolDelta('{"q":'), msgDelta('refusal', 3), stop()]);
+    expect(events.filter((e) => e.type === 'tool_use')).toEqual([]);
+    expect(lastEvent(events).type).toBe('refusal');
+  });
+  it('a refusal after text keeps the usage events, and the refusal event comes last', async () => {
+    const events = await run([start({ input_tokens: 9 }), text('Sure, '), msgDelta('refusal', 3), stop()]);
+    expect(events.filter((e) => e.type === 'usage')).toEqual([
+      { type: 'usage', inputTokens: 9, outputTokens: 0 },
+      { type: 'usage', inputTokens: 0, outputTokens: 3 },
+    ]);
+    expect(events.map((e) => e.type)).toEqual(['usage', 'text', 'usage', 'refusal']);
+  });
+  it('a normal end_turn after text emits no refusal event', async () => {
+    const events = await run([start(), text('Done.'), msgDelta('end_turn', 2), stop()]);
+    expect(events.some((e) => e.type === 'refusal')).toBe(false);
   });
   it('a tool_use block with no input_json_delta yields an empty input object', async () => {
     const events = await run([start(), toolStart('tu_1', 'get_apps'), blockStop(), msgDelta('tool_use', 3), stop()]);

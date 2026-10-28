@@ -11,10 +11,12 @@ DarkRide is configured via environment variables. Copy `.env.example` to `.env` 
 | DATA_ROOT | ./data | Root for all runtime data (DB, screenshots, APKs, plugin storage, etc.). Override to point at a separate disk or mount. |
 | DATABASE_PATH | ./data/darkride.db | SQLite database file path |
 | SCREENSHOT_PATH | ./data/screenshots | Screenshot storage directory |
-| PRUNE_DAYS | 7 | Days of data to retain before auto-cleanup |
+| PRUNE_DAYS | 7 | Days of data to retain before auto-cleanup. Also applies to conversations started by automated runs (APK analysis, diff summaries) |
+| AI_CONVERSATION_PRUNE_DAYS | 90 | Days to keep AI chats you can reopen from the chat History list. See [ai-chat-history.md](ai-chat-history.md) |
 | NODE_ENV | - | Set to `production` to serve frontend static files |
 | DEBUG_LOGS | - | Set to any value to enable verbose logging |
 | TRUST_PROXY | - | Set when behind a reverse proxy (Traefik, nginx). Values: hop count (e.g. `1`), `loopback`, `linklocal`, `uniquelocal`, or a comma-separated IP/subnet list. |
+| DARKRIDE_LOGIN_RATE_LIMIT | 30 | Login attempts one IP address gets per 5 minutes before further attempts are refused. Raise it when many users reach DarkRide from one address, for example through a reverse proxy without `TRUST_PROXY` set. Anything that is not a positive whole number keeps the default. |
 | WEBSOCKET_ALLOWED_ORIGINS | - | Comma-separated extra Origins allowed for `/ws` upgrades on top of the same-host + Vite-dev-port defaults. Needed when the backend sits behind a reverse proxy that re-writes Host. Example: `WEBSOCKET_ALLOWED_ORIGINS=https://darkride.example.com,https://staging.darkride.example.com`. See [SECURITY.md](../SECURITY.md#websocket-origin-allowlist). |
 | DARKRIDE_PLUGINS | (all) | Comma-separated list of plugin names to load. Only those plugins (plus any required dependencies) will start. Useful when iterating on one plugin without spinning up unrelated external service deps. Example: `DARKRIDE_PLUGINS=kitchen-sink npm run dev`. |
 | DARKRIDE_PLUGIN_DIRS | (unset) | Path-delimited list of extra directories to scan for plugins (use `:` on Linux/macOS, `;` on Windows). Falls back to scanning `plugins/` when unset. See [installing-plugins.md](installing-plugins.md). |

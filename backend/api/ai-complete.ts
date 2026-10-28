@@ -6,7 +6,7 @@ import type { AppDatabase } from '../db/index';
 import type { AiModelRouter } from '../services/ai-model-router';
 import { createProvider } from '../services/ai/registry';
 import { AiProviderError, NoModelsConfiguredError } from '../services/ai/errors';
-import { redact } from '../services/ai/http';
+import { safeText } from '../services/ai/http';
 import type { AiCompleteRequest, AiProvider } from '../services/ai/dialect';
 import { getProviderDescriptor } from '../../shared/lib/ai-provider-catalog';
 import { createLoggers } from '../logs';
@@ -27,6 +27,9 @@ function getSystemPrompt(): string {
 }
 
 const SYSTEM_PROMPT = getSystemPrompt();
+
+/** Most characters (UTF-16 code units) of `prefix` and `suffix` combined that a request may carry. */
+export const MAX_COMPLETE_CONTEXT_CHARS = 100_000;
 
 function getSetting(db: AppDatabase, key: string): string | undefined {
   const row = db
@@ -74,18 +77,30 @@ function legacyProvider(db: AppDatabase): Legacy {
 
 /**
  * POST /v1/ai/complete. Completes from the Low tier only (never a slower, more expensive tier), falling
- * back to the deprecated settings when no Low tier model exists. Status by error class: 400 for missing
- * configuration, 502 for any provider error (its message is already redacted by the transport), 500 with a
- * generic message for anything else. When the client goes away (the editor cancels on every keystroke) the
- * upstream call is aborted and nothing is written or logged as an error.
+ * back to the deprecated settings when no Low tier model exists. Status by error class: 400 for a bad
+ * request body or missing configuration, 413 for a prefix and suffix over MAX_COMPLETE_CONTEXT_CHARS
+ * combined (the body is validated before any provider is touched), 502 for any provider error (its message
+ * is already redacted by the transport), 500 with a generic message for anything else. When the client goes
+ * away (the editor cancels on every keystroke) the upstream call is aborted and nothing is written or logged
+ * as an error.
  *
  * Exported so it can be called with the minimal `res` the WebSocket REST adapter builds.
  */
 export function completeHandler(db: AppDatabase, router: AiModelRouter) {
   return async (req: any, res: any): Promise<void> => {
     const { prefix, suffix } = req.body || {};
+    for (const [field, value] of [['prefix', prefix], ['suffix', suffix]] as const) {
+      if (value !== undefined && typeof value !== 'string') {
+        res.status(400).json({ success: false, error: `${field} must be a string` });
+        return;
+      }
+    }
     if (!prefix && !suffix) {
       res.status(400).json({ success: false, error: 'prefix or suffix is required' });
+      return;
+    }
+    if ((prefix?.length ?? 0) + (suffix?.length ?? 0) > MAX_COMPLETE_CONTEXT_CHARS) {
+      res.status(413).json({ success: false, error: `prefix and suffix together may not exceed ${MAX_COMPLETE_CONTEXT_CHARS} characters` });
       return;
     }
 
@@ -138,7 +153,7 @@ export function completeHandler(db: AppDatabase, router: AiModelRouter) {
       }
       // Not a classified provider failure, so the message may hold anything: keep it in the server log only.
       // Masked and capped anyway, since log lines are streamed to live log viewers.
-      error(`Completion failed unexpectedly: ${err?.name ?? 'Error'}: ${redact(String(err?.message ?? err)).slice(0, 500)}`);
+      error(`Completion failed unexpectedly: ${err?.name ?? 'Error'}: ${safeText(err?.message ?? err, {})}`);
       res.status(500).json({ success: false, error: 'Inline completion failed' });
     }
   };

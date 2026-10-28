@@ -3,7 +3,7 @@ import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { scanSource, scanTree } from './provider-branch-scan';
+import { formatHits, scanSource, scanTree } from './provider-branch-scan';
 
 // Records every createSourceFile call so the scanTree prefilter is observable:
 // the TypeScript parser never throws on bad input, so "was this file parsed"
@@ -109,6 +109,49 @@ describe('provider branch scanner', () => {
     });
   });
 
+  describe('lookups keyed by a provider id', () => {
+    it.each([
+      ['Set.has with an id argument', `seen.has('gemini')`],
+      ['Set.has with a wrapped id argument', `seen.has('gemini' as string)`],
+      ['an inline Set of ids', `new Set(['gemini', 'x']).has(t)`],
+      ['an inline Set of ids with a type argument', `new Set<string>(['gemini']).has(t)`],
+      ['indexOf with an id argument', `list.indexOf('ollama')`],
+      ['lastIndexOf with an id argument', `list.lastIndexOf('ollama')`],
+      ['indexOf on an array literal of ids', `['ollama', 'x'].indexOf(t)`],
+      ['an object literal with an identifier id key', `({ gemini: 1, x: 2 })[t]`],
+      ['an object literal with a quoted id key', `({ 'claude-cli': 1 })[t]`],
+      ['an object literal with a template id key', '({ [`gemini`]: 1 })[t]'],
+      ['a wrapped object literal', `({ gemini: 1 } as const)[t]`],
+      ['an id literal as the element-access key', `table['anthropic']`],
+      ['an id template literal as the element-access key', 'table[`anthropic`]'],
+    ])('flags %s', (_name, src) => {
+      expect(hits(src)).toEqual([1]);
+    });
+
+    it('does not flag lookups that involve no provider id', () => {
+      expect(hits(`seen.has('other')`)).toEqual([]);
+      expect(hits(`new Set(['other']).has(t)`)).toEqual([]);
+      expect(hits(`list.indexOf('other')`)).toEqual([]);
+      expect(hits(`({ other: 1 })[t]`)).toEqual([]);
+      expect(hits(`table[t]`)).toEqual([]);
+      expect(hits(`table['other']`)).toEqual([]);
+      expect(hits(`seen.has(t)`)).toEqual([]);
+    });
+
+    it('does not flag an object literal with an id key that is never indexed', () => {
+      expect(hits(`const o = { gemini: 1 };`)).toEqual([]);
+      expect(hits(`const o = { gemini: 1 }; o.gemini;`)).toEqual([]);
+    });
+
+    it('does not flag an id used as a value inside an indexed object literal', () => {
+      expect(hits(`({ kind: 'gemini' })[t]`)).toEqual([]);
+    });
+
+    it('reports one hit per lookup', () => {
+      expect(hits(`seen.has('gemini') && list.indexOf('ollama')`)).toEqual([1, 1]);
+    });
+  });
+
   describe('hit shape', () => {
     it('reports a single hit when includes matches through both the argument and the array literal', () => {
       expect(scanSource('x.ts', `['gemini'].includes('gemini')`, IDS)).toHaveLength(1);
@@ -132,6 +175,30 @@ describe('provider branch scanner', () => {
       const [h] = scanSource('x.ts', long, IDS);
       expect(h.text).toHaveLength(80);
     });
+  });
+});
+
+describe('formatHits', () => {
+  const sample = [
+    { file: 'backend/a.ts', line: 3, text: `t === 'gemini'` },
+    { file: 'frontend/b.tsx', line: 12, text: `seen.has('ollama')` },
+  ];
+
+  it('lists every hit as file:line text, one per line', () => {
+    const out = formatHits(sample);
+    expect(out).toContain(`backend/a.ts:3 t === 'gemini'`);
+    expect(out).toContain(`frontend/b.tsx:12 seen.has('ollama')`);
+  });
+
+  it('says what to do about the hits', () => {
+    const out = formatHits(sample);
+    expect(out).toContain('catalog field');
+    expect(out).toContain('dialect');
+    expect(out).toContain('docs/ai-providers.md');
+  });
+
+  it('is empty when there is nothing to report', () => {
+    expect(formatHits([])).toBe('');
   });
 });
 
@@ -184,6 +251,26 @@ describe('scanTree', () => {
     expect(out.map((h) => h.file)).toEqual(['src/real.ts']);
     // Skipped files are filtered before `allow` is consulted.
     expect(seen).toEqual(['src/real.ts']);
+  });
+
+  it('skips __tests__ and test-utils directories at any depth, and test-helpers files', () => {
+    write('__tests__/fixture.ts', HIT);
+    write('src/__tests__/fixture.ts', HIT);
+    write('src/__tests__/deep/fixture.tsx', HIT);
+    write('test-utils/scan.ts', HIT);
+    write('src/test-utils/scan.ts', HIT);
+    write('src/test-helpers.ts', HIT);
+    write('src/ai/test-helpers.tsx', HIT);
+    write('src/real.ts', HIT);
+    write('src/test-helpers-but-not.ts', HIT);
+    write('src/my__tests__/real-too.ts', HIT);
+    const seen: string[] = [];
+    const out = scanTree(root, IDS, (rel) => { seen.push(rel); return false; });
+    expect(out.map((h) => h.file).sort()).toEqual([
+      'src/my__tests__/real-too.ts', 'src/real.ts', 'src/test-helpers-but-not.ts',
+    ]);
+    // Skipped files are filtered before `allow` is consulted.
+    expect(seen.sort()).toEqual(['src/my__tests__/real-too.ts', 'src/real.ts', 'src/test-helpers-but-not.ts']);
   });
 
   it('passes forward-slash relative paths to allow and does not scan an allowed file', () => {

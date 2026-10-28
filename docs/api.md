@@ -98,6 +98,38 @@ Classification comes from `shared/lib/traffic-classify.ts`, the same code the Tr
 | POST | /v1/automation/run/:id/:passcode | External trigger (POST) |
 | POST | /v1/automation/validate | Validate automation code |
 | GET | /v1/automation/types | Get TypeScript type definitions for editor |
+| GET | /v1/automation/unclaimed | Count scripts with no author (`core.automations:read`) |
+| POST | /v1/automation/claim-all | Make the caller the author of every script with no author (`core.automations:edit`) |
+
+### Tool access from scripts
+
+A script's global `tools` object calls the same tools as the AI chat. Every call runs with the scopes of the script's **author**, the person who last saved its code, and never with the scopes of whoever starts the run. A call is allowed only when both of these cover the tool's scope: the scopes of the session or API key that saved the code, and the scopes the author holds now. Revoking a scope, or disabling the user, therefore applies on the next call. A refused call throws `Insufficient scope: <scope> required for tool <name>`, which the script can catch.
+
+- Saving a script with `code`, from the editor or through `POST /v1/automation/create` or `PUT /v1/automation/update/:id`, makes the caller its author, even if the code is unchanged. An update without `code` leaves the author alone.
+- Changing code through the AI chat or MCP (`update_automation_code`, `patch_automation_code`) removes the author, because those tools cannot tell who asked. `create_automation` leaves a new script without one.
+- A script with no author, or whose author's account is disabled or deleted, cannot call tools or the device calls listed below. The error says why. Saving the automation in the editor claims it, and so does **Claim all** (next list).
+- A script shipped by a plugin keeps full tool access while its code matches what the plugin ships. Once an operator saves an override, the operator becomes its author. Resetting to the plugin's default removes the author.
+- Starting a script (`core.automations:execute`) runs it as written, with its author's scopes. Scripts do not follow `allowUnattended`.
+- If a different person saves the script while a run is in flight, that run's remaining tool calls are refused, so the old code never takes on the new author's scopes. Saving it again yourself does not interrupt your own run.
+- The author is not part of any automation response.
+- Scripts saved before authors were recorded have none. The banner at the top of the Automations page counts them and **Claim all** (or `POST /v1/automation/claim-all`) makes the signed-in user the author of all of them at once, with the scopes of the session or key used. It only takes scripts that have no author, never one that already has an author, and the user is vouching for the code: the scripts then run with that user's permissions. A user who holds fewer scopes gives the scripts fewer.
+
+#### Device calls that need a scope
+
+These calls on the objects a script receives (`device`, `device.http`, `device.frida`, `http`) are checked the same way as `tools`, against the author's scopes. They are the scopes the same operations need over REST. A refused call throws `Insufficient scope: <scope> required for <object>.<method>`, which the script can catch.
+
+| Call | Scope the author needs |
+|---|---|
+| `device.getCredentials(appId)` | `core.credentials:read` |
+| `device.setProxy(mode)` | `core.proxies:manage` |
+| `http.setProxy(mode)` | `core.proxies:manage` |
+| `device.frida.run`, `inject`, `loadScript`, `send`, `stop` | `core.frida:manage` |
+| `device.frida.getMessages()` | `core.frida:read` |
+| `device.http.hook`, `hookRequest`, `hookResponse`, `intercept`, `useClientCert` | `core.traffic:manage` |
+
+Everything else in the automation API needs only `core.automations:execute` to start the run. That includes outbound requests (`device.httpGet`, `device.httpPost`, `http.get` and the rest), which are what an automation is for, and `device.http.unhook` and `unhookAll`, which only remove hooks the script registered. A script an administrator saved keeps working.
+
+A script can call only the methods in the automation API reference (`shared/types/automation.ts`). The objects a script receives have other functions that the server uses to run it, and a call to one of those is refused with `<object>.<method> is not available to scripts`, whoever wrote the script. A script shipped by a plugin gets the same refusal: it is trusted with scopes, not with a wider API. Adding a public method to one of these objects makes a test fail until the method is listed as callable or runner-only.
 
 ### Sessions
 
@@ -298,16 +330,18 @@ Create takes `name` and `providerId` (required), and optionally `model`, `enable
 |--------|------|-------------|
 | POST | /v1/ai/complete | Code completion for automation scripts |
 
-Request body: `{ "prefix": "...", "suffix": "..." }`. At least one must be non-empty; a missing one counts as an empty string. The request uses the enabled models of the `Low` tier only, never another tier, with the fallback described in [ai-providers.md](ai-providers.md#errors-and-fallback). If the `Low` tier has no usable model, it falls back to the deprecated AI settings keys. Output is capped at 256 tokens.
+Request body: `{ "prefix": "...", "suffix": "..." }`. Each must be a string when present, and `null` is not a string. At least one must be non-empty; a missing one counts as an empty string. Together they may not exceed 100,000 characters (UTF-16 code units, as `String.length` counts them); the check runs before any provider is called. The request uses the enabled models of the `Low` tier only, never another tier, with the fallback described in [ai-providers.md](ai-providers.md#errors-and-fallback). If the `Low` tier has no usable model, it falls back to the deprecated AI settings keys. Output is capped at 256 tokens.
 
 Success: `200` with `{ "success": true, "data": { "completion": "..." } }`. `completion` can be an empty string.
 
 | Status | `error` | When |
 |--------|---------|------|
+| 400 | `prefix must be a string` or `suffix must be a string` | that field is present and is not a string (a number, boolean, object, array or `null`). Checked before the next row |
 | 400 | `prefix or suffix is required` | both are empty or missing |
 | 400 | `No AI provider configured` | no usable `Low` tier model and no `ai_provider` setting |
 | 400 | `Unknown AI provider: <type>` | the `ai_provider` setting is not `anthropic`, `gemini`, `ollama`, `openrouter`, or `codestral` |
 | 400 | `<Name> API key not configured` | the `ai_provider` setting names Anthropic, Gemini, OpenRouter, or Codestral and its key setting is empty |
+| 413 | `prefix and suffix together may not exceed 100000 characters` | the two lengths add up to more than 100,000 |
 | 502 | the provider's message, key masked | the provider failed, for example `OpenAI API error (400): <provider message>`. When every `Low` tier model failed or is cooling down: `All AI models are rate-limited or unavailable:` and one `<model>: <reason>` line per model |
 | 500 | `Inline completion failed` | any other error. The detail goes to the server log only |
 
@@ -322,7 +356,7 @@ If the client disconnects, the upstream request is cancelled and nothing is writ
 
 `GET /v1/ai/usage/report` needs the `core.settings:read` scope. The Usage panel in Settings → AI reads it. The rest of this section describes it.
 
-`GET /v1/ai/usage` is a separate, older endpoint: it sums the input and output tokens stored on chat conversations and returns `{ totalInputTokens, totalOutputTokens, conversationCount, byContext, conversations }`. It has no cache tokens, costs or agent runs.
+`GET /v1/ai/usage` is a separate, older endpoint: it sums the input and output tokens stored on chat conversations and returns `{ totalInputTokens, totalOutputTokens, conversationCount, byContext, conversations }`. It has no cache tokens, costs or agent runs. It needs the `core.ai:chat` scope and counts only the caller's own conversations plus ones with no owner (automated runs and chats saved before ownership existed). For totals across all users, use `GET /v1/ai/usage/report`.
 
 Query parameters, both optional:
 
@@ -360,6 +394,29 @@ Notes:
 | 400 | `days must be an integer from 1 to 90` | `days` is empty, repeated, not a whole number, or out of range |
 | 400 | `limit must be an integer from 1 to 200` | `limit` is empty, repeated, not a whole number, or out of range |
 
+## Tools
+
+The same tool registry that backs the AI chat and the MCP server.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | /v1/tools | The tools the caller may run: `{ name, description, contexts }` each |
+| POST | /v1/tools/:name | Run a tool with the request body as its parameters |
+
+Both need a signed-in session or an API key; a request with no identity gets `401`. A tool can list a required scope, for example `core.credentials:read` for `list_credentials`. `GET /v1/tools` leaves out tools whose scope the caller does not hold, so its length is what MCP shows that caller. `POST /v1/tools/:name` answers `403` when the scope is missing and `404` for an unknown name.
+
+### Analysis tools
+
+The decompilers and scanners that APK analysis uses. They install themselves on the first analysis; these routes let you do it ahead of time or check what is there.
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | /v1/tools/status | `core.apk:read` | `{ tools, java }`: for each of `jadx`, `apktool`, `mobsfscan` and `blutter`, whether it is installed, its version and its path on the server |
+| POST | /v1/tools/install/:toolName | `core.apk:manage` | Install `jadx`, `apktool` or `mobsfscan` (anything else is `400`), then return the status |
+| POST | /v1/tools/install-all | `core.apk:manage` | Install every analysis tool that is missing |
+
+A request with no identity gets `401`, and one without the scope gets `403` before anything is installed.
+
 ## Plugin Endpoints
 
 Plugins can register their own REST endpoints using `ctx.api()` in their `start()` hook. Endpoints added this way are available over both HTTP and the WebSocket-REST transport (the `restapi` action), exactly like core endpoints. For full details see [docs/plugins/backend.md — API Endpoints](plugins/backend.md#api-endpoints).
@@ -369,7 +426,7 @@ Plugins can register their own REST endpoints using `ctx.api()` in their `start(
 MCP clients get one read-only tool, `darkride_api_get`, for GET requests against a short list of REST routes. It takes a `path` and an optional `query` object and returns `{ status, body }`. There is no way to set a method, body or header.
 
 - **Allow-list.** Reachable: everything under `/disney-menus`, and exactly `/v1/system/status`, `/v1/plugins/list` and `/v1/plugins/registry` (`API_GET_ALLOWED_ROUTES` in `backend/services/api-get-tool.ts`). The request path and the registered route that would answer it must both be on the list, so a `:param` route that happens to match an allowed path is refused. A route is added only after every GET handler it can reach has been read for sensitive output. A path off the list answers `{ status: 403 }`; an allowed path with no GET route answers `{ status: 404 }`.
-- **Secret-looking words.** A path containing a word such as `credential`, `secret`, `token`, `password`, `key`, `auth`, `cert`, `jwt`, `cookie` or `session` (matched anywhere in a segment, any case) is refused even under an allowed entry. This is a backstop and errs towards refusing; the allow-list is the control.
+- **Secret-looking words.** A path containing a word such as `credential`, `secret`, `token`, `password`, `key`, `auth`, `cert`, `jwt`, `cookie` or `session` (matched inside a segment, any case; `key`, `keys`, `pem` and `id_rsa` only as whole words, so `monkey` is not refused) is refused even under an allowed entry. This is a backstop and errs towards refusing; the allow-list is the control.
 - **Your scopes apply.** Every scope in the route's `requires` must be held by the MCP user. The tool needs an authenticated MCP caller. It does not run for automations, for `POST /v1/tools/{name}` or for the in-app agent's own tool loop; the Claude CLI provider reaches it through MCP with the user's own token and scopes.
 - **Path rules.** At most 512 characters; must start with `/`; no scheme, host, `?`, `#`, backslash, empty segment, or dot segment (raw, percent-encoded or double-encoded). A bad path is a tool error (`Invalid path: ...`), not a 403. Pass query parameters in `query`; values must be strings, numbers or booleans.
 - **Limits.** A body over 60,000 characters (UTF-16 code units of the JSON text) is cut and the result carries `truncated: true` and `totalChars`. Binary bodies are replaced by a size note. A handler that does not answer within 15 s returns 504; the handler is not cancelled and keeps running. Routes that stream or send files are unsupported and return 500.

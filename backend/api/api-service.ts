@@ -20,6 +20,11 @@ interface EndpointRegistration {
 const apiRouter = Router();
 const registeredEndpoints: EndpointRegistration[] = [];
 
+/** Query strings write a space as `+`, which is how URLSearchParams and Express's own parser treat it. */
+function decodeQueryPart(part: string): string {
+  return decodeURIComponent(part.replace(/\+/g, ' '));
+}
+
 /**
  * Convert an Express-style path pattern (/v1/proxy/view/:id) to a regex
  * for matching incoming WebSocket restapi requests and in-process GETs.
@@ -96,7 +101,7 @@ export async function handleWebSocketRestApi(
     if (queryString) {
       for (const pair of queryString.split('&')) {
         const [key, val] = pair.split('=');
-        if (key) query[decodeURIComponent(key)] = decodeURIComponent(val || '');
+        if (key) query[decodeQueryPart(key)] = decodeQueryPart(val || '');
       }
     }
 

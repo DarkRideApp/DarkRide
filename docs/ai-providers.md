@@ -11,8 +11,8 @@ an optional Base URL. A model row picks a provider, a model id, and a tier.
 
 | Type | Dialect | Default base URL | Default model | Notes |
 |---|---|---|---|---|
-| `anthropic` | Anthropic Messages | `https://api.anthropic.com` | `claude-sonnet-5-5` | Chat and agent requests use prompt caching. Inline completion and connection tests do not. See [Claude plans and API credits](#claude-plans-and-api-credits). |
-| `gemini` | Gemini `generateContent` | `https://generativelanguage.googleapis.com` | `gemini-2.5-flash` | Gemini 3.x function calling needs thought signatures, which are not supported yet. Use a 2.5 model. |
+| `anthropic` | Anthropic Messages | `https://api.anthropic.com` | `claude-sonnet-5-5` | Chat and agent requests use prompt caching. Inline completion caches only its system prompt (the code around the cursor changes on every call), and connection tests do not use caching. See [Claude plans and API credits](#claude-plans-and-api-credits). |
+| `gemini` | Gemini `generateContent` | `https://generativelanguage.googleapis.com` | `gemini-2.5-flash` | Thought signatures are kept with the conversation and sent back, which function calling on Gemini 3 and later (Gemini 4 included) requires; see [Provider data on stored messages](#provider-data-on-stored-messages). |
 | `ollama` | Ollama `/api/chat` | `http://localhost:11434` | `llama3.1` | No key. Waits up to 180 s for response headers (60 s for the other types). |
 | `openrouter` | OpenAI chat completions | `https://openrouter.ai/api/v1` | `openrouter/auto` | `openrouter/auto` lets OpenRouter choose the model for each request. Choose a model to pin one. |
 | `openai` | OpenAI chat completions | `https://api.openai.com/v1` | none | A model must be chosen. Sends `max_completion_tokens` and no stop sequences. |
@@ -37,12 +37,19 @@ as exhausted credits and moves on to the next model.
   is set and omits `system` when the system prompt is empty. `max_tokens` is 16000 unless the
   caller sets one. Never sends `temperature`, `top_p`, `top_k`, `thinking`, or `tool_choice`.
   Reported input tokens include cache reads and writes. A model refusal before any output is an
-  error the router falls back on (see Errors and fallback); a refusal after the model has started
-  answering is appended to the partial answer as a message.
+  error the router falls back on; a refusal after the model has started answering ends the stream
+  with a `refusal` event and the output of that turn is discarded (see Errors and fallback).
 - **Gemini**: the key goes in the `x-goog-api-key` header, never the URL. Omits
   `systemInstruction` when the system prompt is empty. Tool results carry the real function
   name. `thought` parts are not shown, and thinking tokens count as output tokens. An invalid
-  key (HTTP 400 `API_KEY_INVALID`) is treated as a rejected key.
+  key (HTTP 400 `API_KEY_INVALID`) is treated as a rejected key. Inline completion limits
+  thinking so the 256-token budget is not spent on it: a budget of 0 on 2.5 Flash and
+  Flash-Lite, 128 on 2.5 Pro, and level `low` on Gemini 3 and later (Gemini 4 cannot turn
+  thinking off). Chat and agent requests set no thinking option. "Gemini 3 and later" is
+  decided by the model id: a number of 3 or more right after `gemini-` (`gemini-3.8-flash`,
+  `gemini-4-argon`). Aliases such as `gemini-flash-latest` have no number, so they are
+  treated as older models; choose the versioned id (for example `gemini-3.8-flash`) to get
+  the Gemini 3 handling.
 - **Ollama**: tool-call arguments are sent as a JSON object.
 - **OpenAI chat completions** (`openai`, `openrouter`, `mistral`, `codestral`,
   `openai-compatible`): token usage is requested with `stream_options.include_usage`. `openai`
@@ -117,8 +124,15 @@ A refusal is about the request, not the model, so it falls back to the next mode
 cooldown. If every model that was tried refused, the request fails with the first model's own
 message (for Anthropic it names the category and, for `cyber`, the Cyber Verification Program)
 instead of the generic "rate-limited or unavailable" text. A refusal that arrives after the model
-has already started answering keeps the partial answer and adds the message, as before. In a
-background run that message is just text, so such a run is not recorded as failed.
+has already started answering cannot fall back, because the caller may already hold output. For
+Anthropic, which says to treat output from a refused stream as incomplete, the text and tool calls
+of that turn are dropped: the stored and shown turn is the refusal message alone, no tool call of
+that turn runs, and later turns never replay it. A tiered run counts a refused research turn as
+final (no escalation to the write tier) and a refused write turn as declining to write. A refused
+context-compaction summary is dropped and the conversation keeps its full history. Inline
+completion treats a refusal after partial output like one before any output and tries the next
+model. Gemini and OpenAI-style providers still keep the partial answer and add the message. In a
+background run the message is just text, so such a run is not recorded as failed.
 
 Within one run, a model that refused is not asked again by that run's later requests, and the
 research and write providers of a tiered run share that memory. Refusals start no cooldown, so
@@ -183,7 +197,9 @@ another tier. The fallback and cooldown rules above apply. `claude-cli` models a
 because the CLI has no HTTP completion. On a `mistral` or `codestral` provider a model whose
 id starts with `codestral` uses FIM. Every other model gets a chat request with the cursor
 marked `<CURSOR>` and no tools. Output is capped at 256 tokens and cut at the first run of
-three newlines. If the Low tier has no usable model, the deprecated settings below apply.
+three newlines. `prefix` and `suffix` must be strings, and together at most 100,000 characters;
+otherwise the request is refused with 400 or 413 before any provider is called. If the Low tier
+has no usable model, the deprecated settings below apply.
 
 ## Usage and cost
 
@@ -212,6 +228,27 @@ Not recorded: inline completion (the provider returns text only), requests cance
 their first output, and the per-request detail of runs from before this feature (their token
 totals still count, their cost shows `n/a`).
 
+### Would a 1-hour prompt cache be cheaper?
+
+Requests use Anthropic's 5-minute prompt cache. A 1-hour cache writes at twice the input price
+instead of 1.25 times, so it only pays when the gaps between requests in one conversation run
+past five minutes, which happens in a chat you come back to. `scripts/ai-cache-ttl-whatif.ts`
+replays the recorded requests under both lifetimes and prints, per purpose, how many follow-up
+requests came more than five minutes and more than an hour after the one before, the two
+prompt costs, and which lifetime wins:
+
+```bash
+npx tsx scripts/ai-cache-ttl-whatif.ts --days 30
+npx tsx scripts/ai-cache-ttl-whatif.ts --db /path/to/copy-of-darkride.db
+```
+
+It reads the database (`DATABASE_PATH`, or `--db`) and nothing else: it changes nothing and
+makes no AI request, so it is safe to run while the server is up. The figures cover prompt
+tokens only, use the price table above, and leave out requests on a model with no price. Runs do
+not record which chat they belong to, so chat runs of one user on one page are joined when a
+later run starts with a longer prompt than the earlier one ended with. There is no setting for a
+1-hour cache yet; this report is what decides whether one is worth adding.
+
 ## Deprecated settings
 
 `ai_provider`, `anthropic_api_key`, `gemini_api_key`, `openrouter_api_key`,
@@ -239,7 +276,7 @@ For an OpenAI-compatible API that takes a bearer token, add one entry to `AI_PRO
   id: 'groq', label: 'Groq', shortName: 'Groq', kind: 'http', dialect: 'openai-chat',
   defaultBaseUrl: 'https://api.groq.com/openai/v1', defaultPath: '/openai/v1', baseUrl: 'optional',
   auth: { scheme: 'bearer', required: true, label: 'API Key' },
-  rateLimitScheme: 'none', listModels: { path: '/models' }, capabilities: { tools: true },
+  rateLimitScheme: 'none', listModels: { path: '/models' },
 },
 ```
 
@@ -249,16 +286,20 @@ Then add one row to the golden table in
 streaming, error classification, and key redaction for every catalog entry. Nothing else
 changes: the settings form, model listing, connection test, and router all read the catalog.
 
-Only the `openai-chat` dialect reads `auth.scheme`, and it sends a bearer token. The Anthropic
-and Gemini dialects set their own key header and Ollama sends none, so a host that needs a
-different auth header or a key in the query string needs a change in the dialect, plus a
-golden-table row.
+Every dialect sends the key through `authHeaders` in `backend/services/ai/http.ts`, which reads
+`auth.scheme`: `bearer` sends `Authorization: Bearer <key>`, `x-api-key` and `x-goog-api-key`
+send the key in a header of that name, and `none` sends nothing. A host that needs another
+header name or a key in the query string needs a new scheme in `authHeaders` or a change in
+the dialect, plus a golden-table row.
 
 Keep provider ids out of comparisons everywhere except the catalog and the dialects. A test
 (`backend/services/ai/__tests__/provider-branch-guard.test.ts`) catches direct comparisons such
-as `type === 'openai'` or a `case 'gemini':`. It does not catch lookups through a table, a
-`Set`, or a named constant, so treat it as a safety net and put provider-specific behaviour in
-the catalog or a dialect.
+as `type === 'openai'` or a `case 'gemini':`, `includes`, `indexOf` and `Set.has` with a
+provider id, and lookups such as `({ openai: 1 })[type]` or `table['openai']`. It skips test
+files, `__tests__` and `test-utils` directories, and `test-helpers.ts`. It does not catch an id
+held in a named constant or table, `startsWith` or a regular expression on an id, or an id
+passed to a catalog function such as `getProviderDescriptor('claude-cli')`, so treat it as a
+safety net and put provider-specific behaviour in the catalog or a dialect.
 
 If you only need to use a service yourself, the `openai-compatible` type works with no code
 change. Add a catalog entry when the service should be its own type with its own defaults.
@@ -279,9 +320,47 @@ required for `openai` and `mistral`, which have no default. With nothing set, ev
 skipped and no request is made. The lane spends tokens, is excluded from `npm test` and from
 CI, and prints no keys or response bodies.
 
+## Provider data on stored messages
+
+Some responses carry data a provider wants back on a later turn. The dialect attaches it to the
+text or tool call it arrived with as `providerData` (`{ dialect, model, data }`), and it is stored
+with the conversation. Only the dialect named in `dialect` reads it, and only when the request
+is for the model that wrote it: another model, another dialect, or history that has none behaves
+as before. A turn's text block keeps the last data its text events carried, and a tool call keeps
+its own. The browser never gets it: the conversation endpoints leave it out. Compaction replaces
+the history with new messages, so the data goes with the blocks it belonged to.
+
+Gemini uses it for thought signatures. A response puts the signature on the first function call
+of a step (Gemini 3 and later require it back) and on the last part of an answer without calls (optional),
+and while streaming that part can have empty text. The dialect keeps each one and sends it back in
+the part it came from. A first function call with no stored signature still gets Google's documented
+placeholder, as does one whose signature was written for a different model, for example after a
+fallback or when the compaction request runs on another model of the tier.
+
+## Context compaction
+
+When a turn's prompt reaches 55% of the context window, the agent asks the model for a summary of the run so
+far and carries on from that summary in place of the history. The window is the model's: 1M tokens for the
+current Claude models (`shared/lib/ai-model-context.ts`), 200K for any other model and for a request whose
+provider does not report the model, so an unlisted model compacts early, never late. A run that several
+models served is measured against the smallest, because the router can send the next request to any of them.
+The percentage shown in the chat and on the APK analysis page uses the same window.
+
+The summary request carries the run's system prompt and tools, because Anthropic does not accept tool calls
+in the history of a request that defines no tools, and so that the request extends the prefix the run has
+already cached. The instruction tells the model not to call a tool. A reply that calls one anyway is
+discarded and the history is kept, as it is for a refusal or an error.
+
 ## Known limits
 
-- Anthropic `thinking` blocks and Gemini thought signatures are not carried between tool
-  turns, so models that think lose their earlier reasoning at each tool step.
+- Anthropic `thinking` blocks are not carried between tool turns, so models that think lose
+  their earlier reasoning at each tool step. The API rejects a thinking block that is sent back
+  after anything before it changed (the system prompt, the tool list or an earlier message) on
+  accounts created on or after 2026-08-31, and the agent changes the tool list when it loads
+  more tools and rewrites the history when it compacts. Sending them needs a way to know the
+  history is unchanged, so they are dropped, which the API allows.
 - The tiered research/write path does not fall back across models.
-- The built-in agent assumes a 200k-token context window when deciding to compact.
+- The built-in agent knows the context window of the current Claude models only. A model of another
+  provider with a longer window is taken to have 200K tokens and compacts earlier than it needs to.
+- Haiku 5.5 charges higher rates for a prompt over 100K tokens, and the agent does not compact it until 55%
+  of its 1M window.
