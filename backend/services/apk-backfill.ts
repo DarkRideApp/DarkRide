@@ -4,7 +4,7 @@ import { and, eq, or, like } from 'drizzle-orm';
 import { apkVersions, cloudFiles, trackedApps } from '../db/schema';
 import type { AppDatabase } from '../db/index';
 import type { FileStorageService } from './file-storage';
-import { getApkDir } from '../utils/apk-paths';
+import { getApkDir, analysisDbCloudKey } from '../utils/apk-paths';
 import { createLoggers } from '../logs';
 
 const { log, error } = createLoggers('apk-backfill');
@@ -116,6 +116,9 @@ function dirSizeBytes(dir: string): number {
  * Also removes analysis dirs that have no matching apk_versions row at all
  * (orphans from deleted DB entries).
  *
+ * A dir whose source.db has no cloud copy is kept: nothing registers source.db
+ * with file sync, so the local file is the only one and the diff engine reads it.
+ *
  * Notes are preserved in apk_notes — this function only removes disk-side
  * decompiled output.
  */
@@ -124,6 +127,7 @@ export function cleanupStaleAnalysisDirs(db: AppDatabase): void {
   if (!fs.existsSync(apkDir)) return;
 
   let removed = 0;
+  let keptUnbacked = 0;
   let bytesFreed = 0;
 
   for (const pkg of fs.readdirSync(apkDir, { withFileTypes: true })) {
@@ -168,6 +172,10 @@ export function cleanupStaleAnalysisDirs(db: AppDatabase): void {
       if (!stale) continue;
 
       const dir = path.join(analysisRoot, vcEntry.name);
+      if (version && hasOnlyLocalSourceDb(db, pkg.name, versionCode, dir)) {
+        keptUnbacked++;
+        continue;
+      }
       const size = dirSizeBytes(dir);
       try {
         fs.rmSync(dir, { recursive: true, force: true });
@@ -182,4 +190,22 @@ export function cleanupStaleAnalysisDirs(db: AppDatabase): void {
   if (removed > 0) {
     log(`Stale analysis cleanup — removed ${removed} dirs, freed ${(bytesFreed / 1024 / 1024).toFixed(1)} MB`);
   }
+  if (keptUnbacked > 0) {
+    log(`Stale analysis cleanup — kept ${keptUnbacked} dirs whose source.db has no cloud copy`);
+  }
+}
+
+/** True when the dir holds a source.db that is not safely in the cloud, so deleting the dir would lose it. */
+function hasOnlyLocalSourceDb(
+  db: AppDatabase,
+  packageName: string,
+  versionCode: number,
+  dir: string,
+): boolean {
+  if (!fs.existsSync(path.join(dir, 'source.db'))) return false;
+  const row = db.select({ syncState: cloudFiles.syncState })
+    .from(cloudFiles)
+    .where(eq(cloudFiles.cloudKey, analysisDbCloudKey(packageName, versionCode)))
+    .get();
+  return !row || (row.syncState !== 'synced' && row.syncState !== 'cloud_only');
 }
