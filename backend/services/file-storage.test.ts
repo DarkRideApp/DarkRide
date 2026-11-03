@@ -2032,22 +2032,46 @@ describe('runEviction with safety check', () => {
       expect(SPLIT_KEYS.map(stateOf)).toEqual(['cloud_only', 'cloud_only', 'cloud_only']);
     });
 
-    // The state production is already in: one child cloud_only, rest synced.
-    it('finishes evicting a split APK that is already half-evicted', async () => {
-      seedSplitVersion(['cloud_only', 'synced', 'synced']);
+    // A version left half-evicted by an earlier pass: one child cloud_only, rest synced.
+    it.each([
+      ['first', ['cloud_only', 'synced', 'synced']],
+      ['middle', ['synced', 'cloud_only', 'synced']],
+      ['last', ['synced', 'synced', 'cloud_only']],
+    ])('finishes evicting a split APK whose %s child is already cloud_only', async (_which, states) => {
+      seedSplitVersion(states as string[]);
 
       await (fileSync as any).runEviction();
 
       expect(SPLIT_KEYS.map(stateOf)).toEqual(['cloud_only', 'cloud_only', 'cloud_only']);
     });
 
-    it('keeps synced children local while a sibling is still uploading', async () => {
-      seedSplitVersion(['synced', 'pending_upload', 'synced']);
+    // The gate is an allow-list: only synced and cloud_only have a cloud copy.
+    it.each(['pending_upload', 'error'])(
+      'keeps synced children local while a sibling is %s',
+      async (siblingState) => {
+        seedSplitVersion(['synced', siblingState, 'synced']);
+
+        await (fileSync as any).runEviction();
+
+        expect(SPLIT_KEYS.map(stateOf)).toEqual(['synced', siblingState, 'synced']);
+        expect(unlinkSyncSpy).not.toHaveBeenCalled();
+      },
+    );
+
+    it('evicts one version of a package without touching a blocked neighbour with a similar filename', async () => {
+      seedSplitVersion(['synced', 'synced', 'synced']);
+      const neighbourKeys = [
+        'apks/com.split/1000.apk/base.apk',
+        'apks/com.split/1000.apk/split_config.arm64.apk',
+      ];
+      insertVersion(db, Number(db.select().from(schema.trackedApps).get()!.id), 1000, '1000.apk');
+      seedCloudFile(db, neighbourKeys[0], 'synced', { lastAccessed: new Date(10), fileSize: 2_000_000 });
+      seedCloudFile(db, neighbourKeys[1], 'pending_upload', { lastAccessed: new Date(11), fileSize: 2_000_000 });
 
       await (fileSync as any).runEviction();
 
-      expect(SPLIT_KEYS.map(stateOf)).toEqual(['synced', 'pending_upload', 'synced']);
-      expect(unlinkSyncSpy).not.toHaveBeenCalled();
+      expect(SPLIT_KEYS.map(stateOf)).toEqual(['cloud_only', 'cloud_only', 'cloud_only']);
+      expect(neighbourKeys.map(stateOf)).toEqual(['synced', 'pending_upload']);
     });
 
     it('does not evict children of a pinned split APK', async () => {
