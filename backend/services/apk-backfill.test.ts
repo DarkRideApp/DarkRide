@@ -207,11 +207,49 @@ describe('cleanupStaleAnalysisDirs', () => {
     }).run();
   }
 
-  it('removes analysis dirs whose APK is cloud_only', () => {
+  it('removes analysis dirs whose APK is cloud_only and whose source.db has a cloud copy', () => {
     const appId = seedApp('com.evict');
     seedVersion(appId, 100, '100_1.0.apk');
     const dir = writeAnalysisDir('com.evict', 100);
     seedCloudFile('apks/com.evict/100_1.0.apk', 'cloud_only');
+    seedCloudFile('apks/com.evict/analysis/100/source.db', 'synced');
+
+    cleanupStaleAnalysisDirs(db);
+
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it('keeps an analysis dir whose source.db has no cloud copy, even when the APK is cloud_only', () => {
+    const appId = seedApp('com.unbacked');
+    seedVersion(appId, 100, '100_1.0.apk');
+    const dir = writeAnalysisDir('com.unbacked', 100);
+    seedCloudFile('apks/com.unbacked/100_1.0.apk', 'cloud_only');
+    // Deliberately no cloud_files row for source.db: the local file is the only copy.
+
+    cleanupStaleAnalysisDirs(db);
+
+    expect(fs.existsSync(path.join(dir, 'source.db'))).toBe(true);
+  });
+
+  it('keeps an analysis dir whose source.db is still uploading', () => {
+    const appId = seedApp('com.uploading');
+    seedVersion(appId, 100, '100_1.0.apk');
+    const dir = writeAnalysisDir('com.uploading', 100);
+    seedCloudFile('apks/com.uploading/100_1.0.apk', 'cloud_only');
+    seedCloudFile('apks/com.uploading/analysis/100/source.db', 'pending_upload');
+
+    cleanupStaleAnalysisDirs(db);
+
+    expect(fs.existsSync(path.join(dir, 'source.db'))).toBe(true);
+  });
+
+  it('removes a stale analysis dir that holds no source.db', () => {
+    const appId = seedApp('com.nodb');
+    seedVersion(appId, 100, '100_1.0.apk');
+    const dir = path.join(tmpDir, 'data', 'apks', 'com.nodb', 'analysis', '100');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'partial.tmp'), 'x');
+    seedCloudFile('apks/com.nodb/100_1.0.apk', 'cloud_only');
 
     cleanupStaleAnalysisDirs(db);
 
@@ -250,15 +288,28 @@ describe('cleanupStaleAnalysisDirs', () => {
     expect(fs.existsSync(dir)).toBe(true);
   });
 
-  it('removes analysis dir when every split-apk child is cloud_only', () => {
+  it('removes analysis dir when every split-apk child is cloud_only and source.db has a cloud copy', () => {
     const appId = seedApp('com.split');
     seedVersion(appId, 7, '7_1.0');
     const dir = writeAnalysisDir('com.split', 7);
     seedCloudFile('apks/com.split/7_1.0/base.apk', 'cloud_only');
     seedCloudFile('apks/com.split/7_1.0/split_config.en.apk', 'cloud_only');
+    seedCloudFile('apks/com.split/analysis/7/source.db', 'cloud_only');
 
     cleanupStaleAnalysisDirs(db);
 
     expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it('keeps analysis dir when every split-apk child is cloud_only but source.db has no cloud copy', () => {
+    const appId = seedApp('com.splitkeep');
+    seedVersion(appId, 7, '7_1.0');
+    const dir = writeAnalysisDir('com.splitkeep', 7);
+    seedCloudFile('apks/com.splitkeep/7_1.0/base.apk', 'cloud_only');
+    seedCloudFile('apks/com.splitkeep/7_1.0/split_config.en.apk', 'cloud_only');
+
+    cleanupStaleAnalysisDirs(db);
+
+    expect(fs.existsSync(path.join(dir, 'source.db'))).toBe(true);
   });
 });
