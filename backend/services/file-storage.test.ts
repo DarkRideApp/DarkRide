@@ -1872,6 +1872,27 @@ describe('isVersionSafeToEvict', () => {
     expect(isVersionSafeToEvict(db, 'com.foo', 101, 'v101.apk')).toBe(true);
   });
 
+  it('treats a cloud_only split child as safe: it already has a cloud copy', () => {
+    const db = createTestDb();
+    const appId = insertApp(db, 'com.foo');
+    insertVersion(db, appId, 101, 'v101.apk');
+    seedCloudFile(db, 'apks/com.foo/v101.apk/base.apk', 'cloud_only');
+    seedCloudFile(db, 'apks/com.foo/v101.apk/split_config.en.apk', 'synced');
+    seedCloudFile(db, 'apks/com.foo/analysis/101/source.db', 'synced');
+    seedCloudFile(db, 'apks/com.foo/analysis/101/metadata.json', 'synced');
+    expect(isVersionSafeToEvict(db, 'com.foo', 101, 'v101.apk')).toBe(true);
+  });
+
+  it('treats a cloud_only analysis artifact as safe: it already has a cloud copy', () => {
+    const db = createTestDb();
+    const appId = insertApp(db, 'com.foo');
+    insertVersion(db, appId, 101, 'v101.apk');
+    seedCloudFile(db, 'apks/com.foo/v101.apk', 'synced');
+    seedCloudFile(db, 'apks/com.foo/analysis/101/source.db', 'cloud_only');
+    seedCloudFile(db, 'apks/com.foo/analysis/101/metadata.json', 'synced');
+    expect(isVersionSafeToEvict(db, 'com.foo', 101, 'v101.apk')).toBe(true);
+  });
+
   it('returns false when APK row is entirely missing', () => {
     const db = createTestDb();
     const appId = insertApp(db, 'com.foo');
@@ -1972,6 +1993,70 @@ describe('runEviction with safety check', () => {
     const apkRow = db.select().from(schema.cloudFiles)
       .where(eq(schema.cloudFiles.cloudKey, 'apks/com.foo/old.apk')).get();
     expect(apkRow!.syncState).toBe('cloud_only');
+  });
+
+  describe('split APKs', () => {
+    const SPLIT_KEYS = [
+      'apks/com.split/100.apk/base.apk',
+      'apks/com.split/100.apk/split_config.arm64.apk',
+      'apks/com.split/100.apk/split_config.xxhdpi.apk',
+    ];
+
+    function seedSplitVersion(states: string[], opts: { retain?: boolean } = {}): void {
+      db.insert(schema.settings).values({ key: 'cloud_local_cache_mb', value: '1' }).run();
+      const appId = insertApp(db, 'com.split');
+      insertVersion(db, appId, 100, '100.apk');
+      SPLIT_KEYS.forEach((key, i) => {
+        seedCloudFile(db, key, states[i], {
+          retain: opts.retain ?? false,
+          lastAccessed: new Date(i), // children evict in a stable order
+          relativePath: `/tmp/${key}`,
+          fileSize: 2_000_000,
+        });
+      });
+      existsSyncSpy.mockReturnValue(true);
+    }
+
+    function stateOf(key: string): string | undefined {
+      return db.select().from(schema.cloudFiles)
+        .where(eq(schema.cloudFiles.cloudKey, key)).get()?.syncState;
+    }
+
+    // Regression: evicting the first child made the gate see a non-synced
+    // sibling and block every remaining child, leaving the version half-evicted.
+    it('evicts every child of a fully synced split APK in one pass', async () => {
+      seedSplitVersion(['synced', 'synced', 'synced']);
+
+      await (fileSync as any).runEviction();
+
+      expect(SPLIT_KEYS.map(stateOf)).toEqual(['cloud_only', 'cloud_only', 'cloud_only']);
+    });
+
+    // The state production is already in: one child cloud_only, rest synced.
+    it('finishes evicting a split APK that is already half-evicted', async () => {
+      seedSplitVersion(['cloud_only', 'synced', 'synced']);
+
+      await (fileSync as any).runEviction();
+
+      expect(SPLIT_KEYS.map(stateOf)).toEqual(['cloud_only', 'cloud_only', 'cloud_only']);
+    });
+
+    it('keeps synced children local while a sibling is still uploading', async () => {
+      seedSplitVersion(['synced', 'pending_upload', 'synced']);
+
+      await (fileSync as any).runEviction();
+
+      expect(SPLIT_KEYS.map(stateOf)).toEqual(['synced', 'pending_upload', 'synced']);
+      expect(unlinkSyncSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not evict children of a pinned split APK', async () => {
+      seedSplitVersion(['cloud_only', 'synced', 'synced'], { retain: true });
+
+      await (fileSync as any).runEviction();
+
+      expect(SPLIT_KEYS.map(stateOf)).toEqual(['cloud_only', 'synced', 'synced']);
+    });
   });
 
   it('non-APK files are still evicted normally regardless of safety check', async () => {

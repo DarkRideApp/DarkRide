@@ -52,6 +52,12 @@ export function isVersionSafeToEvict(
  */
 export type ApkEvictability = 'blocked' | 'safe' | 'safe-no-analysis';
 
+// cloud_only counts: runEviction flips a split APK's children one at a time, so
+// an evicted sibling must not block the rest of its version.
+function hasCloudCopy(syncState: string): boolean {
+  return syncState === 'synced' || syncState === 'cloud_only';
+}
+
 export function apkVersionEvictability(
   db: AppDatabase,
   packageName: string,
@@ -68,7 +74,7 @@ export function apkVersionEvictability(
     )).all();
 
   if (apkRows.length === 0) return 'blocked'; // APK never tracked
-  if (apkRows.some(r => r.syncState !== 'synced')) return 'blocked';
+  if (apkRows.some(r => !hasCloudCopy(r.syncState))) return 'blocked';
 
   const requiredAnalysisKeys = [
     `apks/${packageName}/analysis/${versionCode}/source.db`,
@@ -80,7 +86,7 @@ export function apkVersionEvictability(
     const row = db.select().from(cloudFiles).where(eq(cloudFiles.cloudKey, key)).get();
     if (!row) continue;
     // Tracked but mid-flight — this is the race the gate exists to prevent.
-    if (row.syncState !== 'synced') return 'blocked';
+    if (!hasCloudCopy(row.syncState)) return 'blocked';
     tracked++;
   }
 
